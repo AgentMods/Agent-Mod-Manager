@@ -12,6 +12,12 @@ from the mounted read-only DMG under an isolated profile, passed SQLite
 `3f56aca902edccf90491eb10d6edeef6a3c97dc629b2fc82958c49785de92dfd`.
 Native distribution acceptance remains tracked below.
 
+The product name is `Agent Mod Manager` and its Tauri identifier is
+`com.glossmod.amm`. A rebuilt macOS ARM64 debug app confirmed both bundle
+metadata fields and initialized a healthy database with six plugins in the
+new app-data directory. Existing profiles require a separate migration. The
+Windows and Linux smoke scripts use the new identity for future package runs.
+
 ## Implemented
 
 - Yarn 1 lockfile, React 19/Vite/Tailwind dependency scaffold and Tauri v2 config.

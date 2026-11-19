@@ -56,7 +56,7 @@ function Assert-FreshProfiles {
 function Assert-FreshInstall([string] $PackagePath) {
     # The stock NSIS can uninstall a matching WiX product, and WiX can perform major upgrades.
     $arpPath = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
-    $productPath = 'SOFTWARE\agentmodmanager\Mod Manager'
+    $productPath = 'SOFTWARE\glossmod\Agent Mod Manager'
     $edgePath = 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
     $views = @('Registry32')
     if ([Environment]::Is64BitOperatingSystem) { $views += 'Registry64' }
@@ -66,13 +66,13 @@ function Assert-FreshInstall([string] $PackagePath) {
         foreach ($view in $views) {
             $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey($hive, $view)
             try {
-                $keys = @($base.OpenSubKey($productPath), $base.OpenSubKey("$arpPath\Mod Manager"))
+                $keys = @($base.OpenSubKey($productPath), $base.OpenSubKey("$arpPath\Agent Mod Manager"))
                 $previous = $false
                 foreach ($key in $keys) {
                     if ($key) { $key.Dispose(); $previous = $true }
                 }
                 if ($previous) {
-                    throw "Existing Mod Manager install metadata in $hive ($view); use a fresh machine/profile."
+                    throw "Existing Agent Mod Manager install metadata in $hive ($view); use a fresh machine/profile."
                 }
 
                 $arp = $base.OpenSubKey($arpPath)
@@ -82,8 +82,8 @@ function Assert-FreshInstall([string] $PackagePath) {
                             $entry = $arp.OpenSubKey($name)
                             if (-not $entry) { continue }
                             try {
-                                if ($entry.GetValue('DisplayName') -eq 'Mod Manager') {
-                                    throw "Existing Mod Manager uninstall entry in $hive ($view): $name"
+                                if ($entry.GetValue('DisplayName') -eq 'Agent Mod Manager') {
+                                    throw "Existing Agent Mod Manager uninstall entry in $hive ($view): $name"
                                 }
                             } finally { $entry.Dispose() }
                         }
@@ -108,7 +108,7 @@ function Assert-FreshInstall([string] $PackagePath) {
     }
 
     # Verified with the locked CLI's `tauri inspect wix-upgrade-code`.
-    $upgradeCode = '{883767B3-B7BA-5592-A23A-14FAE571E470}'
+    $upgradeCode = '{2268683E-95F5-580A-B89A-FD4DB10D7A1C}'
     if (-not ('AmmSmoke.WindowsInstaller' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
@@ -155,18 +155,18 @@ namespace AmmSmoke {
 '@
     }
     if ($Kind -eq 'msi' -and [guid][AmmSmoke.WindowsInstaller]::ReadUpgradeCode($PackagePath) -ne [guid]$upgradeCode) {
-        throw "MSI does not have the expected Tauri Mod Manager upgrade code: $PackagePath"
+        throw "MSI does not have the expected Tauri Agent Mod Manager upgrade code: $PackagePath"
     }
     $productCode = [Text.StringBuilder]::new(39)
     $result = [AmmSmoke.WindowsInstaller]::MsiEnumRelatedProductsW($upgradeCode, 0, 0, $productCode)
-    if ($result -eq 0) { throw "Existing Mod Manager MSI product: $productCode" }
-    if ($result -ne 259) { throw "Could not verify absence of an installed Mod Manager MSI (error $result)." }
+    if ($result -eq 0) { throw "Existing Agent Mod Manager MSI product: $productCode" }
+    if ($result -ne 259) { throw "Could not verify absence of an installed Agent Mod Manager MSI (error $result)." }
 
     foreach ($folder in @($localData, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432)) {
-        if ($folder) { Assert-Missing (Join-Path $folder 'Mod Manager') }
+        if ($folder) { Assert-Missing (Join-Path $folder 'Agent Mod Manager') }
     }
-    if (Get-Process | Where-Object ProcessName -In @('agent-mod-manager', 'Mod Manager')) {
-        throw 'Refusing to install while Mod Manager is running. No processes were stopped.'
+    if (Get-Process | Where-Object ProcessName -In @('agent-mod-manager', 'Agent Mod Manager')) {
+        throw 'Refusing to install while Agent Mod Manager is running. No processes were stopped.'
     }
     if (-not $webviewVersion) {
         throw 'A registered WebView2 Runtime is required before the smoke test; it will not be provisioned by this wrapper.'
@@ -193,8 +193,8 @@ $powerShell = Join-Path $PSHOME 'pwsh.exe'
 $package = Get-Item -LiteralPath $Installer -Force
 $extension = @{ nsis = '.exe'; msi = '.msi' }[$Kind]
 if ($package -isnot [IO.FileInfo] -or $package.Extension -ne $extension -or
-    ($Kind -eq 'nsis' -and $package.VersionInfo.ProductName -ne 'Mod Manager')) {
-    throw "Expected a Tauri Mod Manager $Kind release installer ($extension): $Installer"
+    ($Kind -eq 'nsis' -and $package.VersionInfo.ProductName -ne 'Agent Mod Manager')) {
+    throw "Expected a Tauri Agent Mod Manager $Kind release installer ($extension): $Installer"
 }
 Assert-LocalUnlinkedPath $package.FullName
 
@@ -203,8 +203,8 @@ $roamingData = [Environment]::GetFolderPath('ApplicationData')
 $localData = [Environment]::GetFolderPath('LocalApplicationData')
 Assert-LocalUnlinkedPath $roamingData
 Assert-LocalUnlinkedPath $localData
-$appData = Join-Path $roamingData 'app.agentmodmanager.desktop'
-$webviewData = Join-Path $localData 'app.agentmodmanager.desktop'
+$appData = Join-Path $roamingData 'com.glossmod.amm'
+$webviewData = Join-Path $localData 'com.glossmod.amm'
 Assert-FreshProfiles
 
 $evidence = [IO.Path]::GetFullPath($EvidenceDir, $PWD.ProviderPath).TrimEnd('\')

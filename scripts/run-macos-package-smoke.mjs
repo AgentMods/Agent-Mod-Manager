@@ -74,7 +74,7 @@ async function run() {
     child.once('exit', (code, signal) => resolveExit({ code, signal }));
   });
 
-  const database = join(profile, 'Library', 'Application Support', 'app.agentmodmanager.desktop', 'manager.db');
+  const database = join(profile, 'Library', 'Application Support', 'com.glossmod.amm', 'manager.db');
   try {
     await waitForDatabase(database, child, output, () => launchError);
     const { DatabaseSync } = await import('node:sqlite');
@@ -92,7 +92,7 @@ async function run() {
     const result = await stop(child, exit);
     await writeFile(join(evidenceDir, 'launch.json'), JSON.stringify({
       application: basename(application),
-      database: 'Library/Application Support/app.agentmodmanager.desktop/manager.db',
+      database: 'Library/Application Support/com.glossmod.amm/manager.db',
       quickCheck,
       pluginCount,
       exit: result,

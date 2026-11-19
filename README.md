@@ -1,4 +1,4 @@
-# Mod Manager
+# Agent Mod Manager
 
 Agent-driven game Mod management with Tauri v2, React 19, TypeScript and Rust.
 The full implementation goal is active. This repository is not release-ready;
@@ -50,7 +50,7 @@ with an absolute `.app` path:
 
 ```sh
 node scripts/run-macos-package-smoke.mjs \
-  "$PWD/src-tauri/target/release/bundle/macos/Mod Manager.app" \
+  "$PWD/src-tauri/target/release/bundle/macos/Agent Mod Manager.app" \
   "$PWD/output/macos-package-smoke"
 ```
 
@@ -91,12 +91,12 @@ installed app's real WebView2 through the same extended Agent scenario. They
 save installer logs and screenshots. Hosted results and platform acceptance
 status are tracked in `docs/implementation-status.md`.
 
-For Windows, use a disposable VM with no Mod Manager installation or profile,
+For Windows, use a disposable VM with no Agent Mod Manager installation or profile,
 PowerShell 7, Node 24, WebView2 and `yarn install --frozen-lockfile`. Use an
 elevated PowerShell for MSI. Run one installer per clean VM or snapshot:
 
 ```powershell
-./scripts/run-windows-package-smoke.ps1 -Kind msi -Installer 'C:\packages\Mod Manager_0.1.0_x64_en-US.msi' `
+./scripts/run-windows-package-smoke.ps1 -Kind msi -Installer 'C:\packages\Agent Mod Manager_0.1.0_x64_en-US.msi' `
   -EvidenceDir 'output\windows-package-smoke\msi' -DisposableMachine
 ```
 

@@ -16,7 +16,7 @@ import {
 const endpoint = 'http://127.0.0.1:4444';
 const platform = process.platform;
 const windows = platform === 'win32';
-const dataDirectoryName = 'app.agentmodmanager.desktop';
+const dataDirectoryName = 'com.glossmod.amm';
 const exec = promisify(execFile);
 const xdo = args => exec('xdotool', args, { timeout: 5_000 });
 const elementKey = 'element-6066-11e4-a52e-4f735466cecf';
@@ -373,7 +373,7 @@ async function fixtureProcessAlive(pid, dataHome) {
 }
 
 async function quitForRelaunch(ui, dataHome) {
-  const { stdout } = await xdo(['search', '--onlyvisible', '--name', '^Mod 管家$']);
+  const { stdout } = await xdo(['search', '--onlyvisible', '--name', '^Agent Mod Manager$']);
   const windows = stdout.trim().split(/\s+/);
   assert.ok(windows.length === 1 && /^\d+$/.test(windows[0]), 'Expected one packaged main window');
   const pid = Number((await xdo(['getwindowpid', windows[0]])).stdout.trim());

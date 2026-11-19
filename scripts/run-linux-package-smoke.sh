@@ -47,7 +47,7 @@ curl -fsS --max-time 1 http://127.0.0.1:4444/status > /dev/null
 node "$smoke" "$application" "$evidence/native-smoke.png"
 BASH
 
-db="$profile/data/app.agentmodmanager.desktop/manager.db"
+db="$profile/data/com.glossmod.amm/manager.db"
 test -f "$db"
 actual=$(sqlite3 -readonly -batch -noheader "$db" '
     PRAGMA quick_check;
