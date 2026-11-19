@@ -1,0 +1,21 @@
+{
+  "success": true,
+  "msg": "Fixture search",
+  "data": {
+    "data": [
+      {
+        "id": 1001,
+        "game_id": 2,
+        "mods_title": "Fixture Mod",
+        "mods_desc": "A synthetic 3DM entry",
+        "mods_author": "Fixture Author",
+        "mods_image_url": "/static/upload/mod/fixture.webp",
+        "mods_download_cnt": 123
+      }
+    ],
+    "count": 1,
+    "page": 1,
+    "pageSize": 20,
+    "totalPages": 1
+  }
+}

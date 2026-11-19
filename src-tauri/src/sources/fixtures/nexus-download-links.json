@@ -1,0 +1,7 @@
+[
+  {
+    "name": "CDN",
+    "short_name": "CDN",
+    "URI": "https://nexus-cdn.example.org/1704/123/sample-tools-700.zip?expires=1999999999&token=fixture-signature"
+  }
+]

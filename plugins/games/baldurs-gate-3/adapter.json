@@ -1,0 +1,182 @@
+{
+  "schemaVersion": 1,
+  "slug": "baldurs-gate-3",
+  "name": "Baldur's Gate 3",
+  "version": "1.0.0",
+  "platforms": [
+    "windows"
+  ],
+  "markers": [
+    {
+      "path": "bin/bg3.exe",
+      "kind": "file",
+      "required": false,
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "path": "bin/bg3_dx11.exe",
+      "kind": "file",
+      "required": true,
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "path": "Data",
+      "kind": "directory",
+      "required": true,
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "steamAppId": "1086940",
+  "installRoots": [
+    {
+      "id": "game",
+      "kind": "game",
+      "relativePath": ".",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [
+        "Steam/GOG installation containing bin and Data"
+      ],
+      "notes": "游戏根用于识别及经审查的特殊扩展器；普通 .pak 不放在游戏根。"
+    },
+    {
+      "id": "user-mods",
+      "kind": "registered_user",
+      "relativePath": "Mods",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [
+        "Windows: %LOCALAPPDATA%/Larian Studios/Baldur's Gate 3"
+      ],
+      "notes": "先把实际 BG3 用户数据目录登记为 user-mods 的基目录并纳入宿主管理根；解析后才得到 Mods。不得回退游戏根。"
+    },
+    {
+      "id": "profile",
+      "kind": "registered_user",
+      "relativePath": "PlayerProfiles/Public",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [
+        "Windows: %LOCALAPPDATA%/Larian Studios/Baldur's Gate 3"
+      ],
+      "notes": "profile 同样登记 BG3 用户数据基目录；Public 是常见默认配置，其他配置需明确选择并适配。"
+    },
+    {
+      "id": "launcher-cache",
+      "kind": "registered_user",
+      "relativePath": ".",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [
+        "Windows: %LOCALAPPDATA%/Larian Studios/Launcher/Cache"
+      ],
+      "notes": "用户选择并登记启动器 Cache 后才允许读取诊断日志，不清空整个 Cache。"
+    }
+  ],
+  "modTypes": [
+    {
+      "id": "pak",
+      "name": "玩家 .pak 模组",
+      "root": "user-mods",
+      "extensions": [
+        "pak"
+      ],
+      "notes": "将 .pak 放入 AppData 用户数据 Mods，非游戏根 Data/Mods。"
+    },
+    {
+      "id": "runtime-extension",
+      "name": "根目录扩展或松散覆盖",
+      "root": "game",
+      "extensions": [
+        "dll",
+        "lsx"
+      ],
+      "notes": "特殊第三方运行时和松散文件仅限审查后逐文件计划，不属于普通 .pak 自动安装。"
+    }
+  ],
+  "archiveRules": [
+    {
+      "modType": "pak",
+      "layout": "single_file",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "原样复制 .pak，不解包游戏 PAK 容器；ZIP 可在暂存区安全展开后挑选明确 .pak 载荷。"
+    },
+    {
+      "modType": "runtime-extension",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "严格按作者说明规划，默认不自动覆盖 Data、bin 或原版 PAK，不运行扩展器。"
+    }
+  ],
+  "loadOrder": {
+    "kind": "bg3_mod_settings",
+    "paths": [
+      {
+        "root": "profile",
+        "path": "modsettings.lsx",
+        "platforms": [
+          "windows"
+        ]
+      }
+    ],
+    "notes": "默认 Public 配置的 modsettings.lsx 保存模组选择/顺序，包含 UUID 等结构化元数据；不能凭 .pak 文件名生成完整条目。优先通过游戏模组管理器处理；本包不解析 PAK、不自动改 LSX，也不覆盖 Gustav 等基础模块。多配置/联机需确认相同模组版本及顺序。"
+  },
+  "savePaths": [
+    {
+      "root": "profile",
+      "path": "Savegames/Story",
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "logPaths": [
+    {
+      "root": "launcher-cache",
+      "path": ".",
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "uninstallNotes": [
+    "普通玩家 .pak 安装在用户 AppData 的 Mods，而非游戏根；卸载只处理登记根内该安装的记录。",
+    "优先使用游戏内模组管理器调整启用状态；需要改 modsettings.lsx 时先备份并理解 UUID/依赖，不删除整个配置。",
+    "保留 PlayerProfiles、Savegames 与基础模块；存档可能要求原模组及版本，移除后不保证能载入。",
+    "官方 Toolkit 的 Data/Mods、Data/Public 是创作目录，不能把官方故障排查中的删除步骤当成通用卸载策略。"
+  ],
+  "sources": [
+    {
+      "title": "Steam 游戏与 App ID",
+      "url": "https://store.steampowered.com/app/1086940/",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "Larian：手动安装 .pak 到用户 Mods 目录",
+      "url": "https://baldursgate3.game/mods-how-to/",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "Larian 支持：用户数据、modsettings 与启动器日志",
+      "url": "https://larian.com/support/faqs/mod-issues_112",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "Larian Toolkit：创作项目目录不是玩家安装目录",
+      "url": "https://docs.baldursgate3.game/Getting_Started:_Creating_a_New_Mod",
+      "checkedAt": "2026-11-17"
+    }
+  ]
+}

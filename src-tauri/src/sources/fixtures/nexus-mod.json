@@ -1,0 +1,30 @@
+{
+  "mod_id": 123,
+  "game_id": 1704,
+  "domain_name": "skyrimspecialedition",
+  "category_id": 15,
+  "contains_adult_content": false,
+  "name": "Sample Skyrim Tools",
+  "summary": "Sample tools for Skyrim",
+  "description": "A long description",
+  "version": "1.2.3",
+  "author": "SkyrimAuthor",
+  "user": {
+    "member_id": 42,
+    "member_group_id": 4,
+    "name": "Uploader"
+  },
+  "uploaded_by": "Uploader",
+  "uploaded_users_profile_url": "https://www.nexusmods.com/users/42",
+  "status": "published",
+  "available": true,
+  "picture_url": "https://staticdelivery.nexusmods.com/mods/1704/images/123.png",
+  "created_timestamp": 1735689600,
+  "created_time": "2025-01-01T00:00:00Z",
+  "updated_timestamp": 1767225600,
+  "updated_time": "2026-01-01T00:00:00Z",
+  "allow_rating": true,
+  "endorsement_count": 12,
+  "mod_downloads": 4200,
+  "mod_unique_downloads": 4000
+}

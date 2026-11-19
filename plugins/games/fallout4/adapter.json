@@ -1,0 +1,221 @@
+{
+  "schemaVersion": 1,
+  "slug": "fallout4",
+  "name": "Fallout 4",
+  "version": "1.0.0",
+  "platforms": [
+    "windows"
+  ],
+  "markers": [
+    {
+      "path": "Fallout4.exe",
+      "kind": "file",
+      "required": true,
+      "platforms": [
+        "windows"
+      ]
+    },
+    {
+      "path": "Data/Fallout4.esm",
+      "kind": "file",
+      "required": true,
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "steamAppId": "377160",
+  "installRoots": [
+    {
+      "id": "game",
+      "kind": "game",
+      "relativePath": ".",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [
+        "Steam library common/Fallout 4"
+      ],
+      "notes": "登记包含游戏 EXE 的安装目录；不兼容 VR 或原版 Skyrim 布局。"
+    },
+    {
+      "id": "data",
+      "kind": "game",
+      "relativePath": "Data",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [],
+      "notes": "插件、资源、脚本与扩展器插件保留 Data 内部结构。"
+    },
+    {
+      "id": "local-profile",
+      "kind": "registered_user",
+      "relativePath": ".",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [
+        "Windows: %LOCALAPPDATA%/Fallout4"
+      ],
+      "notes": "用户确认并登记对应配置目录后才可写插件列表；GOG 等发行版可能采用不同目录名，须实测。"
+    },
+    {
+      "id": "documents-profile",
+      "kind": "registered_user",
+      "relativePath": ".",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [
+        "Windows Documents known folder/My Games/Fallout4"
+      ],
+      "notes": "通过系统已知文件夹定位，Documents 可能重定向；不硬编码用户名。"
+    }
+  ],
+  "modTypes": [
+    {
+      "id": "data-mod",
+      "name": "Data 插件与资源",
+      "root": "data",
+      "extensions": [
+        "esp",
+        "esm",
+        "esl",
+        "ba2",
+        "pex",
+        "dds",
+        "nif"
+      ],
+      "notes": "保留插件与 BA2 文件名配对及脚本目录；散文件可能无插件。"
+    },
+    {
+      "id": "extender-plugin",
+      "name": "F4SE 原生插件",
+      "root": "data",
+      "extensions": [
+        "dll",
+        "ini",
+        "toml"
+      ],
+      "notes": "通常在 F4SE/Plugins；必须精确匹配游戏运行时和扩展器 ABI。"
+    },
+    {
+      "id": "root-loader",
+      "name": "F4SE 加载器或根目录文件",
+      "root": "game",
+      "extensions": [
+        "dll",
+        "exe"
+      ],
+      "notes": "仅可在审查后逐文件部署，绝不能把未知 EXE 当作普通 Data 文件。"
+    },
+    {
+      "id": "fomod",
+      "name": "FOMOD 选择式安装",
+      "root": "data",
+      "extensions": [
+        "xml"
+      ],
+      "notes": "先解析 ModuleConfig 选项、依赖与条件，不执行归档附带安装脚本。"
+    }
+  ],
+  "archiveRules": [
+    {
+      "modType": "data-mod",
+      "layout": "strip_prefix",
+      "sourcePrefix": "Data",
+      "requiredFiles": [],
+      "notes": "只有确认顶层 Data 是有效载荷且无选项分支时，才去掉一次 Data，防止 Data/Data。"
+    },
+    {
+      "modType": "data-mod",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "无顶层 Data 的散文件包需要确认载荷相对布局，不盲目剥离任意目录。"
+    },
+    {
+      "modType": "extender-plugin",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "保留 Data/F4SE/Plugins 结构；原生插件必须另核对运行时版本。"
+    },
+    {
+      "modType": "root-loader",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "F4SE 的加载器在游戏 EXE 旁，脚本在 Data/Scripts；分开规划，不能把所有内容塞入 Data。"
+    },
+    {
+      "modType": "fomod",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [
+        "fomod/ModuleConfig.xml"
+      ],
+      "notes": "遇到 fomod/ModuleConfig.xml 时先做条件选择，不能按普通 Data 规则自动部署。"
+    }
+  ],
+  "loadOrder": {
+    "kind": "bethesda_plugins",
+    "paths": [
+      {
+        "root": "local-profile",
+        "path": "Plugins.txt",
+        "platforms": [
+          "windows"
+        ]
+      }
+    ],
+    "notes": "插件列表的 * 前缀标记启用；诊断只在有界范围内读取已列出的 loose 插件 TES4 MAST 主文件，不实现 LOOT、完整插件依赖解算或排序算法。Data 文件覆盖顺序不同于 ESP/ESM/ESL 插件顺序；Skyrim SE/Fallout 4 不套用经典 Skyrim 的 loadorder.txt。非默认发行版或 INI 测试插件配置可能改变行为，先核对。"
+  },
+  "savePaths": [
+    {
+      "root": "documents-profile",
+      "path": "Saves",
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "logPaths": [
+    {
+      "root": "documents-profile",
+      "path": "F4SE",
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "uninstallNotes": [
+    "仅根据安装事务记录卸载模组并恢复原文件；不要删除整个 Data。",
+    "移除脚本或内容插件前备份存档与伴随扩展器存档；不能承诺移除后存档安全。",
+    "插件列表和 INI 位于游戏根外，先登记对应用户管理根；不要顺带清空用户配置。",
+    "保留其他模组依赖的扩展器与共享库；游戏版本更新后重新核对原生插件 ABI。"
+  ],
+  "sources": [
+    {
+      "title": "Steam 游戏与 App ID",
+      "url": "https://store.steampowered.com/app/377160/",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "F4SE 作者安装说明",
+      "url": "https://github.com/ianpatt/f4se/blob/master/f4se_readme.txt",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "libloadorder：插件位置与固定顺序",
+      "url": "https://github.com/Ortham/libloadorder/blob/master/src/game_settings.rs",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "LOOT：依赖与排序规则",
+      "url": "https://github.com/loot/loot/blob/master/docs/app/sorting.rst",
+      "checkedAt": "2026-11-17"
+    }
+  ]
+}

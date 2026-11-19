@@ -1,0 +1,193 @@
+{
+  "schemaVersion": 1,
+  "slug": "stardew-valley",
+  "name": "Stardew Valley",
+  "version": "1.0.0",
+  "platforms": [
+    "windows",
+    "macos",
+    "linux"
+  ],
+  "markers": [
+    {
+      "path": "Stardew Valley.dll",
+      "kind": "file",
+      "required": true,
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ]
+    }
+  ],
+  "steamAppId": "413150",
+  "installRoots": [
+    {
+      "id": "game",
+      "kind": "game",
+      "relativePath": ".",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "discoveryHints": [
+        "Select the SMAPI game directory containing Stardew Valley.dll",
+        "On macOS this can be the installation Contents/MacOS directory"
+      ],
+      "notes": "以 SMAPI 实际使用的运行目录为根，不假定 macOS 应用包顶层。"
+    },
+    {
+      "id": "mods",
+      "kind": "game",
+      "relativePath": "Mods",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "discoveryHints": [],
+      "notes": "默认 SMAPI 模组目录；自定义 --mods-path 需要独立登记并适配。"
+    },
+    {
+      "id": "user-data",
+      "kind": "registered_user",
+      "relativePath": ".",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "discoveryHints": [
+        "Windows (Steam/GOG): %APPDATA%/StardewValley",
+        "macOS/Linux: ~/.config/StardewValley"
+      ],
+      "notes": "选择当前用户真实数据目录；Xbox 发行版路径不在本包范围。"
+    }
+  ],
+  "modTypes": [
+    {
+      "id": "smapi-mod",
+      "name": "SMAPI 模组",
+      "root": "mods",
+      "extensions": [
+        "json",
+        "dll"
+      ],
+      "notes": "每个模组目录有 manifest.json；DLL 文件不是安装器，不执行。"
+    },
+    {
+      "id": "content-pack",
+      "name": "SMAPI 内容包",
+      "root": "mods",
+      "extensions": [
+        "json"
+      ],
+      "notes": "manifest.json 的 ContentPackFor 指向内容框架，按依赖核对。"
+    },
+    {
+      "id": "legacy-xnb",
+      "name": "旧式 XNB 替换",
+      "root": "game",
+      "extensions": [
+        "xnb"
+      ],
+      "notes": "只作为手动迁移场景，不自动覆盖原版 Content；优先查找现代内容包。"
+    }
+  ],
+  "archiveRules": [
+    {
+      "modType": "smapi-mod",
+      "layout": "mod_directory",
+      "sourcePrefix": null,
+      "requiredFiles": [
+        "manifest.json"
+      ],
+      "notes": "保留 ModName/manifest.json 及其全部必要文件，不扁平化 DLL。"
+    },
+    {
+      "modType": "content-pack",
+      "layout": "mod_directory",
+      "sourcePrefix": null,
+      "requiredFiles": [
+        "manifest.json"
+      ],
+      "notes": "保留内容包文件夹及 manifest，核对 ContentPackFor 对应框架。"
+    },
+    {
+      "modType": "legacy-xnb",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "旧式 Content 替换必须逐文件备份并审查；本包不自动部署。"
+    }
+  ],
+  "loadOrder": {
+    "kind": "loader_dependencies",
+    "paths": [],
+    "notes": "SMAPI 根据 manifest 依赖排序；不要以文件夹名字或数值列表伪造通用加载顺序。"
+  },
+  "savePaths": [
+    {
+      "root": "user-data",
+      "path": "Saves",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ]
+    }
+  ],
+  "logPaths": [
+    {
+      "root": "user-data",
+      "path": "ErrorLogs/SMAPI-latest.txt",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "root": "user-data",
+      "path": "ErrorLogs/SMAPI-crash.txt",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ]
+    }
+  ],
+  "uninstallNotes": [
+    "按记录移除整个已安装模组目录，先核对其他模组是否依赖它。",
+    "保留 Saves、用户配置及模组数据；移除新增地图或物品前按模组说明处理存档。",
+    "旧 XNB 替换须恢复备份，不能仅删除替换文件；不要自动卸载 SMAPI。"
+  ],
+  "sources": [
+    {
+      "title": "Steam 游戏与 App ID",
+      "url": "https://store.steampowered.com/app/413150/",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "SMAPI 作者：模组打包及默认 Mods 路径",
+      "url": "https://github.com/Pathoschild/SMAPI/blob/develop/docs/technical/mod-package.md",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "SMAPI 作者：路径常量与存档",
+      "url": "https://github.com/Pathoschild/SMAPI/blob/develop/src/SMAPI/Constants.cs",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "SMAPI 日志位置",
+      "url": "https://smapi.io/log",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "SMAPI 作者：依赖排序配置",
+      "url": "https://github.com/Pathoschild/SMAPI/blob/develop/src/SMAPI/SMAPI.config.json",
+      "checkedAt": "2026-11-17"
+    }
+  ]
+}

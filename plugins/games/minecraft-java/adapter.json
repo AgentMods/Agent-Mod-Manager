@@ -1,0 +1,232 @@
+{
+  "schemaVersion": 1,
+  "slug": "minecraft-java",
+  "name": "Minecraft Java Edition",
+  "version": "1.0.0",
+  "platforms": [
+    "windows",
+    "macos",
+    "linux"
+  ],
+  "markers": [
+    {
+      "path": "options.txt",
+      "kind": "file",
+      "required": false,
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "path": "versions",
+      "kind": "directory",
+      "required": false,
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "path": "saves",
+      "kind": "directory",
+      "required": false,
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ]
+    }
+  ],
+  "steamAppId": null,
+  "installRoots": [
+    {
+      "id": "instance",
+      "kind": "game",
+      "relativePath": ".",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "discoveryHints": [
+        "Windows: %APPDATA%/.minecraft",
+        "macOS: ~/Library/Application Support/minecraft",
+        "Linux: ~/.minecraft",
+        "Launcher-selected instance game directory"
+      ],
+      "notes": "登记实际实例目录；不等于启动器程序目录。标记仅供候选发现，不能证明加载器已安装。"
+    },
+    {
+      "id": "mods",
+      "kind": "game",
+      "relativePath": "mods",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "discoveryHints": [],
+      "notes": "使用与该实例匹配的 Fabric、Forge 或 NeoForge。"
+    },
+    {
+      "id": "resource-packs",
+      "kind": "game",
+      "relativePath": "resourcepacks",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "discoveryHints": [],
+      "notes": "资源包由游戏界面启用。"
+    },
+    {
+      "id": "world-datapacks",
+      "kind": "registered_user",
+      "relativePath": "datapacks",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ],
+      "discoveryHints": [
+        "Select the specific instance saves/<world> directory and register it explicitly"
+      ],
+      "notes": "根映射必须是用户选择的单个世界目录，不能推断世界名。"
+    }
+  ],
+  "modTypes": [
+    {
+      "id": "java-mod",
+      "name": "Java 加载器模组",
+      "root": "mods",
+      "extensions": [
+        "jar"
+      ],
+      "notes": "原样复制 JAR，不解压；核对 Minecraft 版本、加载器及依赖。"
+    },
+    {
+      "id": "resource-pack",
+      "name": "资源包",
+      "root": "resource-packs",
+      "extensions": [
+        "zip"
+      ],
+      "notes": "ZIP 原样保留；检查根部 pack.mcmeta。"
+    },
+    {
+      "id": "datapack",
+      "name": "世界数据包",
+      "root": "world-datapacks",
+      "extensions": [
+        "zip"
+      ],
+      "notes": "选择世界后才可计划安装，ZIP 根部须有 pack.mcmeta。"
+    },
+    {
+      "id": "modpack",
+      "name": "整合包导入",
+      "root": "instance",
+      "extensions": [
+        "mrpack",
+        "zip"
+      ],
+      "notes": "需要专门导入器解析清单与下载策略，本声明不执行清单或脚本。"
+    }
+  ],
+  "archiveRules": [
+    {
+      "modType": "java-mod",
+      "layout": "single_file",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "JAR 是最终载荷；不要按 ZIP 展开，也不要把 Fabric/Forge/NeoForge 混用。"
+    },
+    {
+      "modType": "resource-pack",
+      "layout": "single_file",
+      "sourcePrefix": null,
+      "requiredFiles": [
+        "pack.mcmeta"
+      ],
+      "notes": "保留 ZIP；不是 mods 加载器模组。"
+    },
+    {
+      "modType": "datapack",
+      "layout": "single_file",
+      "sourcePrefix": null,
+      "requiredFiles": [
+        "pack.mcmeta"
+      ],
+      "notes": "保留 ZIP；目标为已登记世界根中的 datapacks。"
+    },
+    {
+      "modType": "modpack",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "解析整合包清单、覆盖文件与依赖后生成独立实例计划，不批量覆盖现有实例。"
+    }
+  ],
+  "loadOrder": {
+    "kind": "loader_dependencies",
+    "paths": [],
+    "notes": "加载器按元数据处理依赖；不存在通用的手写 plugins.txt。资源包与世界数据包的启用和顺序由游戏管理，不通过重命名 JAR 排序。"
+  },
+  "savePaths": [
+    {
+      "root": "instance",
+      "path": "saves",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ]
+    }
+  ],
+  "logPaths": [
+    {
+      "root": "instance",
+      "path": "logs/latest.log",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "root": "instance",
+      "path": "crash-reports",
+      "platforms": [
+        "windows",
+        "macos",
+        "linux"
+      ]
+    }
+  ],
+  "uninstallNotes": [
+    "删除或禁用只限记录过的 JAR/资源包/数据包；保留 config、saves 和未知文件。",
+    "移除内容模组或数据包可能破坏世界；先备份该世界并遵循模组作者说明。",
+    "不要移除其他模组仍依赖的 API 或加载器。"
+  ],
+  "sources": [
+    {
+      "title": "Fabric：安装模组与各平台 mods 路径",
+      "url": "https://docs.fabricmc.net/players/installing-mods",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "Fabric：独立实例游戏目录",
+      "url": "https://wiki.fabricmc.net/player:tutorials:install_mcl:windows",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "Fabric：提交日志",
+      "url": "https://docs.fabricmc.net/players/troubleshooting/uploading-logs",
+      "checkedAt": "2026-11-17"
+    }
+  ]
+}

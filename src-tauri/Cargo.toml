@@ -1,0 +1,79 @@
+[package]
+name = "agent-mod-manager"
+version = "0.1.0"
+description = "Agent-driven cross-platform game mod manager"
+authors = ["Agent Mod Manager"]
+edition = "2021"
+rust-version = "1.88"
+
+[lib]
+name = "agent_mod_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-store = "2"
+aes-gcm = "0.10"
+dotenvy = "0.15"
+zeroize = "1"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+async-trait = "0.1"
+thiserror = "2"
+anyhow = "1"
+
+rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli"] }
+zip = { version = "2", default-features = false, features = ["deflate", "bzip2", "zstd", "time"] }
+sevenz-rust = "0.6"
+flate2 = "1"
+bzip2 = "0.5"
+tar = "0.4"
+
+walkdir = "2"
+notify = "8"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+dirs = "6"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+rand = "0.9"
+url = "2"
+percent-encoding = "2.3"
+regex = "1"
+encoding_rs = "0.8"
+roxmltree = "0.21"
+rmcp = { version = "=3.10.0", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "reqwest", "server", "transport-streamable-http-server"] }
+reqwest-mcp = { package = "reqwest", version = "0.13.2", default-features = false, features = ["rustls"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+subtle = "2.6"
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[dev-dependencies]
+tempfile = "3"
+tauri = { version = "2", features = ["test"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

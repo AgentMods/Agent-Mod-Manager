@@ -1,0 +1,47 @@
+{
+  "data": {
+    "id": 67217,
+    "gameId": 432,
+    "name": "Sample Toolkit",
+    "slug": "sample-toolkit",
+    "links": {
+      "websiteUrl": "https://www.curseforge.com/minecraft/mc-mods/sample-toolkit",
+      "wikiUrl": null,
+      "issuesUrl": null,
+      "sourceUrl": null
+    },
+    "summary": "A toolkit for Minecraft",
+    "status": 4,
+    "downloadCount": 9876,
+    "isFeatured": false,
+    "primaryCategoryId": 6,
+    "categories": [],
+    "classId": 6,
+    "authors": [
+      {
+        "id": 44,
+        "name": "ToolkitAuthor",
+        "url": "https://www.curseforge.com/members/toolkitauthor"
+      }
+    ],
+    "logo": {
+      "id": 55,
+      "modId": 67217,
+      "title": "Icon",
+      "description": "Icon",
+      "thumbnailUrl": "https://media.forgecdn.net/avatars/thumbnails/1/2/256/256/icon.png",
+      "url": "https://media.forgecdn.net/avatars/1/2/icon.png"
+    },
+    "screenshots": [],
+    "mainFileId": 9004,
+    "latestFiles": [],
+    "latestFilesIndexes": [],
+    "dateCreated": "2025-01-01T00:00:00Z",
+    "dateModified": "2026-01-01T00:00:00Z",
+    "dateReleased": "2026-01-01T00:00:00Z",
+    "allowModDistribution": true,
+    "gamePopularityRank": 10,
+    "isAvailable": true,
+    "thumbsUpCount": 0
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "hits": [
+    {
+      "project_id": "A1b2C3d4",
+      "project_type": "mod",
+      "slug": "sample-tools",
+      "author": "SampleAuthor",
+      "title": "Sample Tools",
+      "description": "Tools for Minecraft",
+      "categories": [
+        "fabric",
+        "utility"
+      ],
+      "display_categories": [
+        "fabric",
+        "utility"
+      ],
+      "versions": [
+        "1.21.1"
+      ],
+      "downloads": 12345,
+      "follows": 45,
+      "icon_url": "https://cdn.modrinth.com/data/A1b2C3d4/icon.png",
+      "date_created": "2025-01-01T00:00:00Z",
+      "date_modified": "2026-01-01T00:00:00Z",
+      "latest_version": "Version2",
+      "license": "MIT",
+      "client_side": "required",
+      "server_side": "optional",
+      "gallery": [],
+      "featured_gallery": null,
+      "color": null
+    }
+  ],
+  "offset": 0,
+  "limit": 20,
+  "total_hits": 1
+}

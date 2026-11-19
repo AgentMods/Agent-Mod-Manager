@@ -1,0 +1,62 @@
+{
+  "files": [
+    {
+      "file_id": 700,
+      "category_id": 1,
+      "category_name": "MAIN",
+      "changelog_html": null,
+      "content_preview_link": "https://staticdelivery.nexusmods.com/mods/1704/files/700.json",
+      "name": "Sample Skyrim Tools 700",
+      "description": "File description",
+      "version": "1.2.3",
+      "size": 12,
+      "size_kb": 12,
+      "size_in_bytes": 12345,
+      "file_name": "sample-tools-700.zip",
+      "uploaded_timestamp": 1767225600,
+      "uploaded_time": "2026-01-01T00:00:00Z",
+      "mod_version": "1.2.3",
+      "external_virus_scan_url": null,
+      "is_primary": true
+    },
+    {
+      "file_id": 701,
+      "category_id": 3,
+      "category_name": "OPTIONAL",
+      "changelog_html": null,
+      "content_preview_link": "https://staticdelivery.nexusmods.com/mods/1704/files/701.json",
+      "name": "Sample Skyrim Tools 701",
+      "description": "File description",
+      "version": "1.2.3",
+      "size": 12,
+      "size_kb": 12,
+      "size_in_bytes": 12345,
+      "file_name": "sample-tools-701.zip",
+      "uploaded_timestamp": 1767225600,
+      "uploaded_time": "2026-01-01T00:00:00Z",
+      "mod_version": "1.2.3",
+      "external_virus_scan_url": null,
+      "is_primary": false
+    },
+    {
+      "file_id": 702,
+      "category_id": 7,
+      "category_name": "ARCHIVED",
+      "changelog_html": null,
+      "content_preview_link": "https://staticdelivery.nexusmods.com/mods/1704/files/702.json",
+      "name": "Sample Skyrim Tools 702",
+      "description": "File description",
+      "version": "1.2.3",
+      "size": 12,
+      "size_kb": 12,
+      "size_in_bytes": 12345,
+      "file_name": "sample-tools-702.zip",
+      "uploaded_timestamp": 1767225600,
+      "uploaded_time": "2026-01-01T00:00:00Z",
+      "mod_version": "1.2.3",
+      "external_virus_scan_url": null,
+      "is_primary": false
+    }
+  ],
+  "file_updates": []
+}

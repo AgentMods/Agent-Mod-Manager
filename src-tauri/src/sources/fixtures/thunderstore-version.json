@@ -1,0 +1,43 @@
+{
+  "categories": [],
+  "community_identifier": "valheim",
+  "community_name": "Valheim",
+  "dependant_count": 0,
+  "dependencies": [
+    {
+      "description": "Loader",
+      "icon_url": null,
+      "is_active": true,
+      "name": "BepInExPack_Valheim",
+      "namespace": "denikson",
+      "version_number": "5.4.2202",
+      "is_removed": false,
+      "community_identifier": "valheim",
+      "is_unavailable": false
+    }
+  ],
+  "dependency_count": 1,
+  "description": "Sample Valheim mod",
+  "download_count": 120,
+  "download_url": "https://thunderstore.io/package/download/Team/SampleMod/1.2.3/",
+  "full_version_name": "Team-SampleMod-1.2.3",
+  "has_changelog": false,
+  "icon_url": "https://gcdn.thunderstore.io/live/repository/icons/Team-SampleMod-1.2.3.png",
+  "install_url": "ror2mm://v1/install/thunderstore.io/Team/SampleMod/1.2.3/",
+  "is_deprecated": false,
+  "is_nsfw": false,
+  "is_pinned": false,
+  "latest_version_number": "2.0.0",
+  "name": "SampleMod",
+  "namespace": "Team",
+  "package_created": "2025-01-01T00:00:00Z",
+  "rating_count": 8,
+  "size": 1234567,
+  "team": {
+    "name": "Team",
+    "members": []
+  },
+  "version_count": 2,
+  "version_created": "2026-01-01T00:00:00Z",
+  "website_url": null
+}

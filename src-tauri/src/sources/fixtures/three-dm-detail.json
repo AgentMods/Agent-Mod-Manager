@@ -1,0 +1,39 @@
+{
+  "success": true,
+  "msg": "Fixture detail",
+  "data": {
+    "id": 1001,
+    "game_id": 2,
+    "mods_title": "Fixture Mod",
+    "mods_version": "2.0",
+    "mods_resource": [
+      {
+        "id": 2001,
+        "mods_id": 1001,
+        "mods_resource_name": "Fixture.zip",
+        "mods_resource_url": "https://dmod.3dmgame.com/static/upload/resource2/202611/fixture.zip",
+        "mods_resource_version": "2.0",
+        "mods_resource_size": "0.14MB",
+        "mods_resource_latest_version": true
+      },
+      {
+        "id": 2002,
+        "mods_id": 1001,
+        "mods_resource_name": "Fixture.zip",
+        "mods_resource_url": "https://pan.example.org/share/fixture",
+        "mods_resource_version": "2.0",
+        "mods_resource_size": "0.14MB",
+        "mods_resource_latest_version": true
+      },
+      {
+        "id": 2003,
+        "mods_id": 1001,
+        "mods_resource_name": "Fixture-old.zip",
+        "mods_resource_url": "https://dmod.3dmgame.com/static/upload/resource/202610/fixture-old.zip",
+        "mods_resource_version": "1.0",
+        "mods_resource_size": "0.10MB",
+        "mods_resource_latest_version": false
+      }
+    ]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "count": 3,
+  "previous": null,
+  "next": "https://thunderstore.io/api/cyberstorm/package/Team/SampleMod/versions/?page=2",
+  "results": [
+    {
+      "version_number": "1.2.3",
+      "datetime_created": "2026-01-01T00:00:00Z",
+      "download_count": 120,
+      "download_url": "https://thunderstore.io/package/download/Team/SampleMod/1.2.3/",
+      "install_url": "ror2mm://v1/install/thunderstore.io/Team/SampleMod/1.2.3/",
+      "is_readme_edited": false
+    },
+    {
+      "version_number": "1.1.0",
+      "datetime_created": "2025-12-01T00:00:00Z",
+      "download_count": 80,
+      "download_url": "https://thunderstore.io/package/download/Team/SampleMod/1.1.0/",
+      "install_url": "ror2mm://v1/install/thunderstore.io/Team/SampleMod/1.1.0/",
+      "is_readme_edited": true
+    }
+  ]
+}

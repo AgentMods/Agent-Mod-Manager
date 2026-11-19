@@ -1,0 +1,24 @@
+{
+  "data": {
+    "mods": {
+      "totalCount": 8,
+      "nodes": [
+        {
+          "modId": 123,
+          "name": "Sample Skyrim Tools",
+          "summary": "Sample tools for Skyrim",
+          "downloads": 4200,
+          "author": "SkyrimAuthor",
+          "game": { "domainName": "skyrimspecialedition" }
+        },
+        {
+          "modId": 456,
+          "name": "Sample Skyrim UI",
+          "summary": "Sample interface for Skyrim",
+          "downloads": null,
+          "game": { "domainName": "skyrimspecialedition" }
+        }
+      ]
+    }
+  }
+}

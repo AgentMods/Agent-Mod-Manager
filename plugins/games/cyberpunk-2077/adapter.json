@@ -1,0 +1,241 @@
+{
+  "schemaVersion": 1,
+  "slug": "cyberpunk-2077",
+  "name": "Cyberpunk 2077",
+  "version": "1.0.0",
+  "platforms": [
+    "windows"
+  ],
+  "markers": [
+    {
+      "path": "bin/x64/Cyberpunk2077.exe",
+      "kind": "file",
+      "required": true,
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "steamAppId": "1091500",
+  "installRoots": [
+    {
+      "id": "game",
+      "kind": "game",
+      "relativePath": ".",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [
+        "Steam/GOG/Epic installation containing bin/x64/Cyberpunk2077.exe"
+      ],
+      "notes": "本包覆盖 Windows 布局，不推断 macOS 或 Proton 布局。"
+    },
+    {
+      "id": "legacy-archives",
+      "kind": "game",
+      "relativePath": "archive/pc/mod",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [],
+      "notes": "传统 .archive 模组；不要覆盖 archive/pc/content 原版归档。"
+    },
+    {
+      "id": "redmod-mods",
+      "kind": "game",
+      "relativePath": "mods",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [],
+      "notes": "REDmod 每个模组子目录包含 info.json。"
+    },
+    {
+      "id": "redscript",
+      "kind": "game",
+      "relativePath": "r6/scripts",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [],
+      "notes": "redscript 脚本需要独立加载器与版本核对。"
+    },
+    {
+      "id": "red4ext-plugins",
+      "kind": "game",
+      "relativePath": "red4ext/plugins",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [],
+      "notes": "RED4ext 原生插件目录，保留每个插件文件结构。"
+    },
+    {
+      "id": "saves",
+      "kind": "registered_user",
+      "relativePath": ".",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [
+        "Windows Saved Games known folder/CD Projekt Red/Cyberpunk 2077"
+      ],
+      "notes": "存档根仅供用户登记后访问，不能从归档创建用户路径。"
+    }
+  ],
+  "modTypes": [
+    {
+      "id": "legacy-archive",
+      "name": "传统归档模组",
+      "root": "legacy-archives",
+      "extensions": [
+        "archive",
+        "xl"
+      ],
+      "notes": "识别归档及可选 ArchiveXL 辅助数据；相关框架须单独核对。"
+    },
+    {
+      "id": "redmod",
+      "name": "REDmod 内容包",
+      "root": "redmod-mods",
+      "extensions": [
+        "json",
+        "archive"
+      ],
+      "notes": "保留命名子目录及 info.json。"
+    },
+    {
+      "id": "redscript",
+      "name": "redscript 脚本",
+      "root": "redscript",
+      "extensions": [
+        "reds"
+      ],
+      "notes": "脚本只部署，不执行；需核对 redscript 依赖。"
+    },
+    {
+      "id": "red4ext-plugin",
+      "name": "RED4ext 原生插件",
+      "root": "red4ext-plugins",
+      "extensions": [
+        "dll",
+        "json",
+        "toml"
+      ],
+      "notes": "需核对 RED4ext 与运行时 ABI。"
+    },
+    {
+      "id": "mixed-framework",
+      "name": "混合框架与根目录包",
+      "root": "game",
+      "extensions": [
+        "dll",
+        "asi",
+        "lua",
+        "json"
+      ],
+      "notes": "CET、加载器与多根归档需要手动逐文件计划，不能套用 archive 规则。"
+    }
+  ],
+  "archiveRules": [
+    {
+      "modType": "legacy-archive",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "确认裸 .archive 或 archive/pc/mod 前缀再定位；不要把所有 ZIP 内容扁平化到此处。"
+    },
+    {
+      "modType": "legacy-archive",
+      "layout": "strip_prefix",
+      "sourcePrefix": "archive/pc/mod",
+      "requiredFiles": [],
+      "notes": "仅移除明确匹配的 archive/pc/mod 前缀，其他根的文件需另分配。"
+    },
+    {
+      "modType": "redmod",
+      "layout": "mod_directory",
+      "sourcePrefix": null,
+      "requiredFiles": [
+        "info.json"
+      ],
+      "notes": "保留 ModName/info.json 与其 archives/scripts 等内部布局。"
+    },
+    {
+      "modType": "redscript",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "保留 r6/scripts 下的脚本子目录；混合包各目标分别审查。"
+    },
+    {
+      "modType": "red4ext-plugin",
+      "layout": "mod_directory",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "保留插件目录及依赖 DLL；不得执行 DLL。"
+    },
+    {
+      "modType": "mixed-framework",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "根目录加载器、CET 与混合框架使用作者逐文件说明，不执行 redMod.exe 或安装脚本。"
+    }
+  ],
+  "loadOrder": {
+    "kind": "redmod",
+    "paths": [],
+    "notes": "REDmod 的部署与启用由官方工具/启动器管理，info.json 不是本管理器执行入口。传统 archive、redscript 和原生框架不是同一套通用顺序机制；本包不运行 REDmod 部署或修改加载顺序。"
+  },
+  "savePaths": [
+    {
+      "root": "saves",
+      "path": ".",
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "logPaths": [
+    {
+      "root": "game",
+      "path": "red4ext/logs",
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "uninstallNotes": [
+    "卸载只处理记录中的模组文件及备份，保留原版 archive/pc/content 和存档。",
+    "先核对共享框架依赖，不能为了一个模组删除整个 r6、bin、red4ext 或 mods。",
+    "REDmod 部署缓存或启动器状态应由官方工具按明确授权刷新，本声明不执行工具或清空共享缓存。"
+  ],
+  "sources": [
+    {
+      "title": "Steam 游戏与 App ID",
+      "url": "https://store.steampowered.com/app/1091500/",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "CD PROJEKT RED：REDmod 安装与 info.json",
+      "url": "https://www.cyberpunk.net/en/modding-support",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "RED4ext 作者：插件目录",
+      "url": "https://docs.red4ext.com/getting-started/installing-a-plugin",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "RED4ext 作者：脚本与插件示例",
+      "url": "https://docs.red4ext.com/mod-developers/creating-a-plugin-with-redlib",
+      "checkedAt": "2026-11-17"
+    },
+    {
+      "title": "CD PROJEKT RED：存档路径",
+      "url": "https://support.cdprojektred.com/en/cyberpunk%20/pc/sp-technical/issue/2233/how-do-i-perform-a-clean-install-of-the-game",
+      "checkedAt": "2026-11-17"
+    }
+  ]
+}

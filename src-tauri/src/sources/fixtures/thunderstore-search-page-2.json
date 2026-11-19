@@ -1,0 +1,29 @@
+{
+  "count": 21,
+  "previous": "https://thunderstore.io/api/cyberstorm/listing/valheim/?page=1",
+  "next": null,
+  "results": [
+    {
+      "categories": [
+        {
+          "id": 1,
+          "name": "Mods",
+          "slug": "mods"
+        }
+      ],
+      "community_identifier": "valheim",
+      "description": "Sample Valheim mod",
+      "download_count": 120,
+      "icon_url": "https://gcdn.thunderstore.io/live/repository/icons/Team-FinalMod-1.2.3.png",
+      "is_deprecated": false,
+      "is_nsfw": false,
+      "is_pinned": false,
+      "last_updated": "2026-01-01T00:00:00Z",
+      "name": "FinalMod",
+      "namespace": "Team",
+      "rating_count": 8,
+      "size": 1234567,
+      "datetime_created": "2025-01-01T00:00:00Z"
+    }
+  ]
+}

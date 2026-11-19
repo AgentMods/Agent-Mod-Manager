@@ -1,0 +1,175 @@
+{
+  "data": [
+    {
+      "id": 9000,
+      "gameId": 432,
+      "modId": 99,
+      "isAvailable": true,
+      "displayName": "Sample Toolkit 2.0",
+      "fileName": "sample-toolkit-2.0.jar",
+      "releaseType": 1,
+      "fileStatus": 4,
+      "hashes": [
+        {
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "algo": 1
+        },
+        {
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "algo": 2
+        }
+      ],
+      "fileDate": "2026-11-01T00:00:00Z",
+      "fileLength": 54321,
+      "downloadCount": 123,
+      "downloadUrl": "https://edge.forgecdn.net/files/9004/sample-toolkit-2.0.jar",
+      "gameVersions": [
+        "1.21.1",
+        "Java 21"
+      ],
+      "sortableGameVersions": [],
+      "dependencies": [],
+      "isServerPack": false,
+      "fileFingerprint": 12345,
+      "modules": []
+    },
+    {
+      "id": 9001,
+      "gameId": 432,
+      "modId": 67217,
+      "isAvailable": false,
+      "displayName": "Sample Toolkit 2.0",
+      "fileName": "sample-toolkit-2.0.jar",
+      "releaseType": 1,
+      "fileStatus": 4,
+      "hashes": [
+        {
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "algo": 1
+        },
+        {
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "algo": 2
+        }
+      ],
+      "fileDate": "2026-10-01T00:00:00Z",
+      "fileLength": 54321,
+      "downloadCount": 123,
+      "downloadUrl": "https://edge.forgecdn.net/files/9004/sample-toolkit-2.0.jar",
+      "gameVersions": [
+        "1.21.1",
+        "Java 21"
+      ],
+      "sortableGameVersions": [],
+      "dependencies": [],
+      "isServerPack": false,
+      "fileFingerprint": 12345,
+      "modules": []
+    },
+    {
+      "id": 9002,
+      "gameId": 432,
+      "modId": 67217,
+      "isAvailable": true,
+      "displayName": "Sample Toolkit 2.0",
+      "fileName": "sample-toolkit-2.0.jar",
+      "releaseType": 1,
+      "fileStatus": 4,
+      "hashes": [
+        {
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "algo": 1
+        },
+        {
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "algo": 2
+        }
+      ],
+      "fileDate": "2026-09-01T00:00:00Z",
+      "fileLength": 54321,
+      "downloadCount": 123,
+      "downloadUrl": "https://edge.forgecdn.net/files/9004/sample-toolkit-2.0.jar",
+      "gameVersions": [
+        "1.20.1",
+        "Java 21"
+      ],
+      "sortableGameVersions": [],
+      "dependencies": [],
+      "isServerPack": false,
+      "fileFingerprint": 12345,
+      "modules": []
+    },
+    {
+      "id": 9003,
+      "gameId": 432,
+      "modId": 67217,
+      "isAvailable": true,
+      "displayName": "Sample Toolkit 2.0",
+      "fileName": "sample-toolkit-2.0.jar",
+      "releaseType": 1,
+      "fileStatus": 4,
+      "hashes": [
+        {
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "algo": 1
+        },
+        {
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "algo": 2
+        }
+      ],
+      "fileDate": "2025-01-01T00:00:00Z",
+      "fileLength": 54321,
+      "downloadCount": 123,
+      "downloadUrl": "https://edge.forgecdn.net/files/9004/sample-toolkit-2.0.jar",
+      "gameVersions": [
+        "1.21.1",
+        "Java 21"
+      ],
+      "sortableGameVersions": [],
+      "dependencies": [],
+      "isServerPack": false,
+      "fileFingerprint": 12345,
+      "modules": []
+    },
+    {
+      "id": 9004,
+      "gameId": 432,
+      "modId": 67217,
+      "isAvailable": true,
+      "displayName": "Sample Toolkit 2.0",
+      "fileName": "sample-toolkit-2.0.jar",
+      "releaseType": 1,
+      "fileStatus": 4,
+      "hashes": [
+        {
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "algo": 1
+        },
+        {
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "algo": 2
+        }
+      ],
+      "fileDate": "2026-01-01T00:00:00Z",
+      "fileLength": 54321,
+      "downloadCount": 123,
+      "downloadUrl": "https://edge.forgecdn.net/files/9004/sample-toolkit-2.0.jar",
+      "gameVersions": [
+        "1.21.1",
+        "Java 21"
+      ],
+      "sortableGameVersions": [],
+      "dependencies": [],
+      "isServerPack": false,
+      "fileFingerprint": 12345,
+      "modules": []
+    }
+  ],
+  "pagination": {
+    "index": 0,
+    "pageSize": 50,
+    "resultCount": 5,
+    "totalCount": 5
+  }
+}

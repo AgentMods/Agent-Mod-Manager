@@ -1,0 +1,153 @@
+[
+  {
+    "id": "WrongMod",
+    "project_id": "Z9y8X7w6",
+    "author_id": "AuthorId",
+    "featured": false,
+    "name": "Sample Tools 2.0",
+    "version_number": "2.0.0",
+    "changelog": "Fixes",
+    "changelog_url": null,
+    "date_published": "2026-01-01T00:00:00Z",
+    "downloads": 34,
+    "version_type": "release",
+    "status": "listed",
+    "requested_status": null,
+    "files": [
+      {
+        "hashes": {
+          "sha512": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "url": "https://cdn.modrinth.com/data/A1b2C3d4/versions/Version2/other.jar",
+        "filename": "other.jar",
+        "primary": true,
+        "size": 1,
+        "file_type": null
+      }
+    ],
+    "dependencies": [],
+    "game_versions": [
+      "1.21.1"
+    ],
+    "loaders": [
+      "fabric"
+    ]
+  },
+  {
+    "id": "WrongLoader",
+    "project_id": "A1b2C3d4",
+    "author_id": "AuthorId",
+    "featured": false,
+    "name": "Sample Tools 2.0",
+    "version_number": "2.0.0",
+    "changelog": "Fixes",
+    "changelog_url": null,
+    "date_published": "2026-01-01T00:00:00Z",
+    "downloads": 34,
+    "version_type": "release",
+    "status": "listed",
+    "requested_status": null,
+    "files": [
+      {
+        "hashes": {
+          "sha512": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "url": "https://cdn.modrinth.com/data/A1b2C3d4/versions/Version2/forge.jar",
+        "filename": "forge.jar",
+        "primary": true,
+        "size": 2,
+        "file_type": null
+      }
+    ],
+    "dependencies": [],
+    "game_versions": [
+      "1.21.1"
+    ],
+    "loaders": [
+      "forge"
+    ]
+  },
+  {
+    "id": "WrongGame",
+    "project_id": "A1b2C3d4",
+    "author_id": "AuthorId",
+    "featured": false,
+    "name": "Sample Tools 2.0",
+    "version_number": "2.0.0",
+    "changelog": "Fixes",
+    "changelog_url": null,
+    "date_published": "2026-01-01T00:00:00Z",
+    "downloads": 34,
+    "version_type": "release",
+    "status": "listed",
+    "requested_status": null,
+    "files": [
+      {
+        "hashes": {
+          "sha512": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "url": "https://cdn.modrinth.com/data/A1b2C3d4/versions/Version2/old.jar",
+        "filename": "old.jar",
+        "primary": true,
+        "size": 3,
+        "file_type": null
+      }
+    ],
+    "dependencies": [],
+    "game_versions": [
+      "1.20.1"
+    ],
+    "loaders": [
+      "fabric"
+    ]
+  },
+  {
+    "id": "Version2",
+    "project_id": "A1b2C3d4",
+    "author_id": "AuthorId",
+    "featured": false,
+    "name": "Sample Tools 2.0",
+    "version_number": "2.0.0",
+    "changelog": "Fixes",
+    "changelog_url": null,
+    "date_published": "2026-01-01T00:00:00Z",
+    "downloads": 34,
+    "version_type": "release",
+    "status": "listed",
+    "requested_status": null,
+    "files": [
+      {
+        "hashes": {
+          "sha512": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "url": "https://cdn.modrinth.com/data/A1b2C3d4/versions/Version2/sources.jar",
+        "filename": "sources.jar",
+        "primary": false,
+        "size": 100,
+        "file_type": null
+      },
+      {
+        "hashes": {
+          "sha512": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "sha1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "url": "https://cdn.modrinth.com/data/A1b2C3d4/versions/Version2/sample-tools.jar",
+        "filename": "sample-tools.jar",
+        "primary": true,
+        "size": 123456,
+        "file_type": null
+      }
+    ],
+    "dependencies": [],
+    "game_versions": [
+      "1.21.1"
+    ],
+    "loaders": [
+      "fabric"
+    ]
+  }
+]

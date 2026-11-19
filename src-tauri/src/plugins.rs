@@ -1,0 +1,1070 @@
+//! Declarative game packages. Loading never expands environment variables, runs
+//! a script, installs a mod, or grants filesystem access. All paths in an
+//! adapter are relative to an explicitly registered root.
+use crate::db::Db;
+use crate::error::{AppError, AppResult};
+use crate::storage::AppPaths;
+use rusqlite::{params, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+const MAX_ADAPTER_BYTES: usize = 256 * 1024;
+const MAX_SKILL_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Platform {
+    Windows,
+    Macos,
+    Linux,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootKind {
+    Game,
+    RegisteredUser,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InstallRoot {
+    pub id: String,
+    pub kind: RootKind,
+    pub relative_path: String,
+    pub platforms: Vec<Platform>,
+    /// Display only: these strings must never be interpolated into write paths.
+    pub discovery_hints: Vec<String>,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkerKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Marker {
+    pub path: String,
+    pub kind: MarkerKind,
+    pub required: bool,
+    pub platforms: Vec<Platform>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModType {
+    pub id: String,
+    pub name: String,
+    pub root: String,
+    /// Payload hints, not an executable allowlist or a substitute for inspection.
+    pub extensions: Vec<String>,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveLayout {
+    /// Copy the payload intact; e.g. a Minecraft JAR is itself a ZIP container.
+    SingleFile,
+    /// Preserve the mod directory and its manifest, never flatten it.
+    ModDirectory,
+    /// Remove only this rule's sourcePrefix after inspecting archive entries.
+    StripPrefix,
+    /// Needs a reviewed file plan, e.g. FOMOD choices or a script extender.
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArchiveRule {
+    pub mod_type: String,
+    pub layout: ArchiveLayout,
+    pub source_prefix: Option<String>,
+    pub required_files: Vec<String>,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdapterPath {
+    pub root: String,
+    pub path: String,
+    pub platforms: Vec<Platform>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadOrderKind {
+    LoaderDependencies,
+    BethesdaPlugins,
+    Redmod,
+    Bg3ModSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoadOrder {
+    pub kind: LoadOrderKind,
+    pub paths: Vec<AdapterPath>,
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SourceReference {
+    pub title: String,
+    pub url: String,
+    pub checked_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GameAdapter {
+    pub schema_version: u32,
+    pub slug: String,
+    pub name: String,
+    /// Adapter package version, not a game or mod-loader version.
+    pub version: String,
+    pub platforms: Vec<Platform>,
+    /// Required markers must all match; at least one marker must match.
+    pub markers: Vec<Marker>,
+    pub steam_app_id: Option<String>,
+    pub install_roots: Vec<InstallRoot>,
+    pub mod_types: Vec<ModType>,
+    pub archive_rules: Vec<ArchiveRule>,
+    pub load_order: LoadOrder,
+    pub save_paths: Vec<AdapterPath>,
+    pub log_paths: Vec<AdapterPath>,
+    pub uninstall_notes: Vec<String>,
+    pub sources: Vec<SourceReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillMetadata {
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GamePackage {
+    pub adapter: GameAdapter,
+    pub skill: SkillMetadata,
+    pub skill_markdown: String,
+}
+
+fn invalid(message: impl Into<String>) -> AppError {
+    AppError::Invalid(message.into())
+}
+
+pub fn validate_slug(slug: &str) -> AppResult<()> {
+    let valid = !slug.is_empty()
+        && slug.len() <= 64
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !slug.starts_with('-')
+        && !slug.ends_with('-')
+        && !slug.contains("--");
+    let reserved = ["con", "prn", "aux", "nul"].contains(&slug)
+        || (slug.len() == 4
+            && (slug.starts_with("com") || slug.starts_with("lpt"))
+            && matches!(slug.as_bytes()[3], b'1'..=b'9'));
+    if !valid || reserved {
+        return Err(invalid(format!("无效或保留的适配包 slug: {slug}")));
+    }
+    Ok(())
+}
+
+/// SemVer 2.0 syntax, without imposing a bounded integer on numeric components.
+pub fn validate_version(version: &str) -> AppResult<()> {
+    fn identifiers(value: &str, prerelease: bool) -> bool {
+        value.split('.').all(|id| {
+            !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !(prerelease
+                    && id.len() > 1
+                    && id.starts_with('0')
+                    && id.bytes().all(|b| b.is_ascii_digit()))
+        })
+    }
+    let mut parts = version.split('+');
+    let base = parts.next().unwrap_or_default();
+    let build = parts.next();
+    let (core, pre) = base
+        .split_once('-')
+        .map_or((base, None), |(a, b)| (a, Some(b)));
+    let numbers: Vec<_> = core.split('.').collect();
+    if version.len() > 128
+        || parts.next().is_some()
+        || numbers.len() != 3
+        || numbers.iter().any(|n| {
+            n.is_empty()
+                || !n.bytes().all(|b| b.is_ascii_digit())
+                || (n.len() > 1 && n.starts_with('0'))
+        })
+        || pre.is_some_and(|p| !identifiers(p, true))
+        || build.is_some_and(|b| !identifiers(b, false))
+    {
+        return Err(invalid(format!("适配包版本必须符合 SemVer: {version}")));
+    }
+    Ok(())
+}
+
+/// Portable fixed relative paths only: no interpolation, globbing, ADS, device
+/// paths or Windows aliases, including when validation runs on a Unix host.
+pub fn validate_relative_path(path: &str, allow_root: bool) -> AppResult<()> {
+    if allow_root && path == "." {
+        return Ok(());
+    }
+    if path.is_empty()
+        || path.len() > 1024
+        || path.contains(['\\', ':', '~', '%', '$', '*', '?', '"', '<', '>', '|'])
+        || path.chars().any(char::is_control)
+    {
+        return Err(AppError::PathEscape(format!("不是固定相对路径: {path}")));
+    }
+    for part in path.split('/') {
+        let stem = part
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if part.is_empty()
+            || part == "."
+            || part == ".."
+            || part.ends_with(['.', ' '])
+            || ["con", "prn", "aux", "nul"].contains(&stem.as_str())
+            || (stem.len() == 4
+                && (stem.starts_with("com") || stem.starts_with("lpt"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9'))
+        {
+            return Err(AppError::PathEscape(format!("路径含不安全组件: {path}")));
+        }
+    }
+    Ok(())
+}
+
+fn validate_platforms(platforms: &[Platform], supported: &[Platform]) -> AppResult<()> {
+    let unique: BTreeSet<_> = platforms.iter().collect();
+    if platforms.is_empty()
+        || unique.len() != platforms.len()
+        || platforms.iter().any(|p| !supported.contains(p))
+    {
+        return Err(invalid("platforms 不能为空、重复或超出适配包支持范围"));
+    }
+    Ok(())
+}
+
+impl GameAdapter {
+    pub fn validate(&self) -> AppResult<()> {
+        validate_slug(&self.slug)?;
+        validate_version(&self.version)?;
+        if self.schema_version != 1 || self.name.trim().is_empty() || self.name.len() > 256 {
+            return Err(invalid("适配包名称为空或 schemaVersion 不受支持"));
+        }
+        validate_platforms(
+            &self.platforms,
+            &[Platform::Windows, Platform::Macos, Platform::Linux],
+        )?;
+        if self.steam_app_id.as_ref().is_some_and(|id| {
+            id.parse::<u32>()
+                .map_or(true, |n| n == 0 || n.to_string() != *id)
+        }) {
+            return Err(invalid("steamAppId 必须为正整数的十进制字符串"));
+        }
+        if self.markers.is_empty()
+            || self.install_roots.is_empty()
+            || self.mod_types.is_empty()
+            || self.archive_rules.is_empty()
+        {
+            return Err(invalid("适配包缺少标记、安装根、模组类型或归档规则"));
+        }
+        for marker in &self.markers {
+            validate_relative_path(&marker.path, false)?;
+            validate_platforms(&marker.platforms, &self.platforms)?;
+        }
+        let mut roots = BTreeMap::new();
+        for root in &self.install_roots {
+            validate_slug(&root.id)?;
+            validate_relative_path(&root.relative_path, true)?;
+            validate_platforms(&root.platforms, &self.platforms)?;
+            if roots.insert(root.id.as_str(), root).is_some() {
+                return Err(invalid("安装根 id 重复"));
+            }
+            if root.kind == RootKind::RegisteredUser && root.discovery_hints.is_empty() {
+                return Err(invalid("用户管理根必须说明如何由用户定位并登记"));
+            }
+        }
+        let mut types = BTreeSet::new();
+        for ty in &self.mod_types {
+            validate_slug(&ty.id)?;
+            if !types.insert(ty.id.as_str())
+                || !roots.contains_key(ty.root.as_str())
+                || ty.name.trim().is_empty()
+            {
+                return Err(invalid("模组类型重复或引用未知安装根"));
+            }
+            if ty.extensions.iter().any(|s| {
+                s.is_empty()
+                    || !s
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+            }) {
+                return Err(invalid("模组扩展名必须为小写字母或数字，不含点号"));
+            }
+        }
+        let mut ruled = BTreeSet::new();
+        for rule in &self.archive_rules {
+            if !types.contains(rule.mod_type.as_str()) {
+                return Err(invalid("归档规则引用未知模组类型"));
+            }
+            ruled.insert(rule.mod_type.as_str());
+            if (rule.layout == ArchiveLayout::StripPrefix) != rule.source_prefix.is_some() {
+                return Err(invalid("只有 strip_prefix 规则必须包含 sourcePrefix"));
+            }
+            if let Some(prefix) = &rule.source_prefix {
+                validate_relative_path(prefix, false)?;
+            }
+            for required in &rule.required_files {
+                validate_relative_path(required, false)?;
+            }
+        }
+        if ruled != types {
+            return Err(invalid("每种模组类型都必须声明归档规则"));
+        }
+        for path in self
+            .load_order
+            .paths
+            .iter()
+            .chain(&self.save_paths)
+            .chain(&self.log_paths)
+        {
+            validate_relative_path(&path.path, true)?;
+            let root = roots
+                .get(path.root.as_str())
+                .ok_or_else(|| invalid("数据路径引用未知安装根"))?;
+            validate_platforms(&path.platforms, &root.platforms)?;
+        }
+        if self.uninstall_notes.is_empty()
+            || self.uninstall_notes.iter().any(|n| n.trim().is_empty())
+            || self.sources.is_empty()
+        {
+            return Err(invalid("适配包必须提供卸载说明和一手资料来源"));
+        }
+        for source in &self.sources {
+            let url = url::Url::parse(&source.url).map_err(|_| invalid("资料来源 URL 无效"))?;
+            if url.scheme() != "https"
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || source.title.trim().is_empty()
+                || chrono::NaiveDate::parse_from_str(&source.checked_at, "%Y-%m-%d").is_err()
+            {
+                return Err(invalid("资料来源须为 HTTPS URL，并附标题和核对日期"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a root using trusted host registrations, never discoveryHints.
+    /// `registered_user_roots` maps adapter root IDs to explicitly registered
+    /// directories; do not populate it from untrusted agent/tool arguments.
+    /// `managed_roots` is the file engine's authoritative allowlist.
+    pub fn resolve_root(
+        &self,
+        id: &str,
+        platform: Platform,
+        game_root: &Path,
+        registered_user_roots: &BTreeMap<String, PathBuf>,
+        managed_roots: &[PathBuf],
+    ) -> AppResult<PathBuf> {
+        self.validate()?;
+        let root = self
+            .install_roots
+            .iter()
+            .find(|r| r.id == id)
+            .ok_or_else(|| AppError::NotFound(format!("安装根: {id}")))?;
+        if !root.platforms.contains(&platform) {
+            return Err(AppError::Unsupported(format!(
+                "安装根 {id} 不支持 {platform:?}"
+            )));
+        }
+        let base = match root.kind {
+            RootKind::Game => game_root,
+            RootKind::RegisteredUser => registered_user_roots
+                .get(id)
+                .map(PathBuf::as_path)
+                .ok_or_else(|| {
+                    AppError::Denied(format!(
+                        "先登记用户管理根 {id}；discoveryHints 不授予写入权限"
+                    ))
+                })?,
+        };
+        if !base.is_absolute() {
+            return Err(AppError::PathEscape("管理根必须是绝对路径".into()));
+        }
+        if !fs::symlink_metadata(base)?.file_type().is_dir() || base.canonicalize()? != base {
+            return Err(AppError::Denied(
+                "此游戏/用户管理根缺失或已被链接替换，请重新核对原登记目录".into(),
+            ));
+        }
+        let base = crate::paths::ensure_within(base, managed_roots)?;
+        let target = crate::paths::ensure_within(
+            &base.join(&root.relative_path),
+            std::slice::from_ref(&base),
+        )?;
+        crate::paths::ensure_within(&target, managed_roots)
+    }
+
+    pub fn resolve_path(
+        &self,
+        path: &AdapterPath,
+        platform: Platform,
+        game_root: &Path,
+        registered_user_roots: &BTreeMap<String, PathBuf>,
+        managed_roots: &[PathBuf],
+    ) -> AppResult<PathBuf> {
+        validate_relative_path(&path.path, true)?;
+        if !path.platforms.contains(&platform) {
+            return Err(AppError::Unsupported("数据路径不支持当前平台".into()));
+        }
+        let root = self.resolve_root(
+            &path.root,
+            platform,
+            game_root,
+            registered_user_roots,
+            managed_roots,
+        )?;
+        crate::paths::ensure_within(&root.join(&path.path), &[root])
+    }
+}
+
+/// Package frontmatter is deliberately a small, auditable YAML subset: exactly
+/// name and description, each a single-line letter-led plain, single-quoted or
+/// JSON string. Ambiguous YAML booleans/numbers must be quoted.
+/// YAML tags, aliases, multiline scalars and executable extensions are rejected.
+pub fn parse_skill(markdown: &str, expected_slug: &str) -> AppResult<SkillMetadata> {
+    validate_slug(expected_slug)?;
+    if markdown.len() > MAX_SKILL_BYTES || markdown.contains('\0') {
+        return Err(invalid("SKILL.md 超出大小限制或包含空字节"));
+    }
+    let normalized = markdown.replace("\r\n", "\n");
+    let mut lines = normalized.lines();
+    if lines.next() != Some("---") {
+        return Err(invalid("SKILL.md 缺少 YAML frontmatter"));
+    }
+    let mut fields = BTreeMap::new();
+    let mut closed = false;
+    for line in lines.by_ref() {
+        if line == "---" {
+            closed = true;
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (key, raw) = line
+            .split_once(':')
+            .ok_or_else(|| invalid("frontmatter 必须使用单行键值"))?;
+        if !["name", "description"].contains(&key) || fields.contains_key(key) {
+            return Err(invalid("frontmatter 含未知或重复键"));
+        }
+        let raw = raw.trim();
+        let value = if raw.starts_with('"') {
+            serde_json::from_str::<String>(raw)
+                .map_err(|_| invalid("frontmatter 双引号字符串无效"))?
+        } else if raw.starts_with('\'') && raw.ends_with('\'') && raw.len() >= 2 {
+            let inner = &raw[1..raw.len() - 1];
+            if inner.replace("''", "").contains('\'') {
+                return Err(invalid("frontmatter 单引号转义无效"));
+            }
+            inner.replace("''", "'")
+        } else {
+            if !raw.chars().next().is_some_and(char::is_alphabetic)
+                || ["true", "false", "yes", "no", "on", "off", "null"]
+                    .contains(&raw.to_ascii_lowercase().as_str())
+                || raw.contains(": ")
+                || raw.contains(" #")
+            {
+                return Err(invalid("frontmatter 不支持此 YAML 标量语法"));
+            }
+            raw.to_string()
+        };
+        if value.chars().any(char::is_control) {
+            return Err(invalid("frontmatter 不能包含控制字符"));
+        }
+        fields.insert(key, value);
+    }
+    if !closed || lines.collect::<Vec<_>>().join("\n").trim().is_empty() {
+        return Err(invalid("SKILL.md frontmatter 未闭合或正文为空"));
+    }
+    let name = fields
+        .remove("name")
+        .ok_or_else(|| invalid("SKILL.md 缺少 name"))?;
+    let description = fields
+        .remove("description")
+        .ok_or_else(|| invalid("SKILL.md 缺少 description"))?;
+    if name != expected_slug
+        || description.trim().is_empty()
+        || description.chars().count() > 1024
+        || description.contains(['<', '>'])
+    {
+        return Err(invalid(
+            "SKILL.md 名称须与目录相同，描述须为 1..=1024 字符且不含尖括号",
+        ));
+    }
+    Ok(SkillMetadata { name, description })
+}
+
+pub fn parse_package(
+    directory_name: &str,
+    adapter_json: &str,
+    skill_markdown: &str,
+) -> AppResult<GamePackage> {
+    validate_slug(directory_name)?;
+    if adapter_json.len() > MAX_ADAPTER_BYTES {
+        return Err(invalid("adapter.json 超出大小限制"));
+    }
+    let adapter: GameAdapter = serde_json::from_str(adapter_json)?;
+    adapter.validate()?;
+    if adapter.slug != directory_name {
+        return Err(invalid("adapter slug 与目录不一致"));
+    }
+    let skill = parse_skill(skill_markdown, directory_name)?;
+    Ok(GamePackage {
+        adapter,
+        skill,
+        skill_markdown: skill_markdown.to_string(),
+    })
+}
+
+/// Read exactly two regular files, rejecting package and file symlinks. No
+/// recursive discovery and no package-provided code is loaded.
+pub fn load_package(directory: &Path) -> AppResult<GamePackage> {
+    if !fs::symlink_metadata(directory)?.file_type().is_dir() {
+        return Err(invalid("适配包目录必须是普通目录"));
+    }
+    let slug = directory
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| invalid("适配包目录名无效"))?;
+    validate_slug(slug)?;
+    let read = |name: &str, limit: usize| -> AppResult<String> {
+        use std::io::Read;
+        let path = directory.join(name);
+        let meta = fs::symlink_metadata(&path)?;
+        if !meta.file_type().is_file() || meta.len() > limit as u64 {
+            return Err(invalid(format!("{name} 必须是大小受限的普通文件")));
+        }
+        let mut bytes = Vec::new();
+        fs::File::open(path)?
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(invalid(format!("{name} 超出大小限制")));
+        }
+        String::from_utf8(bytes).map_err(|_| invalid(format!("{name} 必须为 UTF-8")))
+    };
+    parse_package(
+        slug,
+        &read("adapter.json", MAX_ADAPTER_BYTES)?,
+        &read("SKILL.md", MAX_SKILL_BYTES)?,
+    )
+}
+
+macro_rules! builtin {
+    ($slug:literal) => {
+        (
+            $slug,
+            include_str!(concat!("../../plugins/games/", $slug, "/adapter.json")),
+            include_str!(concat!("../../plugins/games/", $slug, "/SKILL.md")),
+        )
+    };
+}
+
+pub const BUILTIN_PACKAGES: [(&str, &str, &str); 6] = [
+    builtin!("minecraft-java"),
+    builtin!("skyrim-se"),
+    builtin!("fallout4"),
+    builtin!("stardew-valley"),
+    builtin!("cyberpunk-2077"),
+    builtin!("baldurs-gate-3"),
+];
+
+pub fn builtin_packages() -> AppResult<Vec<GamePackage>> {
+    BUILTIN_PACKAGES
+        .iter()
+        .map(|(slug, json, skill)| parse_package(slug, json, skill))
+        .collect()
+}
+
+/// Idempotent registration of embedded packages in the existing schema. Enabled
+/// flags and created_at survive reseeding. External name collisions fail closed.
+/// The package files are materialized only inside AppPaths, never game/user roots.
+/// A filesystem failure can leave unregistered static files; retrying is safe.
+pub fn seed_builtins(db: &Db, paths: &AppPaths) -> AppResult<()> {
+    let packages = builtin_packages()?;
+    let mut conn = db.conn();
+    let tx = conn.transaction()?;
+    // Check every collision before writing any files or changing any rows.
+    for package in &packages {
+        let slug = &package.adapter.slug;
+        for (table, key) in [("plugins", "slug"), ("skills", "name")] {
+            let source: Option<String> = tx
+                .query_row(
+                    &format!("SELECT source FROM {table} WHERE {key}=?1"),
+                    [slug],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if source.as_deref().is_some_and(|s| s != "builtin") {
+                return Err(AppError::Conflict(format!("保留外部 {table} 记录: {slug}")));
+            }
+        }
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    for (package, (_, json, markdown)) in packages.iter().zip(BUILTIN_PACKAGES.iter()) {
+        let dir = paths.plugins().join("games").join(&package.adapter.slug);
+        write_static(paths, &dir.join("adapter.json"), json.as_bytes())?;
+        write_static(paths, &dir.join("SKILL.md"), markdown.as_bytes())?;
+        let location = dir.join("SKILL.md").to_string_lossy().to_string();
+        tx.execute(
+            "INSERT INTO plugins (slug,name,game_name,version,description,source,enabled,validated,install_path,adapter_json,created_at,updated_at)
+             VALUES (?1,?2,?2,?3,?4,'builtin',1,1,?5,?6,?7,?7)
+             ON CONFLICT(slug) DO UPDATE SET name=excluded.name,game_name=excluded.game_name,version=excluded.version,description=excluded.description,validated=1,install_path=excluded.install_path,adapter_json=excluded.adapter_json,updated_at=excluded.updated_at",
+            params![package.adapter.slug, package.adapter.name, package.adapter.version, package.skill.description, dir.to_string_lossy(), json, now],
+        )?;
+        tx.execute(
+            "INSERT INTO skills (name,description,location,source,enabled,created_at) VALUES (?1,?2,?3,'builtin',1,?4)
+             ON CONFLICT(name) DO UPDATE SET description=excluded.description,location=excluded.location",
+            params![package.skill.name, package.skill.description, location, now],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn write_static(paths: &AppPaths, target: &Path, bytes: &[u8]) -> AppResult<()> {
+    // Keep the plugin directory itself inside app storage, even if an existing
+    // ancestor is a symlink. Check the leaf too before opening it for writing.
+    let parent = target
+        .parent()
+        .ok_or_else(|| invalid("适配包路径没有父目录"))?;
+    let guarded = paths.guard(parent, &[])?;
+    fs::create_dir_all(&guarded)?;
+    paths.guard(target, &[])?;
+    if let Ok(meta) = fs::symlink_metadata(target) {
+        if !meta.file_type().is_file() {
+            return Err(AppError::Denied(format!(
+                "拒绝覆盖非普通包文件: {}",
+                target.display()
+            )));
+        }
+        if fs::read(target)? == bytes {
+            return Ok(());
+        }
+    }
+    crate::util::atomic_write(target, bytes)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginInfo {
+    pub slug: String,
+    pub name: String,
+    pub game_name: String,
+    pub version: String,
+    pub description: String,
+    pub source: String,
+    pub enabled: bool,
+    pub validated: bool,
+    pub install_path: String,
+}
+
+pub fn list_plugins(db: &Db) -> AppResult<Vec<PluginInfo>> {
+    let conn = db.conn();
+    let mut statement = conn.prepare("SELECT slug,name,game_name,version,description,source,enabled,validated,install_path FROM plugins ORDER BY name,slug")?;
+    let rows = statement.query_map([], |r| {
+        Ok(PluginInfo {
+            slug: r.get(0)?,
+            name: r.get(1)?,
+            game_name: r.get(2)?,
+            version: r.get(3)?,
+            description: r.get(4)?,
+            source: r.get(5)?,
+            enabled: r.get(6)?,
+            validated: r.get(7)?,
+            install_path: r.get(8)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Revalidate stored JSON at use time; a database boolean alone is not trust.
+pub fn adapter_for(db: &Db, slug: &str) -> AppResult<GameAdapter> {
+    validate_slug(slug)?;
+    let conn = db.conn();
+    let row: Option<(String, bool, bool, String)> = conn
+        .query_row(
+            "SELECT adapter_json,enabled,validated,version FROM plugins WHERE slug=?1",
+            [slug],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let (json, enabled, validated, version) =
+        row.ok_or_else(|| AppError::NotFound(format!("适配包: {slug}")))?;
+    if !enabled || !validated {
+        return Err(AppError::Denied(format!("适配包未启用或未验证: {slug}")));
+    }
+    if json.len() > MAX_ADAPTER_BYTES {
+        return Err(invalid("数据库适配包超出大小限制"));
+    }
+    let adapter: GameAdapter = serde_json::from_str(&json)?;
+    adapter.validate()?;
+    if adapter.slug != slug || adapter.version != version {
+        return Err(invalid("数据库适配包身份与声明不一致"));
+    }
+    Ok(adapter)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, AppPaths, Db) {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::new(temp.path().join("manager")).unwrap();
+        let db = Db::open(&paths.db_file()).unwrap();
+        (temp, paths, db)
+    }
+
+    #[test]
+    fn all_six_embedded_packages_validate_and_roundtrip() {
+        let packages = builtin_packages().unwrap();
+        assert_eq!(packages.len(), 6);
+        let mut names = BTreeSet::new();
+        for p in packages {
+            assert!(names.insert(p.adapter.slug.clone()));
+            let json = serde_json::to_string(&p.adapter).unwrap();
+            parse_package(&p.adapter.slug, &json, &p.skill_markdown).unwrap();
+        }
+    }
+
+    #[test]
+    fn rejects_portable_path_attacks() {
+        for value in [
+            "",
+            "../Data",
+            "Data/../Mods",
+            "/Mods",
+            "C:/Mods",
+            "C:\\Mods",
+            "\\\\server\\Mods",
+            "Data//Mods",
+            "Data/./Mods",
+            "Data/name:stream",
+            "%APPDATA%/Mods",
+            "$HOME/Mods",
+            "~/Mods",
+            "Data/*",
+            "Data/NUL.txt",
+            "Data/COM1",
+            "Data/file.",
+            "Data/file ",
+            "Data/\0",
+        ] {
+            assert!(
+                validate_relative_path(value, false).is_err(),
+                "accepted {value:?}"
+            );
+        }
+        assert!(validate_relative_path(".", false).is_err());
+        validate_relative_path(".", true).unwrap();
+        validate_relative_path("PlayerProfiles/Public/modsettings.lsx", false).unwrap();
+    }
+
+    #[test]
+    fn validates_slug_and_semver() {
+        for slug in [
+            "", "../foo", "Foo", "a_b", "a--b", "-a", "a-", "con", "lpt1",
+        ] {
+            assert!(validate_slug(slug).is_err());
+        }
+        for version in [
+            "",
+            "1",
+            "1.0",
+            "v1.0.0",
+            "01.0.0",
+            "1.0.0-01",
+            "1.0.0-",
+            "1.0.0+",
+            "1.0.0+x+y",
+            "1.0.0-a..b",
+        ] {
+            assert!(validate_version(version).is_err(), "{version}");
+        }
+        for version in ["0.1.0", "1.2.3-rc.1+build.004", "1.0.0-alpha-1"] {
+            validate_version(version).unwrap();
+        }
+    }
+
+    #[test]
+    fn validates_frontmatter_identity_boundaries_and_duplicates() {
+        let make = |description: &str| {
+            format!("---\nname: minecraft-java\ndescription: {description}\n---\nGuidance.\n")
+        };
+        parse_skill(&make(&"a".repeat(1024)), "minecraft-java").unwrap();
+        assert!(parse_skill(&make(&"a".repeat(1025)), "minecraft-java").is_err());
+        parse_skill(&make(&"界".repeat(1024)), "minecraft-java").unwrap();
+        for text in [
+            make(""),
+            make("|"),
+            make("[a]"),
+            make("true"),
+            make("null"),
+            make("123"),
+            make("# comment only"),
+            make("\"\\u0000\""),
+            make("'a'b'"),
+            make("a").replace("name: minecraft-java", "name: other"),
+            make("a").replace("description:", "name: duplicate\ndescription:"),
+            make("a").replace("---\nGuidance.", "Guidance."),
+        ] {
+            assert!(parse_skill(&text, "minecraft-java").is_err(), "{text}");
+        }
+        parse_skill(
+            &make("\"Guide: install safely\"").replace('\n', "\r\n"),
+            "minecraft-java",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_code_fields_identity_and_root_references() {
+        let (slug, json, skill) = BUILTIN_PACKAGES[0];
+        let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+        value["command"] = "run me".into();
+        assert!(parse_package(slug, &value.to_string(), skill).is_err());
+        value.as_object_mut().unwrap().remove("command");
+        value["modTypes"][0]["root"] = "missing".into();
+        assert!(parse_package(slug, &value.to_string(), skill).is_err());
+        assert!(parse_package("different", json, skill).is_err());
+    }
+
+    #[test]
+    fn validates_paths_in_every_declarative_location() {
+        let (slug, json, skill) = BUILTIN_PACKAGES[1];
+        for pointer in [
+            "/markers/0/path",
+            "/installRoots/0/relativePath",
+            "/archiveRules/0/sourcePrefix",
+            "/loadOrder/paths/0/path",
+            "/savePaths/0/path",
+            "/logPaths/0/path",
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+            *value.pointer_mut(pointer).unwrap() = "../outside".into();
+            assert!(
+                parse_package(slug, &value.to_string(), skill).is_err(),
+                "{pointer}"
+            );
+        }
+        let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
+        value["archiveRules"][0]["requiredFiles"] = serde_json::json!(["C:/outside"]);
+        assert!(parse_package(slug, &value.to_string(), skill).is_err());
+        value = serde_json::from_str(json).unwrap();
+        value["installRoots"][0]["platforms"] = serde_json::json!(["macos"]);
+        assert!(parse_package(slug, &value.to_string(), skill).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_input_and_invalid_package_files() {
+        let (slug, json, skill) = BUILTIN_PACKAGES[0];
+        assert!(parse_package(slug, &" ".repeat(MAX_ADAPTER_BYTES + 1), skill).is_err());
+        assert!(parse_package(slug, json, &" ".repeat(MAX_SKILL_BYTES + 1)).is_err());
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join(slug);
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("adapter.json"), json).unwrap();
+        assert!(load_package(&package).is_err());
+        fs::write(package.join("SKILL.md"), [0xff, 0xfe]).unwrap();
+        assert!(load_package(&package).is_err());
+    }
+
+    #[test]
+    fn seeds_idempotently_preserving_disabled_flags() {
+        let (_temp, paths, db) = fixture();
+        seed_builtins(&db, &paths).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE plugins SET enabled=0 WHERE slug='minecraft-java'",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE skills SET enabled=0 WHERE name='minecraft-java'",
+                [],
+            )
+            .unwrap();
+        seed_builtins(&db, &paths).unwrap();
+        assert_eq!(list_plugins(&db).unwrap().len(), 6);
+        assert!(adapter_for(&db, "minecraft-java").is_err());
+        assert_eq!(
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM skills", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            6
+        );
+        assert!(!db
+            .conn()
+            .query_row(
+                "SELECT enabled FROM skills WHERE name='minecraft-java'",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap());
+        load_package(&paths.plugins().join("games/baldurs-gate-3")).unwrap();
+    }
+
+    #[test]
+    fn seed_preserves_external_collision_and_rolls_back() {
+        let (_temp, paths, db) = fixture();
+        db.conn().execute("INSERT INTO skills (name,description,location,source,created_at) VALUES ('fallout4','custom','external','user','original')", []).unwrap();
+        assert!(seed_builtins(&db, &paths).is_err());
+        assert!(list_plugins(&db).unwrap().is_empty());
+        assert!(!paths.plugins().join("games").exists());
+        assert_eq!(
+            db.conn()
+                .query_row(
+                    "SELECT description FROM skills WHERE name='fallout4'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            "custom"
+        );
+    }
+
+    #[test]
+    fn database_tampering_is_revalidated() {
+        let (_temp, paths, db) = fixture();
+        seed_builtins(&db, &paths).unwrap();
+        db.conn().execute("UPDATE plugins SET adapter_json=replace(adapter_json,'archive/pc/mod','../escape') WHERE slug='cyberpunk-2077'", []).unwrap();
+        assert!(adapter_for(&db, "cyberpunk-2077").is_err());
+    }
+
+    #[test]
+    fn bg3_requires_explicit_registered_and_managed_user_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        let user = temp.path().join("user-data");
+        fs::create_dir_all(&game).unwrap();
+        fs::create_dir_all(&user).unwrap();
+        let game = game.canonicalize().unwrap();
+        let user = user.canonicalize().unwrap();
+        let adapter = builtin_packages().unwrap().pop().unwrap().adapter;
+        let mut registered = BTreeMap::new();
+        assert!(adapter
+            .resolve_root(
+                "user-mods",
+                Platform::Windows,
+                &game,
+                &registered,
+                std::slice::from_ref(&game)
+            )
+            .is_err());
+        registered.insert("user-mods".into(), user.clone());
+        assert!(adapter
+            .resolve_root(
+                "user-mods",
+                Platform::Windows,
+                &game,
+                &registered,
+                std::slice::from_ref(&game)
+            )
+            .is_err());
+        let resolved = adapter
+            .resolve_root(
+                "user-mods",
+                Platform::Windows,
+                &game,
+                &registered,
+                &[game.clone(), user.clone()],
+            )
+            .unwrap();
+        assert_eq!(resolved, user.canonicalize().unwrap().join("Mods"));
+        assert!(!resolved.starts_with(game.canonicalize().unwrap()));
+        assert!(!resolved.exists()); // resolving never creates game/user paths
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_packages_and_escaped_destinations() {
+        use std::os::unix::fs::symlink;
+        let (temp, paths, db) = fixture();
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, paths.plugins().join("games")).unwrap();
+        assert!(seed_builtins(&db, &paths).is_err());
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        assert!(list_plugins(&db).unwrap().is_empty());
+        let package = temp.path().join("minecraft-java");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(outside.join("adapter.json"), BUILTIN_PACKAGES[0].1).unwrap();
+        symlink(outside.join("adapter.json"), package.join("adapter.json")).unwrap();
+        fs::write(package.join("SKILL.md"), BUILTIN_PACKAGES[0].2).unwrap();
+        assert!(load_package(&package).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_paths_cannot_follow_symlinks_outside_the_registered_root() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let game = temp.path().join("game");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&game).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, game.join("mods")).unwrap();
+        let adapter = builtin_packages().unwrap().remove(0).adapter;
+        assert!(adapter
+            .resolve_root(
+                "mods",
+                Platform::Windows,
+                &game,
+                &BTreeMap::new(),
+                std::slice::from_ref(&game)
+            )
+            .is_err());
+        symlink(&outside, game.join("saves")).unwrap();
+        assert!(adapter
+            .resolve_path(
+                &adapter.save_paths[0],
+                Platform::Windows,
+                &game,
+                &BTreeMap::new(),
+                std::slice::from_ref(&game)
+            )
+            .is_err());
+        assert!(adapter
+            .resolve_root(
+                "mods",
+                Platform::Windows,
+                Path::new("relative"),
+                &BTreeMap::new(),
+                &[game]
+            )
+            .is_err());
+        assert!(fs::read_dir(outside).unwrap().next().is_none());
+    }
+}

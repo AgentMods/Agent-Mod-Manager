@@ -1,0 +1,14 @@
+node_modules/
+dist/
+src-tauri/target/
+tmp/
+prototypes
+.yarnrc
+output
+*.tsbuildinfo
+playwright-report/
+test-results/
+.env
+.env.*
+!.env.example
+**/private/
