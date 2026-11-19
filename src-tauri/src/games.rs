@@ -83,7 +83,10 @@ pub fn list_games(db: &Db) -> AppResult<Vec<Game>> {
 }
 
 pub fn get_game(db: &Db, id: &str) -> AppResult<Game> {
-    let conn = db.conn();
+    get_game_from(&db.conn(), id)
+}
+
+pub(crate) fn get_game_from(conn: &rusqlite::Connection, id: &str) -> AppResult<Game> {
     conn.query_row(
         &format!("SELECT {GAME_COLUMNS} FROM games WHERE id=?1"),
         [id],

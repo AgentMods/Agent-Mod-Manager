@@ -124,7 +124,7 @@ async function calls(page: Page, command: string) {
 async function recordDialog(dialog: Locator, info: TestInfo, name: string) {
   expect(await dialog.evaluate(element => {
     const box = element.getBoundingClientRect();
-    const body = element.querySelector('.modal-body')!;
+    const body = element.querySelector('[data-slot="modal-body"]')!;
     return box.left >= 0 && box.right <= innerWidth + 1 && body.scrollWidth <= body.clientWidth + 1;
   })).toBe(true);
   await dialog.screenshot({ path: info.outputPath(`${name}.png`) });

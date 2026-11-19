@@ -1,10 +1,13 @@
 import { useState } from "react";
-import { Check, ShieldCheck, X } from "lucide-react";
+import { CheckIcon, ShieldCheckIcon, XIcon } from "lucide-react";
 import { api } from "../lib/api";
 import { pendingApprovals, replayConversation, useAgent } from "../lib/agent-store";
 import type { AgentEvent, FilePlan } from "../lib/types";
 import { PlanPreview } from "./PlanDialog";
-import { Button, ErrorState, Modal } from "./ui";
+import { ErrorState, Modal } from "./ui";
+import { Button } from "@/components/ui/button";
+import { Field, FieldLabel } from "@/components/ui/field";
+import { Textarea } from "@/components/ui/textarea";
 
 function findPlan(value: unknown): FilePlan | null {
   if (!value || typeof value !== "object") return null;
@@ -34,10 +37,14 @@ function Approval({event}: {event: AgentEvent}) {
     } catch (failure) { setError(failure); }
     finally { setBusy(false); }
   }
-  return <Modal title={question ? "Agent 等待你的回答" : "操作审批"} onClose={() => {void respond(false);}} actions={<><Button disabled={busy} onClick={() => {void respond(false);}}><X size={16}/>拒绝</Button><Button className="primary" disabled={busy || (!!question && !answer.trim())} onClick={() => {void respond(true);}}><Check size={16}/>{question ? "提交回答" : "批准并执行"}</Button></>}>
-    <p className="approval-title"><ShieldCheck size={18}/>{String(event.payload.title || "待确认操作")}</p>
-    {question ? <label className="field">{String(question)}<textarea value={answer} onChange={(e) => setAnswer(e.target.value)} rows={4}/></label> : plan ? <PlanPreview plan={plan}/> : <pre className="json-preview">{JSON.stringify(preview, null, 2)}</pre>}
-    {plan && <details><summary>完整请求</summary><pre className="json-preview">{JSON.stringify(preview, null, 2)}</pre></details>}
+  const jsonPreview = <pre className="max-h-72 overflow-auto rounded-md border bg-muted p-3 font-mono text-xs break-all whitespace-pre-wrap">{JSON.stringify(preview, null, 2)}</pre>;
+  return <Modal title={question ? "Agent 等待你的回答" : "操作审批"} onClose={() => {void respond(false);}} actions={<>
+    <Button variant="outline" disabled={busy} onClick={() => {void respond(false);}}><XIcon data-icon="inline-start"/>拒绝</Button>
+    <Button disabled={busy || (!!question && !answer.trim())} onClick={() => {void respond(true);}}><CheckIcon data-icon="inline-start"/>{question ? "提交回答" : "批准并执行"}</Button>
+  </>}>
+    <p className="flex items-center gap-2 text-sm font-medium"><ShieldCheckIcon className="size-4 text-primary"/>{String(event.payload.title || "待确认操作")}</p>
+    {question ? <Field><FieldLabel htmlFor="approval-answer">{String(question)}</FieldLabel><Textarea id="approval-answer" value={answer} onChange={(e) => setAnswer(e.target.value)} rows={4}/></Field> : plan ? <PlanPreview plan={plan}/> : jsonPreview}
+    {plan && <details className="text-sm"><summary className="cursor-pointer text-muted-foreground">完整请求</summary><div className="mt-2">{jsonPreview}</div></details>}
     <ErrorState error={error}/>
   </Modal>;
 }

@@ -128,8 +128,10 @@ fn parse_record(bytes: &[u8]) -> io::Result<Record> {
     };
 
     let mut wide = Vec::with_capacity(name_len / 2);
-    for unit in bytes[NAME_OFFSET..end].chunks_exact(2) {
-        let unit = u16::from_le_bytes([unit[0], unit[1]]);
+    let (units, remainder) = bytes[NAME_OFFSET..end].as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for unit in units {
+        let unit = u16::from_le_bytes(*unit);
         // Do not emit a NUL, a path separator, or a drive/stream delimiter.
         if matches!(u8::try_from(unit), Ok(0 | b'/' | b'\\' | b':')) {
             return Err(invalid_record());
@@ -163,7 +165,9 @@ mod tests {
         let mut bytes = vec![0; NAME_OFFSET + 2 * name.len()];
         set_u32(&mut bytes, ATTRIBUTES_OFFSET, attributes);
         set_u32(&mut bytes, NAME_LENGTH_OFFSET, (2 * name.len()) as u32);
-        for (out, unit) in bytes[NAME_OFFSET..].chunks_exact_mut(2).zip(name) {
+        let (out_chunks, remainder) = bytes[NAME_OFFSET..].as_chunks_mut::<2>();
+        debug_assert!(remainder.is_empty());
+        for (out, unit) in out_chunks.iter_mut().zip(name) {
             out.copy_from_slice(&unit.to_le_bytes());
         }
         bytes

@@ -1,5 +1,8 @@
-import { AlertTriangle, CheckCircle2, FileWarning } from 'lucide-react';
-import { Badge } from './ui';
+import { AlertTriangleIcon, CheckCircle2Icon, FileWarningIcon } from 'lucide-react';
+import { Badge, EmptyState, PathText } from '@/components/ui';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Item, ItemActions, ItemContent, ItemGroup, ItemTitle } from '@/components/ui/item';
 
 const scanLabels = {
   scanned: '已完成有界检查',
@@ -38,15 +41,15 @@ export type BethesdaEvidence = {
 
 function PluginStatus({ plugin }: { plugin: BethesdaPlugin }) {
   if (Array.isArray(plugin.missingMasters) && plugin.missingMasters.length > 0) {
-    return <Badge tone="warning"><AlertTriangle size={13}/>缺少主文件</Badge>;
+    return <Badge tone="warning"><AlertTriangleIcon data-icon="inline-start"/>缺少主文件</Badge>;
   }
   if ((Array.isArray(plugin.disabledMasters) && plugin.disabledMasters.length > 0) || (Array.isArray(plugin.mastersAfterPlugin) && plugin.mastersAfterPlugin.length > 0)) {
-    return <Badge tone="warning"><AlertTriangle size={13}/>加载顺序需核对</Badge>;
+    return <Badge tone="warning"><AlertTriangleIcon data-icon="inline-start"/>加载顺序需核对</Badge>;
   }
   if (plugin.headerStatus === 'parsed') {
-    return <Badge tone="success"><CheckCircle2 size={13}/>已解析</Badge>;
+    return <Badge tone="success"><CheckCircle2Icon data-icon="inline-start"/>已解析</Badge>;
   }
-  return <Badge tone="warning"><FileWarning size={13}/>{headerLabels[plugin.headerStatus]}</Badge>;
+  return <Badge tone="warning"><FileWarningIcon data-icon="inline-start"/>{headerLabels[plugin.headerStatus]}</Badge>;
 }
 
 export function BethesdaPluginEvidence({ report }: { report: BethesdaEvidence }) {
@@ -59,51 +62,63 @@ export function BethesdaPluginEvidence({ report }: { report: BethesdaEvidence })
   const incomplete = report.status === 'partial' || hasIncompleteRows;
   const statusLabel = report.status === 'unavailable' ? scanLabels.unavailable : incomplete ? '证据不完整' : scanLabels.scanned;
   const statusTone = report.status === 'scanned' && !incomplete && missingCount === 0 ? 'success' : 'warning';
-  return <section className="fabric-evidence bethesda-evidence" aria-labelledby="bethesda-evidence-heading">
-    <div className="fabric-evidence-heading">
-      <h2 id="bethesda-evidence-heading">Bethesda 插件头证据</h2>
-      <Badge tone={statusTone}>{statusLabel}</Badge>
-    </div>
-    <div className="bethesda-summary">
-      <span>已检查 {plugins.length} 个启用插件</span>
-      <span>{missingCount ? `发现 ${missingCount} 个缺失主文件` : '未发现已确认的缺失主文件'}</span>
-      {disabledCount > 0 && <span>未启用主文件 {disabledCount} 个</span>}
-      {lateCount > 0 && <span>主文件顺序异常 {lateCount} 个</span>}
-    </div>
-    {plugins.length > 0 ? <details open>
-      <summary>TES4 主文件依赖（{plugins.length}）</summary>
-      <ul className="bethesda-plugin-list" aria-label="Bethesda 插件头依赖清单" role="list">
-        {plugins.map(plugin => {
-          const masters = Array.isArray(plugin.masters) ? plugin.masters : [];
-          const missingMasters = Array.isArray(plugin.missingMasters) ? plugin.missingMasters : [];
-          const unlistedMasters = Array.isArray(plugin.unlistedMasters) ? plugin.unlistedMasters : [];
-          const disabledMasters = Array.isArray(plugin.disabledMasters) ? plugin.disabledMasters : [];
-          const mastersAfterPlugin = Array.isArray(plugin.mastersAfterPlugin) ? plugin.mastersAfterPlugin : [];
-          const notesForPlugin = Array.isArray(plugin.notes) ? plugin.notes : [];
-          return <li className={`bethesda-plugin-row${missingMasters.length || unlistedMasters.length || disabledMasters.length || mastersAfterPlugin.length ? ' has-issue' : ''}`} key={`${plugin.name}:${plugin.listLine}`}>
-          <div className="bethesda-plugin-name">
-            <strong>{plugin.name}</strong>
-            <small className="path-text">Plugins.txt 第 {plugin.listLine} 行</small>
-            {plugin.loadOrder ? <small className="path-text">启用顺序 #{plugin.loadOrder}</small> : null}
-          </div>
-          <div className="bethesda-masters">
-            {masters.length > 0 ? masters.map(master => {
-              const missing = missingMasters.includes(master);
-              const unlisted = unlistedMasters.includes(master);
-              const disabled = disabledMasters.includes(master);
-              const late = mastersAfterPlugin.includes(master);
-              return <span className={`bethesda-master${missing ? ' missing' : ''}${unlisted || disabled || late ? ' unlisted' : ''}`} key={master} title={unlisted ? '主文件未出现在当前 Plugins.txt' : disabled ? '主文件已列出但未启用' : late ? '主文件排在当前插件之后' : undefined}>
-                {master}{unlisted && <small>未列出</small>}{disabled && <small>未启用</small>}{late && <small>顺序异常</small>}
-              </span>;
-            }) : <span className="muted">未声明 MAST</span>}
-          </div>
-          <PluginStatus plugin={plugin}/>
-          {notesForPlugin.map((note, index) => <p className="bethesda-note" key={index}>{note}</p>)}
-        </li>;
-        })}
-      </ul>
-    </details> : <p className="muted">没有可读取的启用插件头。</p>}
-    {notes.map((note, index) => <p className="warning-text bethesda-note" key={index}>{note}</p>)}
-    <p className="muted">只读取 Plugins.txt 声明的 loose 插件；不代表 MO2/VFS、归档内容或游戏当前加载状态。</p>
+  return <section className="min-w-0" aria-labelledby="bethesda-evidence-heading">
+    <Card>
+      <CardHeader className="flex flex-wrap items-center gap-2">
+        <CardTitle id="bethesda-evidence-heading">Bethesda 插件头证据</CardTitle>
+        <Badge tone={statusTone}>{statusLabel}</Badge>
+      </CardHeader>
+      <CardContent className="flex min-w-0 flex-col gap-3">
+        <div className="flex flex-wrap gap-x-3 gap-y-1 text-sm text-muted-foreground">
+          <span>已检查 {plugins.length} 个启用插件</span>
+          <span>{missingCount ? `发现 ${missingCount} 个缺失主文件` : '未发现已确认的缺失主文件'}</span>
+          {disabledCount > 0 && <span>未启用主文件 {disabledCount} 个</span>}
+          {lateCount > 0 && <span>主文件顺序异常 {lateCount} 个</span>}
+        </div>
+        {plugins.length > 0 ? <details open className="min-w-0 rounded-md border p-3">
+          <summary className="cursor-pointer rounded-sm text-sm font-medium focus-visible:outline-2 focus-visible:outline-ring">TES4 主文件依赖（{plugins.length}）</summary>
+          <ItemGroup aria-label="Bethesda 插件头依赖清单" className="mt-3 gap-2">
+            {plugins.map(plugin => {
+              const masters = Array.isArray(plugin.masters) ? plugin.masters : [];
+              const missingMasters = Array.isArray(plugin.missingMasters) ? plugin.missingMasters : [];
+              const unlistedMasters = Array.isArray(plugin.unlistedMasters) ? plugin.unlistedMasters : [];
+              const disabledMasters = Array.isArray(plugin.disabledMasters) ? plugin.disabledMasters : [];
+              const mastersAfterPlugin = Array.isArray(plugin.mastersAfterPlugin) ? plugin.mastersAfterPlugin : [];
+              const notesForPlugin = Array.isArray(plugin.notes) ? plugin.notes : [];
+              return <Item key={`${plugin.name}:${plugin.listLine}`} role="listitem" variant="outline" size="sm" className="items-start">
+                <ItemContent className="min-w-0 basis-36">
+                  <ItemTitle className="max-w-full break-all">{plugin.name}</ItemTitle>
+                  <PathText>Plugins.txt 第 {plugin.listLine} 行</PathText>
+                  {plugin.loadOrder ? <PathText>启用顺序 #{plugin.loadOrder}</PathText> : null}
+                </ItemContent>
+                <ItemActions className="min-w-0 flex-wrap">
+                  <PluginStatus plugin={plugin}/>
+                </ItemActions>
+                <div className="flex min-w-0 basis-full flex-wrap gap-1.5">
+                  {masters.length > 0 ? masters.map(master => {
+                    const missing = missingMasters.includes(master);
+                    const unlisted = unlistedMasters.includes(master);
+                    const disabled = disabledMasters.includes(master);
+                    const late = mastersAfterPlugin.includes(master);
+                    const title = unlisted ? '主文件未出现在当前 Plugins.txt' : disabled ? '主文件已列出但未启用' : late ? '主文件排在当前插件之后' : undefined;
+                    return <span className="min-w-0 max-w-full" key={master} title={title}>
+                      <Badge tone={missing || unlisted || disabled || late ? 'warning' : undefined} className="max-w-full flex-wrap break-all">
+                        {master}{unlisted && <small>未列出</small>}{disabled && <small>未启用</small>}{late && <small>顺序异常</small>}
+                      </Badge>
+                    </span>;
+                  }) : <span className="text-muted-foreground">未声明 MAST</span>}
+                </div>
+                {notesForPlugin.map((note, index) => <p className="min-w-0 basis-full wrap-anywhere text-muted-foreground" key={index}>{note}</p>)}
+              </Item>;
+            })}
+          </ItemGroup>
+        </details> : <EmptyState title="没有可读取的启用插件头。"/>}
+        {notes.map((note, index) => <Alert role="note" variant="warning" key={index}>
+          <AlertTriangleIcon/>
+          <AlertDescription className="wrap-anywhere">{note}</AlertDescription>
+        </Alert>)}
+        <p className="text-sm text-muted-foreground">只读取 Plugins.txt 声明的 loose 插件；不代表 MO2/VFS、归档内容或游戏当前加载状态。</p>
+      </CardContent>
+    </Card>
   </section>;
 }

@@ -241,6 +241,10 @@ async function startLinuxSession(application) {
 
 async function registerAndOpen(ui, root) {
   const packagedUrl = windows ? /^https?:\/\/tauri\.localhost(?:[/?#]|$)/ : /^tauri:\/\/localhost(?:[/?#]|$)/;
+  // A fresh profile starts with first-run onboarding before the normal shell is shown.
+  await ui.visible(textAt(main, '先找到你想管理的游戏', 'h2'));
+  assert.equal(await ui.count('//nav[@aria-label="主导航"]'), 0, 'Onboarding must replace the normal navigation');
+  await ui.click(button('退出引导'));
   await ui.visible(`${main}//input[@aria-label="游戏目录"]`);
   assert.match(await ui.url(), packagedUrl,
     'Expected assets from the packaged Tauri protocol, not a dev server');

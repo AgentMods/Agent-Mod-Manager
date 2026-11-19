@@ -1,12 +1,19 @@
 use super::sse::{Completion, SseDecoder};
-use crate::error::{AppError, AppResult};
+use crate::{
+    error::{AppError, AppResult},
+    settings::{parse_model_base_url, ReasoningEffort},
+};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
+use std::error::Error;
 use tokio_util::sync::CancellationToken;
+
+const MAX_ERROR_BYTES: usize = 64 * 1024;
 
 pub struct ModelConfig {
     pub base_url: String,
     pub model: String,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub api_key: Option<String>,
 }
 pub struct ModelClient {
@@ -29,24 +36,15 @@ impl ModelClient {
         cancel: &CancellationToken,
         mut on_delta: impl FnMut(&super::sse::Delta, &Completion) -> AppResult<()>,
     ) -> AppResult<Completion> {
-        let base = url::Url::parse(&config.base_url)
-            .map_err(|_| AppError::Invalid("模型地址无效".into()))?;
-        if !matches!(base.scheme(), "https" | "http")
-            || base.host_str().is_none()
-            || !base.username().is_empty()
-            || base.password().is_some()
-            || base.query().is_some()
-            || base.fragment().is_some()
-        {
-            return Err(AppError::Invalid(
-                "模型地址必须为无凭据的 HTTP(S) URL".into(),
-            ));
-        }
+        parse_model_base_url(&config.base_url)?;
         if config.model.trim().is_empty() {
             return Err(AppError::Invalid("请先在设置中选择模型".into()));
         }
         let endpoint = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
         let mut body = json!({"model":config.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
+        if let Some(effort) = config.reasoning_effort {
+            body["reasoning_effort"] = json!(effort);
+        }
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
@@ -58,20 +56,31 @@ impl ModelClient {
         if let Some(key) = &config.api_key {
             request = request.bearer_auth(key);
         }
-        let response = tokio::select! {biased;_=cancel.cancelled()=>return Err(AppError::Cancelled),response=request.send()=>response.map_err(|_|AppError::Other("无法连接模型服务".into()))?};
-        if !response.status().is_success() {
-            return Err(AppError::Other(format!(
-                "模型服务请求失败 (HTTP {})",
-                response.status().as_u16()
-            )));
-        }
-        if !response
+        let api_key = config.api_key.as_deref().filter(|key| !key.is_empty());
+        let response = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(AppError::Cancelled),
+            result = request.send() => result.map_err(|error| {
+                model_error(transport_details("无法连接模型服务", error), api_key, false)
+            })?,
+        };
+        let status = response.status().as_u16();
+        let content_type = response
             .headers()
             .get("content-type")
-            .and_then(|h| h.to_str().ok())
-            .is_some_and(|t| t.starts_with("text/event-stream"))
-        {
-            return Err(AppError::Invalid("模型服务未返回 SSE 流".into()));
+            .and_then(|header| header.to_str().ok());
+        let failure = if !response.status().is_success() {
+            Some(format!("模型服务请求失败 (HTTP {status})"))
+        } else if !content_type.is_some_and(|value| value.starts_with("text/event-stream")) {
+            let content_type = content_type.unwrap_or("缺失");
+            Some(format!(
+                "模型服务未返回 SSE 流 (HTTP {status}, Content-Type = {content_type})"
+            ))
+        } else {
+            None
+        };
+        if let Some(summary) = failure {
+            return Err(response_error(response, summary, api_key, cancel).await);
         }
         let mut stream = response.bytes_stream();
         let mut decoder = SseDecoder::default();
@@ -81,16 +90,93 @@ impl ModelClient {
             let Some(chunk) = next else {
                 break;
             };
-            let chunk = chunk.map_err(|_| AppError::Other("模型流连接中断".into()))?;
+            let chunk = chunk.map_err(|error| {
+                model_error(transport_details("模型流连接中断", error), api_key, false)
+            })?;
             for frame in decoder.push(&chunk)? {
-                let delta = completion.accept(&frame)?;
+                let delta = completion
+                    .accept(&frame)
+                    .map_err(|error| model_error(error.to_string(), api_key, false))?;
                 on_delta(&delta, &completion)?;
                 if completion.done {
-                    completion.calls()?;
+                    completion
+                        .calls()
+                        .map_err(|error| model_error(error.to_string(), api_key, false))?;
                     return Ok(completion);
                 }
             }
         }
         Err(AppError::Other("模型流提前结束，未执行工具调用".into()))
     }
+}
+
+async fn response_error(
+    response: reqwest::Response,
+    mut details: String,
+    api_key: Option<&str>,
+    cancel: &CancellationToken,
+) -> AppError {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    let mut truncated = false;
+    while let Some(result) = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return AppError::Cancelled,
+        result = stream.next() => result,
+    } {
+        let chunk = match result {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                details.push('\n');
+                details.push_str(&transport_details("读取错误响应失败", error));
+                break;
+            }
+        };
+        let remaining = MAX_ERROR_BYTES - body.len();
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if chunk.len() > remaining {
+            truncated = true;
+            break;
+        }
+    }
+    if !body.is_empty() {
+        details.push('\n');
+        match serde_json::from_slice::<Value>(&body) {
+            Ok(value) => details.push_str(&format!("{value:#}")),
+            Err(_) => details.push_str(&String::from_utf8_lossy(&body)),
+        }
+    }
+    model_error(details, api_key, truncated)
+}
+
+fn transport_details(summary: &str, error: reqwest::Error) -> String {
+    let error = error.without_url();
+    let mut details = format!("{summary}\n{error}");
+    let mut cause = error.source();
+    while let Some(error) = cause {
+        details.push('\n');
+        details.push_str(&error.to_string());
+        cause = error.source();
+    }
+    details
+}
+
+fn model_error(mut details: String, api_key: Option<&str>, truncated: bool) -> AppError {
+    if let Some(key) = api_key {
+        let encoded = Value::String(key.to_owned()).to_string();
+        let escaped = &encoded[1..encoded.len() - 1];
+        details = details.replace(escaped, "[REDACTED]");
+        if escaped != key {
+            details = details.replace(key, "[REDACTED]");
+        }
+    }
+    if truncated || details.len() > MAX_ERROR_BYTES {
+        let mut end = details.len().min(MAX_ERROR_BYTES);
+        while !details.is_char_boundary(end) {
+            end -= 1;
+        }
+        details.truncate(end);
+        details.push_str("\n（错误详情超过 64 KiB，已截断）");
+    }
+    AppError::Other(details)
 }

@@ -11,6 +11,7 @@ pub mod encrypted_store;
 pub mod error;
 pub mod filesystem;
 pub mod fomod;
+mod game_actions;
 pub mod game_identity;
 pub mod game_roots;
 pub mod games;
@@ -52,6 +53,8 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
+            commands::start_onboarding,
+            commands::set_onboarding_completed,
             commands::list_plugins,
             commands::get_game_adapter,
             commands::plan_import_archive,
@@ -81,6 +84,10 @@ pub fn run() {
             commands::restore_snapshot,
             commands::list_games,
             commands::get_game,
+            commands::update_game,
+            commands::remove_game,
+            commands::open_game_location,
+            commands::launch_game,
             commands::identify_game,
             commands::preview_game_identity,
             commands::search_game_identity,
@@ -105,6 +112,8 @@ pub fn run() {
             commands::get_conversation,
             commands::archive_conversation,
             commands::get_settings,
+            commands::list_agent_models,
+            commands::get_agent_model_metadata,
             commands::set_settings,
             commands::set_secret,
             commands::set_conversation_permission,

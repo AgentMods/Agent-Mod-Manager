@@ -1,54 +1,53 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Check, KeyRound, Link, Moon, Pencil, Play, Plus, Save, Server, Square, Sun, Trash2 } from "lucide-react";
-import { api, backendAvailable, useBackendQuery } from "../lib/api";
-import { useUI } from "../lib/store";
-import type { AppSettings, FilePlan, PermissionMode } from "../lib/types";
-import { Badge, Button, ErrorState, IconButton, Modal, PageHeader } from "../components/ui";
+import { CheckIcon, KeyRoundIcon, LinkIcon, MoonIcon, PencilIcon, PlayIcon, PlusIcon, RotateCcwIcon, SaveIcon, ServerIcon, SquareIcon, SunIcon, Trash2Icon } from "lucide-react";
+import { api, backendAvailable, useBackendQuery } from "@/lib/api";
+import { useUI } from "@/lib/store";
+import type { FilePlan } from "@/lib/types";
+import { AgentConfiguration } from "@/components/AgentConfiguration";
+import { Badge, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, PathText } from "@/components/ui";
+import { Button } from "@/components/ui/button";
+import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
+import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group";
+import { Item, ItemActions, ItemContent, ItemDescription, ItemGroup, ItemMedia, ItemTitle } from "@/components/ui/item";
+import { Label } from "@/components/ui/label";
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { Separator } from "@/components/ui/separator";
+import { Spinner } from "@/components/ui/spinner";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 
 type McpConfig = {id: string; name: string; transport: "stdio" | "streamable_http"; command: string | null; args: string[]; url: string | null; env_secret_refs: Record<string, string>; bearer_secret_ref: string | null; enabled: boolean; builtin: boolean};
 type LocalStatus = {running: boolean; stopping: boolean; endpoint: string | null; tokenRef: string; activeCalls: number};
 type Connection = {id: string; serverId?: string; server_id?: string; toolCount?: number; tool_count?: number};
 
+const sections = [["model", "AI 与模型"], ["sources", "Mod 来源"], ["mcp", "MCP 服务"], ["skills", "Skills"], ["appearance", "外观与存储"]] as const;
+
 export default function SettingsPage() {
   const [tab, setTab] = useState("model");
-  return <div className="page settings-page"><PageHeader title="设置"/>
-    <div className="tabs" style={{maxWidth: "100%", overflowX: "auto"}} role="tablist" aria-label="设置分类">{[["model", "AI 与模型"], ["sources", "Mod 来源"], ["mcp", "MCP 服务"], ["skills", "Skills"], ["appearance", "外观与存储"]].map(([id, name]) => <button role="tab" aria-selected={tab === id} className={tab === id ? "active" : ""} onClick={() => setTab(id)} key={id}>{name}</button>)}</div>
-    {tab === "model" && <ModelSettings/>}{tab === "sources" && <SourceSettings/>}{tab === "mcp" && <McpSettings/>}{tab === "skills" && <SkillsSettings/>}{tab === "appearance" && <AppearanceSettings/>}
-  </div>;
+  return <Page>
+    <PageHeader title="设置" subtitle="模型、Mod 来源、MCP 与外观"/>
+    <Tabs value={tab} onValueChange={setTab} className="gap-6">
+      <div className="max-w-full overflow-x-auto"><TabsList aria-label="设置分类">{sections.map(([id, name]) => <TabsTrigger key={id} value={id}>{name}</TabsTrigger>)}</TabsList></div>
+      <TabsContent value="model"><ModelSettings/></TabsContent>
+      <TabsContent value="sources"><SourceSettings/></TabsContent>
+      <TabsContent value="mcp"><McpSettings/></TabsContent>
+      <TabsContent value="skills"><SkillsSettings/></TabsContent>
+      <TabsContent value="appearance"><AppearanceSettings/></TabsContent>
+    </Tabs>
+  </Page>;
 }
 
 function ModelSettings() {
-  const settings = useBackendQuery<AppSettings>(["settings"], "get_settings");
-  const [draft, setDraft] = useState<AppSettings | null>(null);
-  const [key, setKey] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<unknown>(null);
-  const notify = useUI((s) => s.notify);
-  const client = useQueryClient();
-  useEffect(() => {if (settings.data) setDraft(settings.data);}, [settings.data]);
-  async function save() {
-    if (!draft) return;
-    setBusy(true); setError(null);
-    try {
-      const next = {...draft, api_key_ref: key ? "model.api_key" : draft.api_key_ref};
-      if (key) {await api("set_secret", {key: "model.api_key", value: key}); setKey("");}
-      await api("set_settings", {settings: next});
-      await client.invalidateQueries({queryKey: ["settings"]}); notify("模型设置已保存");
-    } catch (failure) {setError(failure);}
-    finally {setBusy(false);}
-  }
-  return <section className="page-section"><h2>模型服务</h2><ErrorState error={settings.error || error}/>
-    <form className="settings-form" onSubmit={(event) => {event.preventDefault(); void save();}}>
-      <label className="field">API 地址<input aria-label="API 地址" type="url" placeholder="https://api.example.com/v1" value={draft?.base_url || ""} disabled={!draft || busy} onChange={(event) => setDraft((value) => value && ({...value, base_url: event.target.value}))} required/></label>
-      <label className="field">模型名称<input aria-label="模型名称" value={draft?.model || ""} disabled={!draft || busy} onChange={(event) => setDraft((value) => value && ({...value, model: event.target.value}))} required/></label>
-      <label className="field">API 密钥<input aria-label="API 密钥" type="password" autoComplete="new-password" value={key} disabled={!draft || busy} placeholder={draft?.api_key_ref ? "已加密保存，留空保留" : "可选，使用本地加密存储"} onChange={(event) => setKey(event.target.value)}/></label>
-      <label className="field">上下文预算<input aria-label="上下文预算" type="number" min={1} max={16777216} step={1} value={draft?.context_budget || 32768} disabled={!draft || busy} onChange={(event) => setDraft((value) => value && ({...value, context_budget: Number(event.target.value)}))} required/></label>
-      <label className="field">默认权限策略<select aria-label="默认权限策略" value={draft?.permission_mode || "request_approval"} disabled={!draft || busy} onChange={(event) => setDraft((value) => value && ({...value, permission_mode: event.target.value as PermissionMode}))}><option value="request_approval">逐次审批</option><option value="auto_approve">已登记游戏目录内自动批准</option><option value="full_trust">完全信任</option></select></label>
-      {draft?.permission_mode === "full_trust" && <p className="warning-text">完全信任会跳过工具确认，包括外部服务写入与发布。路径限制仍生效；第三方 stdio 进程不受本地文件引擎约束。</p>}
-      <div><Button type="submit" className="primary" disabled={!backendAvailable || !draft || busy}><Save size={16}/>保存设置</Button></div>
-    </form>
-  </section>;
+  return <Card>
+    <CardHeader><CardTitle>模型服务</CardTitle><CardDescription>配置 Agent 使用的模型服务、密钥与默认权限策略。</CardDescription></CardHeader>
+    <CardContent><AgentConfiguration/></CardContent>
+  </Card>;
 }
 
 function SecretField({label, reference}: {label: string; reference: string}) {
@@ -57,22 +56,46 @@ function SecretField({label, reference}: {label: string; reference: string}) {
   const [error, setError] = useState<unknown>(null);
   const notify = useUI((s) => s.notify);
   const client = useQueryClient();
-  return <form className="secret-field" onSubmit={async (event) => {
+  return <form className="flex flex-col gap-2" onSubmit={async (event) => {
     event.preventDefault(); if (!value.trim()) return;
     setBusy(true); setError(null);
     try {await api("set_secret", {key: reference, value}); setValue(""); await client.invalidateQueries({queryKey: ["sources"]}); notify(`${label}已保存`);}
     catch (failure) {setError(failure);} finally {setBusy(false);}
-  }}><label className="field">{label}<div className="toolbar"><input type="password" autoComplete="new-password" aria-label={label} value={value} onChange={(event) => setValue(event.target.value)} disabled={!backendAvailable || busy} placeholder={reference}/><IconButton type="submit" title={`保存${label}`} disabled={!backendAvailable || busy || !value.trim()}><KeyRound size={16}/></IconButton></div></label><ErrorState error={error}/></form>;
+  }}>
+    <Field>
+      <FieldLabel htmlFor={`secret-${reference}`}>{label}</FieldLabel>
+      <InputGroup>
+        <InputGroupInput id={`secret-${reference}`} type="password" autoComplete="new-password" aria-label={label} value={value} onChange={(event) => setValue(event.target.value)} disabled={!backendAvailable || busy} placeholder={reference}/>
+        <InputGroupAddon align="inline-end">
+          <InputGroupButton type="submit" size="icon-xs" aria-label={`保存${label}`} title={`保存${label}`} disabled={!backendAvailable || busy || !value.trim()}>{busy ? <Spinner/> : <KeyRoundIcon/>}</InputGroupButton>
+        </InputGroupAddon>
+      </InputGroup>
+    </Field>
+    <ErrorState error={error}/>
+  </form>;
 }
 
 function SourceSettings() {
   const sources = useBackendQuery<Array<{source_id: string; state: string; message: string}>>(["sources"], "list_mod_sources");
-  return <section className="page-section"><h2>来源凭据</h2><ErrorState error={sources.error}/>
-    <div className="source-status-list">{sources.data?.map((source) => <div className="list-row" key={source.source_id}><strong>{source.source_id}</strong><Badge tone={source.state === "available" ? "success" : "warning"}>{source.state}</Badge><span className="muted">{source.message}</span></div>)}</div>
-    <SecretField label="CurseForge API Key" reference="sources.curseforge"/><SecretField label="Nexus API Key" reference="sources.nexus"/><SecretField label="3DM API Key" reference="sources.3dm"/>
-    <SecretField label="Brave Search API Key" reference="sources.brave"/>
-    <p className="muted">Agent 的通用网页搜索使用 Brave Search。未配置时会提示配置，Mod 来源搜索仍可使用。</p>
-  </section>;
+  return <Card>
+    <CardHeader><CardTitle>来源凭据</CardTitle><CardDescription>Agent 的通用网页搜索使用 Brave Search。未配置时会提示配置，Mod 来源搜索仍可使用。</CardDescription></CardHeader>
+    <CardContent className="flex flex-col gap-6">
+      <ErrorState error={sources.error}/>
+      {!!sources.data?.length && <ItemGroup className="gap-2">
+        {sources.data.map((source) => <Item key={source.source_id} variant="outline" size="sm">
+          <ItemContent><ItemTitle>{source.source_id}</ItemTitle>{source.message && <ItemDescription className="line-clamp-none break-words">{source.message}</ItemDescription>}</ItemContent>
+          <ItemActions><Badge tone={source.state === "available" ? "success" : "warning"}>{source.state}</Badge></ItemActions>
+        </Item>)}
+      </ItemGroup>}
+      <Separator/>
+      <FieldGroup>
+        <SecretField label="CurseForge API Key" reference="sources.curseforge"/>
+        <SecretField label="Nexus API Key" reference="sources.nexus"/>
+        <SecretField label="3DM API Key" reference="sources.3dm"/>
+        <SecretField label="Brave Search API Key" reference="sources.brave"/>
+      </FieldGroup>
+    </CardContent>
+  </Card>;
 }
 
 function McpSettings() {
@@ -93,22 +116,60 @@ function McpSettings() {
     catch (failure) {setError(failure);} finally {setBusy(false);}
   }
   const connected = (id: string) => connections.data?.some((connection) => (connection.id || connection.serverId || connection.server_id) === id);
-  return <section className="page-section"><div className="section-heading"><h2>外部 MCP 连接</h2><Button disabled={!backendAvailable} onClick={() => {setFresh(true); setEdit({id: `custom_${Date.now()}`, name: "自定义 MCP", transport: "streamable_http", command: null, args: [], url: "https://", env_secret_refs: {}, bearer_secret_ref: null, enabled: false, builtin: false});}}><Plus size={16}/>添加连接</Button></div>
-    <ErrorState error={configs.error || connections.error || local.error || error}/>
-    {(configs.data || []).map((config) => <div className="mcp-row" key={config.id}><div className="list-row"><Server size={21}/><div className="grow"><strong>{config.name}</strong><p className="path-text">{config.url || [config.command, ...config.args].join(" ")}</p></div><Badge tone={connected(config.id) ? "success" : "neutral"}>{connected(config.id) ? "已连接" : config.enabled ? "未连接" : "已停用"}</Badge><IconButton title={`编辑 ${config.name}`} onClick={() => {setFresh(false); setEdit(config);}}><Pencil size={16}/></IconButton>
-      {connected(config.id) ? <IconButton title={`断开 ${config.name}`} disabled={busy} onClick={() => {void perform(() => api("mcp_disconnect", {id: config.id}));}}><Square size={16}/></IconButton> : <IconButton title={`连接 ${config.name}`} disabled={busy || !config.enabled} onClick={() => {setAcknowledged(false); setConfirm(config);}}><Link size={16}/></IconButton>}</div>
-      {[...new Set([config.bearer_secret_ref, ...Object.values(config.env_secret_refs)].filter((reference): reference is string => !!reference))].map((reference) => <SecretField key={reference} label={`${config.name} 密钥`} reference={reference}/>)}</div>)}
-    <section className="page-section"><div className="section-heading"><h2>本地 MCP 服务</h2><Badge tone={local.data?.running ? "success" : "neutral"}>{local.data?.stopping ? "正在等待事务完成" : local.data?.running ? "运行中" : "未开启"}</Badge></div>
-      {local.data?.endpoint && <p className="path-text">{local.data.endpoint}</p>}
-      {local.data?.running ? <Button disabled={busy} onClick={() => {void perform(() => api("mcp_server_stop"));}}><Square size={16}/>停止服务</Button> : <Button disabled={!backendAvailable || busy || local.data?.stopping} onClick={() => {setAcknowledged(false); setConfirm("local");}}><Play size={16}/>开启服务</Button>}
-      {local.data?.running && <p className="muted">加密令牌引用：{local.data.tokenRef}。活动调用 {local.data.activeCalls}。</p>}
-    </section>
+  return <div className="flex flex-col gap-6">
+    <Card>
+      <CardHeader>
+        <CardTitle>外部 MCP 连接</CardTitle>
+        <CardDescription>连接第三方 MCP 服务，扩展 Agent 可用的工具。</CardDescription>
+        <CardAction><Button variant="outline" disabled={!backendAvailable} onClick={() => {setFresh(true); setEdit({id: `custom_${Date.now()}`, name: "自定义 MCP", transport: "streamable_http", command: null, args: [], url: "https://", env_secret_refs: {}, bearer_secret_ref: null, enabled: false, builtin: false});}}><PlusIcon data-icon="inline-start"/>添加连接</Button></CardAction>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        <ErrorState error={configs.error || connections.error || local.error || error}/>
+        {!configs.data?.length && !configs.isLoading && !configs.error && <EmptyState icon={<ServerIcon/>} title="尚未配置外部 MCP 连接"/>}
+        {(configs.data || []).map((config) => <div className="flex flex-col gap-3" key={config.id}>
+          <Item variant="outline">
+            <ItemMedia variant="icon"><ServerIcon/></ItemMedia>
+            <ItemContent className="min-w-0"><ItemTitle>{config.name}</ItemTitle><ItemDescription className="line-clamp-none"><PathText>{config.url || [config.command, ...config.args].join(" ")}</PathText></ItemDescription></ItemContent>
+            <ItemActions>
+              <Badge tone={connected(config.id) ? "success" : "neutral"}>{connected(config.id) ? "已连接" : config.enabled ? "未连接" : "已停用"}</Badge>
+              <IconButton title={`编辑 ${config.name}`} onClick={() => {setFresh(false); setEdit(config);}}><PencilIcon/></IconButton>
+              {connected(config.id)
+                ? <IconButton title={`断开 ${config.name}`} disabled={busy} onClick={() => {void perform(() => api("mcp_disconnect", {id: config.id}));}}><SquareIcon/></IconButton>
+                : <IconButton title={`连接 ${config.name}`} disabled={busy || !config.enabled} onClick={() => {setAcknowledged(false); setConfirm(config);}}><LinkIcon/></IconButton>}
+            </ItemActions>
+          </Item>
+          {[...new Set([config.bearer_secret_ref, ...Object.values(config.env_secret_refs)].filter((reference): reference is string => !!reference))].map((reference) => <SecretField key={reference} label={`${config.name} 密钥`} reference={reference}/>)}
+        </div>)}
+      </CardContent>
+    </Card>
+
+    <Card>
+      <CardHeader>
+        <CardTitle>本地 MCP 服务</CardTitle>
+        <CardDescription>让外部 Agent 通过受控工具使用本机的 Agent Mod Manager。</CardDescription>
+        <CardAction><Badge tone={local.data?.running ? "success" : "neutral"}>{local.data?.stopping ? "正在等待事务完成" : local.data?.running ? "运行中" : "未开启"}</Badge></CardAction>
+      </CardHeader>
+      <CardContent className="flex flex-col items-start gap-3">
+        {local.data?.endpoint && <PathText>{local.data.endpoint}</PathText>}
+        {local.data?.running
+          ? <Button variant="outline" disabled={busy} onClick={() => {void perform(() => api("mcp_server_stop"));}}><SquareIcon data-icon="inline-start"/>停止服务</Button>
+          : <Button variant="outline" disabled={!backendAvailable || busy || local.data?.stopping} onClick={() => {setAcknowledged(false); setConfirm("local");}}><PlayIcon data-icon="inline-start"/>开启服务</Button>}
+        {local.data?.running && <p className="text-sm text-muted-foreground">加密令牌引用：{local.data.tokenRef}。活动调用 {local.data.activeCalls}。</p>}
+      </CardContent>
+    </Card>
+
     {edit && <McpEditor config={edit} fresh={fresh} onClose={() => setEdit(null)} onSaved={async () => {setEdit(null); await client.invalidateQueries({queryKey: ["mcp"]});}}/>}
-    {confirm && <Modal title={confirm === "local" ? "开启本地 MCP 服务" : "确认外部 MCP 连接"} onClose={() => {if (!busy) setConfirm(null);}} actions={<><Button disabled={busy} onClick={() => setConfirm(null)}>取消</Button><Button className="primary" disabled={busy || (confirm !== "local" && confirm.transport === "stdio" && !acknowledged)} onClick={() => {void perform(() => confirm === "local" ? api("mcp_server_start", {confirmation: "START_LOCAL_MCP"}) : api("mcp_connect", {expectedConfig: confirm, acceptsUnsandboxedStdio: acknowledged}));}}><Check size={16}/>确认连接</Button></>}>
-      {confirm === "local" ? <p>允许持有本机令牌的外部 Agent 调用受控工具。文件写入沿用桌面权限策略，审批只能在桌面完成。</p> : <><pre className="json-preview">{JSON.stringify(confirm, null, 2)}</pre>{confirm.transport === "stdio" && <label className="checkbox-row"><input type="checkbox" checked={acknowledged} onChange={(event) => setAcknowledged(event.target.checked)}/>我信任此进程。它具有当前用户的操作系统权限，不受本地路径与“不删除”规则保护。</label>}</>}
+    {confirm && <Modal title={confirm === "local" ? "开启本地 MCP 服务" : "确认外部 MCP 连接"} onClose={() => {if (!busy) setConfirm(null);}} className="sm:max-w-xl" actions={<>
+      <Button variant="outline" disabled={busy} onClick={() => setConfirm(null)}>取消</Button>
+      <Button disabled={busy || (confirm !== "local" && confirm.transport === "stdio" && !acknowledged)} onClick={() => {void perform(() => confirm === "local" ? api("mcp_server_start", {confirmation: "START_LOCAL_MCP"}) : api("mcp_connect", {expectedConfig: confirm, acceptsUnsandboxedStdio: acknowledged}));}}><CheckIcon data-icon="inline-start"/>确认连接</Button>
+    </>}>
+      {confirm === "local" ? <p className="text-sm">允许持有本机令牌的外部 Agent 调用受控工具。文件写入沿用桌面权限策略，审批只能在桌面完成。</p> : <>
+        <pre className="max-h-72 overflow-auto rounded-md border bg-muted p-3 font-mono text-xs break-all whitespace-pre-wrap">{JSON.stringify(confirm, null, 2)}</pre>
+        {confirm.transport === "stdio" && <Label className="items-start font-normal"><Checkbox checked={acknowledged} onCheckedChange={(checked) => setAcknowledged(checked === true)}/>我信任此进程。它具有当前用户的操作系统权限，不受本地路径与“不删除”规则保护。</Label>}
+      </>}
       <ErrorState error={error}/>
     </Modal>}
-  </section>;
+  </div>;
 }
 
 function McpEditor({config, fresh, onClose, onSaved}: {config: McpConfig; fresh: boolean; onClose: () => void; onSaved: () => Promise<void>}) {
@@ -128,10 +189,29 @@ function McpEditor({config, fresh, onClose, onSaved}: {config: McpConfig; fresh:
       await onSaved();
     } catch (failure) {setError(failure);} finally {setBusy(false);}
   }
-  return <Modal title={remove ? "移除 MCP 配置" : fresh ? "添加 MCP 连接" : "编辑 MCP 连接"} onClose={() => {if (!busy) onClose();}} actions={<>{!fresh && !remove && <IconButton title="移除配置" onClick={() => setRemove(true)}><Trash2 size={16}/></IconButton>}<Button disabled={busy} onClick={onClose}>取消</Button><Button className={remove ? "danger" : "primary"} disabled={busy} onClick={() => {void save();}}><Save size={16}/>{remove ? "确认移除" : "保存配置"}</Button></>}>
-    {remove ? <p>移除 {draft.name} 的连接配置并断开连接。本地加密凭据仍会保留。</p> : <div className="settings-form"><label className="field">名称<input value={draft.name} onChange={(e) => setDraft({...draft, name: e.target.value})}/></label><label className="field">传输<select value={draft.transport} onChange={(e) => setDraft({...draft, transport: e.target.value as McpConfig["transport"]})}><option value="streamable_http">Streamable HTTP</option><option value="stdio">stdio</option></select></label>
-      {draft.transport === "streamable_http" ? <><label className="field">URL<input type="url" value={draft.url || ""} onChange={(e) => setDraft({...draft, url: e.target.value})}/></label><label className="field">Bearer 密钥引用<input placeholder="mcp.custom.api_key" value={draft.bearer_secret_ref || ""} onChange={(e) => setDraft({...draft, bearer_secret_ref: e.target.value})}/></label></> : <><label className="field">命令<input value={draft.command || ""} onChange={(e) => setDraft({...draft, command: e.target.value})}/></label><label className="field">参数，每行一项<textarea rows={3} value={draft.args.join("\n")} onChange={(e) => setDraft({...draft, args: e.target.value ? e.target.value.split("\n") : []})}/></label><label className="field">环境变量与密钥引用 JSON<textarea rows={4} value={env} onChange={(e) => setEnv(e.target.value)}/></label></>}
-      <label className="checkbox-row"><input type="checkbox" checked={draft.enabled} onChange={(e) => setDraft({...draft, enabled: e.target.checked})}/>启用此配置</label></div>}
+  return <Modal title={remove ? "移除 MCP 配置" : fresh ? "添加 MCP 连接" : "编辑 MCP 连接"} onClose={() => {if (!busy) onClose();}} className="sm:max-w-xl" actions={<>
+    {!fresh && !remove && <IconButton title="移除配置" className="mr-auto" onClick={() => setRemove(true)}><Trash2Icon/></IconButton>}
+    <Button variant="outline" disabled={busy} onClick={onClose}>取消</Button>
+    <Button variant={remove ? "destructive" : "default"} disabled={busy} onClick={() => {void save();}}>{busy ? <Spinner data-icon="inline-start"/> : <SaveIcon data-icon="inline-start"/>}{remove ? "确认移除" : "保存配置"}</Button>
+  </>}>
+    {remove ? <p className="text-sm">移除 {draft.name} 的连接配置并断开连接。本地加密凭据仍会保留。</p> : <FieldGroup>
+      <Field><FieldLabel htmlFor="mcp-name">名称</FieldLabel><Input id="mcp-name" value={draft.name} onChange={(e) => setDraft({...draft, name: e.target.value})}/></Field>
+      <Field>
+        <FieldLabel htmlFor="mcp-transport">传输</FieldLabel>
+        <NativeSelect id="mcp-transport" className="w-full" value={draft.transport} onChange={(e) => setDraft({...draft, transport: e.target.value as McpConfig["transport"]})}>
+          <NativeSelectOption value="streamable_http">Streamable HTTP</NativeSelectOption><NativeSelectOption value="stdio">stdio</NativeSelectOption>
+        </NativeSelect>
+      </Field>
+      {draft.transport === "streamable_http" ? <>
+        <Field><FieldLabel htmlFor="mcp-url">URL</FieldLabel><Input id="mcp-url" type="url" value={draft.url || ""} onChange={(e) => setDraft({...draft, url: e.target.value})}/></Field>
+        <Field><FieldLabel htmlFor="mcp-bearer">Bearer 密钥引用</FieldLabel><Input id="mcp-bearer" placeholder="mcp.custom.api_key" value={draft.bearer_secret_ref || ""} onChange={(e) => setDraft({...draft, bearer_secret_ref: e.target.value})}/></Field>
+      </> : <>
+        <Field><FieldLabel htmlFor="mcp-command">命令</FieldLabel><Input id="mcp-command" value={draft.command || ""} onChange={(e) => setDraft({...draft, command: e.target.value})}/></Field>
+        <Field><FieldLabel htmlFor="mcp-args">参数，每行一项</FieldLabel><Textarea id="mcp-args" rows={3} value={draft.args.join("\n")} onChange={(e) => setDraft({...draft, args: e.target.value ? e.target.value.split("\n") : []})}/></Field>
+        <Field><FieldLabel htmlFor="mcp-env">环境变量与密钥引用 JSON</FieldLabel><Textarea id="mcp-env" rows={4} className="font-mono text-xs" value={env} onChange={(e) => setEnv(e.target.value)}/></Field>
+      </>}
+      <Label className="font-normal"><Checkbox checked={draft.enabled} onCheckedChange={(checked) => setDraft({...draft, enabled: checked === true})}/>启用此配置</Label>
+    </FieldGroup>}
     <ErrorState error={error}/>
   </Modal>;
 }
@@ -139,8 +219,27 @@ function McpEditor({config, fresh, onClose, onSaved}: {config: McpConfig; fresh:
 function AppearanceSettings() {
   const theme = useUI((s) => s.theme);
   const toggleTheme = useUI((s) => s.toggleTheme);
+  const navigate = useUI((s) => s.navigate);
   const bootstrap = useBackendQuery<{dataRoot: string}>(["bootstrap"], "get_bootstrap_state");
-  return <section className="page-section"><h2>外观</h2><div className="segmented" role="group" aria-label="主题"><Button className={theme === "light" ? "active" : ""} onClick={() => {if (theme !== "light") toggleTheme();}}><Sun size={16}/>亮色</Button><Button className={theme === "dark" ? "active" : ""} onClick={() => {if (theme !== "dark") toggleTheme();}}><Moon size={16}/>暗色</Button></div><h2>存储</h2><p className="path-text">{bootstrap.data?.dataRoot || "未连接桌面服务"}</p><ErrorState error={bootstrap.error}/></section>;
+  return <div className="flex flex-col gap-6">
+    <Card>
+      <CardHeader><CardTitle>外观</CardTitle><CardDescription>选择界面主题，设置会保存在本机。</CardDescription></CardHeader>
+      <CardContent>
+        <ToggleGroup type="single" variant="outline" aria-label="主题" value={theme} onValueChange={(value) => {if (value && value !== theme) toggleTheme();}}>
+          <ToggleGroupItem value="light" aria-label="亮色"><SunIcon/>亮色</ToggleGroupItem>
+          <ToggleGroupItem value="dark" aria-label="暗色"><MoonIcon/>暗色</ToggleGroupItem>
+        </ToggleGroup>
+      </CardContent>
+    </Card>
+    <Card>
+      <CardHeader><CardTitle>存储</CardTitle><CardDescription>管理器数据（数据库、快照、回收站、下载）所在目录。</CardDescription></CardHeader>
+      <CardContent className="flex flex-col items-start gap-4">
+        <PathText>{bootstrap.data?.dataRoot || "未连接桌面服务"}</PathText>
+        <Button variant="outline" disabled={!backendAvailable || !bootstrap.data} onClick={() => navigate("onboarding")}><RotateCcwIcon data-icon="inline-start"/>重新查看新手引导</Button>
+        <ErrorState error={bootstrap.error}/>
+      </CardContent>
+    </Card>
+  </div>;
 }
 
 type SkillInfo = {name: string; description: string; location: string; source: string; enabled: boolean; kind: string; valid: boolean; issues: string[]};
@@ -178,15 +277,49 @@ function SkillsSettings() {
       });
     } catch (failure) {setError(failure);} finally {setBusy(false);}
   }
-  return <section className="page-section"><div className="section-heading"><h2>Skills</h2><Button disabled={!backendAvailable || busy} onClick={() => {setError(null); setImporting(true);}}><Plus size={16}/>导入 Skill</Button></div>
-    <ErrorState error={skills.error || error}/><div className="table-wrap"><table><thead><tr><th>名称</th><th>来源</th><th>状态</th><th>启用</th></tr></thead><tbody>{skills.data?.map((skill) => <tr key={skill.name}><td><button className="skill-name" onClick={() => {void inspect(skill.name);}} disabled={busy || !skill.valid}>{skill.name}</button><small>{skill.description}</small>{skill.issues.map((issue) => <small className="warning-text" key={issue}>{issue}</small>)}</td><td>{skill.kind}</td><td><Badge tone={skill.valid ? "success" : "warning"}>{skill.valid ? "已校验" : "不可用"}</Badge></td><td><input type="checkbox" aria-label={`启用 ${skill.name}`} checked={skill.enabled} disabled={busy || !backendAvailable || (!skill.valid && !skill.enabled)} onChange={async (event) => {
-      const enabled = event.target.checked; setBusy(true); setError(null);
-      try {await api("set_skill_enabled", {name: skill.name, enabled}); await skills.refetch();}
-      catch (failure) {setError(failure);} finally {setBusy(false);}
-    }}/></td></tr>)}</tbody></table></div>
-    {selected && <Modal title={selected.skill.name} onClose={() => {if (!busy) setSelected(null);}} actions={<>{selected.skill.kind === "standalone" && <IconButton title={`预览卸载 Skill ${selected.skill.name}`} disabled={!backendAvailable || busy || !selected.skill.valid} onClick={() => {void uninstall(selected.skill);}}><Trash2 size={16}/></IconButton>}<Button disabled={busy} onClick={() => setSelected(null)}>关闭</Button></>}><pre className="json-preview">{selected.markdown}</pre><ErrorState error={error}/></Modal>}
-    {importing && <Modal title="导入声明式 Skill" onClose={() => {if (!busy) setImporting(false);}} actions={<><Button disabled={busy} onClick={() => setImporting(false)}>取消</Button><Button className="primary" disabled={busy || !name.trim() || !markdown.trim()} onClick={() => {void install();}}>预览文件计划</Button></>}>
-      <label className="field">名称<input aria-label="Skill 名称" value={name} onChange={(event) => setName(event.target.value)} placeholder="my-game-guide"/></label><label className="field">SKILL.md<textarea aria-label="SKILL.md" rows={12} value={markdown} onChange={(event) => setMarkdown(event.target.value)}/></label><ErrorState error={error}/>
+  return <Card>
+    <CardHeader>
+      <CardTitle>Skills</CardTitle>
+      <CardDescription>声明式 Skill 为 Agent 提供游戏相关的操作说明。</CardDescription>
+      <CardAction><Button variant="outline" disabled={!backendAvailable || busy} onClick={() => {setError(null); setImporting(true);}}><PlusIcon data-icon="inline-start"/>导入 Skill</Button></CardAction>
+    </CardHeader>
+    <CardContent className="flex flex-col gap-4">
+      <ErrorState error={skills.error || error}/>
+      <div className="rounded-md border">
+        <Table>
+          <TableHeader><TableRow><TableHead>名称</TableHead><TableHead>来源</TableHead><TableHead>状态</TableHead><TableHead>启用</TableHead></TableRow></TableHeader>
+          <TableBody>{skills.data?.map((skill) => <TableRow key={skill.name}>
+            <TableCell className="whitespace-normal">
+              <Button variant="link" className="h-auto p-0 font-medium" onClick={() => {void inspect(skill.name);}} disabled={busy || !skill.valid}>{skill.name}</Button>
+              <p className="text-xs text-muted-foreground">{skill.description}</p>
+              {skill.issues.map((issue) => <p className="text-xs text-warning" key={issue}>{issue}</p>)}
+            </TableCell>
+            <TableCell>{skill.kind}</TableCell>
+            <TableCell><Badge tone={skill.valid ? "success" : "warning"}>{skill.valid ? "已校验" : "不可用"}</Badge></TableCell>
+            <TableCell><Checkbox aria-label={`启用 ${skill.name}`} checked={skill.enabled} disabled={busy || !backendAvailable || (!skill.valid && !skill.enabled)} onCheckedChange={async (checked) => {
+              const enabled = checked === true; setBusy(true); setError(null);
+              try {await api("set_skill_enabled", {name: skill.name, enabled}); await skills.refetch();}
+              catch (failure) {setError(failure);} finally {setBusy(false);}
+            }}/></TableCell>
+          </TableRow>)}</TableBody>
+        </Table>
+      </div>
+    </CardContent>
+    {selected && <Modal title={selected.skill.name} onClose={() => {if (!busy) setSelected(null);}} actions={<>
+      {selected.skill.kind === "standalone" && <IconButton title={`预览卸载 Skill ${selected.skill.name}`} className="mr-auto" disabled={!backendAvailable || busy || !selected.skill.valid} onClick={() => {void uninstall(selected.skill);}}><Trash2Icon/></IconButton>}
+      <Button variant="outline" disabled={busy} onClick={() => setSelected(null)}>关闭</Button>
+    </>}>
+      <pre className="max-h-96 overflow-auto rounded-md border bg-muted p-3 font-mono text-xs break-words whitespace-pre-wrap">{selected.markdown}</pre><ErrorState error={error}/>
     </Modal>}
-  </section>;
+    {importing && <Modal title="导入声明式 Skill" onClose={() => {if (!busy) setImporting(false);}} actions={<>
+      <Button variant="outline" disabled={busy} onClick={() => setImporting(false)}>取消</Button>
+      <Button disabled={busy || !name.trim() || !markdown.trim()} onClick={() => {void install();}}>预览文件计划</Button>
+    </>}>
+      <FieldGroup>
+        <Field><FieldLabel htmlFor="skill-name">名称</FieldLabel><Input id="skill-name" aria-label="Skill 名称" value={name} onChange={(event) => setName(event.target.value)} placeholder="my-game-guide"/></Field>
+        <Field><FieldLabel htmlFor="skill-md">SKILL.md</FieldLabel><Textarea id="skill-md" aria-label="SKILL.md" rows={12} className="font-mono text-xs" value={markdown} onChange={(event) => setMarkdown(event.target.value)}/><FieldDescription>粘贴完整的 SKILL.md（含 frontmatter）。</FieldDescription></Field>
+      </FieldGroup>
+      <ErrorState error={error}/>
+    </Modal>}
+  </Card>;
 }

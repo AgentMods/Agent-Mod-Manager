@@ -11,7 +11,8 @@ use crate::{
     transaction::{FileEngine, FileOp, FilePlan},
     trash,
 };
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_opener::OpenerExt;
 
 #[tauri::command]
 pub async fn read_dir(
@@ -349,6 +350,39 @@ pub async fn get_settings(agent: State<'_, AgentRuntime>) -> AppResult<AppSettin
     agent.settings.load()
 }
 #[tauri::command]
+pub async fn list_agent_models(
+    agent: State<'_, AgentRuntime>,
+    base_url: String,
+    api_key: Option<String>,
+) -> AppResult<Vec<String>> {
+    let base = crate::settings::parse_model_base_url(&base_url)?;
+    let api_key = match api_key.filter(|key| !key.is_empty()) {
+        Some(key) => Some(key),
+        None => {
+            let saved = agent.settings.load()?;
+            let saved_base = crate::settings::parse_model_base_url(&saved.base_url)?;
+            if base.as_str().trim_end_matches('/') == saved_base.as_str().trim_end_matches('/') {
+                match saved.api_key_ref {
+                    Some(reference) => agent.settings.read_secret(&reference)?,
+                    None => None,
+                }
+            } else {
+                None
+            }
+        }
+    };
+    crate::agent::model_catalog::list(&base, api_key.as_deref()).await
+}
+
+#[tauri::command]
+pub async fn get_agent_model_metadata(
+    base_url: String,
+    model_ids: Vec<String>,
+) -> AppResult<Vec<crate::agent::model_catalog::ModelMetadata>> {
+    crate::agent::model_catalog::metadata(&base_url, &model_ids).await
+}
+
+#[tauri::command]
 pub async fn set_settings(agent: State<'_, AgentRuntime>, settings: AppSettings) -> AppResult<()> {
     agent.settings.save(&settings)
 }
@@ -470,6 +504,80 @@ pub async fn register_game(
     .await
 }
 
+#[tauri::command]
+pub async fn update_game(
+    state: State<'_, AppServices>,
+    id: String,
+    name: String,
+    launch_path: Option<String>,
+) -> AppResult<games::Game> {
+    blocking(state.engine.clone(), move |e| {
+        crate::game_actions::update_game(&e, &id, &name, launch_path.as_deref())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn remove_game(state: State<'_, AppServices>, id: String) -> AppResult<()> {
+    blocking(state.engine.clone(), move |e| {
+        crate::game_actions::remove_game(&e, &id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn open_game_location(
+    app: AppHandle,
+    state: State<'_, AppServices>,
+    id: String,
+    target: String,
+) -> AppResult<()> {
+    blocking(state.engine.clone(), move |e| {
+        let _guard = crate::transaction::write_lock();
+        let directory = crate::game_actions::resolve_location(&e, &id, &target)?;
+        #[cfg(target_os = "macos")]
+        if directory
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+        {
+            // Launch Services opens an .app as a program. Reveal it in Finder instead.
+            return app
+                .opener()
+                .reveal_item_in_dir(&directory)
+                .map_err(|error| AppError::Other(format!("无法打开目录: {error}")));
+        }
+        let directory = directory
+            .into_os_string()
+            .into_string()
+            .map_err(|_| AppError::Invalid("目录路径包含无法表示的字符".into()))?;
+        app.opener()
+            .open_path(directory, None::<&str>)
+            .map_err(|error| AppError::Other(format!("无法打开目录: {error}")))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn launch_game(
+    app: AppHandle,
+    state: State<'_, AppServices>,
+    id: String,
+) -> AppResult<()> {
+    use crate::game_actions::{self, LaunchAction};
+    blocking(state.engine.clone(), move |e| {
+        let _guard = crate::transaction::write_lock();
+        let game = games::get_game(&e.db, &id)?;
+        match game_actions::decide_launch(&e.paths, &game)? {
+            LaunchAction::Program(program) => game_actions::launch_program(&program),
+            LaunchAction::Steam(url) => app
+                .opener()
+                .open_url(url, None::<&str>)
+                .map_err(|error| AppError::Other(format!("无法通过 Steam 启动游戏: {error}"))),
+        }
+    })
+    .await
+}
+
 async fn blocking<T: Send + 'static>(
     engine: FileEngine,
     work: impl FnOnce(FileEngine) -> AppResult<T> + Send + 'static,
@@ -480,8 +588,31 @@ async fn blocking<T: Send + 'static>(
 }
 
 #[tauri::command]
-pub fn get_bootstrap_state(state: State<'_, AppServices>) -> serde_json::Value {
-    serde_json::json!({"dataRoot":state.engine.paths.root,"recoveredTransactions":state.recovered,"recoveryError":state.recovery_error})
+pub fn get_bootstrap_state(
+    state: State<'_, AppServices>,
+    agent: State<'_, AgentRuntime>,
+) -> AppResult<serde_json::Value> {
+    let (completed, first_run, resumable) = agent.settings.onboarding_state()?;
+    Ok(serde_json::json!({
+        "dataRoot": state.engine.paths.root,
+        "recoveredTransactions": state.recovered,
+        "recoveryError": state.recovery_error,
+        "onboardingCompleted": completed,
+        "isFirstRun": first_run,
+        "resumeOnboarding": resumable,
+    }))
+}
+
+#[tauri::command]
+pub fn start_onboarding(agent: State<'_, AgentRuntime>) -> AppResult<()> {
+    agent.settings.start_onboarding()
+}
+
+#[tauri::command]
+pub fn set_onboarding_completed(agent: State<'_, AgentRuntime>, completed: bool) -> AppResult<()> {
+    agent
+        .settings
+        .set("onboarding_completed", serde_json::Value::Bool(completed))
 }
 
 #[tauri::command]

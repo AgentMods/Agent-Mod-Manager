@@ -1,3 +1,5 @@
+import { createElement } from "react";
+import { toast } from "sonner";
 import { create } from "zustand";
 import type { FilePlan, PageName } from "./types";
 
@@ -6,7 +8,6 @@ interface UIState {
   gameId: string | null;
   conversationId: string | null;
   theme: "light" | "dark";
-  toast: string | null;
   planReview: { plan: FilePlan; onApplied?: () => void } | null;
   navigate: (view: PageName) => void;
   selectGame: (id: string) => void;
@@ -24,9 +25,8 @@ function initialTheme(): "light" | "dark" {
   return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-let toastTimer: ReturnType<typeof setTimeout>;
 export const useUI = create<UIState>((set) => ({
-  view: "library", gameId: null, conversationId: null, theme: initialTheme(), toast: null, planReview: null,
+  view: "library", gameId: null, conversationId: null, theme: initialTheme(), planReview: null,
   navigate: (view) => set({view}),
   selectGame: (gameId) => set({gameId, view: "detail"}),
   openConversation: (conversationId) => set({conversationId, view: "agent"}),
@@ -36,11 +36,8 @@ export const useUI = create<UIState>((set) => ({
     try { localStorage.setItem("amm.theme", theme); } catch { /* Keep in-memory selection. */ }
     return {theme};
   }),
-  notify: (toast) => {
-    clearTimeout(toastTimer);
-    set({toast});
-    toastTimer = setTimeout(() => set({toast: null}), 6000);
-  },
+  // One shared id: a new notice replaces the previous one instead of stacking.
+  notify: (message) => { toast(createElement("span", {role: "status"}, message), {id: "app-notice", duration: 6000}); },
   reviewPlan: (plan, onApplied) => set({planReview: {plan, onApplied}}),
   closePlan: () => set({planReview: null}),
 }));

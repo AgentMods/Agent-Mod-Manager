@@ -178,7 +178,7 @@ test('checks the exact Modrinth version only on request and reports record evide
   await expect(results(dialog)).toContainText('共 7 条相关记录（显示前 4 条）');
   await expect(results(dialog)).toContainText('记录 deployed · 项目 ExactDep · 版本 PinVers1 · 事务已部署');
   await expect(preview(dialog)).toBeEnabled();
-  expect(await dialog.locator('.modal-body').evaluate(body => body.scrollWidth <= body.clientWidth + 1)).toBe(true);
+  expect(await dialog.locator('[data-slot="modal-body"]').evaluate(body => body.scrollWidth <= body.clientWidth + 1)).toBe(true);
 });
 
 test('distinguishes unknown and empty declarations without claiming to exclude a replacement', async ({ page }) => {

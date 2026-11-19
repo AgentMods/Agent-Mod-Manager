@@ -103,12 +103,14 @@ fn decrypt(key: &[u8; 32], name: &str, value: Value) -> AppResult<String> {
 
 fn private_directory(path: &Path) -> AppResult<()> {
     if !path.exists() {
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
             builder.mode(0o700);
-        }
+            builder
+        };
         builder.create(path)?;
     }
     if !fs::symlink_metadata(path)?.is_dir() || path.canonicalize()? != path {

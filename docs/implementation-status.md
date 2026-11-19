@@ -3,9 +3,21 @@
 Updated: 2026-11-19. The full project goal remains active. This is an
 implementation and verification snapshot, not a release-completion claim.
 
-Current local verification: 613 Rust library tests passed and 5 were ignored.
-All 222 Playwright cases passed across the three configured viewports.
-`yarn typecheck`, `yarn build`, strict Clippy, and Rust formatting passed.
+Current local verification (Windows): all 246 Playwright cases passed across
+the three configured viewports. `yarn typecheck`, `yarn build`, strict Clippy,
+and Rust formatting passed. Rust library tests: 591 passed, 5 failed, 5 ignored,
+run with `TEMP`/`TMP` pointed at a directory outside `AppData` (game identity
+rejects scan roots under the default `AppData` temp directory). The same 5
+failures reproduce on the pre-onboarding baseline and are existing Windows
+issues: `diagnostics::tests::noncanonical_database_roots_are_rejected`,
+`diagnostics::tests::records_cannot_authorize_relative_outside_manager_or_other_game_paths`,
+`encrypted_store::tests::actual_tauri_store_persists_ciphertext_and_reopens_without_keychain`,
+`imports::tests::filenames_are_portable_and_match_the_install_contract`, and
+`paths::tests::existing_regular_file_is_not_an_ancestor`. They were hidden
+before because the Windows test binary failed to start with
+`STATUS_ENTRYPOINT_NOT_FOUND`; `src-tauri/build.rs` now embeds
+`windows-app-manifest.xml` (Common Controls v6) into every Windows binary,
+including test executables.
 The macOS ARM64 debug `.app` and `.dmg` built successfully. The app launched
 from the mounted read-only DMG under an isolated profile, passed SQLite
 `quick_check`, and seeded six plugins. The DMG SHA-256 is
@@ -69,6 +81,27 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   libraries, Epic/Legendary metadata, explicit canonical root registration,
   idempotent game state persistence and list/get commands. Discovery does not
   grant write access or execute launcher metadata.
+- First-run onboarding: desktop-only bootstrap detection with persisted
+  `onboarding_completed`, explicit scan-candidate registration, Agent settings
+  setup with encrypted API-key storage, and a three-stage feature tour. The
+  onboarding UI uses local React shadcn/ui-compatible Button/Card/Badge/
+  Progress/Tabs/Alert/Dialog components, supports light/dark themes and a
+  narrow 390px layout, and can be reopened from Settings. Browser preview keeps
+  its existing disconnected behavior and never fabricates scan results.
+  `get_bootstrap_state` reports `onboardingCompleted`, `isFirstRun` (not
+  completed and no registered games) and `resumeOnboarding`. The first
+  registration inside automatic onboarding records a private in-progress marker
+  through `start_onboarding`, so quitting mid-way resumes the guide; existing
+  users with registered games are not interrupted. Finishing or "退出引导"
+  calls `set_onboarding_completed(true)`. The desktop WebView smoke script
+  dismisses the guide before its library workflow. Existing pages keep their
+  `src/components/ui.tsx` imports; Button, IconButton, Badge and ErrorState now
+  render through the shadcn/ui components while `Modal` stays a native dialog.
+- Onboarding and AI settings enable multiple reasoning levels per model.
+  New models start with the levels reported by BaseLLM. The chat composer
+  offers the active model's enabled levels for each message, including a
+  provider-default option that omits the request field. Legacy single-level
+  settings load as one enabled option.
 - Explicit user-data root registrations, bound to game and adapter root ID.
   Stable canonical root checks reject replaced symlinks, including replacement
   with a different already-authorized game or manager directory.
@@ -116,6 +149,9 @@ Windows and Linux smoke scripts use the new identity for future package runs.
 - Durable turn/event log with sequence-based replay, persisted assistant deltas,
   tool results and approval requests. Startup marks in-memory turns interrupted;
   subsequent turns complete interrupted tool-result groups before a model call.
+  Failed turns display replayable diagnostics beside the affected chat message,
+  including HTTP status or provider SSE error details. Model diagnostics are
+  capped at 64 KiB and redact the configured API key before persistence.
 - Explicit permission matrix: request_approval/auto_approve/full_trust, global,
   conversation and turn overrides; interactive approval responses verify their
   conversation. Read tools and game-target file plans have separate effects.
@@ -663,3 +699,33 @@ distribution acceptance, and it does not repeat the earlier game workflow.
   Final icon/signing decisions also remain open.
 
 All requirements in the original approved plan remain in scope.
+
+## Desktop game card actions (2026-11-19)
+
+- Implemented desktop IPC commands `update_game`, `remove_game`,
+  `open_game_location`, and `launch_game`. The Agent and inbound MCP registries
+  exclude these commands. The existing opener capability is sufficient.
+- Editing preserves game identity and unrelated metadata. A custom launch path
+  is checked on save and launch. The macOS `.app` path resolves its declared
+  bundle executable. A valid custom executable takes priority over the numeric
+  Steam App ID. Discovery and launcher metadata continue to be inert.
+- Removal atomically drops the registration and its user-root mappings and
+  detaches conversations. Shared root registrations, history, and disk files
+  are retained. Active installations, unfinished reviews, and unrecovered file
+  transactions block removal. Abandoned previews that remain `planned` can
+  still block removal because the existing plan lifecycle has no general discard
+  command.
+- Directory opening resolves the game root or the first existing guarded Mod
+  directory in adapter order. macOS Finder reveals a resolved `.app` directory
+  as a package. Directory lookup creates no folders.
+- Windows verification passed all 16 new offline Rust tests, Rust formatting,
+  and strict all-target Clippy. The library suite reported 607 passed, 5 failed,
+  and 5 ignored with `TEMP` and `TMP` outside AppData. The same five failures
+  reproduced before the change (591 passed, 5 failed, 5 ignored).
+- Coverage includes name and path validation, Windows junction escape, launch
+  selection and revalidation, adapter root ordering and explicit registration,
+  installed Mod and pending review checks, atomic database rollback, shared
+  roots, and retained file contents. Native Finder, Explorer, Steam and game
+  launch, macOS bundle behavior, and Linux execution were not exercised. Path
+  validation and the OS open or spawn are separate operations, so same-user
+  filesystem replacement can still race them.

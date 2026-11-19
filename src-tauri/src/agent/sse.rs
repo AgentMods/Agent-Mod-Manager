@@ -90,7 +90,7 @@ impl Completion {
         }
         let value: Value = serde_json::from_str(data)?;
         if value.get("error").is_some() {
-            return Err(AppError::Other("模型服务返回流式错误".into()));
+            return Err(AppError::Other(format!("模型服务返回流式错误\n{value:#}")));
         }
         let mut delta = Delta::default();
         if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
@@ -148,7 +148,10 @@ impl Completion {
             return Err(AppError::Invalid("模型流意外断开，工具不会执行".into()));
         }
         if !matches!(self.finish_reason.as_deref(), Some("stop" | "tool_calls")) {
-            return Err(AppError::Invalid("模型回复未完整结束，工具不会执行".into()));
+            let reason = self.finish_reason.as_deref().unwrap_or("缺失");
+            return Err(AppError::Invalid(format!(
+                "模型回复未完整结束，工具不会执行 (finish_reason = {reason})"
+            )));
         }
         if !self.calls.is_empty() && self.finish_reason.as_deref() != Some("tool_calls") {
             return Err(AppError::Invalid("工具调用未完整结束".into()));

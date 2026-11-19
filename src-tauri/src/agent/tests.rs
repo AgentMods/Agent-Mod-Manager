@@ -50,6 +50,15 @@ async fn server(responses: Vec<String>) -> (String, tokio::task::JoinHandle<Vec<
 
 async fn server_with(
     count: usize,
+    respond: impl FnMut(usize, &Value) -> String + Send + 'static,
+) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
+    server_with_http(count, "200 OK", "text/event-stream", respond).await
+}
+
+async fn server_with_http(
+    count: usize,
+    status: &'static str,
+    content_type: &'static str,
     mut respond: impl FnMut(usize, &Value) -> String + Send + 'static,
 ) -> (String, tokio::task::JoinHandle<Vec<Value>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -79,7 +88,10 @@ async fn server_with(
             let body = serde_json::from_slice(&body).unwrap();
             let response = respond(index, &body);
             bodies.push(body);
-            let header=format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",response.len());
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            );
             socket.write_all(header.as_bytes()).await.unwrap();
             // Chunk at awkward Unicode/tool JSON boundaries.
             for chunk in response.as_bytes().chunks(7) {
@@ -145,6 +157,7 @@ async fn real_sse_tool_loop_waits_for_approval_and_replays_history() {
             conversation_id: conv.clone(),
             content: "移入回收站".into(),
             permission_mode: None,
+            reasoning_effort: None,
         })
         .unwrap();
     let approval = next(&mut rx, "approval-request").await;
@@ -253,6 +266,7 @@ async fn automatic_fomod_sse_install_applies_the_reviewed_plan_and_returns_a_rec
             conversation_id: conv.clone(),
             content: "安装归档中可自动选择的 FOMOD 文件".into(),
             permission_mode: Some(super::policy::PermissionMode::AutoApprove),
+            reasoning_effort: None,
         })
         .unwrap();
 
@@ -378,6 +392,7 @@ async fn reject_approval_does_not_touch_game_files() {
             conversation_id: conv.clone(),
             content: "trash".into(),
             permission_mode: None,
+            reasoning_effort: None,
         })
         .unwrap();
     let a = next(&mut rx, "approval-request").await;
@@ -420,6 +435,7 @@ async fn rejected_plugin_publication_never_grants_upload_consent_in_either_revie
                 conversation_id: conv.clone(),
                 content: "发布适配包".into(),
                 permission_mode: Some(mode),
+                reasoning_effort: None,
             })
             .unwrap();
         let approval = next(&mut rx, "approval-request").await;
@@ -475,6 +491,7 @@ async fn rejected_online_identification_never_searches_or_registers_in_either_re
                 conversation_id: conv.clone(),
                 content: "识别这个游戏，先审核搜索词".into(),
                 permission_mode: Some(mode),
+                reasoning_effort: None,
             })
             .unwrap();
         let approval = next(&mut rx, "approval-request").await;
@@ -529,6 +546,7 @@ async fn cancellation_unblocks_approval_and_next_turn_repairs_tool_protocol() {
             conversation_id: conv.clone(),
             content: "ask".into(),
             permission_mode: None,
+            reasoning_effort: None,
         })
         .unwrap();
     next(&mut rx, "approval-request").await;
@@ -536,7 +554,8 @@ async fn cancellation_unblocks_approval_and_next_turn_repairs_tool_protocol() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "duplicate".into(),
-            permission_mode: None
+            permission_mode: None,
+            reasoning_effort: None,
         })
         .is_err());
     agent.cancel_turn(&conv, &turn).unwrap();
@@ -548,6 +567,7 @@ async fn cancellation_unblocks_approval_and_next_turn_repairs_tool_protocol() {
             conversation_id: conv.clone(),
             content: "continue".into(),
             permission_mode: None,
+            reasoning_effort: None,
         })
         .unwrap();
     let done = next(&mut rx, "done").await;
@@ -560,6 +580,161 @@ async fn cancellation_unblocks_approval_and_next_turn_repairs_tool_protocol() {
         .unwrap();
     let user = messages.iter().rposition(|m| m["role"] == "user").unwrap();
     assert!(previous_tool < user);
+}
+
+#[tokio::test]
+async fn agent_turn_uses_only_reasoning_effort_enabled_for_the_active_model() {
+    use crate::settings::{AgentModelSettings, ReasoningEffort};
+
+    let (_dir, engine, _) = setup();
+    let (url, job) = server(vec![final_reply(), final_reply(), final_reply()]).await;
+    let (agent, conv, mut rx) = runtime(engine, &url);
+    let mut settings = agent.settings.load().unwrap();
+    settings.model = "second-model".into();
+    settings.models = vec![
+        AgentModelSettings {
+            id: "mock-model".into(),
+            context_budget: 32_768,
+            reasoning_levels: vec![ReasoningEffort::Low],
+        },
+        AgentModelSettings {
+            id: "second-model".into(),
+            context_budget: 128_000,
+            reasoning_levels: vec![ReasoningEffort::None, ReasoningEffort::High],
+        },
+    ];
+    agent.settings.save(&settings).unwrap();
+    assert_eq!(agent.settings.load().unwrap(), settings);
+    let request = |reasoning_effort| TurnRequest {
+        conversation_id: conv.clone(),
+        content: "hi".into(),
+        permission_mode: None,
+        reasoning_effort,
+    };
+    assert!(matches!(
+        agent.start_turn(request(Some(ReasoningEffort::Low))),
+        Err(crate::error::AppError::Invalid(_))
+    ));
+    for effort in [
+        Some(ReasoningEffort::High),
+        Some(ReasoningEffort::None),
+        None,
+    ] {
+        agent.start_turn(request(effort)).unwrap();
+        assert_eq!(next(&mut rx, "done").await.payload["status"], "done");
+    }
+    let requests = job.await.unwrap();
+    assert!(requests
+        .iter()
+        .all(|request| request["model"] == "second-model"));
+    assert_eq!(requests[0]["reasoning_effort"], "high");
+    assert_eq!(requests[1]["reasoning_effort"], "none");
+    assert!(requests[2].get("reasoning_effort").is_none());
+}
+
+#[tokio::test]
+async fn model_http_error_keeps_status_and_provider_details_with_key_redacted() {
+    use super::client::{ModelClient, ModelConfig};
+
+    let (base_url, job) = server_with_http(1, "429 Too Many Requests", "application/json", |_, _| {
+        r#"{"error":{"code":"rate_limit_exceeded","message":"Key local-test-credential hit the limit","details":{"retry_after":42}}}"#.into()
+    })
+    .await;
+    let error = ModelClient::new()
+        .unwrap()
+        .stream(
+            &ModelConfig {
+                reasoning_effort: None,
+                base_url,
+                model: "mock-model".into(),
+                api_key: Some("local-test-credential".into()),
+            },
+            &[],
+            &[],
+            &tokio_util::sync::CancellationToken::new(),
+            |_, _| panic!("an HTTP error cannot produce a delta"),
+        )
+        .await
+        .err()
+        .expect("expected HTTP error")
+        .to_string();
+    assert!(error.contains("HTTP 429"), "{error}");
+    assert!(
+        error.contains(r#""code": "rate_limit_exceeded""#),
+        "{error}"
+    );
+    assert!(error.contains("Key [REDACTED] hit the limit"), "{error}");
+    assert!(error.contains(r#""retry_after": 42"#), "{error}");
+    assert!(!error.contains("local-test-credential"));
+    job.await.unwrap();
+}
+
+#[tokio::test]
+async fn unconfigured_model_reports_why_the_turn_failed_without_a_delta() {
+    let (_dir, engine, _) = setup();
+    let (agent, conv, mut rx) = runtime(engine, "http://127.0.0.1:1/v1");
+    agent.settings.set("model", json!("")).unwrap();
+    let turn = agent
+        .start_turn(TurnRequest {
+            conversation_id: conv.clone(),
+            content: "hi".into(),
+            permission_mode: None,
+            reasoning_effort: None,
+        })
+        .unwrap();
+    let error = next(&mut rx, "error").await;
+    assert_eq!(error.turn_id, turn);
+    assert_eq!(error.payload["message"], "无效输入: 请先在设置中选择模型");
+    assert_eq!(next(&mut rx, "done").await.payload["status"], "error");
+    let events = agent.events.replay(&conv, 0, 100).unwrap();
+    assert!(!events.iter().any(|event| event.kind == "delta"));
+    let history = History::new(agent.engine.db.clone())
+        .get_conversation(&conv)
+        .unwrap();
+    assert_eq!(error.message_id.as_ref(), Some(&history.messages[1].id));
+}
+
+#[tokio::test]
+async fn model_sse_error_replays_on_the_partial_reply_without_entering_history() {
+    let (_dir, engine, _) = setup();
+    let partial = "已经生成的内容";
+    let response = format!(
+        "{}{}",
+        event(json!({"choices":[{"delta":{"content":partial}}]})),
+        event(
+            json!({"error":{"code":"overloaded","message":"模型过载","details":{"retry_after":12}}})
+        ),
+    );
+    let (url, job) = server(vec![response]).await;
+    let (agent, conv, mut rx) = runtime(engine, &url);
+    let turn = agent
+        .start_turn(TurnRequest {
+            conversation_id: conv.clone(),
+            content: "hi".into(),
+            permission_mode: None,
+            reasoning_effort: None,
+        })
+        .unwrap();
+    let delta = next(&mut rx, "delta").await;
+    let error = next(&mut rx, "error").await;
+    assert_eq!(error.turn_id, turn);
+    assert_eq!(error.message_id, delta.message_id);
+    assert_eq!(next(&mut rx, "done").await.payload["status"], "error");
+    let diagnostic = error.payload["message"].as_str().unwrap();
+    assert!(
+        diagnostic.contains(r#""code": "overloaded""#),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("模型过载"), "{diagnostic}");
+    assert!(diagnostic.contains(r#""retry_after": 12"#), "{diagnostic}");
+    let replay = agent.events.replay(&conv, delta.seq, 100).unwrap();
+    assert_eq!(replay[0].seq, error.seq);
+    assert_eq!(replay[0].payload, error.payload);
+    let history = History::new(agent.engine.db.clone())
+        .get_conversation(&conv)
+        .unwrap();
+    assert_eq!(history.messages[1].content, partial);
+    job.await.unwrap();
 }
 
 #[tokio::test]
@@ -577,6 +752,7 @@ async fn truncated_tool_stream_never_executes() {
             conversation_id: conv,
             content: "trash".into(),
             permission_mode: Some(super::policy::PermissionMode::FullTrust),
+            reasoning_effort: None,
         })
         .unwrap();
     let done = next(&mut rx, "done").await;
@@ -607,6 +783,7 @@ async fn context_compression_preserves_full_history_and_summarizes_only_older_tu
             conversation_id: conv.clone(),
             content: "继续安装".into(),
             permission_mode: None,
+            reasoning_effort: None,
         })
         .unwrap();
     assert_eq!(next(&mut rx, "done").await.payload["status"], "done");
@@ -638,6 +815,7 @@ async fn cancel_stalled_model_request_finishes_without_waiting_for_network_timeo
             conversation_id: conv.clone(),
             content: "request".into(),
             permission_mode: None,
+            reasoning_effort: None,
         })
         .unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), accepted)
@@ -678,6 +856,7 @@ async fn auto_approve_applies_only_registered_game_plan_without_prompt() {
             conversation_id: conv.clone(),
             content: "安装".into(),
             permission_mode: Some(super::policy::PermissionMode::AutoApprove),
+            reasoning_effort: None,
         })
         .unwrap();
     assert_eq!(next(&mut rx, "done").await.payload["status"], "done");
@@ -718,6 +897,7 @@ async fn auto_approve_requires_confirmation_for_move_out_of_manager_storage() {
             conversation_id: conv.clone(),
             content: "Move".into(),
             permission_mode: Some(super::policy::PermissionMode::AutoApprove),
+            reasoning_effort: None,
         })
         .unwrap();
     let approval = next(&mut rx, "approval-request").await;

@@ -101,6 +101,7 @@ async fn generic_web_download_is_reviewed_before_network_io_in_every_permission_
                 conversation_id: conversation.clone(),
                 content: "Download this public archive for review".into(),
                 permission_mode: Some(mode),
+                reasoning_effort: None,
             })
             .unwrap();
 
@@ -266,6 +267,7 @@ async fn web_download_rejects_unreviewed_destination_without_network_io() {
             conversation_id: conversation.clone(),
             content: "Try to choose an output path".into(),
             permission_mode: Some(PermissionMode::FullTrust),
+            reasoning_effort: None,
         })
         .unwrap();
 

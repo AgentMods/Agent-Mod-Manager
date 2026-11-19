@@ -1,11 +1,23 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { CheckCircle2, FileCode2, Package, Plus, RefreshCw, Search, ShieldCheck, Upload } from 'lucide-react';
-import { api, backendAvailable, useBackendQuery } from '../lib/api';
-import { useUI } from '../lib/store';
-import type { FilePlan } from '../lib/types';
-import { Badge, Button, date, EmptyState, ErrorState, IconButton, Modal, PageHeader } from '../components/ui';
-import { PluginPublications } from '../components/PluginPublications';
+import { CheckCircle2Icon, FileCode2Icon, PackageIcon, PlusIcon, RefreshCwIcon, SearchIcon, ShieldCheckIcon, UploadIcon } from 'lucide-react';
+import { api, backendAvailable, useBackendQuery } from '@/lib/api';
+import { useUI } from '@/lib/store';
+import type { FilePlan } from '@/lib/types';
+import { Badge, date, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, PathText } from '@/components/ui';
+import { PluginPublications } from '@/components/PluginPublications';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Field, FieldLabel } from '@/components/ui/field';
+import { Input } from '@/components/ui/input';
+import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group';
+import { Label } from '@/components/ui/label';
+import { Spinner } from '@/components/ui/spinner';
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Textarea } from '@/components/ui/textarea';
 
 type Plugin = { slug: string; name: string; gameName: string; version: string; description: string; source: string; enabled: boolean; validated: boolean; installPath: string };
 type Draft = { id: string; slug: string; path: string; writeTransactionId: string; createdAt: string };
@@ -66,23 +78,114 @@ export default function PluginsPage() {
       reviewPlan(result.plan, () => { void plugins.refetch(); void drafts.refetch(); });
     } catch (e) { setError(e); } finally { setBusy(false); }
   }
-  return <div className="page plugins-page" data-testid="plugins-page">
-    <PageHeader title="适配包" subtitle={backendAvailable ? `${plugins.data?.length ?? 0} 个已登记适配包` : '桌面能力未连接'} actions={<><IconButton title="刷新适配包" disabled={!backendAvailable || busy} onClick={() => { void plugins.refetch(); void drafts.refetch(); }}><RefreshCw size={16}/></IconButton><Button className="primary" disabled={!writable || busy} onClick={() => { setDraftOpen(true); setError(null); }}><Plus size={16}/>新建草稿</Button></>}/>
-    <div className="tabs" role="tablist"><button role="tab" aria-selected={tab === 'installed'} className={tab === 'installed' ? 'active' : ''} onClick={() => setTab('installed')}>已安装</button><button role="tab" aria-selected={tab === 'drafts'} className={tab === 'drafts' ? 'active' : ''} onClick={() => setTab('drafts')}>草稿 {drafts.data?.length ?? 0}</button><button role="tab" aria-selected={tab === 'publications'} className={tab === 'publications' ? 'active' : ''} onClick={() => setTab('publications')}>发布记录</button></div>
+
+  const plural = (n: number) => `${n}`;
+  return <Page data-testid="plugins-page">
+    <PageHeader title="适配包" subtitle={backendAvailable ? `${plugins.data?.length ?? 0} 个已登记适配包` : '桌面能力未连接'} actions={<>
+      <IconButton title="刷新适配包" variant="outline" size="icon" disabled={!backendAvailable || busy} onClick={() => { void plugins.refetch(); void drafts.refetch(); }}><RefreshCwIcon/></IconButton>
+      <Button disabled={!writable || busy} onClick={() => { setDraftOpen(true); setError(null); }}><PlusIcon data-icon="inline-start"/>新建草稿</Button>
+    </>}/>
+    <Tabs value={tab} onValueChange={setTab} className="gap-4">
+      <div className="max-w-full overflow-x-auto"><TabsList>
+        <TabsTrigger value="installed">已安装</TabsTrigger>
+        <TabsTrigger value="drafts">草稿 {plural(drafts.data?.length ?? 0)}</TabsTrigger>
+        <TabsTrigger value="publications">发布记录</TabsTrigger>
+      </TabsList></div>
+    </Tabs>
     <ErrorState error={plugins.error}/><ErrorState error={drafts.error}/><ErrorState error={error}/>
     {tab === 'installed' && <>
-      <div className="toolbar"><label className="search-field"><Search size={16}/><input placeholder="搜索适配包…" aria-label="搜索适配包" value={search} onChange={e => setSearch(e.target.value)}/></label></div>
-      <div className="split-layout"><section><div className="table-wrap"><table><thead><tr><th>适配包</th><th>版本</th><th>来源</th><th>验证</th><th>状态</th></tr></thead><tbody>{filtered.map(plugin => <tr key={plugin.slug} className={`row-clickable ${selectedSlug === plugin.slug ? 'selected' : ''}`} onClick={() => setSelectedSlug(plugin.slug)}>
-        <td><button className="table-select" onClick={() => setSelectedSlug(plugin.slug)}><Package size={19}/><span><strong>{plugin.name}</strong><small>{plugin.gameName}</small></span></button></td><td>{plugin.version}</td><td>{plugin.source === 'builtin' ? '内置' : plugin.source === 'external' ? '本地导入' : plugin.source}</td><td><Badge tone={plugin.validated ? 'success' : 'warning'}>{plugin.validated ? '已验证' : '未验证'}</Badge></td><td><Badge tone={plugin.enabled && plugin.validated ? 'success' : 'neutral'}>{plugin.enabled ? '已启用' : '已停用'}</Badge></td>
-      </tr>)}</tbody></table></div>{!filtered.length && <EmptyState title={plugins.isLoading ? '正在读取适配包…' : search ? '没有匹配的适配包' : '暂无已登记适配包'}/>}</section>
-      <aside className="inspector"><h2>{selected?.name ?? '适配包详情'}</h2>{selected ? <><p>{selected.description}</p><dl className="metadata-list" style={{ marginTop: 20 }}><dt>标识</dt><dd>{selected.slug}</dd><dt>游戏</dt><dd>{selected.gameName}</dd><dt>版本</dt><dd>{selected.version}</dd><dt>来源</dt><dd>{selected.source}</dd><dt>安装目录</dt><dd className="path-text">{selected.installPath}</dd></dl><div className="toolbar" style={{ marginTop: 24 }}><label className="checkbox-row"><input type="checkbox" data-testid="plugin-enabled-toggle" aria-label={`启用适配包 ${selected.name}`} checked={selected.enabled} disabled={busy || !writable} onChange={e => { void setEnabled(selected, e.target.checked); }}/><span>启用适配包</span></label></div></> : <p>未选择适配包</p>}</aside></div>
+      <InputGroup className="max-w-sm"><InputGroupAddon><SearchIcon/></InputGroupAddon><InputGroupInput placeholder="搜索适配包…" aria-label="搜索适配包" value={search} onChange={e => setSearch(e.target.value)}/></InputGroup>
+      <div className="grid min-w-0 gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
+        <section className="min-w-0">
+          <div className="rounded-lg border">
+            <Table>
+              <TableHeader><TableRow><TableHead>适配包</TableHead><TableHead>版本</TableHead><TableHead>来源</TableHead><TableHead>验证</TableHead><TableHead>状态</TableHead></TableRow></TableHeader>
+              <TableBody>{filtered.map(plugin => <TableRow key={plugin.slug} data-state={selectedSlug === plugin.slug ? 'selected' : undefined} className="cursor-pointer" onClick={() => setSelectedSlug(plugin.slug)}>
+                <TableCell>
+                  <button type="button" className="flex items-center gap-3 rounded-md text-left outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" onClick={() => setSelectedSlug(plugin.slug)}>
+                    <PackageIcon className="size-5 shrink-0 text-muted-foreground"/>
+                    <span className="flex flex-col"><strong className="font-medium">{plugin.name}</strong><span className="text-xs text-muted-foreground">{plugin.gameName}</span></span>
+                  </button>
+                </TableCell>
+                <TableCell>{plugin.version}</TableCell>
+                <TableCell>{plugin.source === 'builtin' ? '内置' : plugin.source === 'external' ? '本地导入' : plugin.source}</TableCell>
+                <TableCell><Badge tone={plugin.validated ? 'success' : 'warning'}>{plugin.validated ? '已验证' : '未验证'}</Badge></TableCell>
+                <TableCell><Badge tone={plugin.enabled && plugin.validated ? 'success' : 'neutral'}>{plugin.enabled ? '已启用' : '已停用'}</Badge></TableCell>
+              </TableRow>)}</TableBody>
+            </Table>
+          </div>
+          {!filtered.length && <div className="mt-4"><EmptyState title={plugins.isLoading ? '正在读取适配包…' : search ? '没有匹配的适配包' : '暂无已登记适配包'}/></div>}
+        </section>
+        <aside className="min-w-0">
+          <Card>
+            <CardHeader><CardTitle>{selected?.name ?? '适配包详情'}</CardTitle>{selected && <CardDescription>{selected.description}</CardDescription>}</CardHeader>
+            <CardContent className="flex flex-col gap-4">
+              {selected ? <>
+                <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
+                  <dt className="text-muted-foreground">标识</dt><dd className="break-all">{selected.slug}</dd>
+                  <dt className="text-muted-foreground">游戏</dt><dd>{selected.gameName}</dd>
+                  <dt className="text-muted-foreground">版本</dt><dd>{selected.version}</dd>
+                  <dt className="text-muted-foreground">来源</dt><dd>{selected.source}</dd>
+                  <dt className="text-muted-foreground">安装目录</dt><dd><PathText>{selected.installPath}</PathText></dd>
+                </dl>
+                <Label className="font-normal">
+                  <Checkbox data-testid="plugin-enabled-toggle" aria-label={`启用适配包 ${selected.name}`} checked={selected.enabled} disabled={busy || !writable} onCheckedChange={checked => { void setEnabled(selected, checked === true); }}/>
+                  <span>启用适配包</span>
+                </Label>
+              </> : <p className="text-sm text-muted-foreground">未选择适配包</p>}
+            </CardContent>
+          </Card>
+        </aside>
+      </div>
     </>}
-    {tab === 'drafts' && <><div className="table-wrap"><table><thead><tr><th>草稿</th><th>创建时间</th><th>事务</th><th/></tr></thead><tbody>{(drafts.data ?? []).map(draft => <tr key={draft.id}>
-      <td><strong>{draft.slug}</strong><small className="path-text">{draft.path}</small></td><td>{date(draft.createdAt)}</td><td className="path-text">{draft.writeTransactionId}</td>
-      <td><div className="page-actions"><Button disabled={!backendAvailable || busy} onClick={() => { void validate(draft); }}><ShieldCheck size={15}/>验证</Button><Button disabled={!writable || busy} aria-label={`准备发布 ${draft.slug}`} onClick={() => setPublishDraft(draft)}><Upload size={15}/>准备发布</Button></div></td>
-    </tr>)}</tbody></table></div>{!drafts.data?.length && <EmptyState title="暂无草稿" action={<Button disabled={!writable} onClick={() => setDraftOpen(true)}><Plus size={15}/>新建草稿</Button>}/>}</>}
+    {tab === 'drafts' && <>
+      {!!drafts.data?.length && <div className="rounded-lg border">
+        <Table>
+          <TableHeader><TableRow><TableHead>草稿</TableHead><TableHead>创建时间</TableHead><TableHead>事务</TableHead><TableHead/></TableRow></TableHeader>
+          <TableBody>{drafts.data.map(draft => <TableRow key={draft.id}>
+            <TableCell className="whitespace-normal"><strong className="font-medium">{draft.slug}</strong><PathText className="block">{draft.path}</PathText></TableCell>
+            <TableCell>{date(draft.createdAt)}</TableCell>
+            <TableCell><PathText>{draft.writeTransactionId}</PathText></TableCell>
+            <TableCell><div className="flex flex-wrap justify-end gap-2">
+              <Button variant="outline" size="sm" disabled={!backendAvailable || busy} onClick={() => { void validate(draft); }}><ShieldCheckIcon data-icon="inline-start"/>验证</Button>
+              <Button variant="outline" size="sm" disabled={!writable || busy} aria-label={`准备发布 ${draft.slug}`} onClick={() => setPublishDraft(draft)}><UploadIcon data-icon="inline-start"/>准备发布</Button>
+            </div></TableCell>
+          </TableRow>)}</TableBody>
+        </Table>
+      </div>}
+      {!drafts.data?.length && <EmptyState title="暂无草稿" action={<Button disabled={!writable} onClick={() => setDraftOpen(true)}><PlusIcon data-icon="inline-start"/>新建草稿</Button>}/>}
+    </>}
     <PluginPublications draft={publishDraft} showHistory={tab === 'publications'} writable={writable} onDraftClose={() => setPublishDraft(null)}/>
-    {draftOpen && <Modal title="声明式适配包草稿" onClose={() => { if (!busy) setDraftOpen(false); }} actions={<><Button disabled={busy} onClick={() => setDraftOpen(false)}>取消</Button><Button className="primary" disabled={!writable || busy || !slug.trim() || !adapterJson.trim() || !skillMarkdown.trim()} onClick={() => { void writeDraft(); }}><FileCode2 size={15}/>预览保存草稿</Button></>}><ErrorState error={error}/><label className="field">Slug<input value={slug} onChange={e => setSlug(e.target.value)} maxLength={100}/></label><label className="field">adapter.json<textarea className="code-editor" rows={12} spellCheck={false} value={adapterJson} onChange={e => setAdapterJson(e.target.value)}/></label><label className="field">SKILL.md<textarea className="code-editor" rows={10} spellCheck={false} value={skillMarkdown} onChange={e => setSkillMarkdown(e.target.value)}/></label></Modal>}
-    {validation && <Modal title={`验证：${validation.draft.slug}`} onClose={() => { if (!busy) setValidation(null); }} actions={<><Button disabled={busy} onClick={() => setValidation(null)}>关闭</Button><Button className="primary" disabled={!writable || busy || !validation.valid} onClick={() => { void install(); }}><Package size={15}/>安装预览</Button></>}><ErrorState error={error}/><Badge tone={validation.valid ? 'success' : 'error'}>{validation.valid ? <><CheckCircle2 size={13}/>验证通过</> : '验证未通过'}</Badge><dl className="metadata-list" style={{ marginTop: 18 }}><dt>草稿事务</dt><dd>{validation.transactionStatus}</dd>{validation.package && <><dt>名称</dt><dd>{validation.package.adapter.name}</dd><dt>版本</dt><dd>{validation.package.adapter.version}</dd><dt>平台</dt><dd>{validation.package.adapter.platforms.join('、')}</dd><dt>Mod 类型</dt><dd>{validation.package.adapter.modTypes.map(type => `${type.name} (${type.id})`).join('、')}</dd></>}{validation.hashes && <><dt>Adapter SHA-256</dt><dd className="path-text">{validation.hashes.adapterSha256}</dd><dt>Skill SHA-256</dt><dd className="path-text">{validation.hashes.skillSha256}</dd></>}</dl>{validation.issues.map((issue, i) => <div className="error-state" key={i}>{issue.code}: {issue.message}</div>)}{validation.warnings.map((warning, i) => <p className="warning-text" key={i}>{warning}</p>)}</Modal>}
-  </div>;
+    {draftOpen && <Modal title="声明式适配包草稿" onClose={() => { if (!busy) setDraftOpen(false); }} actions={<>
+      <Button variant="outline" disabled={busy} onClick={() => setDraftOpen(false)}>取消</Button>
+      <Button disabled={!writable || busy || !slug.trim() || !adapterJson.trim() || !skillMarkdown.trim()} onClick={() => { void writeDraft(); }}>{busy ? <Spinner data-icon="inline-start"/> : <FileCode2Icon data-icon="inline-start"/>}预览保存草稿</Button>
+    </>}>
+      <ErrorState error={error}/>
+      <Field><FieldLabel htmlFor="draft-slug">Slug</FieldLabel><Input id="draft-slug" value={slug} onChange={e => setSlug(e.target.value)} maxLength={100}/></Field>
+      <Field><FieldLabel htmlFor="draft-adapter">adapter.json</FieldLabel><Textarea id="draft-adapter" className="font-mono text-xs" rows={12} spellCheck={false} value={adapterJson} onChange={e => setAdapterJson(e.target.value)}/></Field>
+      <Field><FieldLabel htmlFor="draft-skill">SKILL.md</FieldLabel><Textarea id="draft-skill" className="font-mono text-xs" rows={10} spellCheck={false} value={skillMarkdown} onChange={e => setSkillMarkdown(e.target.value)}/></Field>
+    </Modal>}
+    {validation && <Modal title={`验证：${validation.draft.slug}`} onClose={() => { if (!busy) setValidation(null); }} actions={<>
+      <Button variant="outline" disabled={busy} onClick={() => setValidation(null)}>关闭</Button>
+      <Button disabled={!writable || busy || !validation.valid} onClick={() => { void install(); }}><PackageIcon data-icon="inline-start"/>安装预览</Button>
+    </>}>
+      <ErrorState error={error}/>
+      <div><Badge tone={validation.valid ? 'success' : 'error'}>{validation.valid ? <><CheckCircle2Icon className="size-3"/>验证通过</> : '验证未通过'}</Badge></div>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
+        <dt className="text-muted-foreground">草稿事务</dt><dd>{validation.transactionStatus}</dd>
+        {validation.package && <>
+          <dt className="text-muted-foreground">名称</dt><dd>{validation.package.adapter.name}</dd>
+          <dt className="text-muted-foreground">版本</dt><dd>{validation.package.adapter.version}</dd>
+          <dt className="text-muted-foreground">平台</dt><dd>{validation.package.adapter.platforms.join('、')}</dd>
+          <dt className="text-muted-foreground">Mod 类型</dt><dd>{validation.package.adapter.modTypes.map(type => `${type.name} (${type.id})`).join('、')}</dd>
+        </>}
+        {validation.hashes && <>
+          <dt className="text-muted-foreground">Adapter SHA-256</dt><dd><PathText>{validation.hashes.adapterSha256}</PathText></dd>
+          <dt className="text-muted-foreground">Skill SHA-256</dt><dd><PathText>{validation.hashes.skillSha256}</PathText></dd>
+        </>}
+      </dl>
+      {validation.issues.map((issue, i) => <Alert variant="destructive" key={i}><AlertDescription>{issue.code}: {issue.message}</AlertDescription></Alert>)}
+      {validation.warnings.map((warning, i) => <Alert variant="warning" key={i}><AlertDescription>{warning}</AlertDescription></Alert>)}
+    </Modal>}
+  </Page>;
 }

@@ -8,7 +8,7 @@ use super::{
 use crate::{
     db::Db,
     error::{AppError, AppResult},
-    settings::Settings,
+    settings::{AppSettings, ReasoningEffort, Settings},
     sources::resolutions::{history_arguments, scrub_model_history, ResolutionScope, Resolutions},
     transaction::FileEngine,
     util,
@@ -28,6 +28,7 @@ pub struct TurnRequest {
     pub conversation_id: String,
     pub content: String,
     pub permission_mode: Option<PermissionMode>,
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 #[derive(Clone)]
 struct ActiveTurn {
@@ -140,10 +141,20 @@ impl AgentRuntime {
         if archived {
             return Err(AppError::Denied("请先恢复归档会话".into()));
         }
+        let config = self.settings.load()?;
+        if let Some(level) = request.reasoning_effort {
+            let enabled = config
+                .models
+                .iter()
+                .any(|model| model.id == config.model && model.reasoning_levels.contains(&level));
+            if !enabled {
+                return Err(AppError::Invalid("当前模型未启用所选思考等级".into()));
+            }
+        }
         let id = util::new_id("turn");
         let cancel = CancellationToken::new();
         self.repair_incomplete_tool_groups(&request.conversation_id)?;
-        append_message(
+        let mut error_message_id = append_message(
             &self.engine.db,
             &request.conversation_id,
             "user",
@@ -165,7 +176,9 @@ impl AgentRuntime {
         let runtime = self.clone();
         let turn = id.clone();
         tauri::async_runtime::spawn(async move {
-            let result = runtime.run_turn(&turn, &request, &cancel).await;
+            let result = runtime
+                .run_turn(&turn, &request, config, &cancel, &mut error_message_id)
+                .await;
             let (status, error) = match result {
                 Ok(()) => ("done", None),
                 Err(AppError::Cancelled) => ("cancelled", None),
@@ -179,7 +192,7 @@ impl AgentRuntime {
                 let _ = runtime.events.emit(
                     &turn,
                     &request.conversation_id,
-                    None,
+                    Some(&error_message_id),
                     "error",
                     json!({"message":error}),
                 );
@@ -223,16 +236,20 @@ impl AgentRuntime {
         &self,
         turn: &str,
         request: &TurnRequest,
+        config: AppSettings,
         cancel: &CancellationToken,
+        error_message_id: &mut String,
     ) -> AppResult<()> {
         let conv = &request.conversation_id;
-        let config = self.settings.load()?;
         let key_ref = config
             .api_key_ref
             .as_deref()
             .unwrap_or(crate::settings::MODEL_API_KEY);
         let api_key = self.settings.read_secret(key_ref)?;
+        let preference = config.models.iter().find(|model| model.id == config.model);
+        let context_budget = preference.map_or(config.context_budget, |model| model.context_budget);
         let model = ModelConfig {
+            reasoning_effort: request.reasoning_effort,
             base_url: config.base_url,
             model: config.model,
             api_key,
@@ -257,7 +274,7 @@ impl AgentRuntime {
             ContextBudget {
                 model: &model,
                 tools: &tools,
-                limit: config.context_budget,
+                limit: context_budget,
             },
             cancel,
         )
@@ -278,6 +295,7 @@ impl AgentRuntime {
                 return Err(AppError::Cancelled);
             }
             let message = append_message(&self.engine.db, conv, "assistant", "", None, None)?;
+            error_message_id.clone_from(&message);
             let stream_result = client
                 .stream(&model, &messages, &tools, cancel, |delta, full| {
                     if !delta.content.is_empty() || !delta.reasoning.is_empty() {
@@ -306,15 +324,8 @@ impl AgentRuntime {
                 .await;
             let completion = match stream_result {
                 Ok(value) => value,
-                Err(error) => {
-                    let suffix = format!(
-                        "\n\n[本轮回复未完成: {}]",
-                        if matches!(error, AppError::Cancelled) {
-                            "已取消"
-                        } else {
-                            "连接或流格式错误"
-                        }
-                    );
+                Err(AppError::Cancelled) => {
+                    let suffix = "\n\n[本轮回复未完成: 已取消]";
                     self.engine.db.conn().execute(
                         "UPDATE messages SET content=content||?1 WHERE id=?2",
                         params![suffix, message],
@@ -326,8 +337,9 @@ impl AgentRuntime {
                         "delta",
                         json!({"content":suffix,"reasoning":""}),
                     );
-                    return Err(error);
+                    return Err(AppError::Cancelled);
                 }
+                Err(error) => return Err(error),
             };
             let mut calls = completion.calls()?;
             for call in &mut calls {
@@ -438,7 +450,7 @@ impl AgentRuntime {
                     return Err(AppError::Cancelled);
                 }
             }
-            if estimated_context_tokens(&model.model, &messages, &tools) > config.context_budget {
+            if estimated_context_tokens(&model.model, &messages, &tools) > context_budget {
                 self.compress_context(
                     &client,
                     conv,
@@ -446,7 +458,7 @@ impl AgentRuntime {
                     ContextBudget {
                         model: &model,
                         tools: &tools,
-                        limit: config.context_budget,
+                        limit: context_budget,
                     },
                     cancel,
                 )

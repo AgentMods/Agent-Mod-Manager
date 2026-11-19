@@ -4,6 +4,7 @@ pub mod diagnostic_tools;
 pub mod events;
 pub mod identity_tools;
 pub mod install_tools;
+pub(crate) mod model_catalog;
 pub mod plugin_tools;
 pub mod policy;
 pub mod publication_tool;

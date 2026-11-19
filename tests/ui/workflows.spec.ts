@@ -97,8 +97,10 @@ test("model credentials use the dedicated secret command, not public settings", 
   await installMockTauri(page);
   await page.goto("/");
   await page.getByRole("button", {name: "设置", exact: true}).click();
-  await page.getByRole("textbox", {name: "模型名称", exact: true}).fill("test-provider-model");
   await page.getByLabel("API 密钥", {exact: true}).fill("sk-fixture-only");
+  await page.getByRole("textbox", {name: "模型名称", exact: true}).fill("test-provider-model");
+  await page.getByRole("button", {name: "添加模型", exact: true}).click();
+  await page.getByRole("combobox", {name: "默认模型", exact: true}).selectOption("test-provider-model");
   await page.getByRole("button", {name: "保存设置", exact: true}).click();
   await expect(page.getByLabel("API 密钥", {exact: true})).toHaveValue("");
   const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
@@ -304,7 +306,7 @@ for (const entry of ["local archive", "download"] as const) {
         const row = table.getByRole("row").filter({has: page.getByRole("cell", {name: source, exact: true})});
         await expect(row.getByRole("cell")).toHaveText([source, destination]);
       }
-      expect(await install.locator(".modal-body").evaluate(body => {
+      expect(await install.locator('[data-slot="modal-body"]').evaluate(body => {
         const bounds = body.getBoundingClientRect();
         return bounds.left >= 0 && bounds.right <= innerWidth + 1 && body.scrollWidth <= body.clientWidth + 1;
       })).toBe(true);

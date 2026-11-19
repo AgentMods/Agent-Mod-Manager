@@ -1,4 +1,4 @@
-export type PageName = "library" | "detail" | "agent" | "discover" | "plugins" | "trash" | "history" | "settings";
+export type PageName = "library" | "detail" | "agent" | "discover" | "plugins" | "trash" | "history" | "settings" | "onboarding";
 export type PermissionMode = "request_approval" | "auto_approve" | "full_trust";
 export interface Game {
   id: string; name: string; slug: string; rootPath: string; platform: string;
@@ -25,8 +25,22 @@ export interface FilePlan {
     before: {kind: string; size: number; sha256: string} | null;
     source: {kind: string; size: number; sha256: string} | null}>;
 }
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export interface AgentModelSettings {
+  id: string; context_budget: number; reasoning_levels: ReasoningEffort[];
+}
 export interface AppSettings {
-  base_url: string; model: string; context_budget: number; permission_mode: PermissionMode; api_key_ref: string | null;
+  models?: AgentModelSettings[];
+  base_url: string; model: string; context_budget: number; permission_mode: PermissionMode; api_key_ref: string | null; onboarding_completed: boolean;
+}
+export interface BootstrapState {
+  dataRoot: string; recoveredTransactions: string[]; recoveryError: string | null; onboardingCompleted: boolean; isFirstRun: boolean; resumeOnboarding: boolean;
+}
+export interface GameCandidate {
+  rootPath: string; name: string; confidence: number; suggestedAdapterSlug: string | null; registeredGameId: string | null; platform: string; warnings: string[];
+}
+export interface ScanReport {
+  candidates: GameCandidate[]; warnings: {path: string; message: string}[]; directoriesChecked: number; entriesChecked: number; truncated: boolean;
 }
 export interface Plugin {
   slug: string; name: string; gameName: string; version: string; description: string;

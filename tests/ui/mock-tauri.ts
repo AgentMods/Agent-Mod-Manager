@@ -1,8 +1,8 @@
 import type { Page } from "@playwright/test";
 
 // Test-only IPC transport. It is never imported by the shipped application.
-export async function installMockTauri(page: Page, {fomodSelection = "requires_user"}: {fomodSelection?: "safe" | "requires_user"} = {}) {
-  await page.addInitScript((fomodSelection) => {
+export async function installMockTauri(page: Page, {fomodSelection = "requires_user", onboarding = false, onboardingStarted = false, failRegistration = false}: {fomodSelection?: "safe" | "requires_user"; onboarding?: boolean; onboardingStarted?: boolean; failRegistration?: boolean} = {}) {
+  await page.addInitScript(({fomodSelection, onboarding, onboardingStarted, failRegistration}) => {
     type Args = Record<string, any>;
     const now = "2026-11-18T00:00:00Z";
     const callbacks = new Map<number, (value: any) => void>();
@@ -11,12 +11,17 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
     let seq = 0;
     const calls: Array<{ command: string; args: Args }> = [];
     const events: any[] = [];
-    const games: Args[] = [{
+    const initialGame: Args = {
       id: "game-fixture", name: "Minecraft Java Edition", slug: "minecraft-java",
       rootPath: "/sandbox/minecraft", platform: "windows", adapterSlug: "minecraft-java",
       adapterVersion: "1.0.0", confidence: 1, coverPath: null, steamAppId: null,
       lastScannedAt: now, installedModCount: 1, enabledModCount: 1, metadata: {}, createdAt: now, updatedAt: now,
-    }];
+    };
+    const games: Args[] = onboarding && !onboardingStarted ? [] : [initialGame];
+    const onboardingCandidates: Args[] = [
+      {rootPath: "/sandbox/steam/Fixture", name: "Fixture Game", confidence: 0.92, status: "identified", suggestedAdapterSlug: "minecraft-java", registeredGameId: null, platform: "windows", warnings: ["这是一个测试扫描候选，请确认目录后再登记"]},
+      {rootPath: "/sandbox/steam/Broken", name: "Broken Fixture", confidence: 0.61, status: "ambiguous", suggestedAdapterSlug: null, registeredGameId: null, platform: "unknown", warnings: []},
+    ];
     const conversations = [{
       id: "conversation-fixture", title: "检查 Minecraft 模组", game_id: "game-fixture",
       task_summary: null, archived: false, pinned: false, message_count: 0,
@@ -33,6 +38,7 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
     let skillEnabled = true;
     let fileTrashed = false;
     let directoryPickCount = 0;
+    let modsFolderMissing = false;
     let archiveImported = false;
     let identitySearch: Args | null = null;
     let publicationOutcome = 'completed';
@@ -40,7 +46,9 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
     const unknownCandidate = {rootPath: '/sandbox/unknown-game', name: 'unknown-game', confidence: 0, status: 'unidentified', suggestedAdapterSlug: null, registeredGameId: null, platform: 'unknown', warnings: [], matches: [], sources: [], requiresConfirmation: true};
     const publications: Args[] = [];
     const draft = {id: 'draft-fixture', slug: 'fixture-game', path: '/sandbox/data/staging/plugin-drafts/fixture', writeTransactionId: 'txn-draft-fixture', createdAt: now};
-    let settings: Args = { base_url: "https://example.com/v1", model: "mock-model", context_budget: 32768, permission_mode: "request_approval", api_key_ref: "model.api_key" };
+    let settings: Args = { base_url: "https://example.com/v1", model: onboarding ? "" : "mock-model", context_budget: 32768, permission_mode: "request_approval", api_key_ref: "model.api_key", onboarding_completed: !onboarding };
+    let onboardingCompleted = !onboarding;
+    let onboardingInProgress = onboardingStarted;
     const plan = {
       id: "txn-fixture", summary: "还原 Example.jar", total_bytes: 1024, created_at: now,
       requires_review: true,
@@ -86,7 +94,7 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
       emit("done", { status: "done" }, activeConversation, null);
     };
     const invoke = async (command: string, args: Args = {}) => {
-      calls.push({ command, args });
+      calls.push({command, args: command === "list_agent_models" ? {baseUrl: args.baseUrl, authenticated: !!args.apiKey} : args});
       if (command === "plugin:event|listen") {
         const id = ++counter; listeners.set(id, { event: args.event, handler: args.handler }); return id;
       }
@@ -94,7 +102,7 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
       if (command === "plugin:window|is_maximized") return false;
       if (command.startsWith("plugin:window|") || command.startsWith("plugin:opener|")) return null;
       switch (command) {
-        case "get_bootstrap_state": return { dataRoot: "/sandbox/data", recoveredTransactions: [], recoveryError: null };
+        case "get_bootstrap_state": return { dataRoot: "/sandbox/data", recoveredTransactions: [], recoveryError: null, onboardingCompleted, isFirstRun: !onboardingCompleted && games.length === 0, resumeOnboarding: !onboardingCompleted && onboardingInProgress };
         case "plugin:dialog|open": {
           if (!args.options?.directory) return "/sandbox/incoming/Fixture.jar";
           return ++directoryPickCount === 1 ? "/sandbox/new-game" : null;
@@ -118,8 +126,19 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
         case "get_game": return games.find((game) => game.id === args.id) ?? games[0];
         case "get_game_adapter": return {modTypes: [{id: "java-mod", name: "Java 加载器模组", root: "mods", notes: "请核对加载器和依赖"}], installRoots: [{id: "mods", kind: "game", notes: ""}]};
         case "get_settings": return settings;
-        case "set_settings": settings = args.settings; return null;
+        case "list_agent_models": return ["fixture-thinking", "fixture-standard"];
+        case "get_agent_model_metadata": {
+          if (args.baseUrl === "https://offline.example/v1") throw new Error("metadata unavailable");
+          return args.modelIds.flatMap((id: string) => {
+            if (id === "fixture-thinking") return [{id, contextBudget: 128000, reasoningLevels: ["low", "medium", "high"]}];
+            if (id === "fixture-standard") return [{id, contextBudget: 64000, reasoningLevels: []}];
+            return [];
+          });
+        }
+        case "set_settings": settings = args.settings; onboardingCompleted = settings.onboarding_completed; return null;
         case "set_secret": return null;
+        case "start_onboarding": onboardingInProgress = true; return null;
+        case "set_onboarding_completed": onboardingCompleted = !!args.completed; settings = {...settings, onboarding_completed: onboardingCompleted}; return null;
         case "list_conversations": return conversations.filter((c) => c.archived === !!args.archived);
         case "create_conversation": {
           const conversation = { ...conversations[0], id: `conversation-${++counter}`, title: args.title || "新对话", game_id: args.gameId ?? null, archived: false, message_count: 0 };
@@ -277,8 +296,49 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
         case "read_dir": return [{ name: "mods", path: "/sandbox/minecraft/mods", is_dir: true, size: 0, modified: now }, ...fileTrashed ? [] : [{ name: "options.txt", path: "/sandbox/minecraft/options.txt", is_dir: false, size: 128, modified: now }]];
         case "read_file": if (fileTrashed && args.path === "/sandbox/minecraft/options.txt") throw new Error("file moved to trash"); return { lines: [{ line: 1, text: "fixture log" }], truncated: false };
         case "trash_paths": if (JSON.stringify(args.request.paths) !== JSON.stringify(["/sandbox/minecraft/options.txt"])) throw new Error("unknown file"); return filePlan;
-        case "scan_games": return { candidates: [], warnings: [], scannedRoots: [], truncated: false };
-        default: throw new Error(`Unimplemented test IPC: ${command}`);
+        case "register_game": {
+          const candidate = onboardingCandidates.find((item) => item.rootPath === args.directory);
+          if (!candidate) throw new Error("unknown candidate");
+          if (failRegistration && candidate.name === "Broken Fixture") throw new Error("目录已变化，请重新扫描");
+          const id = `game-${candidate.name.toLowerCase().replaceAll(" ", "-")}`;
+          const game = {...initialGame, id, name: candidate.name, rootPath: candidate.rootPath, adapterSlug: args.adapterSlug ?? null, installedModCount: 0, enabledModCount: 0};
+          if (!games.some((item) => item.id === game.id)) games.push(game);
+          candidate.registeredGameId = game.id;
+          return game;
+        }
+        case "scan_games": return { candidates: onboarding ? structuredClone(onboardingCandidates) : [], warnings: [], directoriesChecked: 3, entriesChecked: 18, truncated: false };
+        // Game-card actions. The native commands resolve every path from the game id, so the mock never accepts a path from the UI.
+        case "launch_game": {
+          const game = games.find((item) => item.id === args.id);
+          if (!game) throw new Error(`未找到: 游戏: ${args.id}`);
+          if (!game.metadata?.launchPath && !game.steamAppId) throw new Error("尚未设置启动方式，请在“编辑”中选择游戏可执行文件");
+          return null;
+        }
+        case "open_game_location": {
+          if (!games.some((item) => item.id === args.id)) throw new Error(`未找到: 游戏: ${args.id}`);
+          if (args.target !== "root" && args.target !== "mods") throw new Error("无效输入: 打开目录的目标只能是 root 或 mods");
+          if (args.target === "mods" && modsFolderMissing) throw new Error("无法定位 Mod 目录：Mod 目录不存在或不是目录: /sandbox/minecraft/mods");
+          return null;
+        }
+        case "update_game": {
+          const game = games.find((item) => item.id === args.id);
+          if (!game) throw new Error(`未找到: 游戏: ${args.id}`);
+          const name = String(args.name ?? "").trim();
+          if (!name || name.length > 80) throw new Error("无效输入: 游戏名称去除首尾空白后须为 1 到 80 个字符，且不能含有控制字符");
+          const launchPath = typeof args.launchPath === "string" ? args.launchPath.trim() : "";
+          if (launchPath && !launchPath.startsWith(`${game.rootPath}/`)) throw new Error("路径越界: 启动程序必须位于该游戏的已登记根目录内");
+          game.name = name;
+          const {launchPath: _previous, ...rest} = game.metadata ?? {};
+          game.metadata = launchPath ? {...rest, launchPath} : rest;
+          return structuredClone(game);
+        }
+        case "remove_game": {
+          const index = games.findIndex((item) => item.id === args.id);
+          if (index < 0) throw new Error(`未找到: 游戏: ${args.id}`);
+          if (games[index].installedModCount > 0) throw new Error(`冲突: 该游戏仍有 ${games[index].installedModCount} 个已安装的 Mod，请先在游戏详情中卸载后再移除`);
+          games.splice(index, 1);
+          return null;
+        }        default: throw new Error(`Unimplemented test IPC: ${command}`);
       }
     };
     const target = window as any;
@@ -294,10 +354,12 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
     target.__AMM_TEST__ = {
       calls, emit, events, conversations,
       get pending() { return pending; },
+      get modsFolderMissing() { return modsFolderMissing; },
+      set modsFolderMissing(value: boolean) { modsFolderMissing = value; },
       get publicationOutcome() { return publicationOutcome; },
       set publicationOutcome(value: string) { publicationOutcome = value; },
       get publicationReconcileOutcome() { return publicationReconcileOutcome; },
       set publicationReconcileOutcome(value: 'verified' | 'unconfirmed') { publicationReconcileOutcome = value; },
     };
-  }, fomodSelection);
+  }, {fomodSelection, onboarding, onboardingStarted, failRegistration});
 }

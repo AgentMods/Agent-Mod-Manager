@@ -1,7 +1,17 @@
 import { useLayoutEffect, useState } from 'react';
-import { Check, Globe, Search } from 'lucide-react';
-import { api, useBackendQuery } from '../lib/api';
-import { Badge, Button, EmptyState, ErrorState, Modal } from './ui';
+import { CheckIcon, GlobeIcon, SearchIcon } from 'lucide-react';
+import { api, useBackendQuery } from '@/lib/api';
+import { Badge, EmptyState, ErrorState, Modal, PathText } from './ui';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Field, FieldGroup, FieldLabel } from '@/components/ui/field';
+import { Input } from '@/components/ui/input';
+import { Item, ItemContent, ItemDescription, ItemGroup, ItemTitle } from '@/components/ui/item';
+import { Label } from '@/components/ui/label';
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group';
+import { Separator } from '@/components/ui/separator';
+import { Spinner } from '@/components/ui/spinner';
 
 type IdentityPreview = {
   rootPath: string; fingerprint: string; signals: string[]; suggestedQuery: string; warnings: string[];
@@ -60,27 +70,44 @@ export function GameIdentityDialog({ directory, writable, onClose, onConfirmed }
     finally { setRegistrationConsent(false); setBusy(false); }
   }
   const canConfirm = writable && !busy && result?.status === 'available' && selected !== null && registrationConsent && !!name.trim();
-  return <Modal title="联网识别游戏" onClose={() => { if (!busy) onClose(); }} actions={<>
-    <Button disabled={busy} onClick={onClose}>取消</Button>
-    <Button className="primary" disabled={!canConfirm} onClick={() => { void confirm(); }}><Check size={15}/>确认登记</Button>
+
+  return <Modal title="联网识别游戏" onClose={() => { if (!busy) onClose(); }} className="sm:max-w-2xl" actions={<>
+    <Button variant="outline" disabled={busy} onClick={onClose}>取消</Button>
+    <Button disabled={!canConfirm} onClick={() => { void confirm(); }}><CheckIcon data-icon="inline-start"/>确认登记</Button>
   </>}>
     <ErrorState error={preview.error || error}/>
-    {!preview.data ? <EmptyState title={preview.isLoading ? '正在检查本地目录…' : '无法检查目录'}/> : <div className="identity-review">
-      <dl className="metadata-list"><dt>本地目录</dt><dd className="path-text">{preview.data.rootPath}</dd><dt>搜索目的地</dt><dd>Brave Search API</dd><dt>发送内容</dt><dd>仅下方搜索词</dd></dl>
-      <details className="identity-evidence"><summary>本地名称信号（{preview.data.signals.length}）</summary><ul>{preview.data.signals.map(signal => <li className="path-text" key={signal}>{signal}</li>)}</ul></details>
-      {preview.data.warnings.map((warning, i) => <p className="warning-text" key={i}>{warning}</p>)}
-      <label className="field">公开搜索词<input aria-label="公开搜索词" value={query} maxLength={512} disabled={busy} onChange={event => changeQuery(event.target.value)}/></label>
-      <label className="checkbox-row"><input type="checkbox" aria-label="同意发送公开搜索词" checked={searchConsent} disabled={busy} onChange={event => setSearchConsent(event.target.checked)}/><span>我已核对搜索词不含本机路径、密钥或私人信息，同意将其发送给 Brave。</span></label>
-      <div className="toolbar"><Button disabled={busy || !searchConsent || !query.trim()} onClick={() => { void search(); }}><Search size={15}/>{busy ? '正在处理…' : '搜索候选'}</Button></div>
-      {result && <section className="identity-results" aria-label="联网识别候选">
-        <div className="section-heading"><h3><Globe size={15}/>网络候选</h3><Badge tone="warning">未验证</Badge></div>
-        {result.status === 'needs_configuration' ? <p role="status" className="warning-text">请先在设置中配置 Brave Search API Key，未执行网络搜索。</p> : result.status === 'unavailable' ? <p role="status" className="warning-text">联网搜索暂不可用，未确认任何游戏身份。</p> : <>
-          {result.candidates.length ? <fieldset className="identity-candidates"><legend className="sr-only">选择游戏候选</legend>{result.candidates.map((candidate, index) => <label className="identity-candidate" key={`${index}:${candidate.url}`}>
-            <input type="radio" name="game-identity-candidate" aria-label={`选择候选 ${index + 1}：${candidate.title}`} checked={selected === index} disabled={busy} onChange={() => { setSelected(index); setName(candidate.name); setRegistrationConsent(false); }}/>
-            <span><strong>{candidate.title}</strong><small className="path-text">{candidate.url}</small><p>{candidate.snippet}</p></span>
-          </label>)}</fieldset> : <EmptyState title="没有找到可确认的候选"/>}
-          {selected !== null && <><label className="field">确认的游戏名称<input aria-label="确认的游戏名称" maxLength={128} value={name} disabled={busy} onChange={event => { setName(event.target.value); setRegistrationConsent(false); }}/></label>
-            <label className="checkbox-row"><input type="checkbox" aria-label="确认游戏目录登记" checked={registrationConsent} disabled={busy || !writable} onChange={event => setRegistrationConsent(event.target.checked)}/><span>我已核对候选，确认将此目录登记为游戏。不自动关联适配包或执行安装。</span></label></>}
+    {!preview.data ? <EmptyState title={preview.isLoading ? '正在检查本地目录…' : '无法检查目录'}/> : <div className="flex flex-col gap-4 text-sm">
+      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2">
+        <dt className="text-muted-foreground">本地目录</dt><dd><PathText>{preview.data.rootPath}</PathText></dd>
+        <dt className="text-muted-foreground">搜索目的地</dt><dd>Brave Search API</dd>
+        <dt className="text-muted-foreground">发送内容</dt><dd>仅下方搜索词</dd>
+      </dl>
+      <details className="rounded-md border px-3 py-2">
+        <summary className="cursor-pointer font-medium">本地名称信号（{preview.data.signals.length}）</summary>
+        <ul className="mt-2 flex max-h-36 list-disc flex-col gap-1 overflow-auto pl-5">{preview.data.signals.map(signal => <li key={signal}><PathText>{signal}</PathText></li>)}</ul>
+      </details>
+      {preview.data.warnings.map((warning, i) => <Alert variant="warning" key={i}><AlertDescription>{warning}</AlertDescription></Alert>)}
+      <FieldGroup>
+        <Field><FieldLabel htmlFor="identity-query">公开搜索词</FieldLabel><Input id="identity-query" aria-label="公开搜索词" value={query} maxLength={512} disabled={busy} onChange={event => changeQuery(event.target.value)}/></Field>
+        <Label className="items-start font-normal"><Checkbox aria-label="同意发送公开搜索词" checked={searchConsent} disabled={busy} onCheckedChange={checked => setSearchConsent(checked === true)}/><span>我已核对搜索词不含本机路径、密钥或私人信息，同意将其发送给 Brave。</span></Label>
+        <div><Button disabled={busy || !searchConsent || !query.trim()} onClick={() => { void search(); }}>{busy ? <Spinner data-icon="inline-start"/> : <SearchIcon data-icon="inline-start"/>}{busy ? '正在处理…' : '搜索候选'}</Button></div>
+      </FieldGroup>
+      {result && <section className="flex flex-col gap-4" aria-label="联网识别候选">
+        <Separator/>
+        <div className="flex items-center justify-between gap-2"><h3 className="flex items-center gap-2 font-medium"><GlobeIcon className="size-4"/>网络候选</h3><Badge tone="warning">未验证</Badge></div>
+        {result.status === 'needs_configuration' ? <Alert variant="warning" role="status"><AlertDescription>请先在设置中配置 Brave Search API Key，未执行网络搜索。</AlertDescription></Alert> : result.status === 'unavailable' ? <Alert variant="warning" role="status"><AlertDescription>联网搜索暂不可用，未确认任何游戏身份。</AlertDescription></Alert> : <>
+          {result.candidates.length ? <RadioGroup aria-label="选择游戏候选" value={selected === null ? '' : String(selected)} disabled={busy} onValueChange={value => { const index = Number(value); setSelected(index); setName(result.candidates[index].name); setRegistrationConsent(false); }}>
+            <ItemGroup className="gap-2">{result.candidates.map((candidate, index) => <Item asChild variant="outline" key={`${index}:${candidate.url}`}>
+              <label className="cursor-pointer items-start">
+                <RadioGroupItem value={String(index)} aria-label={`选择候选 ${index + 1}：${candidate.title}`} className="mt-1"/>
+                <ItemContent className="min-w-0"><ItemTitle className="break-words">{candidate.title}</ItemTitle><PathText>{candidate.url}</PathText><ItemDescription className="line-clamp-none break-words">{candidate.snippet}</ItemDescription></ItemContent>
+              </label>
+            </Item>)}</ItemGroup>
+          </RadioGroup> : <EmptyState title="没有找到可确认的候选"/>}
+          {selected !== null && <FieldGroup>
+            <Field><FieldLabel htmlFor="identity-name">确认的游戏名称</FieldLabel><Input id="identity-name" aria-label="确认的游戏名称" maxLength={128} value={name} disabled={busy} onChange={event => { setName(event.target.value); setRegistrationConsent(false); }}/></Field>
+            <Label className="items-start font-normal"><Checkbox aria-label="确认游戏目录登记" checked={registrationConsent} disabled={busy || !writable} onCheckedChange={checked => setRegistrationConsent(checked === true)}/><span>我已核对候选，确认将此目录登记为游戏。不自动关联适配包或执行安装。</span></Label>
+          </FieldGroup>}
         </>}
       </section>}
     </div>}

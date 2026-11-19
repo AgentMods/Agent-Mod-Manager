@@ -8,17 +8,66 @@ use crate::{
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::Arc,
+};
 
 pub const SECRET_STORE_SERVICE: &str = "tauri-store:aes-256-gcm:v1";
 pub const MODEL_API_KEY: &str = "model.api_key";
 const PUBLIC_KEYS: &[&str] = &[
     "base_url",
     "model",
+    "models",
     "context_budget",
     "permission_mode",
     "api_key_ref",
+    "onboarding_completed",
 ];
+
+pub(crate) const MAX_CONTEXT_BUDGET: usize = 16_777_216;
+pub(crate) const MAX_CONFIGURED_MODELS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredAgentModelSettings")]
+pub struct AgentModelSettings {
+    pub id: String,
+    pub context_budget: usize,
+    pub reasoning_levels: Vec<ReasoningEffort>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAgentModelSettings {
+    id: String,
+    context_budget: usize,
+    reasoning_levels: Option<Vec<ReasoningEffort>>,
+    reasoning_effort: Option<ReasoningEffort>,
+}
+
+impl From<StoredAgentModelSettings> for AgentModelSettings {
+    fn from(stored: StoredAgentModelSettings) -> Self {
+        Self {
+            id: stored.id,
+            context_budget: stored.context_budget,
+            reasoning_levels: stored
+                .reasoning_levels
+                .unwrap_or_else(|| stored.reasoning_effort.into_iter().collect()),
+        }
+    }
+}
 
 /// This DTO contains configuration and an optional reference, never a credential.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,10 +75,12 @@ const PUBLIC_KEYS: &[&str] = &[
 pub struct AppSettings {
     pub base_url: String,
     pub model: String,
+    pub models: Vec<AgentModelSettings>,
     /// Maximum input-context tokens retained by the Agent.
     pub context_budget: usize,
     pub permission_mode: String,
     pub api_key_ref: Option<String>,
+    pub onboarding_completed: bool,
 }
 
 impl Default for AppSettings {
@@ -37,9 +88,11 @@ impl Default for AppSettings {
         Self {
             base_url: "https://api.openai.com/v1".into(),
             model: String::new(),
+            models: Vec::new(),
             context_budget: 32_768,
             permission_mode: "request_approval".into(),
             api_key_ref: None,
+            onboarding_completed: false,
         }
     }
 }
@@ -102,6 +155,32 @@ impl Settings {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    pub fn onboarding_state(&self) -> AppResult<(bool, bool, bool)> {
+        let (completed, started, has_games): (Option<String>, bool, bool) =
+            self.db.conn().query_row(
+                "SELECT (SELECT value FROM settings WHERE key='onboarding_completed'),
+                    EXISTS(SELECT 1 FROM settings WHERE key='onboarding_in_progress'),
+                    EXISTS(SELECT 1 FROM games)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        let completed = completed
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?
+            .unwrap_or(false);
+        Ok((completed, !completed && !has_games, !completed && started))
+    }
+
+    /// Record that a fresh profile can resume even after registering a game.
+    pub fn start_onboarding(&self) -> AppResult<()> {
+        self.db.conn().execute(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES('onboarding_in_progress','true')",
+            [],
+        )?;
         Ok(())
     }
 
@@ -198,9 +277,9 @@ pub(crate) fn validate_permission_mode(mode: &str) -> AppResult<()> {
     Ok(())
 }
 
-fn validate_settings(settings: &AppSettings) -> AppResult<()> {
-    let url = url::Url::parse(&settings.base_url)
-        .map_err(|_| AppError::Invalid("无效的模型 base_url".into()))?;
+pub(crate) fn parse_model_base_url(base_url: &str) -> AppResult<url::Url> {
+    let url =
+        url::Url::parse(base_url).map_err(|_| AppError::Invalid("无效的模型 base_url".into()))?;
     if !matches!(url.scheme(), "https" | "http")
         || url.host_str().is_none()
         || !url.username().is_empty()
@@ -212,11 +291,42 @@ fn validate_settings(settings: &AppSettings) -> AppResult<()> {
             "base_url 仅支持无认证信息的 HTTP(S) 地址".into(),
         ));
     }
+    Ok(url)
+}
+
+pub(crate) fn valid_model_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 256 && id.trim() == id && !id.chars().any(char::is_control)
+}
+
+fn validate_settings(settings: &AppSettings) -> AppResult<()> {
+    parse_model_base_url(&settings.base_url)?;
     if settings.model.len() > 256 || settings.model.chars().any(char::is_control) {
         return Err(AppError::Invalid("无效的模型名称".into()));
     }
-    if settings.context_budget == 0 || settings.context_budget > 16_777_216 {
+    if !(1..=MAX_CONTEXT_BUDGET).contains(&settings.context_budget) {
         return Err(AppError::Invalid("context_budget 超出范围".into()));
+    }
+    let mut ids = HashSet::new();
+    if settings.models.len() > MAX_CONFIGURED_MODELS
+        || settings.models.iter().any(|model| {
+            !valid_model_id(&model.id)
+                || !ids.insert(&model.id)
+                || !(1..=MAX_CONTEXT_BUDGET).contains(&model.context_budget)
+        })
+    {
+        return Err(AppError::Invalid(
+            "模型列表含有重复名称或无效配置，最多可添加 64 个模型".into(),
+        ));
+    }
+    for model in &settings.models {
+        let mut levels = BTreeSet::new();
+        if model
+            .reasoning_levels
+            .iter()
+            .any(|level| !levels.insert(level))
+        {
+            return Err(AppError::Invalid("模型配置含有重复的思考等级".into()));
+        }
     }
     validate_permission_mode(&settings.permission_mode)?;
     if let Some(key) = &settings.api_key_ref {
@@ -273,6 +383,28 @@ mod tests {
             self.0.lock().unwrap().insert(key.into(), value.into());
             Ok(())
         }
+    }
+
+    #[test]
+    fn legacy_model_reasoning_effort_loads_as_an_enabled_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("settings.sqlite")).unwrap();
+        let settings = Settings::with_secret_store(db, Arc::new(MockSecrets::default()));
+        settings.set("models", json!([
+            {"id":"old", "context_budget":32768, "reasoning_effort":"high"},
+            {"id":"cleared", "context_budget":32768, "reasoning_effort":"low", "reasoning_levels":[]}
+        ])).unwrap();
+        let loaded = settings.load().unwrap();
+        assert_eq!(
+            loaded.models[0].reasoning_levels,
+            vec![ReasoningEffort::High]
+        );
+        assert!(loaded.models[1].reasoning_levels.is_empty());
+        settings.save(&loaded).unwrap();
+        let persisted = settings.get("models").unwrap().unwrap();
+        assert_eq!(persisted[0]["reasoning_levels"], json!(["high"]));
+        assert!(persisted[0].get("reasoning_effort").is_none());
+        assert_eq!(persisted[1]["reasoning_levels"], json!([]));
     }
 
     #[test]
@@ -433,5 +565,59 @@ mod tests {
         assert_eq!(settings.get(&key).unwrap(), Some(json!("full_trust")));
         history.set_permission_mode(&conversation.id, None).unwrap();
         assert_eq!(settings.get(&key).unwrap(), None);
+    }
+
+    #[test]
+    fn onboarding_is_false_by_default_and_round_trips_through_public_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings::with_secret_store(
+            Db::open(&dir.path().join("db")).unwrap(),
+            Arc::new(MockSecrets::default()),
+        );
+        assert!(!settings.load().unwrap().onboarding_completed);
+        settings.set("onboarding_completed", json!(true)).unwrap();
+        assert!(settings.load().unwrap().onboarding_completed);
+    }
+
+    #[test]
+    fn onboarding_state_skips_existing_users_and_resumes_started_profiles() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(&temp.path().join("db")).unwrap();
+        let settings = Settings::with_secret_store(db.clone(), Arc::new(MockSecrets::default()));
+        assert_eq!(settings.onboarding_state().unwrap(), (false, true, false));
+
+        settings.start_onboarding().unwrap();
+        settings.start_onboarding().unwrap();
+        let game = temp.path().join("game");
+        std::fs::create_dir(&game).unwrap();
+        crate::games::register_game(&db, &game, None).unwrap();
+        assert_eq!(settings.onboarding_state().unwrap(), (false, false, true));
+
+        settings.set("onboarding_completed", json!(true)).unwrap();
+        assert_eq!(settings.onboarding_state().unwrap(), (true, false, false));
+        assert!(settings.get("onboarding_in_progress").is_err());
+    }
+
+    #[test]
+    fn existing_game_profiles_are_not_forced_into_onboarding() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = Db::open(&temp.path().join("db")).unwrap();
+        let settings = Settings::with_secret_store(db.clone(), Arc::new(MockSecrets::default()));
+        let game = temp.path().join("legacy-game");
+        std::fs::create_dir(&game).unwrap();
+        crate::games::register_game(&db, &game, None).unwrap();
+        assert_eq!(settings.onboarding_state().unwrap(), (false, false, false));
+        assert_eq!(crate::games::list_games(&db).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn onboarding_key_is_rejected_when_unknown_and_legacy_databases_use_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("db")).unwrap();
+        let settings = Settings::with_secret_store(db, Arc::new(MockSecrets::default()));
+        assert!(settings
+            .set("unknown_onboarding_flag", json!(true))
+            .is_err());
+        assert!(!settings.load().unwrap().onboarding_completed);
     }
 }

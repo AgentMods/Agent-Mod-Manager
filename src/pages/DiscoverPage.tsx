@@ -2,16 +2,26 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { listen } from '@tauri-apps/api/event';
 import { openUrl } from '@tauri-apps/plugin-opener';
-import { ArrowLeft, ArrowRight, Download, ExternalLink, ListChecks, LoaderCircle, Package, PackagePlus, RefreshCw, Search, X } from 'lucide-react';
-import { api, backendAvailable, useBackendQuery } from '../lib/api';
-import { dependencyLabels, dependencyOutcome, dependencyReasons, type Dependency, type DependencyCheck } from '../lib/mod-dependencies';
-import { useUI } from '../lib/store';
-import { initialFomodSelections, selectedFomodMappings, validFomodSelection, type FomodPreview, type FomodSelections } from '../lib/fomod';
-import { FomodOptions } from '../components/FomodOptions';
-import type { FilePlan, Game } from '../lib/types';
-import { ModrinthGraphReview } from '../components/ModrinthGraphReview';
-import { Badge, Button, bytes, date, EmptyState, ErrorState, IconButton, Modal, PageHeader } from '../components/ui';
-
+import { ArrowLeftIcon, ArrowRightIcon, DownloadIcon, ExternalLinkIcon, ListChecksIcon, PackageIcon, PackagePlusIcon, RefreshCwIcon, SearchIcon, TriangleAlertIcon, XIcon } from 'lucide-react';
+import { FomodOptions } from '@/components/FomodOptions';
+import { ModrinthGraphReview } from '@/components/ModrinthGraphReview';
+import { Badge, bytes, date, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, PathText } from '@/components/ui';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Field, FieldGroup, FieldLabel } from '@/components/ui/field';
+import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group';
+import { Item, ItemActions, ItemContent, ItemDescription, ItemMedia, ItemTitle } from '@/components/ui/item';
+import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select';
+import { Progress as ProgressBar } from '@/components/ui/progress';
+import { Skeleton } from '@/components/ui/skeleton';
+import { Spinner } from '@/components/ui/spinner';
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import { api, backendAvailable, useBackendQuery } from '@/lib/api';
+import { initialFomodSelections, selectedFomodMappings, validFomodSelection, type FomodPreview, type FomodSelections } from '@/lib/fomod';
+import { dependencyLabels, dependencyOutcome, dependencyReasons, type Dependency, type DependencyCheck } from '@/lib/mod-dependencies';
+import { useUI } from '@/lib/store';
+import type { FilePlan, Game } from '@/lib/types';
 type Source = { source_id: string; state: string; message: string };
 type Mod = { source_id: string; project_id: string; game_id: string | null; name: string; summary: string; author: string | null; homepage_url: string | null; icon_url: string | null; downloads: number | null };
 type Resolved = { source_id: string; project_id: string; version_id: string; name: string; version: string; filename: string; size: number | null; resolution_id: string; hashes: { sha256?: string | null; sha512?: string | null; sha1?: string | null; md5?: string | null }; homepage_url: string | null; warnings: string[] };
@@ -87,30 +97,31 @@ function installOptions(installs: InstalledVersion[], artifact: ArtifactRecord |
 }
 
 function DependencyReference({ dependency }: { dependency: Dependency }) {
-  return <div className="path-text">
-    {dependency.project_id && <div>项目 {dependency.project_id}</div>}
-    {dependency.version_id && <div>版本 {dependency.version_id}</div>}
-    {dependency.file_name && <div>{dependency.file_name}</div>}
+  return <div className="flex min-w-0 flex-col gap-1">
+    {dependency.project_id && <PathText>项目 {dependency.project_id}</PathText>}
+    {dependency.version_id && <PathText>版本 {dependency.version_id}</PathText>}
+    {dependency.file_name && <PathText>{dependency.file_name}</PathText>}
   </div>;
 }
 
 function DependencyDetails({ dependencies }: { dependencies: Dependency[] | null }) {
   if (!dependencies?.length) {
-    return <p className="source-dependencies">{dependencies ? '来源未声明直接依赖' : '来源依赖未知'}</p>;
+    return <p className="source-dependencies min-w-0 border-t pt-3 text-sm text-muted-foreground">
+      {dependencies ? '来源未声明直接依赖' : '来源依赖未知'}
+    </p>;
   }
-  return <details className="source-dependencies">
-    <summary>来源声明的直接依赖（{dependencies.length}）</summary>
-    <ul>
-      {dependencies.map((dependency, index) => (
-        <li key={index}>
+  return <details className="source-dependencies min-w-0 border-t pt-3 text-sm">
+    <summary className="cursor-pointer font-medium">来源声明的直接依赖（{dependencies.length}）</summary>
+    <ul role="list" className="mt-3 flex list-none flex-col gap-2">
+      {dependencies.map((dependency, index) => <Item asChild variant="outline" size="sm" className="items-start" key={index}>
+        <li>
           <Badge tone={dependency.dependency_type === 'incompatible' ? 'error' : dependency.dependency_type === 'required' ? 'warning' : undefined}>{dependencyLabels[dependency.dependency_type]}</Badge>
-          <div className="grow"><DependencyReference dependency={dependency}/></div>
+          <ItemContent className="min-w-0"><DependencyReference dependency={dependency}/></ItemContent>
         </li>
-      ))}
+      </Item>)}
     </ul>
   </details>;
 }
-
 function DependencyReview({ install, gameId, replaceInstallId, disabled }: {
   install: ArtifactRecord; gameId: string; replaceInstallId: string | null; disabled: boolean;
 }) {
@@ -154,36 +165,40 @@ function DependencyReview({ install, gameId, replaceInstallId, disabled }: {
   const pending = state.status === 'checking';
   const report = state.status === 'ready' ? state.report : null;
   const checks = report?.checks;
-  return <section className="source-dependencies" aria-label="已装依赖记录核对">
-    <Button disabled={disabled || pending} aria-busy={pending} aria-describedby={scopeId} onClick={() => { void check(); }}>
-      {pending ? <LoaderCircle size={15} className="spin" aria-hidden="true"/> : <ListChecks size={15} aria-hidden="true"/>}
+  return <section className="source-dependencies flex min-w-0 flex-col gap-3 rounded-lg border p-3 text-sm" aria-label="已装依赖记录核对">
+    <Button variant="outline" className="self-start" disabled={disabled || pending} aria-busy={pending}
+      aria-describedby={scopeId} onClick={() => { void check(); }}>
+      {pending ? <Spinner data-icon="inline-start"/> : <ListChecksIcon data-icon="inline-start" aria-hidden="true"/>}
       {state.status === 'error' ? '重试核对已装依赖' : '核对已装依赖'}
     </Button>
-    <p className="muted" id={scopeId} style={{ marginTop: 8 }}>仅核对目标游戏的管理器 Modrinth 安装记录，不含其他来源或本地安装。不查文件是否存在、校验和或加载器兼容性；仅供参考，不阻止安装。</p>
-    <p className="muted" role="status">
+    <p className="text-muted-foreground" id={scopeId}>仅核对目标游戏的管理器 Modrinth 安装记录，不含其他来源或本地安装。不查文件是否存在、校验和或加载器兼容性；仅供参考，不阻止安装。</p>
+    <p className="text-muted-foreground" role="status">
       {pending ? '正在核对已装依赖记录…' : checks === null ? '该版本的直接依赖声明未知。' : checks?.length === 0 ? '该版本未声明直接依赖。'
         : checks && `已核对 ${checks.length} 条直接依赖声明。${report?.excludedInstallId ? '本次核对已排除所选待替换记录。' : ''}`}
     </p>
     <ErrorState error={state.status === 'error' ? state.error : null}/>
-    {!!checks?.length && <ul role="list" aria-label="直接依赖核对结果">{checks.map((entry, index) => {
-      const { dependency, reason, matches, matchCount } = entry;
-      const outcome = dependencyOutcome(entry);
-      return <li key={index}>
-        <Badge>{dependencyLabels[dependency.dependency_type]}</Badge>
-        <div className="grow">
-          <Badge tone={outcome.tone}>{outcome.label}</Badge>
-          <DependencyReference dependency={dependency}/>
-          {reason && <p className="muted">{dependencyReasons[reason]}</p>}
-          {matchCount > 0 && <p className="muted">共 {matchCount} 条相关记录{matchCount > matches.length && `（显示前 ${matches.length} 条）`}</p>}
-          {matches.map(match => <p className="path-text" key={match.installId}>
-            记录 {match.installId} · 项目 {match.projectId} · 版本 {match.versionId} · {match.status === 'enabled' ? '事务已部署' : match.status === 'partially_restored' ? '部分恢复' : match.status}
-          </p>)}
-        </div>
-      </li>;
-    })}</ul>}
+    {!!checks?.length && <ul role="list" aria-label="直接依赖核对结果" className="flex min-w-0 list-none flex-col gap-2">
+      {checks.map((entry, index) => {
+        const { dependency, reason, matches, matchCount } = entry;
+        const outcome = dependencyOutcome(entry);
+        return <Item asChild variant="outline" size="sm" className="items-start" key={index}>
+          <li>
+            <Badge>{dependencyLabels[dependency.dependency_type]}</Badge>
+            <ItemContent className="min-w-0 items-start">
+              <Badge tone={outcome.tone}>{outcome.label}</Badge>
+              <DependencyReference dependency={dependency}/>
+              {reason && <ItemDescription className="line-clamp-none">{dependencyReasons[reason]}</ItemDescription>}
+              {matchCount > 0 && <ItemDescription>共 {matchCount} 条相关记录{matchCount > matches.length && `（显示前 ${matches.length} 条）`}</ItemDescription>}
+              {matches.map(match => <PathText key={match.installId}>
+                记录 {match.installId} · 项目 {match.projectId} · 版本 {match.versionId} · {match.status === 'enabled' ? '事务已部署' : match.status === 'partially_restored' ? '部分恢复' : match.status}
+              </PathText>)}
+            </ItemContent>
+          </li>
+        </Item>;
+      })}
+    </ul>}
   </section>;
 }
-
 export default function DiscoverPage() {
   const sources = useBackendQuery<Source[]>(['sources'], 'list_mod_sources');
   const artifacts = useBackendQuery<ArtifactRecord[]>(['downloads'], 'list_downloads');
@@ -374,116 +389,320 @@ export default function DiscoverPage() {
   const selectedVersionId = resolutionState?.versionId;
   const versionId = selectedVersionId ?? (selection?.source_id === 'modrinth' ? resolution?.download?.version_id : null);
   const hasMoreVersions = versionPage?.state === 'ready' && versionPage.result.has_more;
-  return <div className="page discover-page" data-testid="discover-page">
-    <PageHeader title="发现 Mod" actions={<IconButton title="刷新来源状态" disabled={!backendAvailable} onClick={() => { void sources.refetch(); }}><RefreshCw size={16}/></IconButton>}/>
-    <form className="toolbar" onSubmit={e => { e.preventDefault(); if (backendAvailable && !busy) void search(); }}><label className="search-field grow"><Search size={17}/><input aria-label="搜索 Mod" placeholder="搜索 Mod…" value={query} onChange={e => setQuery(e.target.value)} maxLength={512}/></label><select aria-label="Mod 来源" value={source} onChange={e => { setSource(e.target.value); setProviderGame(''); }}><option value="">所有来源</option>{(sources.data ?? []).map(item => <option value={item.source_id} key={item.source_id}>{sourceNames[item.source_id] ?? item.source_id}</option>)}</select><Button type="submit" className="primary" disabled={!backendAvailable || busy}><Search size={16}/>{busy ? '请求中…' : '搜索'}</Button></form>
-    <div className="toolbar"><input aria-label="来源游戏 ID" placeholder="来源游戏 ID" disabled={!source} value={providerGame} onChange={e => setProviderGame(e.target.value)}/><input aria-label="游戏版本" placeholder="游戏版本" value={gameVersion} onChange={e => updateFilter(e.target.value, gameVersion, setGameVersion)}/><input aria-label="Mod 加载器" placeholder="加载器" value={loader} onChange={e => updateFilter(e.target.value, loader, setLoader)}/></div>
-    <div className="source-statuses">{statuses.map(item => <span title={item.message} key={item.source_id}><Badge tone={item.state === 'available' ? 'success' : 'warning'}>{sourceNames[item.source_id] ?? item.source_id} · {sourceStates[item.state] ?? item.state}</Badge></span>)}</div>
-    <ErrorState error={sources.error}/><ErrorState error={error}/>
-    <div className="split-layout" style={{ marginTop: 22 }}><section><div className="result-grid">{results?.mods.map(mod => <button className={`mod-result ${selection === mod ? 'selected' : ''}`} key={`${mod.source_id}:${mod.project_id}`} onClick={() => selectProject(mod)} disabled={busy}><div className="mod-thumbnail">{https(mod.icon_url) ? <img alt="" src={https(mod.icon_url)!} loading="lazy" referrerPolicy="no-referrer"/> : <Package size={27}/>}</div><div className="grow"><h2>{mod.name}</h2><p>{mod.summary}</p><small>{mod.author ?? '—'} · {sourceNames[mod.source_id] ?? mod.source_id}{mod.downloads !== null ? ` · ${mod.downloads.toLocaleString('zh-CN')} 次下载` : ''}</small></div></button>)}</div>{!results?.mods.length && <EmptyState title={!backendAvailable ? '桌面能力未连接' : results ? '没有匹配的 Mod' : '尚未搜索'}/>}{results && <div className="toolbar" style={{ marginTop: 18 }}><IconButton title="上一页" disabled={busy || offset === 0} onClick={() => { void search(Math.max(0, offset - 20)); }}><ArrowLeft size={16}/></IconButton><span className="muted">第 {offset / 20 + 1} 页</span><IconButton title="下一页" disabled={busy || !results.mods.length || offset >= 10000} onClick={() => { void search(offset + 20); }}><ArrowRight size={16}/></IconButton></div>}</section>
-      <aside className="inspector">
-        <h2>{selection?.name ?? 'Mod 详情'}</h2>
-        {selection ? <>
-          <p>{selection.summary}</p>
-          <dl className="metadata-list" style={{ marginTop: 18 }}>
-            <dt>来源</dt><dd>{sourceNames[selection.source_id] ?? selection.source_id}</dd>
-            <dt>项目</dt><dd>{selection.project_id}</dd>
-            <dt>作者</dt><dd>{selection.author ?? '—'}</dd>
-            {versionId && <><dt>{selectedVersionId ? '已选版本 ID' : '版本 ID'}</dt><dd>{versionId}</dd></>}
-            {resolution?.download && <>
-              <dt>版本</dt><dd>{resolution.download.version}</dd>
-              <dt>文件</dt><dd>{resolution.download.filename}</dd>
-              <dt>大小</dt><dd>{resolution.download.size === null ? '未知' : bytes(resolution.download.size)}</dd>
-            </>}
-          </dl>
-          {resolution?.download && <DependencyDetails dependencies={resolution.dependencies}/>}
-          {resolution && <p className="warning-text" style={{ marginTop: 16 }}>{resolution.status.message}</p>}
-          {resolution?.download?.warnings.map((warning, i) => <p className="warning-text" key={i}>{warning}</p>)}
-          {resolutionState?.state === 'loading' && <p role="status">{selectedVersionId ? '正在解析所选版本…' : '正在解析默认版本…'}</p>}
-          <ErrorState error={resolutionState?.state === 'error' ? resolutionState.error : null}/>
-          <div className="toolbar" style={{ marginTop: 20 }}>
-            <Button disabled={!https(resolution?.homepage_url ?? selection.homepage_url)} onClick={() => { void openHomepage(resolution?.homepage_url ?? selection.homepage_url); }}><ExternalLink size={15}/>原始页面</Button>
-            {resolution?.download && <Button className="primary" disabled={resolutionState?.state !== 'ready' || busy || !writable || !listenerReady || !!task} onClick={() => { void download(); }}><Download size={15}/>下载归档</Button>}
-            {(['modrinth', 'thunderstore'] as const).includes(selection.source_id as 'modrinth' | 'thunderstore') && <Button disabled={busy} aria-expanded={!!versionPage} aria-controls={versionPage ? versionPanelId : undefined}
-              onClick={() => { if (versionPage) closeVersions(); else void listVersions(projectRequest(selection)); }}>
-              <ListChecks size={15}/>{versionPage ? '收起来源版本' : '查看来源版本'}
-            </Button>}
-            {!resolutionState && <Button disabled={busy} onClick={() => { void resolve(projectRequest(selection)); }}><RefreshCw size={15}/>解析默认版本</Button>}
-            {resolutionState?.state === 'error' && <Button disabled={busy} onClick={() => { void resolve(resolutionState.request, resolutionState.versionId); }}>
-              <RefreshCw size={15}/>{selectedVersionId ? '重试解析所选版本' : '重试解析默认版本'}
-            </Button>}
-          </div>
-          {versionPage && <section className="source-dependencies" id={versionPanelId} aria-label="来源版本">
-            {versionPage.state === 'loading' && <p role="status">正在读取来源版本…</p>}
-            {versionPage.state === 'error' && <>
-              <ErrorState error={versionPage.error}/>
-              <Button disabled={busy} onClick={() => { void listVersions(versionPage.request, versionPage.offset); }}><RefreshCw size={15}/>重试读取来源版本</Button>
-            </>}
-            {versionPage.state === 'ready' && versionPage.result.status.state === 'limited' && <p className="warning-text" role="status">{versionPage.result.status.message}</p>}
-            {versionPage.state === 'ready' && (versionPage.result.versions.length ? <ul role="list" aria-label={`${versionPage.request.source_id} 版本`}>
-              {versionPage.result.versions.map(version => {
-                const selected = selectedVersionId === version.version_id;
-                return <li key={version.version_id}>
-                  <div className="grow" style={{ overflowWrap: 'anywhere' }}>
-                    <strong>{version.name}</strong>
-                    <p>版本：{version.version}</p>
-                    <p className="path-text">版本 ID：{version.version_id}</p>
-                    <Badge tone={version.release_channel === 'release' ? 'success' : 'warning'}>{channelLabels[version.release_channel]}</Badge>
-                    <p>发布日期：<time dateTime={version.published_at}>{date(version.published_at)}</time></p>
-                    {!versionPage.request.loader && <p>来源声明加载器：{sourceListSummary(version.loaders)}</p>}
-                    {!versionPage.request.game_version && <p>来源声明游戏版本：{sourceListSummary(version.game_versions)}</p>}
-                  </div>
-                  <Button aria-label={`选择版本 ${version.version}（${version.version_id}）`} aria-pressed={selected}
-                    style={selected ? { background: 'var(--accent-soft)', color: 'var(--accent)', borderColor: 'var(--accent)' } : undefined}
-                    disabled={busy || (selected && resolutionState?.state === 'loading')}
-                    onClick={() => { void resolve(versionPage.request, version.version_id); }}>选择版本</Button>
-                </li>;
-              })}
-            </ul> : <p role="status">没有符合当前筛选条件的来源版本。</p>)}
-            <div className="toolbar" style={{ marginTop: 12 }}>
-              <IconButton title="上一页来源版本" disabled={busy || versionPage.state === 'loading' || versionPage.offset === 0}
-                onClick={() => { void listVersions(versionPage.request, versionPage.offset - versionPageSize); }}><ArrowLeft size={16}/></IconButton>
-              <span className="muted" aria-live="polite">第 {versionPage.offset / versionPageSize + 1} 页</span>
-              <IconButton title="下一页来源版本" disabled={busy || !hasMoreVersions}
-                onClick={() => { void listVersions(versionPage.request, versionPage.offset + versionPageSize); }}><ArrowRight size={16}/></IconButton>
-            </div>
-          </section>}
-        </> : <p>未选择 Mod</p>}
+  const fieldId = `${versionPanelId}-field`;
+  const modTypeNotes = adapter.data?.modTypes.find(type => type.id === modType)?.notes;
+  return <Page data-testid="discover-page">
+    <PageHeader title="发现 Mod" actions={
+      <IconButton title="刷新来源状态" disabled={!backendAvailable} onClick={() => { void sources.refetch(); }}>
+        <RefreshCwIcon data-icon="inline-start" aria-hidden="true"/>
+      </IconButton>
+    }/>
+    <Card className="min-w-0">
+      <CardContent className="flex min-w-0 flex-col gap-4">
+        <form className="flex min-w-0 flex-col gap-3" onSubmit={e => { e.preventDefault(); if (backendAvailable && !busy) void search(); }}>
+          <FieldGroup className="grid items-end gap-3 sm:grid-cols-[minmax(0,1fr)_auto_auto]">
+            <Field>
+              <FieldLabel className="sr-only" htmlFor={`${fieldId}-search`}>搜索 Mod</FieldLabel>
+              <InputGroup>
+                <InputGroupAddon><SearchIcon aria-hidden="true"/></InputGroupAddon>
+                <InputGroupInput id={`${fieldId}-search`} aria-label="搜索 Mod" placeholder="搜索 Mod…" value={query}
+                  onChange={e => setQuery(e.target.value)} maxLength={512}/>
+              </InputGroup>
+            </Field>
+            <Field className="[&>[data-slot=native-select-wrapper]]:w-full">
+              <FieldLabel className="sr-only" htmlFor={`${fieldId}-source`}>Mod 来源</FieldLabel>
+              <NativeSelect id={`${fieldId}-source`} aria-label="Mod 来源" value={source}
+                onChange={e => { setSource(e.target.value); setProviderGame(''); }}>
+                <NativeSelectOption value="">所有来源</NativeSelectOption>
+                {(sources.data ?? []).map(item => <NativeSelectOption value={item.source_id} key={item.source_id}>
+                  {sourceNames[item.source_id] ?? item.source_id}
+                </NativeSelectOption>)}
+              </NativeSelect>
+            </Field>
+            <Button type="submit" className="justify-self-start" disabled={!backendAvailable || busy}>
+              {busy ? <Spinner data-icon="inline-start"/> : <SearchIcon data-icon="inline-start" aria-hidden="true"/>}
+              {busy ? '请求中…' : '搜索'}
+            </Button>
+          </FieldGroup>
+          <FieldGroup className="grid gap-3 sm:grid-cols-3">
+            <Field className="gap-1.5">
+              <FieldLabel htmlFor={`${fieldId}-provider-game`}>来源游戏 ID</FieldLabel>
+              <InputGroup>
+                <InputGroupInput id={`${fieldId}-provider-game`} aria-label="来源游戏 ID" placeholder="来源游戏 ID" disabled={!source}
+                  value={providerGame} onChange={e => setProviderGame(e.target.value)}/>
+              </InputGroup>
+            </Field>
+            <Field className="gap-1.5">
+              <FieldLabel htmlFor={`${fieldId}-game-version`}>游戏版本</FieldLabel>
+              <InputGroup>
+                <InputGroupInput id={`${fieldId}-game-version`} aria-label="游戏版本" placeholder="游戏版本" value={gameVersion}
+                  onChange={e => updateFilter(e.target.value, gameVersion, setGameVersion)}/>
+              </InputGroup>
+            </Field>
+            <Field className="gap-1.5">
+              <FieldLabel htmlFor={`${fieldId}-loader`}>Mod 加载器</FieldLabel>
+              <InputGroup>
+                <InputGroupInput id={`${fieldId}-loader`} aria-label="Mod 加载器" placeholder="加载器" value={loader}
+                  onChange={e => updateFilter(e.target.value, loader, setLoader)}/>
+              </InputGroup>
+            </Field>
+          </FieldGroup>
+        </form>
+        {statuses.length > 0 && <div className="flex flex-wrap gap-2">
+          {statuses.map(item => <span title={item.message} key={item.source_id}>
+            <Badge tone={item.state === 'available' ? 'success' : 'warning'}>{sourceNames[item.source_id] ?? item.source_id} · {sourceStates[item.state] ?? item.state}</Badge>
+          </span>)}
+        </div>}
+        <ErrorState error={sources.error}/>
+        <ErrorState error={error}/>
+      </CardContent>
+    </Card>
+    <div className="grid min-w-0 items-start gap-6 lg:grid-cols-[minmax(0,1fr)_minmax(0,20rem)]">
+      <section className="flex min-w-0 flex-col gap-4">
+        {results?.mods.length ? <div className="grid min-w-0 gap-3 xl:grid-cols-2">
+          {results.mods.map(mod => {
+            const iconUrl = https(mod.icon_url);
+            return <Item asChild variant={selection === mod ? 'muted' : 'outline'} key={`${mod.source_id}:${mod.project_id}`}
+              className="min-w-0 flex-nowrap items-start bg-card text-left hover:border-ring data-[variant=muted]:bg-accent disabled:opacity-50">
+              <button type="button" onClick={() => selectProject(mod)} disabled={busy}>
+                <ItemMedia variant={iconUrl ? 'image' : 'icon'}>
+                  {iconUrl ? <img alt="" src={iconUrl} loading="lazy" referrerPolicy="no-referrer"/> : <PackageIcon aria-hidden="true"/>}
+                </ItemMedia>
+                <ItemContent className="min-w-0 [overflow-wrap:anywhere]">
+                  <ItemTitle className="max-w-full"><h2>{mod.name}</h2></ItemTitle>
+                  <ItemDescription className="line-clamp-3">{mod.summary}</ItemDescription>
+                  <small className="text-muted-foreground">{mod.author ?? '—'} · {sourceNames[mod.source_id] ?? mod.source_id}{mod.downloads !== null ? ` · ${mod.downloads.toLocaleString('zh-CN')} 次下载` : ''}</small>
+                </ItemContent>
+              </button>
+            </Item>;
+          })}
+        </div> : <EmptyState title={!backendAvailable ? '桌面能力未连接' : results ? '没有匹配的 Mod' : '尚未搜索'}/>}
+        {results && <div className="flex flex-wrap items-center gap-2">
+          <IconButton title="上一页" disabled={busy || offset === 0} onClick={() => { void search(Math.max(0, offset - 20)); }}>
+            <ArrowLeftIcon data-icon="inline-start" aria-hidden="true"/>
+          </IconButton>
+          <span className="text-sm text-muted-foreground">第 {offset / 20 + 1} 页</span>
+          <IconButton title="下一页" disabled={busy || !results.mods.length || offset >= 10000} onClick={() => { void search(offset + 20); }}>
+            <ArrowRightIcon data-icon="inline-start" aria-hidden="true"/>
+          </IconButton>
+        </div>}
+      </section>
+      <aside className="min-w-0">
+        <Card className="min-w-0">
+          <CardHeader className="min-w-0 [overflow-wrap:anywhere]">
+            <CardTitle>{selection?.name ?? 'Mod 详情'}</CardTitle>
+            {selection && <CardDescription>{selection.summary}</CardDescription>}
+          </CardHeader>
+          <CardContent className="flex min-w-0 flex-col gap-4 text-sm [overflow-wrap:anywhere]">
+            {selection ? <>
+              <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-2 [&>dt]:text-muted-foreground">
+                <dt>来源</dt><dd>{sourceNames[selection.source_id] ?? selection.source_id}</dd>
+                <dt>项目</dt><dd>{selection.project_id}</dd>
+                <dt>作者</dt><dd>{selection.author ?? '—'}</dd>
+                {versionId && <><dt>{selectedVersionId ? '已选版本 ID' : '版本 ID'}</dt><dd>{versionId}</dd></>}
+                {resolution?.download && <>
+                  <dt>版本</dt><dd>{resolution.download.version}</dd>
+                  <dt>文件</dt><dd>{resolution.download.filename}</dd>
+                  <dt>大小</dt><dd>{resolution.download.size === null ? '未知' : bytes(resolution.download.size)}</dd>
+                </>}
+              </dl>
+              {resolution?.download && <DependencyDetails dependencies={resolution.dependencies}/>}
+              {resolution && <Alert variant="warning" role="note">
+                <TriangleAlertIcon aria-hidden="true"/>
+                <AlertDescription className="min-w-0">{resolution.status.message}</AlertDescription>
+              </Alert>}
+              {resolution?.download?.warnings.map((warning, i) => <p className="text-warning" key={i}>{warning}</p>)}
+              {resolutionState?.state === 'loading' && <p className="flex items-center gap-2" role="status">
+                <Spinner/>{selectedVersionId ? '正在解析所选版本…' : '正在解析默认版本…'}
+              </p>}
+              <ErrorState error={resolutionState?.state === 'error' ? resolutionState.error : null}/>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="outline" disabled={!https(resolution?.homepage_url ?? selection.homepage_url)}
+                  onClick={() => { void openHomepage(resolution?.homepage_url ?? selection.homepage_url); }}>
+                  <ExternalLinkIcon data-icon="inline-start" aria-hidden="true"/>原始页面
+                </Button>
+                {resolution?.download && <Button disabled={resolutionState?.state !== 'ready' || busy || !writable || !listenerReady || !!task}
+                  onClick={() => { void download(); }}><DownloadIcon data-icon="inline-start" aria-hidden="true"/>下载归档</Button>}
+                {(['modrinth', 'thunderstore'] as const).includes(selection.source_id as 'modrinth' | 'thunderstore') && <Button variant="outline"
+                  disabled={busy} aria-expanded={!!versionPage} aria-controls={versionPage ? versionPanelId : undefined}
+                  onClick={() => { if (versionPage) closeVersions(); else void listVersions(projectRequest(selection)); }}>
+                  <ListChecksIcon data-icon="inline-start" aria-hidden="true"/>{versionPage ? '收起来源版本' : '查看来源版本'}
+                </Button>}
+                {!resolutionState && <Button variant="outline" disabled={busy} onClick={() => { void resolve(projectRequest(selection)); }}>
+                  <RefreshCwIcon data-icon="inline-start" aria-hidden="true"/>解析默认版本
+                </Button>}
+                {resolutionState?.state === 'error' && <Button variant="outline" disabled={busy}
+                  onClick={() => { void resolve(resolutionState.request, resolutionState.versionId); }}>
+                  <RefreshCwIcon data-icon="inline-start" aria-hidden="true"/>{selectedVersionId ? '重试解析所选版本' : '重试解析默认版本'}
+                </Button>}
+              </div>
+              {versionPage && <section className="source-dependencies flex min-w-0 flex-col gap-3 border-t pt-3" id={versionPanelId} aria-label="来源版本">
+                {versionPage.state === 'loading' && <>
+                  <p role="status">正在读取来源版本…</p>
+                  <Skeleton className="h-16 w-full" aria-hidden="true"/>
+                </>}
+                {versionPage.state === 'error' && <>
+                  <ErrorState error={versionPage.error}/>
+                  <Button variant="outline" className="self-start" disabled={busy}
+                    onClick={() => { void listVersions(versionPage.request, versionPage.offset); }}>
+                    <RefreshCwIcon data-icon="inline-start" aria-hidden="true"/>重试读取来源版本
+                  </Button>
+                </>}
+                {versionPage.state === 'ready' && versionPage.result.status.state === 'limited' && <Alert variant="warning" role="status">
+                  <TriangleAlertIcon aria-hidden="true"/>
+                  <AlertDescription className="min-w-0">{versionPage.result.status.message}</AlertDescription>
+                </Alert>}
+                {versionPage.state === 'ready' && (versionPage.result.versions.length ? <ToggleGroup asChild type="single"
+                  value={selectedVersionId ?? ''} variant="outline" size="sm" spacing={1} orientation="vertical"
+                  className="w-full min-w-0 list-none flex-col items-stretch gap-2">
+                  <ul role="list" aria-label={`${versionPage.request.source_id} 版本`}>
+                    {versionPage.result.versions.map(version => {
+                      const selected = selectedVersionId === version.version_id;
+                      return <Item asChild variant="outline" size="sm" className="flex-col items-stretch" key={version.version_id}>
+                        <li>
+                          <ItemContent className="min-w-0 items-start">
+                            <ItemTitle className="max-w-full"><strong>{version.name}</strong></ItemTitle>
+                            <ItemDescription className="line-clamp-none">版本：{version.version}</ItemDescription>
+                            <PathText>版本 ID：{version.version_id}</PathText>
+                            <Badge tone={version.release_channel === 'release' ? 'success' : 'warning'}>{channelLabels[version.release_channel]}</Badge>
+                            <ItemDescription className="line-clamp-none">发布日期：<time dateTime={version.published_at}>{date(version.published_at)}</time></ItemDescription>
+                            {!versionPage.request.loader && <ItemDescription className="line-clamp-none">来源声明加载器：{sourceListSummary(version.loaders)}</ItemDescription>}
+                            {!versionPage.request.game_version && <ItemDescription className="line-clamp-none">来源声明游戏版本：{sourceListSummary(version.game_versions)}</ItemDescription>}
+                          </ItemContent>
+                          <ItemActions>
+                            <ToggleGroupItem value={version.version_id} role="button" aria-checked={undefined} aria-pressed={selected}
+                              aria-label={`选择版本 ${version.version}（${version.version_id}）`}
+                              disabled={busy || (selected && resolutionState?.state === 'loading')}
+                              onClick={() => { void resolve(versionPage.request, version.version_id); }}>选择版本</ToggleGroupItem>
+                          </ItemActions>
+                        </li>
+                      </Item>;
+                    })}
+                  </ul>
+                </ToggleGroup> : <p role="status">没有符合当前筛选条件的来源版本。</p>)}
+                <div className="flex flex-wrap items-center gap-2">
+                  <IconButton title="上一页来源版本" disabled={busy || versionPage.state === 'loading' || versionPage.offset === 0}
+                    onClick={() => { void listVersions(versionPage.request, versionPage.offset - versionPageSize); }}>
+                    <ArrowLeftIcon data-icon="inline-start" aria-hidden="true"/>
+                  </IconButton>
+                  <span className="text-muted-foreground" aria-live="polite">第 {versionPage.offset / versionPageSize + 1} 页</span>
+                  <IconButton title="下一页来源版本" disabled={busy || !hasMoreVersions}
+                    onClick={() => { void listVersions(versionPage.request, versionPage.offset + versionPageSize); }}>
+                    <ArrowRightIcon data-icon="inline-start" aria-hidden="true"/>
+                  </IconButton>
+                </div>
+              </section>}
+            </> : <EmptyState title="未选择 Mod"/>}
+          </CardContent>
+        </Card>
       </aside>
     </div>
-    <section className="page-section"><div className="section-heading"><h2>下载记录</h2><IconButton title="刷新下载记录" disabled={!backendAvailable} onClick={() => { void artifacts.refetch(); }}><RefreshCw size={16}/></IconButton></div><ErrorState error={artifacts.error}/>{task && <div className="download-row"><Download size={18}/><div className="grow"><strong>{task.name}</strong><p>{phases[currentProgress?.phase ?? 'connecting']} · {bytes(currentProgress?.downloaded ?? 0)}{currentProgress?.total != null ? ` / ${bytes(currentProgress.total)}` : ''}</p>{currentProgress?.total != null && <progress max={currentProgress.total} value={currentProgress.downloaded}/>}</div><IconButton title="取消下载" onClick={() => { void api('cancel_download', { taskId: task.id }).catch(setError); }}><X size={16}/></IconButton></div>}{(artifacts.data ?? []).map(record => <div className="download-row" key={record.artifact.id}><Package size={21}/><div className="grow"><strong>{record.name} <small>{record.version}</small></strong><p>{record.artifact.filename} · {bytes(record.artifact.size)} · {date(record.createdAt)}</p>{record.artifact.warnings.map((warning, i) => <small className="warning-text" key={i}>{warning}</small>)}</div><Badge tone={record.artifact.integrity_verified ? 'success' : 'warning'}>{record.artifact.integrity_verified ? '完整性已校验' : '需人工审核'}</Badge><Button disabled={!writable || busy} onClick={() => { setInstall(record); setGameId(''); setModType(''); setReplaceInstallId(''); setFomodPreview(null); setFomodSelections({}); setError(null); }}><PackagePlus size={15}/>安装预览</Button></div>)}{!artifacts.data?.length && !task && <EmptyState title="暂无下载记录"/>}</section>
-    {install && <Modal title="下载归档安装预览" onClose={() => { if (!busy) { setInstall(null); setFomodPreview(null); setFomodSelections({}); } }} actions={<><Button disabled={busy} onClick={() => { setInstall(null); setFomodPreview(null); setFomodSelections({}); }}>取消</Button><Button className="primary" aria-busy={busy} disabled={!canPreviewInstall} onClick={() => { void previewInstall(); }}>{busy && <LoaderCircle size={15} className="spin" aria-hidden="true"/>}生成变更预览</Button></>}>
-      <ErrorState error={error}/><ErrorState error={adapter.error}/><p>{install.name} · {install.version}</p><p className="path-text">{install.artifact.filename}</p>
-      <label className="field" style={{ marginTop: 20 }}>目标游戏<select aria-label="目标游戏" value={gameId} disabled={busy} onChange={e => { setGameId(e.target.value); setModType(''); setReplaceInstallId(''); setFomodPreview(null); setFomodSelections({}); setError(null); }}><option value="">选择已登记游戏</option>{games.data?.map(game => <option key={game.id} value={game.id}>{game.name}</option>)}</select></label>
-      <label className="field">适配包 Mod 类型<select aria-label="适配包 Mod 类型" value={modType} disabled={busy || !gameId || !adapter.data} onChange={e => { setModType(e.target.value); setFomodPreview(null); setFomodSelections({}); setError(null); }}><option value="">选择 Mod 类型</option>{adapter.data?.modTypes.map(type => <option key={type.id} value={type.id}>{type.name}</option>)}</select></label>
-      {adapter.data?.modTypes.find(type => type.id === modType)?.notes && <p className="warning-text">{adapter.data.modTypes.find(type => type.id === modType)?.notes}</p>}
-      <div className="toolbar" style={{ marginTop: 18 }}><Button disabled={!writable || busy} aria-busy={fomodPreviewing.current} onClick={() => { void previewFomod(); }}><PackagePlus size={15}/>扫描 FOMOD 配置</Button></div>
-      {fomodPreview && <FomodOptions preview={fomodPreview} selections={fomodSelections} disabled={busy}
-        onChange={setFomodSelections}/>}
+    <Card className="min-w-0">
+      <CardHeader className="flex flex-wrap items-center justify-between gap-2">
+        <CardTitle>下载记录</CardTitle>
+        <IconButton title="刷新下载记录" disabled={!backendAvailable} onClick={() => { void artifacts.refetch(); }}>
+          <RefreshCwIcon data-icon="inline-start" aria-hidden="true"/>
+        </IconButton>
+      </CardHeader>
+      <CardContent className="flex min-w-0 flex-col gap-3 [overflow-wrap:anywhere]">
+        <ErrorState error={artifacts.error}/>
+        {task && <Item variant="outline" className="download-row min-w-0">
+          <ItemMedia variant="icon"><DownloadIcon aria-hidden="true"/></ItemMedia>
+          <ItemContent className="min-w-0">
+            <ItemTitle className="max-w-full">{task.name}</ItemTitle>
+            <ItemDescription className="line-clamp-none">
+              {phases[currentProgress?.phase ?? 'connecting']} · {bytes(currentProgress?.downloaded ?? 0)}{currentProgress?.total != null ? ` / ${bytes(currentProgress.total)}` : ''}
+            </ItemDescription>
+            {currentProgress?.total != null && <ProgressBar aria-label={task.name}
+              value={currentProgress.total > 0 ? Math.min(100, Math.max(0, currentProgress.downloaded / currentProgress.total * 100)) : 0}/>}
+          </ItemContent>
+          <ItemActions>
+            <IconButton title="取消下载" onClick={() => { void api('cancel_download', { taskId: task.id }).catch(setError); }}>
+              <XIcon data-icon="inline-start" aria-hidden="true"/>
+            </IconButton>
+          </ItemActions>
+        </Item>}
+        {(artifacts.data ?? []).map(record => <Item variant="outline" className="download-row grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-start sm:grid-cols-[auto_minmax(0,1fr)_auto]" key={record.artifact.id}>
+          <ItemMedia variant="icon"><PackageIcon aria-hidden="true"/></ItemMedia>
+          <ItemContent className="min-w-0">
+            <ItemTitle className="block max-w-full">{record.name} <small>{record.version}</small></ItemTitle>
+            <ItemDescription className="line-clamp-none">{record.artifact.filename} · {bytes(record.artifact.size)} · {date(record.createdAt)}</ItemDescription>
+            {record.artifact.warnings.map((warning, i) => <small className="text-warning" key={i}>{warning}</small>)}
+          </ItemContent>
+          <ItemActions className="col-span-2 flex-wrap sm:col-span-1">
+            <Badge tone={record.artifact.integrity_verified ? 'success' : 'warning'}>{record.artifact.integrity_verified ? '完整性已校验' : '需人工审核'}</Badge>
+            <Button variant="outline" disabled={!writable || busy} onClick={() => {
+              setInstall(record); setGameId(''); setModType(''); setReplaceInstallId(''); setFomodPreview(null); setFomodSelections({}); setError(null);
+            }}><PackagePlusIcon data-icon="inline-start" aria-hidden="true"/>安装预览</Button>
+          </ItemActions>
+        </Item>)}
+        {!artifacts.data?.length && !task && <EmptyState title="暂无下载记录"/>}
+      </CardContent>
+    </Card>
+    {install && <Modal title="下载归档安装预览" onClose={() => { if (!busy) { setInstall(null); setFomodPreview(null); setFomodSelections({}); } }} actions={<>
+      <Button variant="outline" disabled={busy} onClick={() => { setInstall(null); setFomodPreview(null); setFomodSelections({}); }}>取消</Button>
+      <Button aria-busy={busy} disabled={!canPreviewInstall} onClick={() => { void previewInstall(); }}>
+        {busy && <Spinner data-icon="inline-start"/>}生成变更预览
+      </Button>
+    </>}>
+      <ErrorState error={error}/>
+      <ErrorState error={adapter.error}/>
+      <div className="flex min-w-0 flex-col gap-1 [overflow-wrap:anywhere]">
+        <p>{install.name} · {install.version}</p>
+        <PathText>{install.artifact.filename}</PathText>
+      </div>
+      <FieldGroup className="grid min-w-0 gap-3 sm:grid-cols-2">
+        <Field className="min-w-0 gap-1.5 [&>[data-slot=native-select-wrapper]]:w-full">
+          <FieldLabel htmlFor={`${fieldId}-game`}>目标游戏</FieldLabel>
+          <NativeSelect id={`${fieldId}-game`} aria-label="目标游戏" value={gameId} disabled={busy}
+            onChange={e => { setGameId(e.target.value); setModType(''); setReplaceInstallId(''); setFomodPreview(null); setFomodSelections({}); setError(null); }}>
+            <NativeSelectOption value="">选择已登记游戏</NativeSelectOption>
+            {games.data?.map(game => <NativeSelectOption key={game.id} value={game.id}>{game.name}</NativeSelectOption>)}
+          </NativeSelect>
+        </Field>
+        <Field className="min-w-0 gap-1.5 [&>[data-slot=native-select-wrapper]]:w-full">
+          <FieldLabel htmlFor={`${fieldId}-mod-type`}>适配包 Mod 类型</FieldLabel>
+          <NativeSelect id={`${fieldId}-mod-type`} aria-label="适配包 Mod 类型" value={modType} disabled={busy || !gameId || !adapter.data}
+            onChange={e => { setModType(e.target.value); setFomodPreview(null); setFomodSelections({}); setError(null); }}>
+            <NativeSelectOption value="">选择 Mod 类型</NativeSelectOption>
+            {adapter.data?.modTypes.map(type => <NativeSelectOption key={type.id} value={type.id}>{type.name}</NativeSelectOption>)}
+          </NativeSelect>
+        </Field>
+      </FieldGroup>
+      {modTypeNotes && <p className="text-sm text-warning [overflow-wrap:anywhere]">{modTypeNotes}</p>}
+      <Button variant="outline" className="self-start" disabled={!writable || busy} aria-busy={fomodPreviewing.current} onClick={() => { void previewFomod(); }}>
+        {fomodPreviewing.current ? <Spinner data-icon="inline-start"/> : <PackagePlusIcon data-icon="inline-start" aria-hidden="true"/>}
+        扫描 FOMOD 配置
+      </Button>
+      {fomodPreview && <FomodOptions preview={fomodPreview} selections={fomodSelections} disabled={busy} onChange={setFomodSelections}/>}
       {gameId && <>
-        {installs.isFetching && !busy && <p className="muted" role="status">正在读取已装版本…</p>}
+        {installs.isFetching && !busy && <p className="flex items-center gap-2 text-sm text-muted-foreground" role="status"><Spinner/>正在读取已装版本…</p>}
         <ErrorState error={installs.error}/>
-        {installs.isError && <Button disabled={busy || installs.isFetching} onClick={() => { setError(null); void installs.refetch(); }}><RefreshCw size={15}/>重试读取已装版本</Button>}
-        {showInstallOptions && options.ambiguousNexus && <p className="warning-text" role="status">此 Nexus 项目与旧记录的数字 ID 相同，但旧 ID 不含游戏域名，无法确认是否为同一项目。请先检查旧安装。</p>}
-        {showInstallOptions && !options.ambiguousNexus && options.duplicateProject && <p className="warning-text" role="status">该项目有多个有效安装记录，请先处理重复版本，才能替换。</p>}
-        {showInstallOptions && !options.ambiguousNexus && !options.duplicateProject && options.sameVersion && <p className="warning-text" role="status">该项目的此版本已安装，不能重复安装。</p>}
+        {installs.isError && <Button variant="outline" className="self-start" disabled={busy || installs.isFetching}
+          onClick={() => { setError(null); void installs.refetch(); }}><RefreshCwIcon data-icon="inline-start" aria-hidden="true"/>重试读取已装版本</Button>}
+        {showInstallOptions && options.ambiguousNexus && <p className="text-sm text-warning" role="status">此 Nexus 项目与旧记录的数字 ID 相同，但旧 ID 不含游戏域名，无法确认是否为同一项目。请先检查旧安装。</p>}
+        {showInstallOptions && !options.ambiguousNexus && options.duplicateProject && <p className="text-sm text-warning" role="status">该项目有多个有效安装记录，请先处理重复版本，才能替换。</p>}
+        {showInstallOptions && !options.ambiguousNexus && !options.duplicateProject && options.sameVersion && <p className="text-sm text-warning" role="status">该项目的此版本已安装，不能重复安装。</p>}
         {showInstallOptions && options.candidate && <>
-          <p className="warning-text" role="status" style={{ marginBottom: 12 }}>该项目已有其他版本。请明确选择要替换的版本，不会同时安装副本。</p>
-          <label className="field">要替换的已装版本<select aria-label="要替换的已装版本" style={{ width: '100%', minWidth: 0 }}
-            value={selectedReplacement?.id ?? ''} disabled={busy}
-            onChange={e => { setReplaceInstallId(e.target.value); setError(null); }}>
-            <option value="">选择要替换的版本</option>
-            <option value={options.candidate.id}>{options.candidate.name} · {options.candidate.version ?? '未标注版本'} · 版本 ID：{options.candidate.downloadOrigin?.versionId} · {date(options.candidate.installedAt)}</option>
-          </select></label>
-          {selectedReplacement?.downloadOrigin && <p className="path-text">已选版本 ID：{selectedReplacement.downloadOrigin.versionId}</p>}
-          {selectedReplacement && options.originalType !== modType && <p className="warning-text" role="status">
+          <p className="text-sm text-warning" role="status">该项目已有其他版本。请明确选择要替换的版本，不会同时安装副本。</p>
+          <Field className="min-w-0 gap-1.5 [&>[data-slot=native-select-wrapper]]:w-full">
+            <FieldLabel htmlFor={`${fieldId}-replacement`}>要替换的已装版本</FieldLabel>
+            <NativeSelect id={`${fieldId}-replacement`} aria-label="要替换的已装版本" value={selectedReplacement?.id ?? ''} disabled={busy}
+              onChange={e => { setReplaceInstallId(e.target.value); setError(null); }}>
+              <NativeSelectOption value="">选择要替换的版本</NativeSelectOption>
+              <NativeSelectOption value={options.candidate.id}>{options.candidate.name} · {options.candidate.version ?? '未标注版本'} · 版本 ID：{options.candidate.downloadOrigin?.versionId} · {date(options.candidate.installedAt)}</NativeSelectOption>
+            </NativeSelect>
+          </Field>
+          {selectedReplacement?.downloadOrigin && <PathText>已选版本 ID：{selectedReplacement.downloadOrigin.versionId}</PathText>}
+          {selectedReplacement && options.originalType !== modType && <p className="text-sm text-warning" role="status">
             {options.originalType ? `原版本使用「${originalTypeName}」类型，请选择相同的 Mod 类型。` : '原版本未记录 Mod 类型，不能替换。'}
           </p>}
         </>}
         {showInstallOptions && !options.ambiguousNexus && !options.duplicateProject && !options.sameVersion && !options.candidate && (options.ordinary
-          ? !replaceInstallId && <p className="muted">普通安装</p>
-          : <p className="warning-text" role="status">该项目已有安装记录，但当前状态不允许替换。请先检查已装 Mod。</p>)}
-        {installsReady && options.ordinary && replaceInstallId && <Button disabled={busy} onClick={() => { setReplaceInstallId(''); setError(null); }}>清除已失效的替换选择</Button>}
+          ? !replaceInstallId && <p className="text-sm text-muted-foreground">普通安装</p>
+          : <p className="text-sm text-warning" role="status">该项目已有安装记录，但当前状态不允许替换。请先检查已装 Mod。</p>)}
+        {installsReady && options.ordinary && replaceInstallId && <Button variant="outline" className="self-start" disabled={busy}
+          onClick={() => { setReplaceInstallId(''); setError(null); }}>清除已失效的替换选择</Button>}
       </>}
       {install.sourceId === 'modrinth' && games.data?.some(game => game.id === gameId) && <DependencyReview
         key={JSON.stringify([install.artifact.id, install.sourceId, install.projectId, install.versionId, gameId, selectedReplacement?.id])}
@@ -493,7 +712,7 @@ export default function DiscoverPage() {
         key={JSON.stringify([install.artifact.id, install.projectId, install.versionId, gameId, selectedReplacement?.id])}
         scope={{ artifactId: install.artifact.id, projectId: install.projectId, versionId: install.versionId, gameId, replaceInstallId: selectedReplacement?.id ?? null }} disabled={busy}
       />}
-      {install.artifact.warnings.map((warning, i) => <p className="warning-text" key={i}>{warning}</p>)}
+      {install.artifact.warnings.map((warning, i) => <p className="text-sm text-warning [overflow-wrap:anywhere]" key={i}>{warning}</p>)}
     </Modal>}
-  </div>;
+  </Page>;
 }

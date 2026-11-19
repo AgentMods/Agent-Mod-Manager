@@ -1,7 +1,9 @@
 //! Filesystem primitives for paths already authorized and canonicalized by the caller.
 //! On desktop platforms, resolve each component relative to a held directory.
 
-use crate::error::{AppError, AppResult};
+use crate::error::AppError;
+#[cfg(not(windows))]
+use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
 #[cfg(not(windows))]
 use std::path::Component;

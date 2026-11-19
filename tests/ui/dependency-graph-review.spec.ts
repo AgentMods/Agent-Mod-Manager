@@ -148,7 +148,7 @@ async function calls(page: Page, ...commands: string[]) {
 }
 
 async function expectHorizontalFit(dialog: Locator) {
-  expect(await dialog.locator('.modal-body').evaluate(body => {
+  expect(await dialog.locator('[data-slot="modal-body"]').evaluate(body => {
     const bounds = body.getBoundingClientRect();
     return bounds.left >= 0 && bounds.right <= innerWidth + 1 && body.scrollWidth <= body.clientWidth + 1;
   })).toBe(true);

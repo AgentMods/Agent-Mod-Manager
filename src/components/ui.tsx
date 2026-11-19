@@ -1,25 +1,72 @@
-import { useEffect, useRef, type ButtonHTMLAttributes, type ReactNode } from "react";
-import { AlertTriangle, Inbox, X } from "lucide-react";
-import { errorText } from "../lib/api";
+import type { ComponentProps, ReactNode } from "react";
+import { AlertTriangleIcon, InboxIcon } from "lucide-react";
+import { errorText } from "@/lib/api";
+import { cn } from "@/lib/utils";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Badge as StatusBadge } from "@/components/ui/badge";
+import { Button as UiButton } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
-export function Button({ className = "", ...props }: ButtonHTMLAttributes<HTMLButtonElement>) {
-  return <button type="button" className={`btn ${className}`} {...props}/>;
+/** Page frame shared by every top-level view: width cap, padding and vertical rhythm. */
+export function Page({ className, ...props }: ComponentProps<"div">) {
+  return <div className={cn("mx-auto flex min-h-full w-full max-w-[1760px] flex-col gap-6 p-4 sm:p-6 lg:p-8", className)} {...props}/>;
 }
-export function IconButton({ title, className = "", ...props }: ButtonHTMLAttributes<HTMLButtonElement> & {title: string}) {
-  return <button type="button" title={title} aria-label={title} className={`icon-btn ${className}`} {...props}/>;
+
+export function PageHeader({ title, subtitle, actions }: { title: string; subtitle?: string; actions?: ReactNode }) {
+  return <header className="flex flex-wrap items-center justify-between gap-4">
+    <div className="flex min-w-0 flex-col gap-1">
+      <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
+      {subtitle && <p className="text-sm text-muted-foreground">{subtitle}</p>}
+    </div>
+    {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
+  </header>;
 }
-export function PageHeader({title, subtitle, actions}: {title: string; subtitle?: string; actions?: ReactNode}) {
-  return <header className="page-header"><div><h1>{title}</h1>{subtitle && <p>{subtitle}</p>}</div><div className="page-actions">{actions}</div></header>;
+
+/**
+ * TEMPORARY migration shim: pages still importing `Button` from this module keep working while
+ * they are moved to `@/components/ui/button`. Delete once `grep "Button.*from .*components/ui\"` is empty.
+ */
+export function Button({ className, ...props }: ComponentProps<typeof UiButton>) {
+  return <UiButton variant="outline" className={cn("btn", className)} {...props}/>;
 }
-export function EmptyState({title, children, action}: {title: string; children?: ReactNode; action?: ReactNode}) {
-  return <div className="empty-state"><Inbox size={30} aria-hidden="true"/><h2>{title}</h2>{children && <p>{children}</p>}{action}</div>;
+
+/** Icon-only button. The label is both the accessible name and the tooltip. */
+export function IconButton({ title, children, variant = "ghost", size = "icon-sm", ...props }: ComponentProps<typeof Button> & { title: string }) {
+  return <Tooltip>
+    <TooltipTrigger asChild><UiButton variant={variant} size={size} aria-label={title} {...props}>{children}</UiButton></TooltipTrigger>
+    <TooltipContent>{title}</TooltipContent>
+  </Tooltip>;
 }
-export function ErrorState({error}: {error: unknown}) {
-  return error ? <div role="alert" className="error-state"><AlertTriangle size={18}/><span>{errorText(error)}</span></div> : null;
+
+export function EmptyState({ title, children, action, icon }: { title: string; children?: ReactNode; action?: ReactNode; icon?: ReactNode }) {
+  return <Empty className="border">
+    <EmptyHeader>
+      <EmptyMedia variant="icon">{icon ?? <InboxIcon/>}</EmptyMedia>
+      <EmptyTitle>{title}</EmptyTitle>
+      {children && <EmptyDescription>{children}</EmptyDescription>}
+    </EmptyHeader>
+    {action && <EmptyContent>{action}</EmptyContent>}
+  </Empty>;
 }
-export function Badge({children, tone = "neutral"}: {children: ReactNode; tone?: string}) {
-  return <span className={`status-badge ${tone}`}>{children}</span>;
+
+export function ErrorState({ error, className }: { error: unknown; className?: string }) {
+  return error ? <Alert variant="destructive" className={className}><AlertTriangleIcon/><AlertDescription className="break-words">{errorText(error)}</AlertDescription></Alert> : null;
 }
+
+const toneVariants = { success: "success", warning: "warning", error: "danger", danger: "danger", neutral: "secondary" } as const;
+/** Status chip. `tone` is the legacy vocabulary used by the data layer. */
+export function Badge({ children, tone, className }: { children: ReactNode; tone?: string; className?: string }) {
+  const variant = tone && tone in toneVariants ? toneVariants[tone as keyof typeof toneVariants] : "secondary";
+  return <StatusBadge variant={variant} className={cn("h-auto min-h-5 whitespace-normal", className)}>{children}</StatusBadge>;
+}
+
+/** File path or other machine text. Wraps instead of overflowing. */
+export function PathText({ className, ...props }: ComponentProps<"span">) {
+  return <span className={cn("font-mono text-xs break-all text-muted-foreground", className)} {...props}/>;
+}
+
 export function bytes(value: number) {
   if (!Number.isFinite(value) || value < 0) return "-";
   const units = ["B", "KiB", "MiB", "GiB"];
@@ -29,13 +76,25 @@ export function bytes(value: number) {
 }
 export function date(value: string) {
   const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("zh-CN", {dateStyle: "short", timeStyle: "short"});
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("zh-CN", { dateStyle: "short", timeStyle: "short" });
 }
-export function Modal({title, children, actions, onClose}: {title: string; children: ReactNode; actions?: ReactNode; onClose: () => void}) {
-  const ref = useRef<HTMLDialogElement>(null);
-  useEffect(() => { ref.current?.showModal(); return () => ref.current?.close(); }, []);
-  return <dialog ref={ref} className="modal" aria-label={title} onCancel={(event) => { event.preventDefault(); onClose(); }}>
-    <header className="modal-header"><h2>{title}</h2><IconButton title="关闭" onClick={onClose}><X size={18}/></IconButton></header>
-    <div className="modal-body">{children}</div>{actions && <footer className="modal-actions">{actions}</footer>}
-  </dialog>;
+
+/**
+ * Modal task dialog. Closes with Escape, the close button or an explicit action,
+ * never by clicking outside, so a stray click cannot reject an approval.
+ */
+export function Modal({ title, description, children, actions, onClose, className }: {
+  title: string; description?: string; children: ReactNode; actions?: ReactNode; onClose: () => void; className?: string;
+}) {
+  return <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+    <DialogContent onInteractOutside={(event) => event.preventDefault()}
+      className={cn("flex max-h-[calc(100dvh-3rem)] flex-col gap-0 p-0 sm:max-w-[850px]", className)}>
+      <DialogHeader className="border-b px-6 py-4 pr-12 text-left">
+        <DialogTitle>{title}</DialogTitle>
+        {description ? <DialogDescription>{description}</DialogDescription> : <DialogDescription className="sr-only">{title}</DialogDescription>}
+      </DialogHeader>
+      <div data-slot="modal-body" className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto px-6 py-5">{children}</div>
+      {actions && <DialogFooter className="border-t px-6 py-4">{actions}</DialogFooter>}
+    </DialogContent>
+  </Dialog>;
 }
