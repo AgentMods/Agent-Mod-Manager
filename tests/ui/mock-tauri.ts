@@ -1,14 +1,33 @@
 import type { Page } from "@playwright/test";
 
+type AskUserQuestionFixture = {question: string; options?: string[]};
+type AskUserPreviewFixture = {title?: string; questions: AskUserQuestionFixture[]} | {question: string};
+
 // Test-only IPC transport. It is never imported by the shipped application.
-export async function installMockTauri(page: Page, {fomodSelection = "requires_user", onboarding = false, onboardingStarted = false, failRegistration = false}: {fomodSelection?: "safe" | "requires_user"; onboarding?: boolean; onboardingStarted?: boolean; failRegistration?: boolean} = {}) {
-  await page.addInitScript(({fomodSelection, onboarding, onboardingStarted, failRegistration}) => {
+export async function installMockTauri(page: Page, {
+  fomodSelection = "requires_user", onboarding = false, onboardingStarted = false, failRegistration = false,
+  gameWithoutAdapter = false,
+  providerModels = ["fixture-thinking", "fixture-standard"],
+  askUser,
+  storage,
+}: {
+  fomodSelection?: "safe" | "requires_user";
+  onboarding?: boolean;
+  onboardingStarted?: boolean;
+  failRegistration?: boolean;
+  gameWithoutAdapter?: boolean;
+  providerModels?: string[];
+  askUser?: {preview: AskUserPreviewFixture; approvalId?: string; toolCallId?: string};
+  storage?: {dataRoot: string; parent: string; previousError?: string; rejectFirstMigration?: boolean};
+} = {}) {
+  await page.addInitScript(({fomodSelection, onboarding, onboardingStarted, failRegistration, gameWithoutAdapter, providerModels, askUser, storage}) => {
     type Args = Record<string, any>;
     const now = "2026-11-18T00:00:00Z";
     const callbacks = new Map<number, (value: any) => void>();
     const listeners = new Map<number, { event: string; handler: number }>();
     let counter = 0;
     let seq = 0;
+    let migrationAttempts = 0;
     const calls: Array<{ command: string; args: Args }> = [];
     const events: any[] = [];
     const initialGame: Args = {
@@ -17,9 +36,11 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
       adapterVersion: "1.0.0", confidence: 1, coverPath: null, steamAppId: null,
       lastScannedAt: now, installedModCount: 1, enabledModCount: 1, metadata: {}, createdAt: now, updatedAt: now,
     };
-    const games: Args[] = onboarding && !onboardingStarted ? [] : [initialGame];
+    const games: Args[] = onboarding && !onboardingStarted ? [] : [
+      gameWithoutAdapter ? {...initialGame, adapterSlug: null, adapterVersion: null} : initialGame,
+    ];
     const onboardingCandidates: Args[] = [
-      {rootPath: "/sandbox/steam/Fixture", name: "Fixture Game", confidence: 0.92, status: "identified", suggestedAdapterSlug: "minecraft-java", registeredGameId: null, platform: "windows", warnings: ["这是一个测试扫描候选，请确认目录后再登记"]},
+      {rootPath: "/sandbox/steam/Fixture", name: "Fixture Game", confidence: 0.92, status: "identified", suggestedAdapterSlug: "minecraft-java", registeredGameId: null, platform: "windows", warnings: ["这是一个测试扫描候选，请确认目录后再添加"]},
       {rootPath: "/sandbox/steam/Broken", name: "Broken Fixture", confidence: 0.61, status: "ambiguous", suggestedAdapterSlug: null, registeredGameId: null, platform: "unknown", warnings: []},
     ];
     const conversations = [{
@@ -29,11 +50,14 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
     }];
     const messages = new Map<string, any[]>();
     messages.set("conversation-fixture", []);
+    const approvalId = askUser?.approvalId ?? "approval-fixture";
+    const toolCallId = askUser?.toolCallId ?? "tool-fixture";
     let activeConversation = "conversation-fixture";
     let pending = false;
     let restored = false;
     let purged = false;
     let pluginEnabled = true;
+    let minecraftSkillEnabled = true;
     let skillRemoved = false;
     let skillEnabled = true;
     let fileTrashed = false;
@@ -47,6 +71,7 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
     const publications: Args[] = [];
     const draft = {id: 'draft-fixture', slug: 'fixture-game', path: '/sandbox/data/staging/plugin-drafts/fixture', writeTransactionId: 'txn-draft-fixture', createdAt: now};
     let settings: Args = { base_url: "https://example.com/v1", model: onboarding ? "" : "mock-model", context_budget: 32768, permission_mode: "request_approval", api_key_ref: "model.api_key", onboarding_completed: !onboarding };
+    let composerPreferences: Args = {model: null, reasoning_effort: null, permission_mode: null};
     let onboardingCompleted = !onboarding;
     let onboardingInProgress = onboardingStarted;
     const plan = {
@@ -72,6 +97,26 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
       entries: [{...plan.entries[0], operation: {op: "copy", src: "/sandbox/data/staging/imports/fixture/Fixture.jar", dst: "/sandbox/minecraft/mods/Fixture.jar"}}],
     };
     const skill = () => ({name: "my-game-notes", description: "本地游戏说明", location: "/sandbox/data/skills/my-game-notes/SKILL.md", source: "external", kind: "standalone", valid: true, enabled: skillEnabled, issues: []});
+    const systemSkills = [
+      {name: "system-adapter-authoring", description: "创建或更新游戏适配包。", instruction: "先确认目标游戏和适配需求。"},
+      {name: "system-web-search", description: "查找游戏、模组和加载器资料。", instruction: "仅发送公开的搜索关键词。"},
+      {name: "system-mod-download", description: "从来源定位版本并下载 Mod。", instruction: "先核对目标版本和加载器。"},
+    ].map(({name, description, instruction}) => ({
+      skill: {name, description, location: `plugins/skills/${name}/SKILL.md`, source: "system", kind: "system", valid: true, enabled: true, issues: []},
+      markdown: `---\nname: ${name}\ndescription: ${description}\n---\n\n${instruction}`,
+    }));
+    const minecraftPlugin = {
+      slug: "minecraft-java", name: "Minecraft Java Edition", gameName: "Minecraft Java Edition",
+      version: "1.0.0", description: "Minecraft 模组安装指引", source: "builtin", validated: true,
+      installPath: "/sandbox/data/plugins/games/minecraft-java", coverUrl: "/favicon.png",
+    };
+    const minecraftSkill = () => ({
+      skill: {
+        name: minecraftPlugin.slug, description: minecraftPlugin.description, location: `${minecraftPlugin.installPath}/SKILL.md`,
+        source: minecraftPlugin.source, kind: "builtin", valid: true, enabled: pluginEnabled && minecraftSkillEnabled, issues: [],
+      },
+      markdown: "---\nname: minecraft-java\ndescription: Minecraft 模组安装指引\n---\n\n# Minecraft Java Edition 适配指导\n\n核对加载器版本和模组依赖。",
+    });
     const emit = (kind: string, payload: any, conversationId = activeConversation, messageId: string | null = "assistant-fixture") => {
       const value = { seq: ++seq, turnId: "turn-fixture", conversationId, messageId, kind, payload, createdAt: now };
       events.push(value);
@@ -87,9 +132,11 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
     };
     const finish = (approved: boolean) => {
       pending = false;
-      emit("approval-resolved", { approvalId: "approval-fixture", status: approved ? "approved" : "rejected" });
-      emit("tool-result", { toolCallId: "tool-fixture", status: approved ? "done" : "denied", result: { status: approved ? "committed" : "denied" } });
-      delta(approved ? "\n检查完成，文件计划已执行。" : "\n未执行文件操作。");
+      emit("approval-resolved", { approvalId, status: approved ? "approved" : "rejected" });
+      emit("tool-result", { toolCallId, status: approved ? "done" : "denied", result: { status: approved ? "committed" : "denied" } });
+      delta(askUser
+        ? approved ? "\n回答已提交。" : "\n回答已跳过。"
+        : approved ? "\n检查完成，文件计划已执行。" : "\n未执行文件操作。");
       emit("usage", { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 });
       emit("done", { status: "done" }, activeConversation, null);
     };
@@ -102,8 +149,15 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
       if (command === "plugin:window|is_maximized") return false;
       if (command.startsWith("plugin:window|") || command.startsWith("plugin:opener|")) return null;
       switch (command) {
-        case "get_bootstrap_state": return { dataRoot: "/sandbox/data", recoveredTransactions: [], recoveryError: null, onboardingCompleted, isFirstRun: !onboardingCompleted && games.length === 0, resumeOnboarding: !onboardingCompleted && onboardingInProgress };
+        case "get_bootstrap_state": return { dataRoot: storage?.dataRoot ?? "/sandbox/data", storageMigrationError: storage?.previousError ?? null, recoveredTransactions: [], recoveryError: null, onboardingCompleted, isFirstRun: !onboardingCompleted && games.length === 0, resumeOnboarding: !onboardingCompleted && onboardingInProgress };
+        case "plugin:path|join": return args.paths.join("\\");
+        case "migrate_storage": {
+          if (!storage || args.parent !== storage.parent) throw new Error("unexpected storage location");
+          if (++migrationAttempts === 1 && storage.rejectFirstMigration) throw new Error("所选位置已包含 Agent Mod Manager 文件夹");
+          return null;
+        }
         case "plugin:dialog|open": {
+          if (storage && args.options?.title === "选择存储位置") return storage.parent;
           if (!args.options?.directory) return "/sandbox/incoming/Fixture.jar";
           return ++directoryPickCount === 1 ? "/sandbox/new-game" : null;
         }
@@ -126,7 +180,7 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
         case "get_game": return games.find((game) => game.id === args.id) ?? games[0];
         case "get_game_adapter": return {modTypes: [{id: "java-mod", name: "Java 加载器模组", root: "mods", notes: "请核对加载器和依赖"}], installRoots: [{id: "mods", kind: "game", notes: ""}]};
         case "get_settings": return settings;
-        case "list_agent_models": return ["fixture-thinking", "fixture-standard"];
+        case "list_agent_models": return providerModels;
         case "get_agent_model_metadata": {
           if (args.baseUrl === "https://offline.example/v1") throw new Error("metadata unavailable");
           return args.modelIds.flatMap((id: string) => {
@@ -136,6 +190,8 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
           });
         }
         case "set_settings": settings = args.settings; onboardingCompleted = settings.onboarding_completed; return null;
+        case "get_composer_preferences": return composerPreferences;
+        case "set_composer_preferences": composerPreferences = args.preferences; return null;
         case "set_secret": return null;
         case "start_onboarding": onboardingInProgress = true; return null;
         case "set_onboarding_completed": onboardingCompleted = !!args.completed; settings = {...settings, onboarding_completed: onboardingCompleted}; return null;
@@ -165,8 +221,8 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
           pending = true;
           setTimeout(() => {
             if (!pending) return;
-            emit("tool-start", { toolCallId: "tool-fixture", providerCallId: "provider-fixture", name: "apply_file_ops", arguments: { plan_id: plan.id } });
-            emit("approval-request", { approvalId: "approval-fixture", toolCallId: "tool-fixture", title: "apply_file_ops", preview: plan });
+            emit("tool-start", { toolCallId, providerCallId: "provider-fixture", name: askUser ? "ask_user" : "apply_file_ops", arguments: askUser?.preview ?? { plan_id: plan.id } });
+            emit("approval-request", { approvalId, toolCallId, title: askUser ? "ask_user" : "apply_file_ops", preview: askUser?.preview ?? plan });
           }, 120);
           return "turn-fixture";
         }
@@ -250,9 +306,33 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
         case "mcp_list": return [];
         case "mcp_connections": return [];
         case "mcp_server_status": return {running: false, stopping: false, endpoint: null, tokenRef: "mcp.local_server.token", activeCalls: 0};
-        case "list_skills": return [skillRemoved ? {...skill(), enabled: false, valid: false, issues: ["Skill 已移入回收站"]} : skill()];
-        case "get_skill": if (args.name !== "my-game-notes" || skillRemoved) throw new Error("unknown Skill"); return {skill: skill(), markdown: "---\nname: my-game-notes\ndescription: 本地游戏说明\n---\n\n只读取已登记游戏目录。"};
-        case "set_skill_enabled": if (args.name !== "my-game-notes" || skillRemoved) throw new Error("unknown Skill"); skillEnabled = args.enabled; return skill();
+        case "list_skills": return [
+          ...systemSkills.map(({skill}) => ({...skill})),
+          minecraftSkill().skill,
+          skillRemoved ? {...skill(), enabled: false, valid: false, issues: ["Skill 已移入回收站"]} : skill(),
+        ];
+        case "get_skill": {
+          const system = systemSkills.find(({skill}) => skill.name === args.name);
+          if (system) return structuredClone(system);
+          if (args.name === minecraftPlugin.slug) return minecraftSkill();
+          if (args.name !== "my-game-notes" || skillRemoved) throw new Error("unknown Skill");
+          return {skill: skill(), markdown: "---\nname: my-game-notes\ndescription: 本地游戏说明\n---\n\n只读取管理中的游戏目录。"};
+        }
+        case "set_skill_enabled": {
+          if (args.name === minecraftPlugin.slug) {
+            if (args.enabled && !pluginEnabled) throw new Error("适配包未启用");
+            minecraftSkillEnabled = args.enabled;
+            return minecraftSkill().skill;
+          }
+          const system = systemSkills.find(({skill}) => skill.name === args.name);
+          if (system) {
+            system.skill.enabled = args.enabled;
+            return {...system.skill};
+          }
+          if (args.name !== "my-game-notes" || skillRemoved) throw new Error("unknown Skill");
+          skillEnabled = args.enabled;
+          return skill();
+        }
         case "plan_uninstall_skill": if (args.name !== "my-game-notes" || skillRemoved) throw new Error("unknown Skill"); return {plan: skillPlan};
         case "list_plugin_drafts": return [draft];
         case "list_plugin_publications": return structuredClone(publications);
@@ -290,7 +370,7 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
           return 'unconfirmed';
         }
         case "set_plugin_enabled": if (args.slug !== "minecraft-java") throw new Error("unknown plugin"); pluginEnabled = args.enabled; return {slug: "minecraft-java", enabled: pluginEnabled};
-        case "list_plugins": return [{ slug: "minecraft-java", name: "Minecraft Java Edition", gameName: "Minecraft Java Edition", version: "1.0.0", description: "Minecraft 模组安装指引", source: "builtin", enabled: pluginEnabled, validated: true, installPath: "/sandbox/data/plugins/games/minecraft-java" }];
+        case "list_plugins": return [{...minecraftPlugin, enabled: pluginEnabled}];
         case "list_mod_sources": return [{ source_id: "modrinth", state: "available", message: "" }, { source_id: "curseforge", state: "missing_key", message: "需要配置 API Key" }];
         case "search_mods": return { mods: [{ source_id: "modrinth", project_id: "example", game_id: "minecraft", name: "Example Performance Mod", summary: "测试来源响应", author: "Fixture Author", homepage_url: "https://example.com/mod", icon_url: null, downloads: 1024 }], sources: [{ source_id: "modrinth", state: "available", message: "" }] };
         case "read_dir": return [{ name: "mods", path: "/sandbox/minecraft/mods", is_dir: true, size: 0, modified: now }, ...fileTrashed ? [] : [{ name: "options.txt", path: "/sandbox/minecraft/options.txt", is_dir: false, size: 128, modified: now }]];
@@ -320,13 +400,22 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
           if (args.target === "mods" && modsFolderMissing) throw new Error("无法定位 Mod 目录：Mod 目录不存在或不是目录: /sandbox/minecraft/mods");
           return null;
         }
+        case "set_game_adapter": {
+          const game = games.find((item) => item.id === args.id);
+          if (!game) throw new Error(`未找到: 游戏: ${args.id}`);
+          if (args.adapterSlug !== minecraftPlugin.slug || !pluginEnabled) throw new Error(`适配包不可用: ${args.adapterSlug}`);
+          game.adapterSlug = minecraftPlugin.slug;
+          game.adapterVersion = minecraftPlugin.version;
+          game.updatedAt = now;
+          return structuredClone(game);
+        }
         case "update_game": {
           const game = games.find((item) => item.id === args.id);
           if (!game) throw new Error(`未找到: 游戏: ${args.id}`);
           const name = String(args.name ?? "").trim();
           if (!name || name.length > 80) throw new Error("无效输入: 游戏名称去除首尾空白后须为 1 到 80 个字符，且不能含有控制字符");
           const launchPath = typeof args.launchPath === "string" ? args.launchPath.trim() : "";
-          if (launchPath && !launchPath.startsWith(`${game.rootPath}/`)) throw new Error("路径越界: 启动程序必须位于该游戏的已登记根目录内");
+          if (launchPath && !launchPath.startsWith(`${game.rootPath}/`)) throw new Error("路径越界: 启动程序必须位于该游戏的根目录内");
           game.name = name;
           const {launchPath: _previous, ...rest} = game.metadata ?? {};
           game.metadata = launchPath ? {...rest, launchPath} : rest;
@@ -360,6 +449,10 @@ export async function installMockTauri(page: Page, {fomodSelection = "requires_u
       set publicationOutcome(value: string) { publicationOutcome = value; },
       get publicationReconcileOutcome() { return publicationReconcileOutcome; },
       set publicationReconcileOutcome(value: 'verified' | 'unconfirmed') { publicationReconcileOutcome = value; },
+      seedEvents(values: any[]) {
+        events.push(...values);
+        seq = Math.max(seq, ...values.map((event) => event.seq).filter(Number.isSafeInteger));
+      },
     };
-  }, {fomodSelection, onboarding, onboardingStarted, failRegistration});
+  }, {fomodSelection, onboarding, onboardingStarted, failRegistration, gameWithoutAdapter, providerModels, askUser, storage});
 }

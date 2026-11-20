@@ -9,6 +9,8 @@ use std::error::Error;
 use tokio_util::sync::CancellationToken;
 
 const MAX_ERROR_BYTES: usize = 64 * 1024;
+const MAX_ATTEMPTS: u32 = 3;
+const RETRY_BASE_MS: u64 = if cfg!(test) { 10 } else { 1000 };
 
 pub struct ModelConfig {
     pub base_url: String,
@@ -40,6 +42,40 @@ impl ModelClient {
         if config.model.trim().is_empty() {
             return Err(AppError::Invalid("请先在设置中选择模型".into()));
         }
+        // A dropped connection before anything reached the user is safe to repeat:
+        // nothing was shown or stored. Once text was emitted a retry would duplicate it.
+        let mut attempt = 0;
+        loop {
+            match self
+                .stream_once(config, messages, tools, cancel, &mut on_delta)
+                .await
+            {
+                Ok(completion) => return Ok(completion),
+                Err(StreamFailure::Retryable(error)) if attempt + 1 < MAX_ATTEMPTS => {
+                    let delay = std::time::Duration::from_millis(RETRY_BASE_MS << attempt);
+                    attempt += 1;
+                    tracing::warn!("模型连接中断，第 {attempt} 次重试: {error}");
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(AppError::Cancelled),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+                Err(StreamFailure::Retryable(error) | StreamFailure::Fatal(error)) => {
+                    return Err(error)
+                }
+            }
+        }
+    }
+
+    async fn stream_once(
+        &self,
+        config: &ModelConfig,
+        messages: &[Value],
+        tools: &[Value],
+        cancel: &CancellationToken,
+        on_delta: &mut impl FnMut(&super::sse::Delta, &Completion) -> AppResult<()>,
+    ) -> Result<Completion, StreamFailure> {
         let endpoint = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
         let mut body = json!({"model":config.model,"messages":messages,"stream":true,"stream_options":{"include_usage":true}});
         if let Some(effort) = config.reasoning_effort {
@@ -59,9 +95,9 @@ impl ModelClient {
         let api_key = config.api_key.as_deref().filter(|key| !key.is_empty());
         let response = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(AppError::Cancelled),
+            _ = cancel.cancelled() => return Err(AppError::Cancelled.into()),
             result = request.send() => result.map_err(|error| {
-                model_error(transport_details("无法连接模型服务", error), api_key, false)
+                StreamFailure::Retryable(model_error(transport_details("无法连接模型服务", error), api_key, false))
             })?,
         };
         let status = response.status().as_u16();
@@ -80,18 +116,25 @@ impl ModelClient {
             None
         };
         if let Some(summary) = failure {
-            return Err(response_error(response, summary, api_key, cancel).await);
+            return Err(response_error(response, summary, api_key, cancel)
+                .await
+                .into());
         }
         let mut stream = response.bytes_stream();
         let mut decoder = SseDecoder::default();
         let mut completion = Completion::default();
         loop {
-            let next = tokio::select! {biased;_=cancel.cancelled()=>return Err(AppError::Cancelled),value=stream.next()=>value};
+            let next = tokio::select! {biased;_=cancel.cancelled()=>return Err(AppError::Cancelled.into()),value=stream.next()=>value};
             let Some(chunk) = next else {
                 break;
             };
             let chunk = chunk.map_err(|error| {
-                model_error(transport_details("模型流连接中断", error), api_key, false)
+                let error = model_error(transport_details("模型流连接中断", error), api_key, false);
+                if completion.content.is_empty() && completion.reasoning.is_empty() {
+                    StreamFailure::Retryable(error)
+                } else {
+                    StreamFailure::Fatal(error)
+                }
             })?;
             for frame in decoder.push(&chunk)? {
                 let delta = completion
@@ -106,7 +149,17 @@ impl ModelClient {
                 }
             }
         }
-        Err(AppError::Other("模型流提前结束，未执行工具调用".into()))
+        Err(AppError::Other("模型流提前结束，未执行工具调用".into()).into())
+    }
+}
+
+enum StreamFailure {
+    Retryable(AppError),
+    Fatal(AppError),
+}
+impl From<AppError> for StreamFailure {
+    fn from(error: AppError) -> Self {
+        Self::Fatal(error)
     }
 }
 

@@ -33,6 +33,7 @@
     }
   ],
   "steamAppId": "1086940",
+  "coverUrl": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/1086940/48a2fcbda8565bb45025e98fd8ebde8a7203f6a0/header.jpg",
   "installRoots": [
     {
       "id": "game",

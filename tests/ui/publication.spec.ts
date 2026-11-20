@@ -20,6 +20,7 @@ async function prepare(page: Page) {
 test('publication exposes exact contents and requires fresh explicit consent', async ({page}, info) => {
   await installMockTauri(page);
   await page.goto('/');
+  await page.getByRole('button', {name: '游戏库', exact: true}).click();
   const preview = await prepare(page);
   await expect(preview.getByRole('button', {name: '核对远端状态', exact: true})).toHaveCount(0);
   await expect(preview).toContainText('https://www.glossmod.com/api/v1/mcp');
@@ -62,6 +63,7 @@ test('publication exposes exact contents and requires fresh explicit consent', a
 test('unknown publication outcomes are reloaded and cannot be resent', async ({page}) => {
   await installMockTauri(page);
   await page.goto('/');
+  await page.getByRole('button', {name: '游戏库', exact: true}).click();
   await page.evaluate(() => { (window as any).__AMM_TEST__.publicationOutcome = 'unknown-create'; });
   const preview = await prepare(page);
   await preview.getByLabel('已核对公开发布内容', {exact: true}).check();
@@ -84,6 +86,7 @@ test('unknown publication outcomes are reloaded and cannot be resent', async ({p
 test('unconfirmed reconciliation preserves unknown completion without resending', async ({page}, info) => {
   await installMockTauri(page);
   await page.goto('/');
+  await page.getByRole('button', {name: '游戏库', exact: true}).click();
   await page.evaluate(() => { (window as any).__AMM_TEST__.publicationOutcome = 'unknown-complete'; });
   const preview = await prepare(page);
   await preview.getByLabel('已核对公开发布内容', {exact: true}).check();
@@ -113,6 +116,7 @@ test('unconfirmed reconciliation preserves unknown completion without resending'
 test('verified upload completion is refetched and requires fresh consent to publish', async ({page}) => {
   await installMockTauri(page);
   await page.goto('/');
+  await page.getByRole('button', {name: '游戏库', exact: true}).click();
   await page.evaluate(() => { (window as any).__AMM_TEST__.publicationOutcome = 'unknown-complete'; });
   const preview = await prepare(page);
   await preview.getByLabel('已核对公开发布内容', {exact: true}).check();
@@ -144,6 +148,7 @@ test('verified upload completion is refetched and requires fresh consent to publ
 test('verified publish-work reconciliation refetches the completed work without resending', async ({page}) => {
   await installMockTauri(page);
   await page.goto('/');
+  await page.getByRole('button', {name: '游戏库', exact: true}).click();
   await page.evaluate(() => { (window as any).__AMM_TEST__.publicationOutcome = 'unknown-publish'; });
   const preview = await prepare(page);
   await preview.getByLabel('已核对公开发布内容', {exact: true}).check();
@@ -168,6 +173,7 @@ test('verified publish-work reconciliation refetches the completed work without 
 test('awaiting-scan publication must be reconciled before renewed confirmation', async ({page}) => {
   await installMockTauri(page);
   await page.goto('/');
+  await page.getByRole('button', {name: '游戏库', exact: true}).click();
   await page.evaluate(() => { (window as any).__AMM_TEST__.publicationOutcome = 'scan'; });
   const preview = await prepare(page);
   await preview.getByLabel('已核对公开发布内容', {exact: true}).check();

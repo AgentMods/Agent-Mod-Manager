@@ -66,6 +66,29 @@ pub(crate) fn update_game(
     Ok(game)
 }
 
+pub(crate) fn set_game_adapter(engine: &FileEngine, id: &str, slug: &str) -> AppResult<Game> {
+    crate::plugin_workflow::reconcile_deployments(engine)?;
+    let _guard = transaction::write_lock();
+    let game = games::get_game(&engine.db, id)?;
+    let root = checked_game_root(&engine.paths, Path::new(&game.root_path))?;
+    let conn = engine.db.conn();
+    let recovery_pending: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM file_transactions WHERE status IN ('applying','rolling_back','recovery_failed'))",
+        [],
+        |row| row.get(0),
+    )?;
+    if recovery_pending {
+        return Err(AppError::Conflict("请先处理待恢复的文件事务".into()));
+    }
+    if has_pending_review(&conn, id, root)? {
+        return Err(AppError::Conflict(
+            "该游戏仍有待审批或待执行的计划，请处理后再选择适配包".into(),
+        ));
+    }
+    drop(conn);
+    games::rebind_game(&engine.db, &game, slug)
+}
+
 pub(crate) fn remove_game(engine: &FileEngine, id: &str) -> AppResult<()> {
     let _guard = transaction::write_lock();
     let mut conn = engine.db.conn();
@@ -167,7 +190,7 @@ fn has_pending_review(conn: &Connection, id: &str, root: PathBuf) -> AppResult<b
     )?;
     for json in stmt.query_map([], |row| row.get::<_, String>(0))? {
         let plan: FilePlan = serde_json::from_str(&json?).map_err(|_| {
-            AppError::Conflict("存在无法核对归属的未完成文件计划，请先处理后再移除游戏".into())
+            AppError::Conflict("存在无法核对归属的未完成文件计划，请先处理该计划".into())
         })?;
         if plan.entries.iter().any(|entry| {
             overlaps_root(entry.operation.dst())

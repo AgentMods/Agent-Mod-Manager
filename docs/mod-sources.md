@@ -10,8 +10,8 @@ provider can still return results.
 `resolve_mod` returns `download: null` for a manual or unavailable download.
 Otherwise the preview includes `download.resolution_id`, source/project/version,
 filename, size, source hashes, and warnings. It does not include the CDN URL.
-The desktop calls `download_mod` with `{taskId, resolutionId}`; the Agent and
-local MCP call it with `{"resolution_id":"…"}`. None accepts a caller-supplied
+The desktop IPC accepts `{taskId, resolutionId}` for `download_mod`. The Agent
+and local MCP call it with `{"resolution_id":"…"}`. None accepts a caller-supplied
 provider, version, URL, filename, size or checksum for a catalog download.
 
 The backend keeps the exact resolved request in memory. IDs are single-use and
@@ -102,10 +102,10 @@ date and release channel; they do not include download URLs, hashes or release
 notes. Listing uses the existing provider request cache and never reads API
 keys. Other known sources return `unsupported`.
 
-The Discover inspector offers an explicit version picker. Choosing a row resolves
-its exact ID with the original project and same filters. A failed or mismatched
-resolution never falls back to another release. Only a separate download action
-retrieves bytes; an installation or replacement still needs its own file plan.
+Use the exact version ID, original project and same filters to resolve a listed
+version. A failed or mismatched resolution never falls back to another release.
+Downloading the resolved archive and approving an install or replacement plan
+are separate actions.
 Source claims do not establish loader compatibility or identify an available
 update. Primary schemas: https://docs.modrinth.com/api/operations/getprojectversions/
 and the Thunderstore Cyberstorm package-version endpoint.
@@ -122,12 +122,8 @@ exact `version_id`, even if no project ID was declared. The response must match
 that version ID and any supplied project, loader and game version filters.
 Do not fall back to another version if those checks fail.
 
-The Discover inspector distinguishes unknown, explicitly empty and populated
-direct declarations. These are upstream claims, not a local installation check
-or evidence of loader activation. Neither listing nor resolving declarations
-downloads or installs anything.
-The download's install dialog can separately compare the exact version's
-declarations with the selected game's [install journal](install-lifecycle.md#modrinth-dependency-review).
+Use `check_modrinth_dependencies` to compare the selected exact version's
+declarations with the game's [install journal](install-lifecycle.md#modrinth-dependency-review).
 
 ### Transitive dependency metadata
 
@@ -135,10 +131,9 @@ declarations with the selected game's [install journal](install-lifecycle.md#mod
 IPC. Inputs are exact root `version_id`, optional root `project_id`, explicit
 `game_version` and `loader`, and optional `project_pins` mapping project IDs to
 user-selected exact version IDs. No local game ID, path, or API key is sent.
-The Discover search inspector still shows direct declarations. In the download
-install preview, a separate transitive review binds the root to the selected
-download catalog record and displays the graph alongside install journal evidence
-and bounded local file checks for exact enabled matches. Neither local path nor
+The separate desktop IPC `review_modrinth_dependency_graph` binds the root to a
+completed download record and adds install journal evidence and bounded local
+file checks for exact enabled matches. Neither local path nor
 local file evidence is sent to Modrinth. The generic graph tool does not inspect
 installed files.
 

@@ -75,6 +75,25 @@ pub fn is_within(child: &Path, root: &Path) -> bool {
     child.starts_with(root)
 }
 
+/// Compare canonical directory paths, including absent destinations under an existing parent.
+pub(crate) fn overlaps(left: &Path, right: &Path) -> bool {
+    fn contains(child: &Path, parent: &Path) -> bool {
+        if !cfg!(windows) {
+            return child.starts_with(parent);
+        }
+        let mut parts = child.components();
+        parent.components().all(|expected| {
+            parts.next().is_some_and(|actual| {
+                actual
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy())
+            })
+        })
+    }
+    contains(left, right) || contains(right, left)
+}
+
 /// Validate that a target path stays inside one of the allowed roots.
 pub fn ensure_within(target: &Path, roots: &[PathBuf]) -> AppResult<PathBuf> {
     let canon = canonicalize_lenient(target)?;

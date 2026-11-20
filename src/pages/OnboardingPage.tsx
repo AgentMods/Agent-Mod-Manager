@@ -19,13 +19,12 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 
-const steps = ["扫描游戏", "配置 Agent", "功能导览"];
+const steps = ["添加", "配置 Agent", "功能导览"];
 
 const features = [
-  {id: "library", title: "游戏库", details: "点击「扫描游戏」发现候选，或输入路径并点击「检查目录」。核对路径和适配包后，逐项确认要登记的游戏。扫描候选没有写入授权。"},
+  {id: "library", title: "游戏库", details: "点击「扫描游戏」发现候选，或输入路径并点击「检查目录」。核对路径和适配包后，逐项添加游戏。扫描候选没有写入授权。"},
   {id: "detail", title: "游戏详情", details: "从游戏库打开游戏，查看目录文件和已装 Mod，创建或还原快照。诊断会列出日志和文件证据，实际修复效果与游戏启动结果需另外验证。"},
-  {id: "discover", title: "Mod 发现", details: "选择来源搜索 Mod，在支持的来源中选择精确版本并下载归档。下载后，到安装预览中选择目标游戏并审批文件计划。"},
-  {id: "agent", title: "Agent 对话", details: "用自然语言描述任务，例如「检查这个游戏的 Mod 加载日志」。可查看工具调用和文件计划。预览展示拟议变更，实际写入须经过当前权限策略审批。"},
+  {id: "agent", title: "Agent 对话", details: "用自然语言搜索、下载 Mod，或检查游戏的 Mod 加载日志。可查看工具调用和文件计划。预览展示拟议变更，实际写入须经过当前权限策略审批。"},
   {id: "plugins", title: "插件中心", details: "查看游戏适配包、版本和验证状态，按需启用或安装。适配包为受支持的游戏提供目录识别和 Mod 安装规则。"},
   {id: "trash", title: "回收站", details: "选择条目并审阅恢复计划，可将文件还原到原路径。永久删除需要单独确认，该操作无法撤回。"},
   {id: "history", title: "历史对话", details: "打开过去的 Agent 会话查看消息和任务进度。可以归档会话，也可以从归档中恢复。"},
@@ -136,7 +135,7 @@ export default function OnboardingPage({automatic = false, recoveryError = null}
           <div className="flex min-w-0 flex-col gap-1.5">
             <CardTitle>{stepTitle}</CardTitle>
             <CardDescription>{[
-              "检查 Steam、Epic 等常见游戏目录。请核对候选路径，然后逐项确认登记。",
+              "检查 Steam、Epic 等常见游戏目录。请核对候选路径，然后逐项添加。",
               "设置模型服务和默认权限。也可以稍后在设置中配置。",
               "选择功能分类，查看使用方法和操作边界。",
             ][step]}</CardDescription>
@@ -157,7 +156,7 @@ export default function OnboardingPage({automatic = false, recoveryError = null}
               </Button>
               <span role="status" className="text-sm text-muted-foreground">{busy === "scan" ? "正在检查常见游戏目录" : report ? `已检查 ${report.directoriesChecked} 个目录、${report.entriesChecked} 个条目` : "扫描仅用于发现候选目录"}</span>
             </div>
-            {recoveryError && <OnboardingAlert warning>文件事务恢复需要处理，暂时无法登记游戏。{recoveryError}</OnboardingAlert>}
+            {recoveryError && <OnboardingAlert warning>文件事务恢复需要处理，暂时无法添加游戏。{recoveryError}</OnboardingAlert>}
             {report?.truncated && <OnboardingAlert warning>已达到扫描上限。可在游戏库中手动检查其他目录。</OnboardingAlert>}
             {!!report?.warnings.length && <details className="rounded-md border px-3 py-2 text-sm">
               <summary className="cursor-pointer font-medium">扫描警告（{report.warnings.length}）</summary>
@@ -212,11 +211,11 @@ function CandidateRow({candidate, selected, disabled, error, onSelect, onRegiste
         {!!candidate.warnings.length && <ul className="flex list-disc flex-col gap-1 pl-5 text-xs text-warning">
           {candidate.warnings.map((warning, index) => <li key={index}>{warning}</li>)}
         </ul>}
-        {error && <p className="text-xs text-destructive" role="alert">登记失败：{error}</p>}
+        {error && <p className="text-xs text-destructive" role="alert">添加失败：{error}</p>}
       </ItemContent>
       <ItemActions className="flex-wrap">
         <Badge variant="outline">{Math.round(candidate.confidence * 100)}% 匹配</Badge>
-        {registered ? <Badge variant="success">已登记</Badge> : <Button variant="outline" size="sm" disabled={disabled || !selected} onClick={onRegister}>确认登记</Button>}
+        {registered ? <Badge variant="success">管理中</Badge> : <Button variant="outline" size="sm" disabled={disabled || !selected} onClick={onRegister}>添加</Button>}
       </ItemActions>
     </li>
   </Item>;

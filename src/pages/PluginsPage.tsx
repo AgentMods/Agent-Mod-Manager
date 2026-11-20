@@ -1,10 +1,11 @@
 import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { CheckCircle2Icon, FileCode2Icon, PackageIcon, PlusIcon, RefreshCwIcon, SearchIcon, ShieldCheckIcon, UploadIcon } from 'lucide-react';
+import { CheckCircle2Icon, FileCode2Icon, PackageIcon, PlusIcon, RefreshCwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, UploadIcon } from 'lucide-react';
 import { api, backendAvailable, useBackendQuery } from '@/lib/api';
 import { useUI } from '@/lib/store';
-import type { FilePlan } from '@/lib/types';
+import type { FilePlan, Plugin } from '@/lib/types';
 import { Badge, date, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, PathText } from '@/components/ui';
+import { GameCover } from '@/components/GameCover';
 import { PluginPublications } from '@/components/PluginPublications';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
@@ -19,7 +20,6 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 
-type Plugin = { slug: string; name: string; gameName: string; version: string; description: string; source: string; enabled: boolean; validated: boolean; installPath: string };
 type Draft = { id: string; slug: string; path: string; writeTransactionId: string; createdAt: string };
 type Validation = { draft: Draft; transactionStatus: string; valid: boolean; package: { adapter: { name: string; version: string; platforms: string[]; modTypes: { id: string; name: string }[] }; skill: { description: string } } | null; hashes: { adapterSha256: string; skillSha256: string } | null; issues: { code: string; message: string }[]; warnings: string[] };
 
@@ -30,9 +30,13 @@ export default function PluginsPage() {
   const bootstrap = useBackendQuery<{ recoveryError: string | null }>(['bootstrap'], 'get_bootstrap_state');
   const writable = backendAvailable && !!bootstrap.data && !bootstrap.data.recoveryError;
   const reviewPlan = useUI(s => s.reviewPlan);
+  const startAdapterChat = useUI(s => s.startAdapterChat);
   const [tab, setTab] = useState('installed');
   const [search, setSearch] = useState('');
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
+  const [skillSlug, setSkillSlug] = useState<string | null>(null);
+  const [skillError, setSkillError] = useState<unknown>(null);
+  const skill = useBackendQuery<{ skill: { enabled: boolean; valid: boolean }; markdown: string }>(['skills', 'package', skillSlug], 'get_skill', { name: skillSlug }, !!skillSlug);
   const [draftOpen, setDraftOpen] = useState(false);
   const [publishDraft, setPublishDraft] = useState<Draft | null>(null);
   const [slug, setSlug] = useState('');
@@ -54,6 +58,14 @@ export default function PluginsPage() {
         client.invalidateQueries({ queryKey: ['skills'] }),
       ]);
     } catch (e) { setError(e); } finally { setBusy(false); }
+  }
+  async function setGameSkillEnabled(enabled: boolean) {
+    if (!skillSlug || !writable || busy) return;
+    setBusy(true); setSkillError(null);
+    try {
+      await api('set_skill_enabled', { name: skillSlug, enabled });
+      await client.invalidateQueries({ queryKey: ['skills'] });
+    } catch (e) { setSkillError(e); } finally { setBusy(false); }
   }
   async function writeDraft() {
     if (!writable) return;
@@ -81,9 +93,10 @@ export default function PluginsPage() {
 
   const plural = (n: number) => `${n}`;
   return <Page data-testid="plugins-page">
-    <PageHeader title="适配包" subtitle={backendAvailable ? `${plugins.data?.length ?? 0} 个已登记适配包` : '桌面能力未连接'} actions={<>
+    <PageHeader title="适配包" subtitle={backendAvailable ? `${plugins.data?.length ?? 0} 个已安装适配包` : '桌面能力未连接'} actions={<>
       <IconButton title="刷新适配包" variant="outline" size="icon" disabled={!backendAvailable || busy} onClick={() => { void plugins.refetch(); void drafts.refetch(); }}><RefreshCwIcon/></IconButton>
-      <Button disabled={!writable || busy} onClick={() => { setDraftOpen(true); setError(null); }}><PlusIcon data-icon="inline-start"/>新建草稿</Button>
+      <Button disabled={!writable || busy} onClick={() => startAdapterChat()}><SparklesIcon data-icon="inline-start"/>用 Agent 创建</Button>
+      <Button variant="outline" disabled={!writable || busy} onClick={() => { setDraftOpen(true); setError(null); }}><PlusIcon data-icon="inline-start"/>新建草稿</Button>
     </>}/>
     <Tabs value={tab} onValueChange={setTab} className="gap-4">
       <div className="max-w-full overflow-x-auto"><TabsList>
@@ -114,24 +127,31 @@ export default function PluginsPage() {
               </TableRow>)}</TableBody>
             </Table>
           </div>
-          {!filtered.length && <div className="mt-4"><EmptyState title={plugins.isLoading ? '正在读取适配包…' : search ? '没有匹配的适配包' : '暂无已登记适配包'}/></div>}
+          {!filtered.length && <div className="mt-4"><EmptyState title={plugins.isLoading ? '正在读取适配包…' : search ? '没有匹配的适配包' : '暂无已安装适配包'}/></div>}
         </section>
         <aside className="min-w-0">
           <Card>
-            <CardHeader><CardTitle>{selected?.name ?? '适配包详情'}</CardTitle>{selected && <CardDescription>{selected.description}</CardDescription>}</CardHeader>
+            <CardHeader><CardTitle>{selected?.name ?? '适配包详情'}</CardTitle></CardHeader>
             <CardContent className="flex flex-col gap-4">
               {selected ? <>
+                <div className="overflow-hidden rounded-md"><GameCover name={selected.name} url={selected.coverUrl}/></div>
                 <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
                   <dt className="text-muted-foreground">标识</dt><dd className="break-all">{selected.slug}</dd>
                   <dt className="text-muted-foreground">游戏</dt><dd>{selected.gameName}</dd>
                   <dt className="text-muted-foreground">版本</dt><dd>{selected.version}</dd>
-                  <dt className="text-muted-foreground">来源</dt><dd>{selected.source}</dd>
+                  <dt className="text-muted-foreground">来源</dt><dd>{selected.source === "builtin" ? "内置" : selected.source === "external" ? "本地导入" : selected.source}</dd>
                   <dt className="text-muted-foreground">安装目录</dt><dd><PathText>{selected.installPath}</PathText></dd>
                 </dl>
                 <Label className="font-normal">
                   <Checkbox data-testid="plugin-enabled-toggle" aria-label={`启用适配包 ${selected.name}`} checked={selected.enabled} disabled={busy || !writable} onCheckedChange={checked => { void setEnabled(selected, checked === true); }}/>
                   <span>启用适配包</span>
                 </Label>
+                <div className="flex flex-col gap-2 border-t pt-4">
+                  <h3 className="text-sm font-semibold">游戏 Skill</h3>
+                  <CardDescription>{selected.description}</CardDescription>
+                  <Button variant="outline" size="sm" className="self-start" disabled={!selected.validated} onClick={() => { setSkillError(null); setSkillSlug(selected.slug); }}><FileCode2Icon data-icon="inline-start"/>查看游戏 Skill</Button>
+                </div>
+                <Button disabled={!writable || busy || !selected.validated} onClick={() => startAdapterChat({ name: selected.name, slug: selected.slug })}><SparklesIcon data-icon="inline-start"/>用 Agent 修改</Button>
               </> : <p className="text-sm text-muted-foreground">未选择适配包</p>}
             </CardContent>
           </Card>
@@ -156,6 +176,15 @@ export default function PluginsPage() {
       {!drafts.data?.length && <EmptyState title="暂无草稿" action={<Button disabled={!writable} onClick={() => setDraftOpen(true)}><PlusIcon data-icon="inline-start"/>新建草稿</Button>}/>}
     </>}
     <PluginPublications draft={publishDraft} showHistory={tab === 'publications'} writable={writable} onDraftClose={() => setPublishDraft(null)}/>
+    {skillSlug && <Modal title={`游戏 Skill · ${skillSlug}`} onClose={() => { if (!busy) setSkillSlug(null); }}>
+      <ErrorState error={skillError || skill.error}/>
+      {skill.data && <Label className="font-normal">
+        <Checkbox aria-label="启用游戏 Skill" checked={skill.data.skill.enabled} disabled={!writable || busy || !selected?.enabled || !skill.data.skill.valid} onCheckedChange={checked => { void setGameSkillEnabled(checked === true); }}/>
+        <span>启用游戏 Skill</span>
+      </Label>}
+      {skill.isLoading && <Spinner/>}
+      {skill.data && <pre className="max-h-[55vh] overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/40 p-3 text-xs">{skill.data.markdown}</pre>}
+    </Modal>}
     {draftOpen && <Modal title="声明式适配包草稿" onClose={() => { if (!busy) setDraftOpen(false); }} actions={<>
       <Button variant="outline" disabled={busy} onClick={() => setDraftOpen(false)}>取消</Button>
       <Button disabled={!writable || busy || !slug.trim() || !adapterJson.trim() || !skillMarkdown.trim()} onClick={() => { void writeDraft(); }}>{busy ? <Spinner data-icon="inline-start"/> : <FileCode2Icon data-icon="inline-start"/>}预览保存草稿</Button>

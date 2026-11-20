@@ -3,21 +3,28 @@
 Updated: 2026-11-19. The full project goal remains active. This is an
 implementation and verification snapshot, not a release-completion claim.
 
-Current local verification (Windows): all 246 Playwright cases passed across
-the three configured viewports. `yarn typecheck`, `yarn build`, strict Clippy,
-and Rust formatting passed. Rust library tests: 591 passed, 5 failed, 5 ignored,
-run with `TEMP`/`TMP` pointed at a directory outside `AppData` (game identity
-rejects scan roots under the default `AppData` temp directory). The same 5
-failures reproduce on the pre-onboarding baseline and are existing Windows
-issues: `diagnostics::tests::noncanonical_database_roots_are_rejected`,
+After removal of Mod Discovery, all 171 remaining Playwright cases passed on
+Windows across the three configured viewports. `yarn typecheck` and the Vite
+production build also passed. The provider model picker scrolls within its
+panel in both themes with 81 models, including a long model ID. Strict Clippy
+and Rust formatting passed in the preceding Rust verification.
+
+Rust library tests: 608 passed, 4 failed, 5 ignored, with `TEMP`/`TMP` outside
+`AppData` (game identity rejects scan roots under the default `AppData` temp
+directory). The four existing Windows failures are
+`diagnostics::tests::noncanonical_database_roots_are_rejected`,
 `diagnostics::tests::records_cannot_authorize_relative_outside_manager_or_other_game_paths`,
-`encrypted_store::tests::actual_tauri_store_persists_ciphertext_and_reopens_without_keychain`,
 `imports::tests::filenames_are_portable_and_match_the_install_contract`, and
-`paths::tests::existing_regular_file_is_not_an_ancestor`. They were hidden
-before because the Windows test binary failed to start with
-`STATUS_ENTRYPOINT_NOT_FOUND`; `src-tauri/build.rs` now embeds
-`windows-app-manifest.xml` (Common Controls v6) into every Windows binary,
-including test executables.
+`paths::tests::existing_regular_file_is_not_an_ancestor`.
+`src-tauri/build.rs` embeds `windows-app-manifest.xml` (Common Controls v6) into
+Windows binaries, including test executables, to avoid `STATUS_ENTRYPOINT_NOT_FOUND`.
+
+The encrypted credential round-trip test now passes on Windows after flushing
+the credential file through a writable handle. An isolated Windows WebView2
+smoke fetched 81 models from a local fixture, selected the last row, saved
+settings with an encrypted test credential, and authenticated again after
+restarting the app.
+
 The macOS ARM64 debug `.app` and `.dmg` built successfully. The app launched
 from the mounted read-only DMG under an isolated profile, passed SQLite
 `quick_check`, and seeded six plugins. The DMG SHA-256 is
@@ -34,6 +41,14 @@ Windows and Linux smoke scripts use the new identity for future package runs.
 
 - Yarn 1 lockfile, React 19/Vite/Tailwind dependency scaffold and Tauri v2 config.
 - SQLite WAL schema, FULL synchronous journal writes, application storage layout.
+- Desktop storage relocation is available under Settings → Appearance and storage.
+  The native folder picker selects the parent for a new `Agent Mod Manager`
+  folder. A confirmed restart copies and verifies the database and managed files,
+  relocates stored paths, and switches the active directory after verification.
+  The original data remains as a backup. A rejected migration leaves the previous
+  directory active and displays the error in settings. Encrypted credentials and
+  the location record remain in the default private directory. Windows path
+  prefixes are hidden in the settings display.
 - File plans with per-file impact, source/destination SHA-256 preconditions,
   approval state, process-wide write lock, durable per-entry intent/completion,
   overwrite backups, reverse rollback, interrupted-transaction recovery.
@@ -76,6 +91,23 @@ Windows and Linux smoke scripts use the new identity for future package runs.
 - Six embedded declarative adapters and Skills: Minecraft Java, Skyrim SE,
   Fallout 4, Stardew Valley, Cyberpunk 2077, Baldur's Gate 3. Validation covers
   schema identity, versions, relative paths, references and Skill frontmatter.
+  Built-in package and Skill reads tolerate the regular backup files retained by
+  reseeding and still verify the current declarations.
+- The adapter manifest provides optional `coverUrl` for the library and package
+  details. The six built-in manifests point to official game artwork. Missing or
+  unavailable covers fall back to the game placeholder. Existing manifests can
+  omit the field. `loadOrder.kind` accepts `none` for games without a dedicated
+  load-order format.
+- Players can start a prefilled Agent chat from the game library and package
+  center or request a new or updated adapter in chat. The Agent can find
+  registered packages, read verified package contents, and use the existing
+  draft, validation and installation transactions. Local updates keep the slug.
+  Built-in packages can be copied under a new slug. The desktop library applies
+  a selected installed package to a registered game after checking its markers.
+- Settings shows three embedded system Skills for adapter authoring, web search
+  and Mod downloads, plus manually installed Skills in their own section.
+  Game Skills are available from their package details. The Agent can read the
+  active system Skills and the selected game's package Skill.
 - Game discovery: bounded shallow scans, marker confidence with ambiguous
   candidates, structured Steam ACF and libraryfolders parsing, secondary Steam
   libraries, Epic/Legendary metadata, explicit canonical root registration,
@@ -97,22 +129,33 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   dismisses the guide before its library workflow. Existing pages keep their
   `src/components/ui.tsx` imports; Button, IconButton, Badge and ErrorState now
   render through the shadcn/ui components while `Modal` stays a native dialog.
-- Onboarding and AI settings enable multiple reasoning levels per model.
-  New models start with the levels reported by BaseLLM. The chat composer
-  offers the active model's enabled levels for each message, including a
-  provider-default option that omits the request field. Legacy single-level
+- Onboarding and AI settings share an editable model table with provider import,
+  manual add, drag and keyboard sorting, and removal. Display names are saved
+  independently of request IDs and appear in the default model and chat menus.
+  New models use BaseLLM metadata when available. The chat composer has
+  an upward model menu and a stepped reasoning slider with a provider-default
+  position. The Ultra position gives the slider an animated blue-violet glow
+  and drifting stars, with a static version for reduced motion. Each turn
+  validates its model and reasoning level against the configured list and uses
+  the selected model's context budget. Selecting a
+  model in the composer leaves the saved default intact. Legacy single-level
   settings load as one enabled option.
+- Agent `ask_user` requests appear inline as a questionnaire: one step per
+  question, with single-choice options, free text, back/next, and skip. The
+  existing approval transport waits for the response and preserves skipped
+  steps as `null`. Legacy single questions render as a one-step text card.
+  Replay shows resolved/cancelled status; file-operation approval is unchanged.
 - Explicit user-data root registrations, bound to game and adapter root ID.
   Stable canonical root checks reject replaced symlinks, including replacement
   with a different already-authorized game or manager directory.
 - Adapter-driven install previews and installed-file manifests. JAR/ZIP payloads
   declared single-file stay intact; SMAPI directories retain their manifests;
   declared Data prefixes are stripped only after inspection. FOMOD archives now
-  have a bounded read-only `ModuleConfig.xml` preview in both desktop install
-  entry points and the Agent. Folder directives expand descendants from the
+  have a bounded read-only `ModuleConfig.xml` preview in the desktop
+  local-archive install flow and the Agent. Folder directives expand descendants from the
   verified archive inventory into exact per-file mappings, including wrapped
-  installers and empty destinations relative to the install root. Both desktop
-  entry points preselect deterministic
+  installers and empty destinations relative to the install root. The desktop
+  flow preselects deterministic
   `SelectAll` and required single-option groups, show the current file mappings,
   and send those mappings to the existing installation review. Conditions or
   scripts, duplicate paths and other ambiguous rules require manual selection.
@@ -181,17 +224,19 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   [source restrictions and evidence](mod-sources.md).
   Shared provider HTTP caching and rate limiting are implemented;
   Brave search opts out of caching raw third-party response bodies.
-- Modrinth releases can be browsed by game version and loader in Discover or
-  via the read-only desktop, Agent and local MCP version list. Selecting one
-  release resolves the exact ID with the same filters before the separate
-  download action. Thunderstore direct dependency declarations are now also
+- Agent Chat provides the in-app Mod search and download workflow. The Mod
+  Discovery page and its standalone download history and install dialog were
+  removed. Mod source settings remain available.
+- Modrinth releases can be browsed by game version and loader via the read-only
+  desktop IPC, Agent and local MCP version list. Resolve the exact ID with the
+  same filters before downloading. Thunderstore direct dependency declarations are now also
   exposed when resolving a package, with unavailable/removed declarations
   kept unknown rather than treated as satisfied. No update selection or
   loader compatibility is inferred. Thunderstore version browsing now validates
   the community/project identity, uses fixed-origin pagination, and marks missing
   game-version or loader declarations as limited rather than inferred.
 - Modrinth and Thunderstore resolution reports expose the selected version's
-  declared direct dependencies in Discover, Agent and local MCP. Exact
+  declared direct dependencies via desktop IPC, Agent and local MCP. Exact
   Modrinth version lookups work with or without a project ID, rejecting
   mismatched identity or loader/game-version constraints. Valid empty
   declarations are distinct from unknown metadata; unavailable Thunderstore
@@ -202,10 +247,9 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   and loader. Ambiguous project-only dependencies require a selection; user pins
   are revalidated without overriding exact declarations. Results expose unknown
   metadata, observed conflicts, cycles and truncation. No files are downloaded
-  or installed by the graph tool. The Discover search inspector still shows
-  direct declarations; the Modrinth download install preview can additionally
-  review the graph for a Minecraft Java target, choose exact candidates, and
-  show per-edge local records. For a selected required edge with a unique exact
+  or installed by the graph tool. The separate desktop IPC
+  `review_modrinth_dependency_graph` supports exact candidate selection and
+  reports per-edge local records for a Minecraft Java target. For a selected required edge with a unique exact
   enabled install, it checks the managed files against the recorded manifest's
   sizes and SHA-256 hashes. It distinguishes changed, missing and unverified
   files from complete matches; the investigation is bounded and read-only. It
@@ -306,6 +350,14 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   through the native settings UI on Windows.
   Stdio is an explicitly acknowledged unsandboxed OS-user process, not contained
   by FileEngine; stronger cross-platform sandboxing remains required.
+- External MCP connections use a compact list with a per-service credentials
+  dialog for Bearer and stdio environment secrets. Each row shows 未启动,
+  启动中, 运行中 (tool count) or 启动失败 with the reason, and has one start/stop
+  button. Starting saves `enabled` itself, so the editor has no enable switch.
+  HTTP starts in one click; stdio asks once, showing the command line, because
+  the backend still requires the unsandboxed-process acknowledgement.
+  Playwright covers both transports, masked inputs, keyboard dismissal and
+  start/stop/failure states at 390, 1280, and 1440 px.
 - An optional desktop-owned MCP server binds numeric loopback on a random port,
   requires a fresh Bearer token and exports a native-tool allowlist. The stdio
   executable proxies to that running server rather than opening another database
@@ -328,6 +380,14 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   cross-platform or release acceptance.
 
 ## Verification
+
+Storage settings passed the Playwright regression with mocked desktop IPC at
+both desktop widths and the narrow viewport, covering Windows display paths,
+confirmation and cancellation, restart arguments, and retry after failure.
+Frontend type-check, production build, and Rust all-target checks passed.
+The Windows migration test
+fixtures could not initialize storage under the sandbox. Automatic restart and
+on-disk migration have not been verified end to end on a desktop build.
 
 Live Modrinth acceptance on 2026-11-18 (macOS ARM64): the opt-in Agent smoke
 used real public search, exact Sodium Fabric version `26nVNc41` resolution and
@@ -658,8 +718,7 @@ distribution acceptance, and it does not repeat the earlier game workflow.
   tracked paths with the historical selection, but cannot establish which bytes
   the loader used or infer manual installation. Fabric locales other than
   English and Simplified Chinese, and other loaders, need independent evidence.
-  The Modrinth desktop graph review now checks manifests for exact selected
-  records; the standalone graph and direct comparisons do not examine files.
+  The Modrinth graph-review IPC checks manifests for exact selected records; the standalone graph and direct comparisons do not examine files.
   Automatic update selection, automatic shared-file repair/reconciliation,
   loader activation, condition-aware FOMOD selection and game-specific
   ABI/dependency solvers remain open. Browsable version lists
@@ -729,3 +788,8 @@ All requirements in the original approved plan remain in scope.
   launch, macOS bundle behavior, and Linux execution were not exercised. Path
   validation and the OS open or spawn are separate operations, so same-user
   filesystem replacement can still race them.
+
+### Agent 对话 UI（2026-11-19）
+- Agent 对话页已按传统桌面 Agent 产品重排：持久工作区/最近对话侧栏、宽画布式消息区、顶部会话信息和底部悬浮式 Prompt Input；亮色/暗色主题共用语义 token，窄屏保留横向会话列表。
+- 使用 shadcn/ui AI Elements 的 Trace 组合承载 Reasoning 与 Tool trace，并新增本地可组合 `trace.tsx`、`code-block.tsx`，不切换项目现有 `new-york` 风格，也不重复实现全局审批弹窗。
+- Agent 状态、流式回复、权限策略、思考等级、token usage、错误回放、原生链接打开与现有 Tauri API 保持不变。2026-11-19 验证：`yarn typecheck`、`yarn build`，以及 Agent/引导/工作流相关 93 个 Playwright 用例在 desktop-1280、desktop-1440、narrow-390 通过。

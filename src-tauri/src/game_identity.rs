@@ -165,7 +165,7 @@ fn safe_root(engine: &FileEngine, directory: &Path) -> AppResult<PathBuf> {
         return Err(invalid("Filesystem roots are not game directories"));
     }
     engine.paths.stable_directory(&engine.paths.root)?;
-    if within(&root, &engine.paths.root) || within(&engine.paths.root, &root) {
+    if engine.paths.overlaps_storage(&root) {
         return Err(invalid("Game directory overlaps manager data"));
     }
     // Descendants of these locations must never become identity scan roots.

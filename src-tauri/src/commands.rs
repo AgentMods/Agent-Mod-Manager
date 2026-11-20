@@ -335,6 +335,35 @@ pub async fn archive_conversation(
     .await
 }
 #[tauri::command]
+pub async fn rename_conversation(
+    state: State<'_, AppServices>,
+    id: String,
+    title: String,
+) -> AppResult<()> {
+    blocking(state.engine.clone(), move |e| {
+        History::new(e.db).rename_conversation(&id, &title)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn set_conversation_pinned(
+    state: State<'_, AppServices>,
+    id: String,
+    pinned: bool,
+) -> AppResult<()> {
+    blocking(state.engine.clone(), move |e| {
+        History::new(e.db).set_conversation_pinned(&id, pinned)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn delete_conversation(state: State<'_, AgentRuntime>, id: String) -> AppResult<()> {
+    let runtime = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || runtime.delete_conversation(&id))
+        .await
+        .map_err(|e| AppError::Other(e.to_string()))?
+}
+#[tauri::command]
 pub async fn set_conversation_permission(
     state: State<'_, AppServices>,
     id: String,
@@ -348,6 +377,19 @@ pub async fn set_conversation_permission(
 #[tauri::command]
 pub async fn get_settings(agent: State<'_, AgentRuntime>) -> AppResult<AppSettings> {
     agent.settings.load()
+}
+#[tauri::command]
+pub async fn get_composer_preferences(
+    agent: State<'_, AgentRuntime>,
+) -> AppResult<crate::settings::ComposerPreferences> {
+    agent.settings.load_composer_preferences()
+}
+#[tauri::command]
+pub async fn set_composer_preferences(
+    agent: State<'_, AgentRuntime>,
+    preferences: crate::settings::ComposerPreferences,
+) -> AppResult<()> {
+    agent.settings.save_composer_preferences(&preferences)
 }
 #[tauri::command]
 pub async fn list_agent_models(
@@ -494,7 +536,7 @@ pub async fn register_game(
     blocking(state.engine.clone(), move |e| {
         let _guard = crate::transaction::write_lock();
         let directory = directory.canonicalize()?;
-        if directory.starts_with(&e.paths.root) || e.paths.root.starts_with(&directory) {
+        if e.paths.overlaps_storage(&directory) {
             return Err(AppError::Denied(
                 "游戏目录与管理器数据目录不能互相包含".into(),
             ));
@@ -513,6 +555,18 @@ pub async fn update_game(
 ) -> AppResult<games::Game> {
     blocking(state.engine.clone(), move |e| {
         crate::game_actions::update_game(&e, &id, &name, launch_path.as_deref())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn set_game_adapter(
+    state: State<'_, AppServices>,
+    id: String,
+    adapter_slug: String,
+) -> AppResult<games::Game> {
+    blocking(state.engine.clone(), move |engine| {
+        crate::game_actions::set_game_adapter(&engine, &id, &adapter_slug)
     })
     .await
 }
@@ -587,20 +641,36 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| AppError::Other(e.to_string()))?
 }
 
+#[cfg(not(test))]
 #[tauri::command]
-pub fn get_bootstrap_state(
+pub(crate) fn get_bootstrap_state(
     state: State<'_, AppServices>,
     agent: State<'_, AgentRuntime>,
+    storage: State<'_, crate::storage_location::StorageLocation>,
 ) -> AppResult<serde_json::Value> {
     let (completed, first_run, resumable) = agent.settings.onboarding_state()?;
     Ok(serde_json::json!({
         "dataRoot": state.engine.paths.root,
+        "storageMigrationError": storage.failure()?,
         "recoveredTransactions": state.recovered,
         "recoveryError": state.recovery_error,
         "onboardingCompleted": completed,
         "isFirstRun": first_run,
         "resumeOnboarding": resumable,
     }))
+}
+
+#[cfg(not(test))]
+#[tauri::command]
+pub(crate) async fn migrate_storage(
+    app: AppHandle,
+    state: State<'_, AppServices>,
+    storage: State<'_, crate::storage_location::StorageLocation>,
+    parent: std::path::PathBuf,
+) -> AppResult<()> {
+    storage.schedule(&state.engine, &parent)?;
+    app.request_restart();
+    Ok(())
 }
 
 #[tauri::command]

@@ -619,6 +619,47 @@ fn builtin_toggle_checks_embedded_content_and_preserves_preference_on_reseed() {
 }
 
 #[test]
+fn builtin_package_and_skill_remain_readable_after_reseed() {
+    let f = Fixture::new();
+    let (slug, adapter, markdown) = plugins::BUILTIN_PACKAGES[0];
+    plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
+    let directory = install_path(&f.engine, slug).unwrap();
+    let old_adapter = format!("{adapter}\n");
+    write(&directory.join("adapter.json"), &old_adapter);
+    plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
+
+    let backup = fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".previous_")
+        })
+        .unwrap();
+    assert_eq!(fs::read_to_string(backup.path()).unwrap(), old_adapter);
+    assert!(validate_package_directory(&f.engine, &directory, false).is_err());
+
+    let baseline = read_plugin_package(&f.engine, slug).unwrap();
+    assert_eq!(baseline.adapter_json, adapter);
+    assert_eq!(baseline.skill_markdown, markdown);
+    let detail = crate::skills::get_skill(&f.engine, slug).unwrap();
+    assert!(detail.skill.valid);
+    assert_eq!(detail.markdown, markdown);
+
+    write(&directory.join(".previous_extra.exe"), "undeclared asset");
+    assert!(matches!(
+        read_plugin_package(&f.engine, slug),
+        Err(AppError::Denied(_))
+    ));
+    assert!(matches!(
+        crate::skills::get_skill(&f.engine, slug),
+        Err(AppError::Denied(_))
+    ));
+}
+
+#[test]
 fn unverified_external_and_unknown_source_plugins_cannot_be_enabled() {
     let f = Fixture::new();
     legacy(&f);

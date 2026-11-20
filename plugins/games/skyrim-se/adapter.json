@@ -25,6 +25,7 @@
     }
   ],
   "steamAppId": "489830",
+  "coverUrl": "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/489830/header.jpg",
   "installRoots": [
     {
       "id": "game",

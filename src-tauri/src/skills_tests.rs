@@ -195,6 +195,121 @@ fn migration_is_additive_and_idempotent() {
 }
 
 #[test]
+fn embedded_catalog_lists_three_readable_system_skills_with_persisted_preferences() {
+    let f = Fixture::new();
+    let guides = [
+        ("system-adapter-authoring", "read_plugin_package"),
+        ("system-web-search", "web_search"),
+        ("system-mod-download", "download_mod"),
+    ];
+    let listed = list_skills(&f.engine).unwrap();
+    assert_eq!(listed.len(), guides.len());
+    for (name, tool) in guides {
+        let info = listed.iter().find(|skill| skill.name == name).unwrap();
+        assert!(is_system_skill(name));
+        assert_eq!(info.kind, SkillKind::System);
+        assert_eq!(serde_json::to_value(info).unwrap()["kind"], "system");
+        assert!(info.enabled && info.valid && info.issues.is_empty());
+        let detail = get_skill(&f.engine, name).unwrap();
+        assert_eq!(detail.skill.description, info.description);
+        assert!(detail.markdown.contains(tool));
+    }
+    assert!(!is_system_skill(NAME));
+
+    let disabled = set_enabled(&f.engine, "system-web-search", false).unwrap();
+    assert!(!disabled.enabled);
+    let reopened = f.reopen();
+    let listed = list_skills(&reopened).unwrap();
+    assert!(listed
+        .iter()
+        .all(|skill| skill.enabled == (skill.name != disabled.name)));
+    let detail = get_skill(&reopened, &disabled.name).unwrap();
+    assert!(!detail.skill.enabled);
+    assert!(detail.markdown.contains("web_search"));
+    assert!(
+        set_enabled(&reopened, &disabled.name, true)
+            .unwrap()
+            .enabled
+    );
+    assert!(
+        get_skill(&f.reopen(), &disabled.name)
+            .unwrap()
+            .skill
+            .enabled
+    );
+    assert_eq!(f.count("file_transactions"), 0);
+    assert_eq!(f.count("skills"), 0);
+}
+
+#[tokio::test]
+async fn agent_read_skill_uses_catalog_preference_and_marks_content_untrusted() {
+    use crate::{
+        agent::tools::{ToolContext, ToolRegistry},
+        sources::resolutions::ResolutionScope,
+    };
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    let f = Fixture::new();
+    let tool = ToolRegistry::builtin().unwrap().get("read_skill").unwrap();
+    let name = "system-web-search";
+    let args = json!({"name":name});
+    let context = ToolContext {
+        engine: f.engine.clone(),
+        cancel: CancellationToken::new(),
+        progress: None,
+        resolution_scope: ResolutionScope::Agent("system-skill-test".into()),
+    };
+    let prepared = tool.prepare(&context, &args).await.unwrap();
+    let value = tool
+        .execute(&context, args.clone(), prepared)
+        .await
+        .unwrap();
+    assert_eq!(value["name"], name);
+    assert_eq!(value["content"], system_skill(name).unwrap().markdown);
+    assert_eq!(value["trust"], "untrusted_instructions");
+
+    set_enabled(&f.engine, name, false).unwrap();
+    let prepared = tool.prepare(&context, &args).await.unwrap();
+    assert!(matches!(
+        tool.execute(&context, args, prepared).await,
+        Err(AppError::Denied(_))
+    ));
+}
+
+#[test]
+fn system_name_rejects_standalone_deployment_and_ignores_legacy_registry_content() {
+    let f = Fixture::new();
+    let name = "system-adapter-authoring";
+    let target = location(&f.engine, name).unwrap();
+    let legacy_markdown = markdown(name, "legacy");
+    assert!(plan_install_skill(&f.engine, name, &legacy_markdown).is_err());
+    assert!(plan_uninstall_skill(&f.engine, name).is_err());
+
+    write(&target, &legacy_markdown);
+    insert_skill(&f, name, SOURCE, &target);
+    let reopened = f.reopen();
+    let listed = list_skills(&reopened).unwrap();
+    let matching = listed
+        .iter()
+        .filter(|skill| skill.name == name)
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1);
+    assert_eq!(matching[0].kind, SkillKind::System);
+    assert_eq!(
+        get_skill(&reopened, name).unwrap().markdown,
+        system_skill(name).unwrap().markdown
+    );
+    set_enabled(&reopened, name, false).unwrap();
+    let legacy_row = registry_row(&reopened, name).unwrap().unwrap();
+    assert!(legacy_row.enabled);
+    assert_eq!(legacy_row.source, SOURCE);
+    assert_eq!(legacy_row.location, target);
+    assert_eq!(fs::read_to_string(target).unwrap(), legacy_markdown);
+    assert_eq!(f.count("file_transactions"), 0);
+}
+
+#[test]
 fn installs_exactly_one_declared_file_only_after_review_and_commit() {
     let f = Fixture::new();
     let text = markdown(NAME, "one");
@@ -286,9 +401,13 @@ fn external_source_alone_never_grants_standalone_ownership() {
         assert!(get_skill(&f.engine, NAME).is_err());
         assert!(set_enabled(&f.engine, NAME, true).is_err());
         assert!(set_enabled(&f.engine, NAME, false).is_err());
-        let infos = list_skills(&f.engine).unwrap();
-        assert!(!infos[0].valid);
-        assert_eq!(infos[0].kind, SkillKind::Unknown);
+        let info = list_skills(&f.engine)
+            .unwrap()
+            .into_iter()
+            .find(|skill| skill.name == NAME)
+            .unwrap();
+        assert!(!info.valid);
+        assert_eq!(info.kind, SkillKind::Unknown);
         assert!(arbitrary.exists());
     }
 }
@@ -590,7 +709,10 @@ fn scratch_tamper_is_rejected_by_file_engine_before_commit() {
     f.engine.approve_plan(&p.plan.id).unwrap();
     assert!(f.engine.apply_file_ops(&p.plan.id).is_err());
     assert!(!p.location.exists());
-    assert!(list_skills(&f.engine).unwrap().is_empty());
+    assert!(!list_skills(&f.engine)
+        .unwrap()
+        .iter()
+        .any(|skill| skill.name == NAME));
 }
 
 #[test]
@@ -734,11 +856,18 @@ fn unknown_arbitrary_directory_is_never_enumerated_or_loaded() {
     let f = Fixture::new();
     let external = f._temp.path().join("outside/SKILL.md");
     write(&external, markdown(NAME, "outside"));
-    assert!(list_skills(&f.engine).unwrap().is_empty());
+    assert!(!list_skills(&f.engine)
+        .unwrap()
+        .iter()
+        .any(|skill| skill.name == NAME));
     assert!(get_skill(&f.engine, external.to_str().unwrap()).is_err());
     insert_skill(&f, NAME, SOURCE, &external);
-    let list = list_skills(&f.engine).unwrap();
-    assert!(!list[0].valid);
+    let unowned = list_skills(&f.engine)
+        .unwrap()
+        .into_iter()
+        .find(|skill| skill.name == NAME)
+        .unwrap();
+    assert!(!unowned.valid);
     assert!(get_skill(&f.engine, NAME).is_err());
 }
 

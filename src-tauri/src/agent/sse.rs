@@ -123,11 +123,14 @@ impl Completion {
                     name: String::new(),
                     arguments: String::new(),
                 });
-                if let Some(id) = call["id"].as_str() {
+                if let Some(id) = call["id"].as_str().filter(|id| !id.is_empty()) {
+                    // OpenAI-compatible gateways are not fully consistent here: some of
+                    // them repeat a regenerated id on later deltas for the same index.
+                    // `index` is the stable identity during one streamed choice, so keep
+                    // the first usable id and continue assembling the call. The stored
+                    // id is the one used in the assistant/tool history pair.
                     if partial.id.is_empty() {
                         partial.id = id.into();
-                    } else if partial.id != id {
-                        return Err(AppError::Invalid("工具调用 ID 在流中改变".into()));
                     }
                 }
                 if let Some(name) = call["function"]["name"].as_str() {
@@ -202,6 +205,18 @@ mod tests {
         assert_eq!(calls[1].arguments, r#"{"path":"mods"}"#);
         assert_eq!(c.usage.unwrap()["total_tokens"], 12);
     }
+    #[test]
+    fn keeps_the_first_id_when_a_gateway_rewrites_it_for_the_same_index() {
+        let mut c = Completion::default();
+        c.accept(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"gateway-call-a","function":{"name":"read_file","arguments":"{\"path\":"}}]}}]}"#).unwrap();
+        c.accept(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"gateway-call-b","function":{"arguments":"\"mods\"}"}}]},"finish_reason":"tool_calls"}]}"#).unwrap();
+        c.accept("[DONE]").unwrap();
+        let calls = c.calls().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "gateway-call-a");
+        assert_eq!(calls[0].arguments, r#"{"path":"mods"}"#);
+    }
+
     #[test]
     fn rejects_truncated_calls_and_oversized_frame() {
         let mut c = Completion::default();

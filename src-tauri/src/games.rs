@@ -421,6 +421,25 @@ pub fn identify_game(db: &Db, directory: &Path) -> AppResult<GameCandidate> {
 /// Existing install counts, cover, creation time, metadata and identity survive
 /// repeated root registration unless a different adapter is explicitly selected.
 pub fn register_game(db: &Db, directory: &Path, adapter_slug: Option<&str>) -> AppResult<Game> {
+    register_game_inner(db, directory, adapter_slug, None)
+}
+
+pub(crate) fn rebind_game(db: &Db, game: &Game, adapter_slug: &str) -> AppResult<Game> {
+    plugins::adapter_for(db, adapter_slug)?;
+    register_game_inner(
+        db,
+        Path::new(&game.root_path),
+        Some(adapter_slug),
+        Some(&game.id),
+    )
+}
+
+fn register_game_inner(
+    db: &Db,
+    directory: &Path,
+    adapter_slug: Option<&str>,
+    expected_game_id: Option<&str>,
+) -> AppResult<Game> {
     let root = canonical_directory(directory)?;
     if root.parent().is_none() {
         return Err(invalid("不能将整个文件系统根登记为游戏目录"));
@@ -460,6 +479,9 @@ pub fn register_game(db: &Db, directory: &Path, adapter_slug: Option<&str>) -> A
             game_from_row,
         )
         .optional()?;
+    if expected_game_id.is_some_and(|id| existing.as_ref().is_none_or(|game| game.id != id)) {
+        return Err(AppError::Conflict("已登记的游戏目录已改变".into()));
+    }
     let retain_identity =
         adapter_slug.is_none() && existing.as_ref().is_some_and(|g| g.adapter_slug.is_some());
     let old = existing.as_ref();

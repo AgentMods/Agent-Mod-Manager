@@ -194,6 +194,7 @@ async fn opt_in_live_modrinth_agent_install_and_rollback() {
             content: format!(
                 "请从 Modrinth 安装适用于 Fabric 1.21.1 的 Sodium {VERSION} 到测试实例。"
             ),
+            model: None,
             permission_mode: None,
             reasoning_effort: None,
         })
@@ -271,6 +272,7 @@ async fn opt_in_live_modrinth_agent_install_and_rollback() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "请回滚刚才的安装。".into(),
+            model: None,
             permission_mode: None,
             reasoning_effort: None,
         })

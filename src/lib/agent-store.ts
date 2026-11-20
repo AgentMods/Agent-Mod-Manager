@@ -75,6 +75,10 @@ export function activeTurn(events: AgentEvent[]) {
   return latest.turnId;
 }
 
+export function isQuestionRequest(event: AgentEvent) {
+  return event.kind === "approval-request" && event.payload.title === "ask_user";
+}
+
 export function pendingApprovals(streams: Record<string, AgentEvent[]>) {
   return Object.values(streams).flatMap((events) => events.filter((event) => event.kind === "approval-request" && !events.some((next) => next.kind === "approval-resolved" && next.payload.approvalId === event.payload.approvalId)));
 }

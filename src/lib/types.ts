@@ -1,4 +1,4 @@
-export type PageName = "library" | "detail" | "agent" | "discover" | "plugins" | "trash" | "history" | "settings" | "onboarding";
+export type PageName = "library" | "detail" | "agent" | "plugins" | "trash" | "history" | "settings" | "onboarding";
 export type PermissionMode = "request_approval" | "auto_approve" | "full_trust";
 export interface Game {
   id: string; name: string; slug: string; rootPath: string; platform: string;
@@ -25,13 +25,22 @@ export interface FilePlan {
     before: {kind: string; size: number; sha256: string} | null;
     source: {kind: string; size: number; sha256: string} | null}>;
 }
-export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export interface AgentModelSettings {
-  id: string; context_budget: number; reasoning_levels: ReasoningEffort[];
+  /** The label shown in model pickers and conversation chrome. */
+  display_name: string;
+  /** The provider-facing model identifier sent with each request. */
+  id: string;
+  context_budget: number;
+  reasoning_levels: ReasoningEffort[];
 }
 export interface AppSettings {
   models?: AgentModelSettings[];
   base_url: string; model: string; context_budget: number; permission_mode: PermissionMode; api_key_ref: string | null; onboarding_completed: boolean;
+}
+/** Last-used per-turn choices, remembered across restarts and reinstalls. `null` = follow the defaults. */
+export interface ComposerPreferences {
+  model: string | null; reasoning_effort: ReasoningEffort | null; permission_mode: PermissionMode | null;
 }
 export interface BootstrapState {
   dataRoot: string; recoveredTransactions: string[]; recoveryError: string | null; onboardingCompleted: boolean; isFirstRun: boolean; resumeOnboarding: boolean;
@@ -44,7 +53,7 @@ export interface ScanReport {
 }
 export interface Plugin {
   slug: string; name: string; gameName: string; version: string; description: string;
-  source: string; enabled: boolean; validated: boolean; installPath: string;
+  source: string; enabled: boolean; validated: boolean; installPath: string; coverUrl: string | null;
 }
 export interface TrashItem {
   id: string; original_path: string; trash_path: string; transaction_id: string | null;

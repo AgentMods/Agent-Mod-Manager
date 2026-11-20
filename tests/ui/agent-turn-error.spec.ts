@@ -13,7 +13,8 @@ test("renders a provider turn error live and after durable replay", async ({page
 
   await installMockTauri(page);
   await page.goto("/");
-  await page.getByRole("button", {name: "Agent 对话", exact: true}).click();
+  await page.getByRole("button", {name: "游戏库", exact: true}).click();
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await page.getByRole("button", {name: "检查 Minecraft 模组", exact: true}).click();
 
   await expect.poll(async () => page.evaluate(() => (
@@ -48,7 +49,7 @@ test("renders a provider turn error live and after durable replay", async ({page
     }, {once: true});
   }, persisted);
   await page.reload();
-  await page.getByRole("button", {name: "Agent 对话", exact: true}).click();
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await page.getByRole("button", {name: "检查 Minecraft 模组", exact: true}).click();
 
   await expect(error).toHaveCount(1);

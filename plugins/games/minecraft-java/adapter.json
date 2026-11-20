@@ -41,6 +41,7 @@
     }
   ],
   "steamAppId": null,
+  "coverUrl": "https://www.minecraft.net/content/dam/minecraftnet/games/minecraft/key-art/About-Minecraft_Featured-Image-0_570x321.jpg",
   "installRoots": [
     {
       "id": "instance",

@@ -1,10 +1,12 @@
 import { useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { open } from "@tauri-apps/plugin-dialog";
-import { EllipsisIcon, FolderOpenIcon, FolderPlusIcon, Gamepad2Icon, GlobeIcon, PencilIcon, PlayIcon, PuzzleIcon, RefreshCwIcon, SearchIcon, Trash2Icon, XIcon } from "lucide-react";
+import { EllipsisIcon, FolderOpenIcon, FolderPlusIcon, Gamepad2Icon, GlobeIcon, PencilIcon, PlayIcon, PuzzleIcon, RefreshCwIcon, SearchIcon, SparklesIcon, Trash2Icon, XIcon } from "lucide-react";
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { useUI } from "@/lib/store";
-import type { BootstrapState, Game, GameCandidate, ScanReport } from "@/lib/types";
+import type { BootstrapState, Game, GameCandidate, Plugin, ScanReport } from "@/lib/types";
 import { Badge, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, PathText } from "@/components/ui";
+import { GameCover } from "@/components/GameCover";
 import { GameIdentityDialog } from "@/components/GameIdentityDialog";
 import { AlertDialog, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
@@ -13,38 +15,33 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem,
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group";
 import { Item, ItemActions, ItemContent, ItemDescription, ItemGroup, ItemMedia, ItemTitle } from "@/components/ui/item";
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 const storedLaunchPath = (game: Game) => typeof game.metadata?.launchPath === "string" ? game.metadata.launchPath : "";
 
-/** Placeholder cover: the first characters of the name on a soft tint, since games carry no artwork. */
-function GameCover({ name }: { name: string }) {
-  return <div className="relative flex aspect-[16/8] w-full items-center justify-center overflow-hidden bg-gradient-to-br from-accent via-muted to-secondary">
-    <Gamepad2Icon className="size-12 text-primary/40" aria-hidden="true"/>
-    <span aria-hidden="true" className="absolute bottom-2 left-4 text-3xl font-semibold tracking-tight text-foreground/60">{Array.from(name).slice(0, 2).join("")}</span>
-  </div>;
-}
-
-function GameCard({ game, disabled, busy, onOpen, onLaunch, onLocation, onEdit, onRemove }: {
-  game: Game; disabled: boolean; busy: string | null;
+function GameCard({ game, coverUrl, disabled, busy, onOpen, onLaunch, onLocation, onEdit, onRemove, onChooseAdapter, onCreateAdapter }: {
+  game: Game; coverUrl: string | null; disabled: boolean; busy: string | null;
   onOpen: () => void; onLaunch: () => void; onLocation: (target: "root" | "mods") => void; onEdit: () => void; onRemove: () => void;
+  onChooseAdapter: () => void; onCreateAdapter: () => void;
 }) {
   const working = busy === game.id;
   return <Card className="gap-0 overflow-hidden py-0">
     <button type="button" onClick={onOpen} className="flex flex-col text-left outline-none transition-colors hover:bg-muted/40 focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:ring-inset">
-      <GameCover name={game.name}/>
+      <GameCover name={game.name} url={coverUrl}/>
       <CardHeader className="gap-1 px-5 pt-4 pb-4">
         <CardTitle className="truncate text-base">{game.name}</CardTitle>
         <CardDescription>{game.platform} · {game.installedModCount} 个 Mod</CardDescription>
       </CardHeader>
     </button>
+    {!game.adapterSlug && <div className="px-5 pb-3">
+      <Button variant="outline" size="sm" disabled={disabled} onClick={onCreateAdapter}><SparklesIcon data-icon="inline-start"/>创建适配包</Button>
+    </div>}
     <CardFooter className="gap-2 border-t px-5 py-3">
       <Button size="sm" className="flex-1" disabled={disabled || working} onClick={onLaunch}>
         {working ? <Spinner data-icon="inline-start"/> : <PlayIcon data-icon="inline-start"/>}启动游戏
       </Button>
-      <IconButton title="打开目录" variant="outline" disabled={disabled || working} onClick={() => onLocation("root")}><FolderOpenIcon/></IconButton>
-      <IconButton title="Mod 文件夹" variant="outline" disabled={disabled || working} onClick={() => onLocation("mods")}><PuzzleIcon/></IconButton>
       <DropdownMenu>
         <Tooltip>
           <TooltipTrigger asChild><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-sm" aria-label="更多操作" disabled={disabled || working}><EllipsisIcon/></Button></DropdownMenuTrigger></TooltipTrigger>
@@ -52,7 +49,10 @@ function GameCard({ game, disabled, busy, onOpen, onLaunch, onLocation, onEdit, 
         </Tooltip>
         <DropdownMenuContent align="end">
           <DropdownMenuGroup>
+            <DropdownMenuItem onSelect={() => onLocation("root")}><FolderOpenIcon/>打开目录</DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => onLocation("mods")}><PuzzleIcon/>Mod 文件夹</DropdownMenuItem>
             <DropdownMenuItem onSelect={onEdit}><PencilIcon/>编辑</DropdownMenuItem>
+            <DropdownMenuItem onSelect={onChooseAdapter}><PuzzleIcon/>选择适配包</DropdownMenuItem>
             <DropdownMenuSeparator/>
             <DropdownMenuItem variant="destructive" onSelect={onRemove}><Trash2Icon/>移除</DropdownMenuItem>
           </DropdownMenuGroup>
@@ -111,6 +111,38 @@ function EditGameDialog({ game, onClose, onSaved }: { game: Game; onClose: () =>
   </Modal>;
 }
 
+function ChooseAdapterDialog({ game, plugins, onClose, onSaved }: {
+  game: Game; plugins: Plugin[]; onClose: () => void; onSaved: () => Promise<void>;
+}) {
+  const choices = plugins.filter((plugin) => plugin.enabled && plugin.validated);
+  const [slug, setSlug] = useState(game.adapterSlug ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const canApply = slug !== game.adapterSlug && choices.some((plugin) => plugin.slug === slug);
+  async function apply() {
+    setBusy(true); setError(null);
+    try {
+      await api<Game>("set_game_adapter", { id: game.id, adapterSlug: slug });
+      await onSaved(); onClose();
+    } catch (failure) { setError(failure); }
+    finally { setBusy(false); }
+  }
+  return <Modal title="选择适配包" description={`为「${game.name}」选择已启用的适配包。应用时会核对游戏目录中的识别标记。`} onClose={() => { if (!busy) onClose(); }}
+    actions={<>
+      <Button variant="outline" disabled={busy} onClick={onClose}>取消</Button>
+      <Button disabled={!canApply || busy} onClick={() => { void apply(); }}>{busy && <Spinner data-icon="inline-start"/>}应用适配包</Button>
+    </>}>
+    <ErrorState error={error}/>
+    <Field>
+      <FieldLabel htmlFor="game-adapter">游戏适配包</FieldLabel>
+      <NativeSelect id="game-adapter" value={choices.some((plugin) => plugin.slug === slug) ? slug : ""} disabled={busy || !choices.length} onChange={(event) => setSlug(event.target.value)}>
+        <NativeSelectOption value="">{choices.length ? "请选择适配包" : "暂无已启用的适配包"}</NativeSelectOption>
+        {choices.map((plugin) => <NativeSelectOption key={plugin.slug} value={plugin.slug}>{plugin.name} · {plugin.slug}</NativeSelectOption>)}
+      </NativeSelect>
+    </Field>
+  </Modal>;
+}
+
 function RemoveGameDialog({ game, onClose, onRemoved }: { game: Game; onClose: () => void; onRemoved: () => Promise<void> }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -124,7 +156,7 @@ function RemoveGameDialog({ game, onClose, onRemoved }: { game: Game; onClose: (
     <AlertDialogContent>
       <AlertDialogHeader>
         <AlertDialogTitle>移除游戏</AlertDialogTitle>
-        <AlertDialogDescription>将「{game.name}」从游戏库移除。只取消登记，不会删除游戏文件、Mod 或存档。仍有已安装的 Mod 时，需要先在游戏详情中卸载。</AlertDialogDescription>
+        <AlertDialogDescription>将「{game.name}」从游戏库移除。只移出管理，不会删除游戏文件、Mod 或存档。仍有已安装的 Mod 时，需要先在游戏详情中卸载。</AlertDialogDescription>
       </AlertDialogHeader>
       <ErrorState error={error}/>
       <AlertDialogFooter>
@@ -136,10 +168,13 @@ function RemoveGameDialog({ game, onClose, onRemoved }: { game: Game; onClose: (
 }
 
 export default function LibraryPage() {
+  const client = useQueryClient();
   const games = useBackendQuery<Game[]>(["games"], "list_games");
+  const plugins = useBackendQuery<Plugin[]>(["plugins"], "list_plugins");
   const bootstrap = useBackendQuery<BootstrapState>(["bootstrap"], "get_bootstrap_state");
   const writable = backendAvailable && !!bootstrap.data && !bootstrap.data.recoveryError;
   const selectGame = useUI((state) => state.selectGame);
+  const startAdapterChat = useUI((state) => state.startAdapterChat);
   const notify = useUI((state) => state.notify);
   const [search, setSearch] = useState("");
   const [directory, setDirectory] = useState("");
@@ -150,6 +185,7 @@ export default function LibraryPage() {
   const [error, setError] = useState<unknown>(null);
   const [identityRoot, setIdentityRoot] = useState<string | null>(null);
   const [editing, setEditing] = useState<Game | null>(null);
+  const [choosingAdapter, setChoosingAdapter] = useState<Game | null>(null);
   const [removing, setRemoving] = useState<Game | null>(null);
 
   async function scan() {
@@ -195,7 +231,7 @@ export default function LibraryPage() {
   const rows = (games.data ?? []).filter((game) => game.name.toLowerCase().includes(search.toLowerCase()));
   const actionsDisabled = !backendAvailable || !!actionBusy;
   return <Page data-testid="library-page">
-    <PageHeader title="游戏库" subtitle={backendAvailable ? `${games.data?.length ?? 0} 个已登记游戏` : "桌面能力未连接"}
+    <PageHeader title="游戏库" subtitle={backendAvailable ? `${games.data?.length ?? 0} 个管理中的游戏` : "桌面能力未连接"}
       actions={<Button variant="outline" disabled={!backendAvailable || busy} onClick={() => { void scan(); }}><RefreshCwIcon data-icon="inline-start" className={busy ? "animate-spin" : undefined}/>扫描游戏</Button>}/>
     <div className="flex flex-wrap items-center gap-3">
       <InputGroup className="max-w-sm"><InputGroupAddon><SearchIcon/></InputGroupAddon><InputGroupInput aria-label="搜索游戏" placeholder="搜索游戏…" value={search} onChange={(event) => setSearch(event.target.value)}/></InputGroup>
@@ -205,17 +241,20 @@ export default function LibraryPage() {
     {error != null && <ErrorState error={error}/>}
     {rows.length > 0 && <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,17rem),1fr))] gap-4">
       {rows.map((game) => <GameCard key={game.id} game={game} disabled={actionsDisabled} busy={actionBusy}
+        coverUrl={plugins.data?.find((plugin) => plugin.slug === game.adapterSlug && plugin.enabled && plugin.validated)?.coverUrl ?? null}
+        onCreateAdapter={() => startAdapterChat({ name: game.name, gameId: game.id })}
+        onChooseAdapter={() => setChoosingAdapter(game)}
         onOpen={() => selectGame(game.id)}
         onLaunch={() => { void perform(game, "launch_game", { id: game.id }, "已发出启动请求"); }}
         onLocation={(target) => { void perform(game, "open_game_location", { id: game.id, target }); }}
         onEdit={() => setEditing(game)} onRemove={() => setRemoving(game)}/>)}
     </div>}
-    {!rows.length && !games.error && <EmptyState icon={<Gamepad2Icon/>} title={!backendAvailable ? "桌面能力未连接" : games.isLoading ? "正在读取游戏库…" : search ? "没有匹配的游戏" : "尚未登记游戏"}/>}
+    {!rows.length && !games.error && <EmptyState icon={<Gamepad2Icon/>} title={!backendAvailable ? "桌面能力未连接" : games.isLoading ? "正在读取游戏库…" : search ? "没有匹配的游戏" : "尚无管理中的游戏"}/>}
 
     <Card>
       <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-base"><FolderPlusIcon className="size-4"/>添加游戏目录</CardTitle>
-        <CardDescription>输入或选择游戏所在目录，检查后再确认登记。</CardDescription>
+        <CardTitle className="flex items-center gap-2 text-base"><FolderPlusIcon className="size-4"/>添加</CardTitle>
+        <CardDescription>输入或选择游戏所在目录，检查后再添加。</CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         <div className="flex flex-wrap items-center gap-2">
@@ -238,7 +277,7 @@ export default function LibraryPage() {
             <ItemActions className="flex-wrap">
               <Badge>{Math.round(candidate.confidence * 100)}% 匹配</Badge>
               {candidate.confidence < 0.85 && !candidate.registeredGameId && <Button variant="outline" size="sm" disabled={!backendAvailable || busy} onClick={() => setIdentityRoot(candidate.rootPath)}><GlobeIcon data-icon="inline-start"/>联网识别</Button>}
-              <Button size="sm" disabled={!writable || busy || !!candidate.registeredGameId} onClick={() => { void register(candidate); }}>{candidate.registeredGameId ? "已登记" : "确认登记"}</Button>
+              <Button size="sm" disabled={!writable || busy || !!candidate.registeredGameId} onClick={() => { void register(candidate); }}>{candidate.registeredGameId ? "管理中" : "添加"}</Button>
             </ItemActions>
           </Item>)}
         </ItemGroup>}
@@ -246,9 +285,17 @@ export default function LibraryPage() {
     </Card>
 
     {identityRoot && <GameIdentityDialog key={identityRoot} directory={identityRoot} writable={writable} onClose={() => setIdentityRoot(null)} onConfirmed={async () => {
-      await games.refetch(); setCandidates((items) => items.filter((candidate) => candidate.rootPath !== identityRoot)); notify("已确认游戏身份并登记目录");
+      await games.refetch(); setCandidates((items) => items.filter((candidate) => candidate.rootPath !== identityRoot)); notify("已确认游戏身份并添加");
     }}/>}
     {editing && <EditGameDialog key={editing.id} game={editing} onClose={() => setEditing(null)} onSaved={async () => { await games.refetch(); notify("已保存游戏设置"); }}/>}
+    {choosingAdapter && <ChooseAdapterDialog key={choosingAdapter.id} game={choosingAdapter} plugins={plugins.data ?? []} onClose={() => setChoosingAdapter(null)} onSaved={async () => {
+      await Promise.all([
+        games.refetch(),
+        client.invalidateQueries({queryKey: ["game", choosingAdapter.id]}),
+        client.invalidateQueries({queryKey: ["game-adapter", choosingAdapter.id]}),
+      ]);
+      notify("已应用游戏适配包");
+    }}/>}
     {removing && <RemoveGameDialog key={removing.id} game={removing} onClose={() => setRemoving(null)} onRemoved={async () => { await games.refetch(); notify("已从游戏库移除"); }}/>}
   </Page>;
 }

@@ -217,8 +217,8 @@ impl AgentTool for Builtin {
                 Effect::Read,
             ),
             _ => (
-                "向用户提出问题并等待回答",
-                schema(json!({"question":string}), &["question"]),
+                "需要玩家澄清或选择时，用 questions 分步提问：一题只问一件事，能列出合理选项时提供简短 options；路径或其他开放问题可省略 options。界面允许自填和跳过，回答数组按题目顺序排列，null 表示未回答，不代表同意。",
+                super::questions::schema(),
                 Effect::AskUser,
             ),
         };
@@ -230,6 +230,13 @@ impl AgentTool for Builtin {
         }
     }
     async fn prepare(&self, context: &ToolContext, args: &Value) -> AppResult<PreparedTool> {
+        if self.name == "ask_user" {
+            return Ok(PreparedTool {
+                preview: super::questions::preview(args)?,
+                effect: Effect::AskUser,
+                plan: None,
+            });
+        }
         let engine = context.engine.clone();
         let args = args.clone();
         let name = self.name.clone();
@@ -272,8 +279,6 @@ impl AgentTool for Builtin {
                 } else {
                     Effect::ManagerWrite
                 }
-            } else if name == "ask_user" {
-                Effect::AskUser
             } else {
                 Effect::Read
             };

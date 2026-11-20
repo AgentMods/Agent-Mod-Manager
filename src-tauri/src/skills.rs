@@ -1,10 +1,10 @@
-//! Standalone declarative Skills. Only SKILL.md is accepted; content is never
-//! executed. Approved FileEngine transactions own installation and removal.
+//! Embedded system guidance and the catalog of registered declarative Skills.
+//! Approved FileEngine transactions own standalone installation and removal.
 //! Call migrate at startup, then reconcile after recovery/apply/rollback.
 use crate::{
     db::Db,
     error::{AppError, AppResult},
-    paths, plugins,
+    paths, plugin_workflow, plugins,
     transaction::{FileEngine, FileOp, FilePlan, Fingerprint},
     trash, util,
 };
@@ -24,6 +24,38 @@ const ADAPTER_LIMIT: usize = 256 * 1024;
 const RECORD_LIMIT: usize = 1024 * 1024;
 const MANIFEST_LIMIT: usize = 64 * 1024;
 const SOURCE: &str = "external";
+const SYSTEM_SOURCE: &str = "system";
+
+struct SystemSkill {
+    name: &'static str,
+    location: &'static str,
+    markdown: &'static str,
+}
+
+macro_rules! system_skill {
+    ($name:literal) => {
+        SystemSkill {
+            name: $name,
+            location: concat!("plugins/skills/", $name, "/SKILL.md"),
+            markdown: include_str!(concat!("../../plugins/skills/", $name, "/SKILL.md")),
+        }
+    };
+}
+
+const SYSTEM_SKILLS: &[SystemSkill] = &[
+    system_skill!("system-adapter-authoring"),
+    system_skill!("system-web-search"),
+    system_skill!("system-mod-download"),
+];
+
+fn system_skill(name: &str) -> Option<&'static SystemSkill> {
+    SYSTEM_SKILLS.iter().find(|skill| skill.name == name)
+}
+
+pub(crate) fn is_system_skill(name: &str) -> bool {
+    system_skill(name).is_some()
+}
+
 static SKILLS_LOCK: Mutex<()> = Mutex::new(());
 
 fn lock() -> MutexGuard<'static, ()> {
@@ -46,7 +78,11 @@ pub fn migrate(db: &Db) -> AppResult<()> {
            created_at TEXT NOT NULL,
            FOREIGN KEY(transaction_id) REFERENCES file_transactions(id)
          );
-         CREATE INDEX IF NOT EXISTS idx_skills_deployments_name ON skills_deployments(name);",
+         CREATE INDEX IF NOT EXISTS idx_skills_deployments_name ON skills_deployments(name);
+         CREATE TABLE IF NOT EXISTS system_skill_preferences (
+           name TEXT PRIMARY KEY,
+           enabled INTEGER NOT NULL CHECK(enabled IN (0,1))
+         );",
     )?;
     Ok(())
 }
@@ -54,6 +90,7 @@ pub fn migrate(db: &Db) -> AppResult<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillKind {
+    System,
     Builtin,
     Plugin,
     Standalone,
@@ -78,6 +115,36 @@ pub struct SkillDetail {
     pub skill: SkillInfo,
     pub markdown: String,
 }
+
+impl SystemSkill {
+    fn info(&self, enabled: bool) -> AppResult<SkillInfo> {
+        let metadata = plugins::parse_skill(self.markdown, self.name)?;
+        Ok(SkillInfo {
+            name: metadata.name,
+            description: metadata.description,
+            location: PathBuf::from(self.location),
+            source: SYSTEM_SOURCE.into(),
+            enabled,
+            created_at: String::new(),
+            kind: SkillKind::System,
+            valid: true,
+            issues: vec![],
+        })
+    }
+
+    fn enabled(&self, db: &Db) -> AppResult<bool> {
+        Ok(db
+            .conn()
+            .query_row(
+                "SELECT enabled FROM system_skill_preferences WHERE name=?1",
+                [self.name],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(true))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillAction {
@@ -308,7 +375,7 @@ fn registry_row(engine: &FileEngine, name: &str) -> AppResult<Option<SkillInfo>>
 /// ownership grant. In particular, game-package Skills are never standalone.
 fn standalone_owner(engine: &FileEngine, name: &str) -> AppResult<Option<SkillInfo>> {
     plugins::validate_slug(name)?;
-    if plugins::BUILTIN_PACKAGES.iter().any(|(n, _, _)| *n == name) {
+    if is_system_skill(name) || plugins::BUILTIN_PACKAGES.iter().any(|(n, _, _)| *n == name) {
         return Err(AppError::Conflict("不能接管内置 Skill 名称".into()));
     }
     let plugin: bool = engine.db.conn().query_row(
@@ -810,13 +877,11 @@ fn inspect(engine: &FileEngine, mut info: SkillInfo) -> (SkillInfo, Option<Strin
             if !validated {
                 return Err(AppError::Denied("关联插件未通过完整性校验".into()));
             }
-            exact_entries(engine, &expected, &["adapter.json", "SKILL.md"])?;
+            plugin_workflow::validate_package_directory(engine, &expected, source == "builtin")?;
             let markdown = read_text(engine, &info.location, SKILL_LIMIT)?;
             let adapter = read_text(engine, &expected.join("adapter.json"), ADAPTER_LIMIT)?;
             let package = plugins::parse_package(&info.name, &adapter, &markdown)?;
-            if serde_json::from_str::<serde_json::Value>(&adapter_json)?
-                != serde_json::to_value(&package.adapter)?
-            {
+            if !plugins::matches_registered_adapter(&adapter_json, &package.adapter)? {
                 return Err(AppError::Conflict(
                     "插件 Skill 对应适配包与登记内容不一致".into(),
                 ));
@@ -862,8 +927,8 @@ fn inspect(engine: &FileEngine, mut info: SkillInfo) -> (SkillInfo, Option<Strin
     }
 }
 
-/// Enumerates only registered metadata; it never discovers arbitrary directories.
-/// Invalid/unowned records remain visible but no content is returned for them.
+/// Enumerates the embedded catalog and registered metadata. Invalid/unowned
+/// records cannot supply Skill content.
 pub fn list_skills(engine: &FileEngine) -> AppResult<Vec<SkillInfo>> {
     let _lock = lock();
     // The package workflow owns plugin Skill hashes and rollback provenance.
@@ -877,18 +942,27 @@ pub fn list_skills(engine: &FileEngine) -> AppResult<Vec<SkillInfo>> {
         let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    names
-        .iter()
-        .map(|name| {
-            let row =
-                registry_row(engine, name)?.ok_or_else(|| AppError::NotFound(name.clone()))?;
-            Ok(inspect(engine, row).0)
-        })
-        .collect()
+    let mut catalog = Vec::with_capacity(SYSTEM_SKILLS.len() + names.len());
+    for system in SYSTEM_SKILLS {
+        catalog.push(system.info(system.enabled(&engine.db)?)?);
+    }
+    // Reserved names always resolve to embedded documents. Legacy registry
+    // rows remain in the database with their original ownership and settings.
+    for name in names.into_iter().filter(|name| !is_system_skill(name)) {
+        let row = registry_row(engine, &name)?.ok_or(AppError::NotFound(name))?;
+        catalog.push(inspect(engine, row).0);
+    }
+    Ok(catalog)
 }
 pub fn get_skill(engine: &FileEngine, name: &str) -> AppResult<SkillDetail> {
     let _lock = lock();
     plugins::validate_slug(name)?;
+    if let Some(system) = system_skill(name) {
+        return Ok(SkillDetail {
+            skill: system.info(system.enabled(&engine.db)?)?,
+            markdown: system.markdown.into(),
+        });
+    }
     crate::plugin_workflow::reconcile_deployments(engine)?;
     let _files = crate::transaction::write_lock();
     reconcile_locked(engine)?;
@@ -898,11 +972,20 @@ pub fn get_skill(engine: &FileEngine, name: &str) -> AppResult<SkillDetail> {
     Ok(SkillDetail { skill, markdown })
 }
 
-/// Toggles known registered builtin/plugin Skills or owned standalone Skills.
+/// Toggles an embedded system Skill or a registered Skill with known ownership.
 /// Enabling requires a currently verified document; disabling cannot load code.
 pub fn set_enabled(engine: &FileEngine, name: &str, enabled: bool) -> AppResult<SkillInfo> {
     let _lock = lock();
     plugins::validate_slug(name)?;
+    if let Some(system) = system_skill(name) {
+        let info = system.info(enabled)?;
+        engine.db.conn().execute(
+            "INSERT INTO system_skill_preferences(name,enabled) VALUES (?1,?2)
+             ON CONFLICT(name) DO UPDATE SET enabled=excluded.enabled",
+            params![name, enabled],
+        )?;
+        return Ok(info);
+    }
     crate::plugin_workflow::reconcile_deployments(engine)?;
     let _files = crate::transaction::write_lock();
     reconcile_locked(engine)?;

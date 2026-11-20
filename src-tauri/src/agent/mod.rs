@@ -8,6 +8,7 @@ pub(crate) mod model_catalog;
 pub mod plugin_tools;
 pub mod policy;
 pub mod publication_tool;
+mod questions;
 pub mod runtime;
 pub mod source_tools;
 pub mod sse;

@@ -10,6 +10,52 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+const DEFAULT_TITLE: &str = "新对话";
+const TITLE_LIMIT: usize = 60;
+
+fn first_message_title(content: &str) -> String {
+    let line = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    let line = line.trim_start_matches(['#', '>', ' ']);
+    let topic = [
+        "请帮我",
+        "麻烦帮我",
+        "能不能帮我",
+        "帮我",
+        "我想要",
+        "我想",
+        "请",
+    ]
+    .iter()
+    .find_map(|prefix| line.strip_prefix(*prefix))
+    .unwrap_or(line);
+    let sentence = topic
+        .trim_start_matches([' ', '，', ',', '：', ':'])
+        .split(['。', '！', '？', '!', '?', '；', ';'])
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let subject = if sentence.is_empty() { line } else { sentence };
+    let clean = subject
+        .split(|c: char| c.is_control() || c.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if clean.is_empty() {
+        return DEFAULT_TITLE.into();
+    }
+    let mut chars = clean.chars();
+    let mut title: String = chars.by_ref().take(TITLE_LIMIT).collect();
+    if chars.next().is_some() {
+        title.pop();
+        title.push('…');
+    }
+    title
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Conversation {
     pub id: String,
@@ -126,15 +172,17 @@ impl History {
     ) -> AppResult<Conversation> {
         let id = new_id("conv");
         let timestamp = now();
-        let title = if title.trim().is_empty() {
-            "新对话"
+        let title = title.trim();
+        let auto_title_pending = title.is_empty();
+        let title = if auto_title_pending {
+            DEFAULT_TITLE
         } else {
             title
         };
         let conn = self.db.conn();
         conn.execute(
-            "INSERT INTO conversations(id,title,game_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)",
-            params![id, title, game_id, timestamp],
+            "INSERT INTO conversations(id,title,game_id,created_at,updated_at,auto_title_pending) VALUES(?1,?2,?3,?4,?4,?5)",
+            params![id, title, game_id, timestamp, auto_title_pending],
         )?;
         read_conversation(&conn, &id)
     }
@@ -173,6 +221,65 @@ impl History {
             params![id, archived, now()],
         )?;
         require_changed(changed, "会话")
+    }
+
+    pub fn rename_conversation(&self, id: &str, title: &str) -> AppResult<()> {
+        let title = title.trim();
+        if title.is_empty()
+            || title.chars().count() > TITLE_LIMIT
+            || title.chars().any(char::is_control)
+        {
+            return Err(AppError::Invalid(
+                "对话名称必须为 1–60 个字符，且不能包含控制字符".into(),
+            ));
+        }
+        let changed = self.db.conn().execute(
+            "UPDATE conversations SET title=?2,auto_title_pending=0 WHERE id=?1",
+            params![id, title],
+        )?;
+        require_changed(changed, "会话")
+    }
+
+    pub fn set_conversation_pinned(&self, id: &str, pinned: bool) -> AppResult<()> {
+        let changed = self.db.conn().execute(
+            "UPDATE conversations SET pinned=?2 WHERE id=?1",
+            params![id, pinned],
+        )?;
+        require_changed(changed, "会话")
+    }
+
+    pub(crate) fn delete_conversation(&self, id: &str) -> AppResult<()> {
+        let mut conn = self.db.conn();
+        let tx = conn.transaction()?;
+        ensure_conversation(&tx, id)?;
+        let busy: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_turns WHERE conversation_id=?1 AND status='running')
+                 OR EXISTS(SELECT 1 FROM tool_calls WHERE conversation_id=?1 AND status='running')
+                 OR EXISTS(SELECT 1 FROM approvals WHERE conversation_id=?1 AND status='pending')",
+            [id],
+            |row| row.get(0),
+        )?;
+        if busy {
+            return Err(AppError::Conflict(
+                "请先结束此对话中的任务，再删除对话".into(),
+            ));
+        }
+        for sql in [
+            "DELETE FROM agent_events WHERE conversation_id=?1",
+            "DELETE FROM approvals WHERE conversation_id=?1",
+            "DELETE FROM tool_calls WHERE conversation_id=?1",
+            "DELETE FROM agent_turns WHERE conversation_id=?1",
+        ] {
+            tx.execute(sql, [id])?;
+        }
+        tx.execute(
+            "DELETE FROM settings WHERE key=?1",
+            [conversation_permission_key(id)],
+        )?;
+        // Messages cascade. The file transaction ledger remains available for recovery.
+        tx.execute("DELETE FROM conversations WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn set_summary(&self, conversation_id: &str, summary: &str) -> AppResult<()> {
@@ -240,6 +347,12 @@ impl History {
             "UPDATE conversations SET message_count=message_count+1,updated_at=?2 WHERE id=?1",
             params![conversation_id, timestamp],
         )?;
+        if role == "user" && !content.trim().is_empty() {
+            tx.execute(
+                "UPDATE conversations SET title=?2,auto_title_pending=0 WHERE id=?1 AND auto_title_pending=1",
+                params![conversation_id, first_message_title(content)],
+            )?;
+        }
         tx.commit()?;
         Ok(message)
     }

@@ -25,6 +25,8 @@ const PUBLIC_KEYS: &[&str] = &[
     "onboarding_completed",
 ];
 
+const COMPOSER_PREFERENCES_KEY: &str = "composer_preferences";
+
 pub(crate) const MAX_CONTEXT_BUDGET: usize = 16_777_216;
 pub(crate) const MAX_CONFIGURED_MODELS: usize = 64;
 
@@ -38,11 +40,13 @@ pub enum ReasoningEffort {
     High,
     Xhigh,
     Max,
+    Ultra,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "StoredAgentModelSettings")]
 pub struct AgentModelSettings {
+    pub display_name: String,
     pub id: String,
     pub context_budget: usize,
     pub reasoning_levels: Vec<ReasoningEffort>,
@@ -51,6 +55,7 @@ pub struct AgentModelSettings {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredAgentModelSettings {
+    display_name: Option<String>,
     id: String,
     context_budget: usize,
     reasoning_levels: Option<Vec<ReasoningEffort>>,
@@ -60,6 +65,10 @@ struct StoredAgentModelSettings {
 impl From<StoredAgentModelSettings> for AgentModelSettings {
     fn from(stored: StoredAgentModelSettings) -> Self {
         Self {
+            display_name: stored
+                .display_name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| stored.id.clone()),
             id: stored.id,
             context_budget: stored.context_budget,
             reasoning_levels: stored
@@ -67,6 +76,17 @@ impl From<StoredAgentModelSettings> for AgentModelSettings {
                 .unwrap_or_else(|| stored.reasoning_effort.into_iter().collect()),
         }
     }
+}
+
+/// The model, reasoning level and permission policy used by the most recent turn.
+/// Kept apart from `AppSettings` so saving the settings page cannot overwrite it.
+/// `None` means the composer falls back to the saved default / conversation policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ComposerPreferences {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub permission_mode: Option<String>,
 }
 
 /// This DTO contains configuration and an optional reference, never a credential.
@@ -86,7 +106,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            base_url: "https://api.openai.com/v1".into(),
+            base_url: "https://one.gloscai.com/v1".into(),
             model: String::new(),
             models: Vec::new(),
             context_budget: 32_768,
@@ -155,6 +175,56 @@ impl Settings {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// A damaged or outdated record falls back to defaults instead of blocking the composer.
+    pub fn load_composer_preferences(&self) -> AppResult<ComposerPreferences> {
+        let encoded: Option<String> = self
+            .db
+            .conn()
+            .query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                [COMPOSER_PREFERENCES_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut preferences: ComposerPreferences = encoded
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        if preferences
+            .model
+            .as_deref()
+            .is_some_and(|model| !valid_model_id(model))
+        {
+            preferences.model = None;
+        }
+        if preferences
+            .permission_mode
+            .as_deref()
+            .is_some_and(|mode| validate_permission_mode(mode).is_err())
+        {
+            preferences.permission_mode = None;
+        }
+        Ok(preferences)
+    }
+
+    pub fn save_composer_preferences(&self, preferences: &ComposerPreferences) -> AppResult<()> {
+        if preferences
+            .model
+            .as_deref()
+            .is_some_and(|model| !valid_model_id(model))
+        {
+            return Err(AppError::Invalid("无效的模型名称".into()));
+        }
+        if let Some(mode) = &preferences.permission_mode {
+            validate_permission_mode(mode)?;
+        }
+        self.db.conn().execute(
+            "INSERT INTO settings(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![COMPOSER_PREFERENCES_KEY, serde_json::to_string(preferences)?],
+        )?;
         Ok(())
     }
 
@@ -309,7 +379,8 @@ fn validate_settings(settings: &AppSettings) -> AppResult<()> {
     let mut ids = HashSet::new();
     if settings.models.len() > MAX_CONFIGURED_MODELS
         || settings.models.iter().any(|model| {
-            !valid_model_id(&model.id)
+            !valid_model_id(&model.display_name)
+                || !valid_model_id(&model.id)
                 || !ids.insert(&model.id)
                 || !(1..=MAX_CONTEXT_BUDGET).contains(&model.context_budget)
         })
@@ -392,19 +463,87 @@ mod tests {
         let settings = Settings::with_secret_store(db, Arc::new(MockSecrets::default()));
         settings.set("models", json!([
             {"id":"old", "context_budget":32768, "reasoning_effort":"high"},
-            {"id":"cleared", "context_budget":32768, "reasoning_effort":"low", "reasoning_levels":[]}
+            {"id":"cleared", "display_name":"Custom label", "context_budget":32768, "reasoning_effort":"low", "reasoning_levels":[]}
         ])).unwrap();
         let loaded = settings.load().unwrap();
         assert_eq!(
             loaded.models[0].reasoning_levels,
             vec![ReasoningEffort::High]
         );
+        assert_eq!(loaded.models[0].display_name, "old");
+        assert_eq!(loaded.models[1].display_name, "Custom label");
         assert!(loaded.models[1].reasoning_levels.is_empty());
         settings.save(&loaded).unwrap();
         let persisted = settings.get("models").unwrap().unwrap();
         assert_eq!(persisted[0]["reasoning_levels"], json!(["high"]));
         assert!(persisted[0].get("reasoning_effort").is_none());
         assert_eq!(persisted[1]["reasoning_levels"], json!([]));
+        assert_eq!(persisted[1]["display_name"], "Custom label");
+    }
+
+    #[test]
+    fn composer_preferences_persist_across_reopen_and_ignore_damaged_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.sqlite");
+        let open = || {
+            Settings::with_secret_store(Db::open(&path).unwrap(), Arc::new(MockSecrets::default()))
+        };
+        assert_eq!(
+            open().load_composer_preferences().unwrap(),
+            ComposerPreferences::default()
+        );
+        let saved = ComposerPreferences {
+            model: Some("fixture-thinking".into()),
+            reasoning_effort: Some(ReasoningEffort::Ultra),
+            permission_mode: Some("full_trust".into()),
+        };
+        open().save_composer_preferences(&saved).unwrap();
+        // A new Db/Settings instance stands in for an application restart.
+        let reopened = open();
+        assert_eq!(reopened.load_composer_preferences().unwrap(), saved);
+        // Saving the settings page must not touch the remembered turn choices.
+        reopened.save(&AppSettings::default()).unwrap();
+        assert_eq!(reopened.load_composer_preferences().unwrap(), saved);
+
+        assert!(reopened
+            .save_composer_preferences(&ComposerPreferences {
+                permission_mode: Some("confirm".into()),
+                ..ComposerPreferences::default()
+            })
+            .is_err());
+        for damaged in [
+            "not json",
+            r#"{"reasoning_effort":"bogus"}"#,
+            r#"{"unknown":1}"#,
+        ] {
+            reopened
+                .db
+                .conn()
+                .execute(
+                    "UPDATE settings SET value=?1 WHERE key=?2",
+                    params![damaged, COMPOSER_PREFERENCES_KEY],
+                )
+                .unwrap();
+            assert_eq!(
+                reopened.load_composer_preferences().unwrap(),
+                ComposerPreferences::default()
+            );
+        }
+        reopened
+            .db
+            .conn()
+            .execute(
+                "UPDATE settings SET value=?1 WHERE key=?2",
+                params![
+                    r#"{"model":"kept","permission_mode":"confirm","reasoning_effort":"low"}"#,
+                    COMPOSER_PREFERENCES_KEY
+                ],
+            )
+            .unwrap();
+        let partial = reopened.load_composer_preferences().unwrap();
+        assert_eq!(partial.model.as_deref(), Some("kept"));
+        assert_eq!(partial.reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(partial.permission_mode, None);
     }
 
     #[test]

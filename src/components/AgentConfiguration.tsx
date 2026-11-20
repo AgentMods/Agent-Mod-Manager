@@ -1,31 +1,42 @@
-import { useId, useMemo, useState, type FormEvent } from "react";
+import { useId, useMemo, useRef, useState, type FormEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ChevronLeftIcon, ChevronRightIcon, ExternalLinkIcon, PlusIcon, SaveIcon, TriangleAlertIcon, XIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronLeftIcon, ChevronRightIcon, DownloadIcon, ExternalLinkIcon, GripVerticalIcon, PlusIcon, SaveIcon, Trash2Icon, TriangleAlertIcon } from "lucide-react";
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
-import { reasoningEffortLabel } from "../lib/reasoning-effort";
+import { REASONING_LEVELS, reasoningEffortLabel } from "../lib/reasoning-effort";
 import { useUI } from "../lib/store";
+import { cn } from "@/lib/utils";
 import type { AgentModelSettings, AppSettings, ReasoningEffort } from "../lib/types";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuGroup, DropdownMenuLabel, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "@/components/ui/empty";
 import { Field, FieldDescription, FieldGroup, FieldLabel, FieldLegend, FieldSet } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
-import { Item, ItemActions, ItemContent, ItemGroup, ItemTitle } from "@/components/ui/item";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
 const KEY_URL = "https://one.gloscai.com/keys";
 const DEFAULT_CONTEXT = 32768;
 const MAX_CONTEXT = 16777216;
 const MAX_MODELS = 64;
+const modelColumnHead = "h-8 px-1 text-xs text-muted-foreground";
+const modelTableCell = "min-w-0 p-0 @min-[37rem]:p-1";
+const modelInput = "h-8 px-2 text-sm";
+const compactFieldLabel = "mb-1 block text-xs text-muted-foreground @min-[37rem]:hidden";
+const modelMetadataQuery = "get_agent_model_metadata";
 type ModelDraft = Omit<AgentModelSettings, "context_budget" | "reasoning_levels"> & {
+  rowKey: number;
+  lookupId: string;
+  focusOnAdd?: boolean;
   context_budget: number | null;
   reasoning_levels: ReasoningEffort[] | null;
 };
-type Draft = Omit<AppSettings, "models"> & {models: ModelDraft[]};
+type Draft = Omit<AppSettings, "models" | "model"> & {models: ModelDraft[]; defaultModelKey: number | undefined};
 type ModelMetadata = {id: string; contextBudget: number | null; reasoningLevels: ReasoningEffort[]};
 type Props = {
   onSaved?: () => void;
@@ -33,16 +44,33 @@ type Props = {
   navigation?: {onBack: () => void; onSkip: () => void};
 };
 
-function initialDraft(settings: AppSettings): Draft {
-  const models = settings.models ?? [];
-  const legacyModel = settings.model.trim();
-  if (legacyModel && !models.some((model) => model.id === legacyModel)) {
-    return {...settings, model: legacyModel, models: [
-      {id: legacyModel, context_budget: settings.context_budget, reasoning_levels: []},
-      ...models.slice(0, MAX_MODELS - 1),
-    ]};
+function initialDraft({model: defaultId, models: savedModels = [], ...settings}: AppSettings): Draft {
+  const legacyId = defaultId.trim();
+  const configured = legacyId && !savedModels.some((model) => model.id === legacyId)
+    ? [{display_name: legacyId, id: legacyId, context_budget: settings.context_budget, reasoning_levels: []}, ...savedModels.slice(0, MAX_MODELS - 1)]
+    : savedModels;
+  const models = configured.map((model, rowKey) => ({
+    ...model,
+    display_name: model.display_name || model.id,
+    rowKey,
+    lookupId: model.id,
+  }));
+  return {...settings, models, defaultModelKey: models.find((model) => model.id === legacyId)?.rowKey ?? models[0]?.rowKey};
+}
+
+function validModelText(value: string) {
+  return !!value && new TextEncoder().encode(value).length <= 256 && !/\p{Cc}/u.test(value);
+}
+
+function summarizeLevels(enabled: ReasoningEffort[]) {
+  const groups: ReasoningEffort[][] = [];
+  for (const level of REASONING_LEVELS) {
+    if (!enabled.includes(level)) continue;
+    const group = groups.at(-1);
+    if (group && REASONING_LEVELS.indexOf(group.at(-1)!) + 1 === REASONING_LEVELS.indexOf(level)) group.push(level);
+    else groups.push([level]);
   }
-  return {...settings, model: legacyModel || models[0]?.id || "", models};
+  return groups.map((group) => group.length >= 3 ? `${group[0]} → ${group.at(-1)}` : group.join(", ")).join(", ") || "服务默认";
 }
 
 export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props) {
@@ -51,12 +79,13 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
   const notify = useUI((state) => state.notify);
   const [edited, setEdited] = useState<Draft>();
   const [apiKey, setApiKey] = useState("");
-  const [manualId, setManualId] = useState("");
+  const nextRowKey = useRef(MAX_MODELS);
   const [serviceModels, setServiceModels] = useState<string[] | null>(null);
   const [selection, setSelection] = useState<string[]>([]);
   const [filter, setFilter] = useState("");
   const [listing, setListing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [draggingRow, setDraggingRow] = useState<number>();
   const [listError, setListError] = useState<string>();
   const [error, setError] = useState<string>();
   const id = useId();
@@ -64,15 +93,21 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
   const saved = useMemo(() => settings.data && initialDraft(settings.data), [settings.data]);
   const draft = edited ?? saved;
   const baseUrl = draft?.base_url.trim() ?? "";
-  const modelIds = draft?.models.map((model) => model.id) ?? [];
-  const metadata = useBackendQuery<ModelMetadata[]>(["agent-model-metadata", baseUrl, modelIds],
-    "get_agent_model_metadata", {baseUrl, modelIds}, !!baseUrl && modelIds.length > 0);
+  const modelIds = draft?.models.map((model) => model.id.trim()) ?? [];
+  const lookupIds = [...new Set(draft?.models.map((model) => model.lookupId).filter(validModelText))].sort();
+  const metadata = useBackendQuery<ModelMetadata[]>(["agent-model-metadata", baseUrl, lookupIds],
+    modelMetadataQuery, {baseUrl, modelIds: lookupIds}, !!baseUrl && lookupIds.length > 0);
   const metadataById = new Map(metadata.data?.map((model) => [model.id, model]));
   const disabled = !draft || saving;
   const available = serviceModels?.filter((modelId) => !modelIds.includes(modelId) && modelId.toLowerCase().includes(filter.trim().toLowerCase()));
-  const validManualId = manualId.trim().length > 0 && !modelIds.includes(manualId.trim());
+  const selectedIds = selection.filter((modelId) => !modelIds.includes(modelId));
+  const duplicateIds = new Set(modelIds.filter((modelId, index) => modelId && modelIds.indexOf(modelId) !== index));
+  const invalidModelIds = duplicateIds.size > 0 || modelIds.some((modelId) => !validModelText(modelId));
+  const invalidNames = draft?.models.some((model) => !!model.display_name.trim() && !validModelText(model.display_name.trim()));
   const waitingForDefaults = metadata.isFetching && draft?.models.some((model) =>
-    model.context_budget === null || model.reasoning_levels === null);
+    model.id.trim() === model.lookupId && (model.context_budget === null || model.reasoning_levels === null));
+  const defaultModel = draft?.models.find((model) => model.rowKey === draft.defaultModelKey);
+  const canSubmit = !(disabled || listing || invalidModelIds || invalidNames || selectedIds.length || (navigation && !defaultModel));
 
   function resetModelList() {
     setServiceModels(null);
@@ -93,57 +128,83 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
     }
   }
 
-  function addModels(requested: string[]) {
+  function appendModels(requested: string[], focusOnAdd = false) {
     if (!draft) return;
-    const additions = [...new Set(requested.map((name) => name.trim()))].filter((name) => name && !modelIds.includes(name));
-    if (additions.some((name) => new TextEncoder().encode(name).length > 256 || /\p{Cc}/u.test(name))) {
-      setError("模型 ID 必须在 256 字节以内，且不能包含控制字符。");
-      return;
-    }
-    if (draft.models.length + additions.length > MAX_MODELS) {
+    if (draft.models.length + requested.length > MAX_MODELS) {
       setError(`最多可添加 ${MAX_MODELS} 个模型。`);
       return;
     }
-    if (!additions.length) return;
-    const models = additions.map((modelId) => ({id: modelId, context_budget: null, reasoning_levels: null}));
-    setEdited({...draft, model: draft.model || additions[0], models: [...draft.models, ...models]});
-    setSelection((selected) => selected.filter((name) => !additions.includes(name)));
-    if (additions.includes(manualId.trim())) setManualId("");
+    const additions = requested.map((id) => ({
+      id, display_name: id, rowKey: nextRowKey.current++, lookupId: id, focusOnAdd,
+      context_budget: null, reasoning_levels: null,
+    }));
+    setEdited({...draft, defaultModelKey: draft.defaultModelKey ?? additions[0]?.rowKey, models: [...draft.models, ...additions]});
+    if (!focusOnAdd) resetModelList();
     setError(undefined);
   }
 
-  function updateModel(modelId: string, change: Partial<ModelDraft>) {
-    if (draft) setEdited({...draft, models: draft.models.map((model) => model.id === modelId ? {...model, ...change} : model)});
-  }
-
-  function removeModel(modelId: string) {
+  function updateModel(rowKey: number, change: Partial<ModelDraft>) {
     if (!draft) return;
-    const models = draft.models.filter((model) => model.id !== modelId);
-    setEdited({...draft, models, model: draft.model === modelId ? models[0]?.id || "" : draft.model});
+    const models = draft.models.map((model) => model.rowKey === rowKey ? {...model, ...change} : model);
+    setEdited({...draft, models});
   }
 
-  function contextFor(model: ModelDraft) {
-    return model.context_budget ?? metadataById.get(model.id)?.contextBudget ?? DEFAULT_CONTEXT;
+  function removeModel(rowKey: number) {
+    if (!draft) return;
+    const models = draft.models.filter((model) => model.rowKey !== rowKey);
+    const defaultModelKey = draft.defaultModelKey === rowKey ? models[0]?.rowKey : draft.defaultModelKey;
+    setEdited({...draft, models, defaultModelKey});
   }
 
-  function levelsFor(model: ModelDraft) {
-    return model.reasoning_levels ?? metadataById.get(model.id)?.reasoningLevels ?? [];
+  function moveModel(rowKey: number, to: number) {
+    if (!draft || to < 0 || to >= draft.models.length) return;
+    const from = draft.models.findIndex((model) => model.rowKey === rowKey);
+    if (from < 0 || from === to) return;
+    const models = [...draft.models];
+    const [moved] = models.splice(from, 1);
+    models.splice(to, 0, moved);
+    setEdited({...draft, models});
+  }
+
+  function contextFor(model: ModelDraft, defaults = metadataById) {
+    return model.context_budget ?? defaults.get(model.id.trim())?.contextBudget ?? DEFAULT_CONTEXT;
+  }
+
+  function levelsFor(model: ModelDraft, defaults = metadataById) {
+    return model.reasoning_levels ?? defaults.get(model.id.trim())?.reasoningLevels ?? [];
   }
 
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!draft || saving || listing || waitingForDefaults || !draft.model || manualId.trim() || selection.length) return;
+    if (!draft || !canSubmit) return;
     setSaving(true);
     onSavingChange?.(true);
     setError(undefined);
     try {
       const key = apiKey.trim();
-      const models = draft.models.map((model) => ({
-        ...model, context_budget: contextFor(model), reasoning_levels: levelsFor(model),
+      const {models: rows, defaultModelKey: _, ...settings} = draft;
+      // A click on Save can also be the first blur of an edited request ID.
+      // Resolve defaults for the IDs being saved, even when that lookup just started.
+      let defaults = metadataById;
+      if (rows.some((model) => model.context_budget === null || model.reasoning_levels === null)) {
+        const idsToResolve = [...modelIds].sort();
+        const queryKey = ["agent-model-metadata", baseUrl, idsToResolve];
+        if (queryClient.getQueryState(queryKey)?.status !== "error") {
+          const matches = await queryClient.fetchQuery({
+            queryKey, queryFn: () => api<ModelMetadata[]>(modelMetadataQuery, {baseUrl, modelIds: idsToResolve}),
+            staleTime: Infinity, retry: false,
+          }).catch(() => []);
+          defaults = new Map(matches.map((model) => [model.id, model]));
+        }
+      }
+      const models = rows.map((model) => ({
+        display_name: model.display_name.trim() || model.id.trim(),
+        id: model.id.trim(),
+        context_budget: contextFor(model, defaults), reasoning_levels: levelsFor(model, defaults),
       }));
-      const next = {...draft, base_url: baseUrl, models,
-        context_budget: models.find((model) => model.id === draft.model)?.context_budget ?? DEFAULT_CONTEXT,
-        api_key_ref: key ? "model.api_key" : draft.api_key_ref};
+      const next: AppSettings = {...settings, base_url: baseUrl, models, model: defaultModel?.id.trim() ?? "",
+        context_budget: defaultModel ? contextFor(defaultModel, defaults) : DEFAULT_CONTEXT,
+        api_key_ref: key ? "model.api_key" : settings.api_key_ref};
       if (key) await api("set_secret", {key: "model.api_key", value: key});
       await api("set_settings", {settings: next});
       setApiKey("");
@@ -161,7 +222,6 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
     }
   }
 
-  const canSubmit = !(disabled || listing || waitingForDefaults || !draft?.model || !!manualId.trim() || !!selection.length);
   return <form className="flex flex-col gap-6" onSubmit={(event) => {void save(event);}}>
     <FieldGroup className={navigation ? "px-6" : undefined}>
       {(error || settings.error) && <Alert variant="destructive"><AlertDescription>{error || errorText(settings.error)}</AlertDescription></Alert>}
@@ -189,90 +249,180 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
         </Field>
       </div>
 
-      <FieldSet disabled={disabled}>
-        <FieldLegend variant="label">添加模型</FieldLegend>
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="min-w-48 flex-1">
-            <Label htmlFor={`${id}-model`} className="sr-only">模型名称</Label>
-            <Input id={`${id}-model`} value={manualId} placeholder="输入模型 ID" onChange={(event) => setManualId(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.nativeEvent.isComposing) {
-                  event.preventDefault();
-                  addModels([manualId]);
-                }
-              }}/>
+      {draft && <section aria-labelledby={`${id}-models`} className="@container flex min-w-0 flex-col gap-3">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="flex min-w-0 flex-col gap-1">
+            <h3 id={`${id}-models`} className="text-sm font-semibold">模型列表</h3>
+            <FieldDescription role="status" className={metadata.isError ? "text-warning" : undefined}>
+              {waitingForDefaults ? "正在读取模型元数据…" : metadata.isError ? "暂时无法读取 BaseLLM 元数据" : "保存后应用到新的 Agent 请求。"}
+            </FieldDescription>
           </div>
-          <Button type="button" variant="outline" disabled={!validManualId} onClick={() => addModels([manualId])}><PlusIcon data-icon="inline-start"/>添加模型</Button>
-          <Button type="button" variant="outline" disabled={listing || !baseUrl} onClick={() => {void listModels();}}>{listing ? "获取中…" : "获取模型列表"}</Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" variant="outline" size="sm" disabled={disabled || listing || !baseUrl} onClick={() => {void listModels();}}>
+              {listing ? <Spinner data-icon="inline-start"/> : <DownloadIcon data-icon="inline-start"/>}
+              {listing ? "获取中…" : "获取模型列表"}
+            </Button>
+            <Button type="button" variant="outline" size="sm" disabled={disabled || draft.models.length >= MAX_MODELS} onClick={() => appendModels([""], true)}>
+              <PlusIcon data-icon="inline-start"/>手动添加
+            </Button>
+          </div>
         </div>
+
         {listError && <p className="text-sm text-warning" role="status">{listError}。也可以手动添加模型 ID。</p>}
-        {available && <FieldSet className="gap-3 rounded-lg border p-4">
+        {available && <FieldSet disabled={disabled} className="gap-3 rounded-lg border p-4">
           <FieldLegend variant="label">服务商模型（可多选）</FieldLegend>
           <Label htmlFor={`${id}-filter`} className="sr-only">搜索服务商模型</Label>
           <Input id={`${id}-filter`} type="search" value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="搜索模型 ID"/>
-          <ScrollArea className="max-h-48 rounded-md border">
+          <ScrollArea className="min-w-0 rounded-md border [&_[data-slot=scroll-area-viewport]]:max-h-48 [&_[data-slot=scroll-area-viewport]>div]:block!">
             <div className="flex flex-col gap-2 p-3">
               {available.slice(0, 100).map((name) => <Label key={name} className="font-normal break-all">
-                <Checkbox checked={selection.includes(name)} onCheckedChange={(checked) => setSelection((current) => checked === true ? [...current, name] : current.filter((item) => item !== name))}/>
+                <Checkbox checked={selectedIds.includes(name)} onCheckedChange={(checked) => setSelection((current) => checked === true ? [...current, name] : current.filter((item) => item !== name))}/>
                 <span>{name}</span>
               </Label>)}
               {!available.length && <p className="text-sm text-muted-foreground">没有可添加的匹配模型。</p>}
             </div>
           </ScrollArea>
           {available.length > 100 && <FieldDescription>请搜索以查看其他模型。</FieldDescription>}
-          <div><Button type="button" size="sm" variant="outline" disabled={!selection.length} onClick={() => addModels(selection)}>添加所选（{selection.length}）</Button></div>
+          <div className="flex flex-wrap gap-2">
+            <Button type="button" size="sm" variant="outline" disabled={!selectedIds.length} onClick={() => appendModels(selectedIds)}>添加所选（{selectedIds.length}）</Button>
+            <Button type="button" size="sm" variant="ghost" onClick={resetModelList}>收起</Button>
+          </div>
         </FieldSet>}
-      </FieldSet>
 
-      {!!draft?.models.length && <FieldSet disabled={disabled}>
-        <FieldLegend variant="label">模型配置</FieldLegend>
-        {draft.models.length > 1 && <Field>
+        {draft.models.length ? <div className="min-w-0 rounded-lg border">
+          <Table aria-label="模型列表" role="table" className="block @min-[37rem]:table @min-[37rem]:table-fixed">
+            <TableHeader role="rowgroup" className="sr-only @min-[37rem]:not-sr-only @min-[37rem]:table-header-group">
+              <TableRow role="row">
+                <TableHead role="columnheader" scope="col" className="h-8 w-9" aria-label="排序"/>
+                <TableHead role="columnheader" scope="col" className={modelColumnHead}>菜单显示名</TableHead>
+                <TableHead role="columnheader" scope="col" className={modelColumnHead}>实际请求模型</TableHead>
+                <TableHead role="columnheader" scope="col" className={cn(modelColumnHead, "w-[7rem]")}>上下文窗口</TableHead>
+                <TableHead role="columnheader" scope="col" className={cn(modelColumnHead, "w-[24%]")}>思考等级</TableHead>
+                <TableHead role="columnheader" scope="col" className="h-8 w-9" aria-label="删除"/>
+              </TableRow>
+            </TableHeader>
+            <TableBody role="rowgroup" className="block @min-[37rem]:table-row-group">
+              {draft.models.map((model, index) => {
+                const {rowKey} = model;
+                const requestId = model.id.trim();
+                const displayName = model.display_name.trim();
+                const fieldName = requestId || "新模型";
+                const rowName = displayName || fieldName;
+                const details = metadataById.get(requestId);
+                const enabledLevels = levelsFor(model);
+                return <TableRow key={rowKey} role="row" data-state={draggingRow === rowKey ? "selected" : undefined}
+                  className="grid grid-cols-2 gap-x-2 gap-y-1.5 p-2 @min-[37rem]:table-row @min-[37rem]:p-0"
+                  onDragOver={(event) => {
+                    if (draggingRow === undefined || disabled) return;
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = "move";
+                  }}
+                  onDrop={(event) => {
+                    if (draggingRow === undefined || disabled) return;
+                    event.preventDefault();
+                    moveModel(draggingRow, index);
+                    setDraggingRow(undefined);
+                  }}>
+                  <TableCell role="cell" className="min-w-0 p-0 @min-[37rem]:px-1">
+                    <Button type="button" variant="ghost" size="icon-sm" aria-label={`移动 ${rowName}`}
+                      title="拖动排序，或按 ↑ / ↓ 移动" aria-keyshortcuts="ArrowUp ArrowDown"
+                      disabled={disabled || draft.models.length < 2} draggable={!disabled && draft.models.length > 1}
+                      className="cursor-grab active:cursor-grabbing"
+                      onDragStart={(event) => {
+                        event.dataTransfer.effectAllowed = "move";
+                        event.dataTransfer.setData("text/plain", String(rowKey));
+                        setDraggingRow(rowKey);
+                      }}
+                      onDragEnd={() => setDraggingRow(undefined)}
+                      onKeyDown={(event) => {
+                        if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+                        event.preventDefault();
+                        const handle = event.currentTarget;
+                        moveModel(rowKey, index + (event.key === "ArrowUp" ? -1 : 1));
+                        requestAnimationFrame(() => {
+                          if (document.activeElement === document.body) handle.focus();
+                        });
+                      }}>
+                      <GripVerticalIcon aria-hidden="true"/>
+                    </Button>
+                  </TableCell>
+                  <TableCell role="cell" className={modelTableCell}>
+                    <span className={compactFieldLabel} aria-hidden="true">菜单显示名</span>
+                    <Input aria-label={`${fieldName} 菜单显示名`} className={modelInput} value={model.display_name}
+                      placeholder={requestId || "可留空"} disabled={disabled}
+                      aria-invalid={!!displayName && !validModelText(displayName)}
+                      onChange={(event) => updateModel(rowKey, {display_name: event.target.value})}/>
+                  </TableCell>
+                  <TableCell role="cell" className={modelTableCell}>
+                    <span className={compactFieldLabel} aria-hidden="true">实际请求模型</span>
+                    <Input aria-label={`${fieldName} 实际请求模型`} className={modelInput} value={model.id}
+                      autoFocus={model.focusOnAdd} autoComplete="off" spellCheck={false} placeholder="输入模型 ID"
+                      required disabled={disabled} aria-invalid={duplicateIds.has(requestId) || (!!requestId && !validModelText(requestId))}
+                      onChange={(event) => updateModel(rowKey, {id: event.target.value})}
+                      onBlur={() => {
+                        if (requestId !== model.lookupId || requestId !== model.id) updateModel(rowKey, {id: requestId, lookupId: requestId});
+                      }}/>
+                  </TableCell>
+                  <TableCell role="cell" className={modelTableCell}>
+                    <span className={compactFieldLabel} aria-hidden="true">上下文窗口</span>
+                    <Input aria-label={`${fieldName} 上下文预算`} className={cn(modelInput, "tabular-nums")}
+                      type="number" min={1} max={MAX_CONTEXT} required disabled={disabled}
+                      title={details?.contextBudget ? `BaseLLM 建议 ${details.contextBudget.toLocaleString("zh-CN")} tokens` : undefined}
+                      value={model.context_budget === 0 ? "" : contextFor(model)}
+                      onChange={(event) => updateModel(rowKey, {context_budget: Number(event.target.value)})}/>
+                  </TableCell>
+                  <TableCell role="cell" className={modelTableCell}>
+                    <span className={compactFieldLabel} aria-hidden="true">思考等级</span>
+                    <DropdownMenu modal={false}>
+                      <DropdownMenuTrigger asChild>
+                        <Button type="button" variant="outline" size="sm" className="w-full justify-between gap-1.5 px-2 font-normal"
+                          aria-label={`${fieldName} 思考等级`} disabled={disabled} title={enabledLevels.join(", ") || "服务默认"}>
+                          <span className="min-w-0 truncate">{summarizeLevels(enabledLevels)}</span><ChevronDownIcon aria-hidden="true"/>
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end" className="min-w-40">
+                        <DropdownMenuGroup>
+                          <DropdownMenuLabel>启用的思考等级</DropdownMenuLabel>
+                          {REASONING_LEVELS.map((level) => <DropdownMenuCheckboxItem key={level}
+                            checked={enabledLevels.includes(level)} onSelect={(event) => event.preventDefault()}
+                            onCheckedChange={(checked) => updateModel(rowKey, {reasoning_levels: REASONING_LEVELS.filter((option) =>
+                              option === level ? checked : enabledLevels.includes(option))})}>
+                            {reasoningEffortLabel(level)}
+                          </DropdownMenuCheckboxItem>)}
+                        </DropdownMenuGroup>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </TableCell>
+                  <TableCell role="cell" className="col-start-2 row-start-1 justify-self-end p-0 text-right @min-[37rem]:px-1">
+                    <Button type="button" variant="ghost" size="icon-sm" aria-label={`删除 ${rowName}`} disabled={disabled}
+                      title="删除模型" onClick={() => removeModel(rowKey)}>
+                      <Trash2Icon aria-hidden="true"/>
+                    </Button>
+                  </TableCell>
+                </TableRow>;
+              })}
+            </TableBody>
+          </Table>
+        </div> : <Empty className="border p-5 md:p-5">
+          <EmptyHeader><EmptyTitle>暂无模型</EmptyTitle><EmptyDescription>从服务商获取模型列表，或手动添加。</EmptyDescription></EmptyHeader>
+        </Empty>}
+
+        {modelIds.some((modelId) => !!modelId && !validModelText(modelId)) || invalidNames
+          ? <FieldDescription role="status">模型名称最多 256 字节，且不能包含控制字符。</FieldDescription> : null}
+        {duplicateIds.size > 0 && <FieldDescription role="status">实际请求模型 ID 不能重复。</FieldDescription>}
+        {draft.models.length > 1 && <Field className="@min-[37rem]:max-w-xs">
           <FieldLabel htmlFor={`${id}-default`}>默认模型</FieldLabel>
-          <NativeSelect id={`${id}-default`} className="w-full" value={draft.model} onChange={(event) => setEdited({...draft, model: event.target.value})}>
-            {draft.models.map((model) => <NativeSelectOption key={model.id}>{model.id}</NativeSelectOption>)}
+          <NativeSelect id={`${id}-default`} className="w-full" value={defaultModel?.id ?? ""} disabled={disabled}
+            onChange={(event) => {
+              const model = draft.models.find((candidate) => candidate.id === event.target.value);
+              if (model) setEdited({...draft, defaultModelKey: model.rowKey});
+            }}>
+            {draft.models.map((model) => <NativeSelectOption key={model.rowKey} value={model.id} disabled={!model.id.trim()}>
+              {model.display_name.trim() || model.id || "新模型"}
+            </NativeSelectOption>)}
           </NativeSelect>
         </Field>}
-        {metadata.isFetching && <p className="flex items-center gap-2 text-sm text-muted-foreground" role="status"><Spinner/>正在查找 BaseLLM 模型元数据…</p>}
-        {metadata.isError && <p className="text-sm text-warning" role="status">暂时无法读取 BaseLLM 元数据，仍可手动填写上下文预算。</p>}
-        <ItemGroup className="gap-3">
-          {draft.models.map((model) => {
-            const details = metadataById.get(model.id);
-            const enabledLevels = levelsFor(model);
-            const savedLevels = saved?.models.find((item) => item.id === model.id)?.reasoning_levels ?? [];
-            const levels = [...new Set([...(details?.reasoningLevels ?? []), ...savedLevels, ...enabledLevels])];
-            return <Item key={model.id} variant="outline" className="items-start">
-              <ItemContent className="min-w-0 gap-4">
-                <ItemTitle className="break-all">{model.id}</ItemTitle>
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <Field>
-                    <FieldLabel htmlFor={`${id}-${model.id}-ctx`}>上下文预算</FieldLabel>
-                    <Input id={`${id}-${model.id}-ctx`} aria-label={`${model.id} 上下文预算`} type="number" min={1} max={MAX_CONTEXT} required
-                      value={model.context_budget === 0 ? "" : contextFor(model)}
-                      onChange={(event) => updateModel(model.id, {context_budget: Number(event.target.value)})}/>
-                    {details?.contextBudget && <FieldDescription>BaseLLM 建议 {details.contextBudget.toLocaleString("zh-CN")} tokens</FieldDescription>}
-                  </Field>
-                  <FieldSet aria-label={`${model.id} 思考等级`}>
-                    <FieldLegend variant="label">思考等级</FieldLegend>
-                    {!!levels.length && <div className="flex flex-wrap gap-x-4 gap-y-2">
-                      {levels.map((level) => <Label key={level} className="font-normal">
-                        <Checkbox checked={enabledLevels.includes(level)} onCheckedChange={(next) => {
-                          const checked = next === true;
-                          updateModel(model.id, {reasoning_levels: levels.filter((option) =>
-                            option === level ? checked : enabledLevels.includes(option))});
-                        }}/>
-                        <span>{reasoningEffortLabel(level)}</span>
-                      </Label>)}
-                    </div>}
-                    {levels.length ? <FieldDescription>所选等级可在 Agent 对话中切换。</FieldDescription> :
-                      !metadata.isFetching && <FieldDescription>该模型暂无可选的思考等级。</FieldDescription>}
-                  </FieldSet>
-                </div>
-              </ItemContent>
-              <ItemActions><Button type="button" variant="ghost" size="icon-sm" aria-label={`移除 ${model.id}`} onClick={() => removeModel(model.id)}><XIcon/></Button></ItemActions>
-            </Item>;
-          })}
-        </ItemGroup>
-      </FieldSet>}
+      </section>}
 
       <Field>
         <FieldLabel htmlFor={`${id}-permission`}>默认权限策略</FieldLabel>
@@ -280,7 +430,7 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
           if (draft) setEdited({...draft, permission_mode: event.target.value as AppSettings["permission_mode"]});
         }}>
           <NativeSelectOption value="request_approval">逐次审批（推荐）</NativeSelectOption>
-          <NativeSelectOption value="auto_approve">已登记游戏目录内自动批准</NativeSelectOption>
+          <NativeSelectOption value="auto_approve">管理中的游戏目录内自动批准</NativeSelectOption>
           <NativeSelectOption value="full_trust">完全信任</NativeSelectOption>
         </NativeSelect>
       </Field>

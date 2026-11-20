@@ -156,6 +156,7 @@ async fn real_sse_tool_loop_waits_for_approval_and_replays_history() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "移入回收站".into(),
+            model: None,
             permission_mode: None,
             reasoning_effort: None,
         })
@@ -265,6 +266,7 @@ async fn automatic_fomod_sse_install_applies_the_reviewed_plan_and_returns_a_rec
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "安装归档中可自动选择的 FOMOD 文件".into(),
+            model: None,
             permission_mode: Some(super::policy::PermissionMode::AutoApprove),
             reasoning_effort: None,
         })
@@ -391,6 +393,7 @@ async fn reject_approval_does_not_touch_game_files() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "trash".into(),
+            model: None,
             permission_mode: None,
             reasoning_effort: None,
         })
@@ -434,6 +437,7 @@ async fn rejected_plugin_publication_never_grants_upload_consent_in_either_revie
             .start_turn(TurnRequest {
                 conversation_id: conv.clone(),
                 content: "发布适配包".into(),
+                model: None,
                 permission_mode: Some(mode),
                 reasoning_effort: None,
             })
@@ -490,6 +494,7 @@ async fn rejected_online_identification_never_searches_or_registers_in_either_re
             .start_turn(TurnRequest {
                 conversation_id: conv.clone(),
                 content: "识别这个游戏，先审核搜索词".into(),
+                model: None,
                 permission_mode: Some(mode),
                 reasoning_effort: None,
             })
@@ -531,6 +536,76 @@ async fn rejected_online_identification_never_searches_or_registers_in_either_re
 }
 
 #[tokio::test]
+async fn questionnaire_waits_for_valid_answers_and_resumes_with_ordered_skips() {
+    let (_dir, engine, _game) = setup();
+    let questions = json!({"title":"确认适配信息","questions":[
+        {"question":"平台？","options":["Windows PC","其他"]},
+        {"question":"目录？"}
+    ]});
+    let response = format!(
+        "{}data: [DONE]\n\n",
+        event(
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"ask","function":{
+            "name":"ask_user","arguments":questions.to_string()
+        }}]},"finish_reason":"tool_calls"}]})
+        )
+    );
+    let (url, job) = server(vec![response, final_reply()]).await;
+    let (agent, conv, mut rx) = runtime(engine, &url);
+    agent
+        .start_turn(TurnRequest {
+            conversation_id: conv.clone(),
+            content: "确认适配".into(),
+            model: None,
+            permission_mode: Some(crate::agent::policy::PermissionMode::FullTrust),
+            reasoning_effort: None,
+        })
+        .unwrap();
+    let request = next(&mut rx, "approval-request").await;
+    assert_eq!(request.payload["preview"], questions);
+    let id = request.payload["approvalId"].as_str().unwrap();
+    assert!(agent
+        .respond_approval(
+            &conv,
+            id,
+            ApprovalResponse {
+                approved: true,
+                answer: json!("[]")
+            }
+        )
+        .is_err());
+    agent
+        .respond_approval(
+            &conv,
+            id,
+            ApprovalResponse {
+                approved: true,
+                answer: json!(r#"["Windows PC",null]"#),
+            },
+        )
+        .unwrap();
+    let resolved = next(&mut rx, "approval-resolved").await;
+    assert_eq!(resolved.payload["status"], "approved");
+    let result = next(&mut rx, "tool-result").await;
+    assert_eq!(
+        result.payload["result"],
+        json!({"answer":["Windows PC",null]})
+    );
+    assert_eq!(next(&mut rx, "done").await.payload["status"], "done");
+    let requests = job.await.unwrap();
+    let response = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["tool_call_id"] == "ask")
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(response["content"].as_str().unwrap()).unwrap(),
+        result.payload["result"]
+    );
+}
+
+#[tokio::test]
 async fn cancellation_unblocks_approval_and_next_turn_repairs_tool_protocol() {
     let (_dir, engine, _game) = setup();
     let response = format!(
@@ -545,6 +620,7 @@ async fn cancellation_unblocks_approval_and_next_turn_repairs_tool_protocol() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "ask".into(),
+            model: None,
             permission_mode: None,
             reasoning_effort: None,
         })
@@ -554,6 +630,7 @@ async fn cancellation_unblocks_approval_and_next_turn_repairs_tool_protocol() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "duplicate".into(),
+            model: None,
             permission_mode: None,
             reasoning_effort: None,
         })
@@ -566,6 +643,7 @@ async fn cancellation_unblocks_approval_and_next_turn_repairs_tool_protocol() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "continue".into(),
+            model: None,
             permission_mode: None,
             reasoning_effort: None,
         })
@@ -593,11 +671,13 @@ async fn agent_turn_uses_only_reasoning_effort_enabled_for_the_active_model() {
     settings.model = "second-model".into();
     settings.models = vec![
         AgentModelSettings {
+            display_name: "Mock model".into(),
             id: "mock-model".into(),
             context_budget: 32_768,
             reasoning_levels: vec![ReasoningEffort::Low],
         },
         AgentModelSettings {
+            display_name: "Second model".into(),
             id: "second-model".into(),
             context_budget: 128_000,
             reasoning_levels: vec![ReasoningEffort::None, ReasoningEffort::High],
@@ -608,6 +688,7 @@ async fn agent_turn_uses_only_reasoning_effort_enabled_for_the_active_model() {
     let request = |reasoning_effort| TurnRequest {
         conversation_id: conv.clone(),
         content: "hi".into(),
+        model: None,
         permission_mode: None,
         reasoning_effort,
     };
@@ -630,6 +711,141 @@ async fn agent_turn_uses_only_reasoning_effort_enabled_for_the_active_model() {
     assert_eq!(requests[0]["reasoning_effort"], "high");
     assert_eq!(requests[1]["reasoning_effort"], "none");
     assert!(requests[2].get("reasoning_effort").is_none());
+}
+
+#[tokio::test]
+async fn per_turn_model_override_uses_configured_budget_and_preserves_saved_default() {
+    use crate::settings::{AgentModelSettings, ReasoningEffort};
+
+    let (_dir, engine, _) = setup();
+    let (url, job) = server(vec![final_reply()]).await;
+    let (agent, conv, mut rx) = runtime(engine, &url);
+    let mut settings = agent.settings.load().unwrap();
+    settings.models = vec![
+        AgentModelSettings {
+            display_name: "Mock model".into(),
+            id: "mock-model".into(),
+            context_budget: 1,
+            reasoning_levels: vec![ReasoningEffort::Low],
+        },
+        AgentModelSettings {
+            display_name: "Second model".into(),
+            id: "second-model".into(),
+            context_budget: 32_768,
+            reasoning_levels: vec![ReasoningEffort::Ultra],
+        },
+    ];
+    settings.model = "mock-model".into();
+    agent.settings.save(&settings).unwrap();
+
+    agent
+        .start_turn(TurnRequest {
+            conversation_id: conv.clone(),
+            content: "hi".into(),
+            model: Some("second-model".into()),
+            permission_mode: None,
+            reasoning_effort: Some(ReasoningEffort::Ultra),
+        })
+        .unwrap();
+    assert_eq!(next(&mut rx, "done").await.payload["status"], "done");
+
+    let requests = job.await.unwrap();
+    assert_eq!(requests[0]["model"], "second-model");
+    assert_eq!(requests[0]["reasoning_effort"], "ultra");
+    assert_eq!(agent.settings.load().unwrap().model, "mock-model");
+}
+
+#[test]
+fn per_turn_model_and_reasoning_are_validated_before_writing_messages() {
+    use crate::settings::{AgentModelSettings, ReasoningEffort};
+
+    let (_dir, engine, _) = setup();
+    let (agent, conv, _rx) = runtime(engine, "http://127.0.0.1:1");
+    let mut settings = agent.settings.load().unwrap();
+    settings.models = vec![AgentModelSettings {
+        display_name: "Second model".into(),
+        id: "second-model".into(),
+        context_budget: 32_768,
+        reasoning_levels: vec![ReasoningEffort::High],
+    }];
+    settings.model = "second-model".into();
+    agent.settings.save(&settings).unwrap();
+    let history = History::new(agent.engine.db.clone());
+    let initial_messages = history.get_conversation(&conv).unwrap().messages.len();
+    let initial_turns: i64 = agent
+        .engine
+        .db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM agent_turns WHERE conversation_id=?1",
+            [&conv],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let parsed: TurnRequest = serde_json::from_value(json!({
+        "conversationId": conv,
+        "content": "parsed",
+        "model": "second-model",
+        "permissionMode": null,
+        "reasoningEffort": "high"
+    }))
+    .unwrap();
+    assert_eq!(parsed.model.as_deref(), Some("second-model"));
+    assert_eq!(parsed.reasoning_effort, Some(ReasoningEffort::High));
+    let parsed_default: TurnRequest = serde_json::from_value(json!({
+        "conversationId": "conversation",
+        "content": "parsed"
+    }))
+    .unwrap();
+    assert!(parsed_default.model.is_none());
+    let parsed_null: TurnRequest = serde_json::from_value(json!({
+        "conversationId": "conversation",
+        "content": "parsed",
+        "model": null
+    }))
+    .unwrap();
+    assert!(parsed_null.model.is_none());
+
+    let invalid_model = agent.start_turn(TurnRequest {
+        conversation_id: conv.clone(),
+        content: "invalid model".into(),
+        model: Some("not-configured".into()),
+        permission_mode: None,
+        reasoning_effort: None,
+    });
+    assert!(matches!(
+        invalid_model,
+        Err(crate::error::AppError::Invalid(_))
+    ));
+
+    let invalid_reasoning = agent.start_turn(TurnRequest {
+        conversation_id: conv.clone(),
+        content: "invalid reasoning".into(),
+        model: Some("second-model".into()),
+        permission_mode: None,
+        reasoning_effort: Some(ReasoningEffort::Low),
+    });
+    assert!(matches!(
+        invalid_reasoning,
+        Err(crate::error::AppError::Invalid(_))
+    ));
+    assert_eq!(
+        history.get_conversation(&conv).unwrap().messages.len(),
+        initial_messages
+    );
+    assert_eq!(
+        agent
+            .engine
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_turns WHERE conversation_id=?1",
+                [&conv],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        initial_turns
+    );
 }
 
 #[tokio::test]
@@ -669,6 +885,96 @@ async fn model_http_error_keeps_status_and_provider_details_with_key_redacted() 
     job.await.unwrap();
 }
 
+/// Serves each scripted reply on its own connection. A reply is cut short (declared
+/// length larger than what is sent) when `truncate` is true, which reqwest reports as a body error.
+async fn flaky_server(replies: Vec<(String, bool)>) -> (String, tokio::task::JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let job = tokio::spawn(async move {
+        let mut served = 0;
+        for (reply, truncate) in replies {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                header.push(byte[0]);
+            }
+            let length = String::from_utf8(header)
+                .unwrap()
+                .lines()
+                .find_map(|s| {
+                    s.to_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|s| s.parse::<usize>().ok())
+                })
+                .unwrap();
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).await.unwrap();
+            let declared = reply.len() + if truncate { 4096 } else { 0 };
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n");
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(reply.as_bytes()).await.unwrap();
+            socket.shutdown().await.ok();
+            served += 1;
+        }
+        served
+    });
+    (format!("http://{addr}/v1"), job)
+}
+
+fn mock_config(base_url: String) -> super::client::ModelConfig {
+    super::client::ModelConfig {
+        reasoning_effort: None,
+        base_url,
+        model: "mock-model".into(),
+        api_key: None,
+    }
+}
+
+#[tokio::test]
+async fn model_stream_dropped_before_any_output_is_retried() {
+    let (base_url, job) = flaky_server(vec![(String::new(), true), (final_reply(), false)]).await;
+    let mut seen = String::new();
+    let completion = super::client::ModelClient::new()
+        .unwrap()
+        .stream(
+            &mock_config(base_url),
+            &[],
+            &[],
+            &tokio_util::sync::CancellationToken::new(),
+            |delta, _| {
+                seen.push_str(&delta.content);
+                Ok(())
+            },
+        )
+        .await
+        .expect("the retry should succeed");
+    assert_eq!(completion.content, "完成");
+    assert_eq!(seen, "完成");
+    assert_eq!(job.await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn model_stream_dropped_after_output_is_not_retried() {
+    let partial = event(json!({"choices":[{"index":0,"delta":{"content":"半截"}}]}));
+    let (base_url, job) = flaky_server(vec![(partial, true)]).await;
+    let error = super::client::ModelClient::new()
+        .unwrap()
+        .stream(
+            &mock_config(base_url),
+            &[],
+            &[],
+            &tokio_util::sync::CancellationToken::new(),
+            |_, _| Ok(()),
+        )
+        .await
+        .err()
+        .expect("a partial reply cannot be replayed")
+        .to_string();
+    assert!(error.contains("模型流连接中断"), "{error}");
+    assert_eq!(job.await.unwrap(), 1);
+}
 #[tokio::test]
 async fn unconfigured_model_reports_why_the_turn_failed_without_a_delta() {
     let (_dir, engine, _) = setup();
@@ -678,6 +984,7 @@ async fn unconfigured_model_reports_why_the_turn_failed_without_a_delta() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "hi".into(),
+            model: None,
             permission_mode: None,
             reasoning_effort: None,
         })
@@ -711,6 +1018,7 @@ async fn model_sse_error_replays_on_the_partial_reply_without_entering_history()
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "hi".into(),
+            model: None,
             permission_mode: None,
             reasoning_effort: None,
         })
@@ -751,6 +1059,7 @@ async fn truncated_tool_stream_never_executes() {
         .start_turn(TurnRequest {
             conversation_id: conv,
             content: "trash".into(),
+            model: None,
             permission_mode: Some(super::policy::PermissionMode::FullTrust),
             reasoning_effort: None,
         })
@@ -782,6 +1091,7 @@ async fn context_compression_preserves_full_history_and_summarizes_only_older_tu
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "继续安装".into(),
+            model: None,
             permission_mode: None,
             reasoning_effort: None,
         })
@@ -814,6 +1124,7 @@ async fn cancel_stalled_model_request_finishes_without_waiting_for_network_timeo
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "request".into(),
+            model: None,
             permission_mode: None,
             reasoning_effort: None,
         })
@@ -855,6 +1166,7 @@ async fn auto_approve_applies_only_registered_game_plan_without_prompt() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "安装".into(),
+            model: None,
             permission_mode: Some(super::policy::PermissionMode::AutoApprove),
             reasoning_effort: None,
         })
@@ -896,6 +1208,7 @@ async fn auto_approve_requires_confirmation_for_move_out_of_manager_storage() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "Move".into(),
+            model: None,
             permission_mode: Some(super::policy::PermissionMode::AutoApprove),
             reasoning_effort: None,
         })

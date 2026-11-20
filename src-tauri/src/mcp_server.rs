@@ -650,7 +650,7 @@ impl DesktopSession {
                 runtime.engine.db.conn().execute("UPDATE tool_calls SET approval_status='pending' WHERE id=?1", [&call.id])?;
                 approval_status = "denied";
                 let response = runtime.approvals.request(&turn, &conv, &message.id, &call.id, name, preview, cancel).await?;
-                approval_status = "approved";
+                approval_status = if response.approved { "approved" } else { "rejected" };
                 Some(response)
             } else { None };
             if cancel.is_cancelled() { return Err(AppError::Cancelled); }

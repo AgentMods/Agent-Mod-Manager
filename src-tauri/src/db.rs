@@ -28,6 +28,14 @@ impl Db {
     fn migrate(&self) -> AppResult<()> {
         let c = self.conn();
         c.execute_batch(SCHEMA)?;
+        let has_auto_title: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='auto_title_pending')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_auto_title {
+            c.execute("ALTER TABLE conversations ADD COLUMN auto_title_pending INTEGER NOT NULL DEFAULT 0", [])?;
+        }
         // lightweight forward migrations
         let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < SCHEMA_VERSION {
@@ -271,6 +279,7 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL DEFAULT '新对话',
+  auto_title_pending INTEGER NOT NULL DEFAULT 0,
   game_id TEXT,
   task_summary TEXT,
   archived INTEGER NOT NULL DEFAULT 0,

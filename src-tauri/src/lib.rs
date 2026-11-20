@@ -34,6 +34,7 @@ pub mod skills;
 pub mod snapshot;
 pub mod sources;
 pub mod storage;
+mod storage_location;
 pub mod transaction;
 pub mod trash;
 pub mod util;
@@ -53,6 +54,7 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
+            commands::migrate_storage,
             commands::start_onboarding,
             commands::set_onboarding_completed,
             commands::list_plugins,
@@ -85,6 +87,7 @@ pub fn run() {
             commands::list_games,
             commands::get_game,
             commands::update_game,
+            commands::set_game_adapter,
             commands::remove_game,
             commands::open_game_location,
             commands::launch_game,
@@ -111,10 +114,15 @@ pub fn run() {
             commands::list_conversations,
             commands::get_conversation,
             commands::archive_conversation,
+            commands::rename_conversation,
+            commands::set_conversation_pinned,
+            commands::delete_conversation,
             commands::get_settings,
             commands::list_agent_models,
             commands::get_agent_model_metadata,
             commands::set_settings,
+            commands::get_composer_preferences,
+            commands::set_composer_preferences,
             commands::set_secret,
             commands::set_conversation_permission,
             commands::search_mods,
@@ -142,8 +150,12 @@ pub fn run() {
             commands::read_file
         ])
         .setup(|app| {
-            let services = app::AppServices::initialize(app.path().app_data_dir()?)?;
-            let credentials = encrypted_store::open(app.handle(), &services.engine.paths.root)?;
+            let location = storage_location::StorageLocation::new(app.path().app_data_dir()?)?;
+            let credentials = encrypted_store::open(app.handle(), location.default_root())?;
+            let root = location.startup_root()?;
+            let paths = storage::AppPaths::new(root)?.with_control_root(location.default_root());
+            let services = app::AppServices::initialize_paths(paths)?;
+            app.manage(location);
             let handle = app.handle().clone();
             let agent = agent::runtime::AgentRuntime::new(
                 services.engine.clone(),

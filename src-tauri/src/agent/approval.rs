@@ -1,4 +1,4 @@
-use super::events::Events;
+use super::{events::Events, questions::AnswerShape};
 use crate::{
     error::{AppError, AppResult},
     util,
@@ -21,6 +21,7 @@ pub struct ApprovalResponse {
 }
 struct Pending {
     conversation: String,
+    answer_shape: Option<AnswerShape>,
     sender: oneshot::Sender<ApprovalResponse>,
 }
 #[derive(Clone)]
@@ -56,6 +57,8 @@ impl Approvals {
                 id.clone(),
                 Pending {
                     conversation: conv.into(),
+                    answer_shape: (title == "ask_user")
+                        .then(|| AnswerShape::from_preview(&payload)),
                     sender: tx,
                 },
             );
@@ -99,18 +102,25 @@ impl Approvals {
             json!({"approvalId":id,"status":status}),
         )?;
         let value = response?;
-        if !value.approved {
+        if !value.approved && title != "ask_user" {
             return Err(AppError::Denied("用户拒绝了此操作".into()));
         }
         Ok(value)
     }
-    pub fn respond(&self, conv: &str, id: &str, response: ApprovalResponse) -> AppResult<()> {
+    pub fn respond(&self, conv: &str, id: &str, mut response: ApprovalResponse) -> AppResult<()> {
         let mut map = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         let p = map
             .get(id)
             .ok_or_else(|| AppError::NotFound("审批不存在、已处理或已过期".into()))?;
         if p.conversation != conv {
             return Err(AppError::Denied("审批不属于此会话".into()));
+        }
+        if let Some(shape) = &p.answer_shape {
+            response.answer = if response.approved {
+                shape.validate(&response.answer)?
+            } else {
+                Value::Null
+            };
         }
         let p = map.remove(id).unwrap();
         p.sender.send(response).map_err(|_| AppError::Cancelled)

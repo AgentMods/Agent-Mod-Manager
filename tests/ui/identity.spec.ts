@@ -4,6 +4,7 @@ import { installMockTauri } from './mock-tauri';
 async function openIdentity(page: Page) {
   await installMockTauri(page);
   await page.goto('/');
+  await page.getByRole('button', {name: '游戏库', exact: true}).click();
   await page.getByLabel('游戏目录', {exact: true}).fill('/sandbox/unknown-game');
   await page.getByRole('button', {name: '检查目录', exact: true}).click();
   await page.getByRole('button', {name: '联网识别', exact: true}).click();
@@ -22,13 +23,13 @@ test('online game identity separates search consent from root registration', asy
   await modal.getByLabel('同意发送公开搜索词', {exact: true}).check();
   await modal.getByRole('button', {name: '搜索候选', exact: true}).click();
   await expect(modal.getByLabel('同意发送公开搜索词', {exact: true})).not.toBeChecked();
-  await expect(modal.getByRole('button', {name: '确认登记', exact: true})).toBeDisabled();
+  await expect(modal.getByRole('button', {name: '添加', exact: true})).toBeDisabled();
   await modal.getByRole('radio').first().check();
   await expect(modal.getByLabel('确认的游戏名称', {exact: true})).toHaveValue('Fixture Game');
-  await modal.getByLabel('确认游戏目录登记', {exact: true}).check();
+  await modal.getByLabel('确认添加', {exact: true}).check();
   await modal.getByLabel('确认的游戏名称', {exact: true}).fill('Confirmed Fixture Game');
-  await expect(modal.getByLabel('确认游戏目录登记', {exact: true})).not.toBeChecked();
-  await modal.getByLabel('确认游戏目录登记', {exact: true}).check();
+  await expect(modal.getByLabel('确认添加', {exact: true})).not.toBeChecked();
+  await modal.getByLabel('确认添加', {exact: true}).check();
   for (const theme of ['light', 'dark']) {
     await page.evaluate(value => document.documentElement.dataset.theme = value, theme);
     await expect(modal).toBeVisible();
@@ -39,7 +40,7 @@ test('online game identity separates search consent from root registration', asy
     expect(await modal.evaluate(element => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
     await page.screenshot({path: `output/playwright/screenshots/${info.project.name}-identity-${theme}.png`, animations: 'disabled'});
   }
-  await modal.getByRole('button', {name: '确认登记', exact: true}).click();
+  await modal.getByRole('button', {name: '添加', exact: true}).click();
   await expect(modal).not.toBeVisible();
   await expect(page.getByText('Confirmed Fixture Game', {exact: true})).toBeVisible();
   const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
@@ -53,17 +54,17 @@ test('changed queries and reopened identity dialogs discard earlier consent', as
   await modal.getByLabel('同意发送公开搜索词', {exact: true}).check();
   await modal.getByRole('button', {name: '搜索候选', exact: true}).click();
   await modal.getByRole('radio').first().check();
-  await modal.getByLabel('确认游戏目录登记', {exact: true}).check();
+  await modal.getByLabel('确认添加', {exact: true}).check();
   await modal.getByLabel('公开搜索词', {exact: true}).fill('Different public query');
   await expect(modal.getByRole('radio')).toHaveCount(0);
-  await expect(modal.getByRole('button', {name: '确认登记', exact: true})).toBeDisabled();
+  await expect(modal.getByRole('button', {name: '添加', exact: true})).toBeDisabled();
   await modal.getByLabel('同意发送公开搜索词', {exact: true}).check();
   await modal.getByRole('button', {name: '取消', exact: true}).click();
   await page.getByRole('button', {name: '联网识别', exact: true}).click();
   modal = page.getByRole('dialog', {name: '联网识别游戏', exact: true});
   await expect(modal.getByLabel('同意发送公开搜索词', {exact: true})).not.toBeChecked();
   await expect(modal.getByRole('radio')).toHaveCount(0);
-  await expect(modal.getByRole('button', {name: '确认登记', exact: true})).toBeDisabled();
+  await expect(modal.getByRole('button', {name: '添加', exact: true})).toBeDisabled();
   expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === 'confirm_game_identity'))).toHaveLength(0);
 });
 
@@ -74,7 +75,7 @@ test('missing search credentials never produce fake game identity candidates', a
   await modal.getByRole('button', {name: '搜索候选', exact: true}).click();
   await expect(modal.getByRole('status')).toContainText('Brave Search API Key');
   await expect(modal.getByRole('radio')).toHaveCount(0);
-  await expect(modal.getByRole('button', {name: '确认登记', exact: true})).toBeDisabled();
+  await expect(modal.getByRole('button', {name: '添加', exact: true})).toBeDisabled();
 });
 
 test('stale evidence remains unregistered and requires renewed consent', async ({page}) => {
@@ -82,10 +83,10 @@ test('stale evidence remains unregistered and requires renewed consent', async (
   await modal.getByLabel('同意发送公开搜索词', {exact: true}).check();
   await modal.getByRole('button', {name: '搜索候选', exact: true}).click();
   await modal.getByRole('radio').first().check();
-  await modal.getByLabel('确认游戏目录登记', {exact: true}).check();
+  await modal.getByLabel('确认添加', {exact: true}).check();
   await page.evaluate(() => (window as any).__AMM_TEST__.identityOutcome = 'stale');
-  await modal.getByRole('button', {name: '确认登记', exact: true}).click();
+  await modal.getByRole('button', {name: '添加', exact: true}).click();
   await expect(modal.getByRole('alert')).toContainText('目录内容已变化');
-  await expect(modal.getByRole('button', {name: '确认登记', exact: true})).toBeDisabled();
+  await expect(modal.getByRole('button', {name: '添加', exact: true})).toBeDisabled();
   await expect(page.getByText('Fixture Game', {exact: true})).not.toBeVisible();
 });

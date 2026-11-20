@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub root: PathBuf,
+    control_root: Option<PathBuf>,
 }
 
 impl AppPaths {
@@ -13,7 +14,10 @@ impl AppPaths {
         let root = crate::paths::lexical_normalize(&root);
         std::fs::create_dir_all(&root)?;
         let root = root.canonicalize()?;
-        let p = AppPaths { root };
+        let p = AppPaths {
+            root,
+            control_root: None,
+        };
         for dir in [
             p.downloads(),
             p.staging(),
@@ -26,6 +30,19 @@ impl AppPaths {
             crate::safe_fs::create_dir_all(&dir)?;
         }
         Ok(p)
+    }
+
+    pub(crate) fn with_control_root(mut self, root: &Path) -> Self {
+        if root != self.root {
+            self.control_root = Some(root.into());
+        }
+        self
+    }
+
+    pub(crate) fn overlaps_storage(&self, path: &Path) -> bool {
+        std::iter::once(&self.root)
+            .chain(self.control_root.iter())
+            .any(|root| crate::paths::overlaps(path, root))
     }
 
     pub fn db_file(&self) -> PathBuf {
@@ -86,7 +103,11 @@ impl AppPaths {
             }
         }
         let resolved = crate::paths::ensure_within(target, &roots)?;
-        if resolved.starts_with(self.root.join("private"))
+        if self
+            .control_root
+            .as_ref()
+            .is_some_and(|root| crate::paths::overlaps(&resolved, root))
+            || resolved.starts_with(self.root.join("private"))
             || resolved
                 .file_name()
                 .and_then(|n| n.to_str())

@@ -59,6 +59,14 @@ pub struct WorkflowIssue {
     pub code: String,
     pub message: String,
 }
+pub(crate) struct PluginPackageBaseline {
+    pub slug: String,
+    pub version: String,
+    pub builtin: bool,
+    pub enabled: bool,
+    pub adapter_json: String,
+    pub skill_markdown: String,
+}
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DraftValidation {
@@ -189,6 +197,11 @@ fn external_slug(engine: &FileEngine, slug: &str) -> AppResult<()> {
             "禁止覆盖内置适配包 slug，请使用新 slug".into(),
         ));
     }
+    if crate::skills::is_system_skill(slug) {
+        return Err(AppError::Denied(
+            "系统 Skill slug 已保留，请使用新 slug".into(),
+        ));
+    }
     let conn = engine.db.conn();
     for (table, key) in [("plugins", "slug"), ("skills", "name")] {
         let source: Option<String> = conn
@@ -250,28 +263,47 @@ fn read_text(engine: &FileEngine, path: &Path, limit: usize) -> AppResult<String
     }
     String::from_utf8(bytes).map_err(|_| invalid("包文件必须是 UTF-8"))
 }
-fn read_content(engine: &FileEngine, directory: &Path) -> AppResult<Content> {
+pub(crate) fn validate_package_directory(
+    engine: &FileEngine,
+    directory: &Path,
+    builtin: bool,
+) -> AppResult<()> {
     checked_path(engine, directory)?;
     if !fs::symlink_metadata(directory)?.is_dir() {
         return Err(invalid("包路径不是普通目录"));
     }
-    let mut entries = fs::read_dir(directory)?;
     let mut count = 0;
-    for entry in entries.by_ref().take(3) {
+    for entry in fs::read_dir(directory)? {
         let entry = entry?;
-        if !["adapter.json", "SKILL.md"]
-            .iter()
-            .any(|n| entry.file_name() == *n)
-        {
-            return Err(AppError::Denied(
-                "声明包只能包含 adapter.json 与 SKILL.md，不接管其他文件".into(),
-            ));
+        let name = entry.file_name();
+        if name == "adapter.json" || name == "SKILL.md" {
+            count += 1;
+            continue;
         }
-        count += 1;
+        // Reseeding a built-in package retains the old declaration through atomic_write.
+        if builtin
+            && name
+                .to_str()
+                .and_then(|name| name.strip_prefix(".previous_"))
+                .is_some_and(|id| {
+                    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                })
+            && entry.file_type()?.is_file()
+        {
+            continue;
+        }
+        return Err(AppError::Denied(
+            "声明包只能包含 adapter.json 与 SKILL.md，不接管其他文件".into(),
+        ));
     }
     if count != 2 {
         return Err(invalid("声明包必须恰好包含两个文件"));
     }
+    Ok(())
+}
+
+fn read_content(engine: &FileEngine, directory: &Path, builtin: bool) -> AppResult<Content> {
+    validate_package_directory(engine, directory, builtin)?;
     Ok(Content::new(
         read_text(engine, &directory.join("adapter.json"), ADAPTER_LIMIT)?,
         read_text(engine, &directory.join("SKILL.md"), SKILL_LIMIT)?,
@@ -452,7 +484,7 @@ fn validate_inner(engine: &FileEngine, id: &str) -> AppResult<DraftValidation> {
         if report.transaction_status != "committed" {
             return Err(AppError::Conflict("草稿写入事务尚未提交或已回滚".into()));
         }
-        let content = read_content(engine, &expected)?;
+        let content = read_content(engine, &expected, false)?;
         verify_copy_plan(
             &engine.get_plan(&report.draft.write_transaction_id)?,
             &report.draft.write_transaction_id,
@@ -632,7 +664,10 @@ fn registry_state(
 /// external version in its normal journal/backup and owns rollback approval.
 pub fn plan_install_plugin(engine: &FileEngine, draft_id: &str) -> AppResult<DeploymentPreview> {
     let _lock = lock();
-    reconcile_inner(engine)?;
+    {
+        let _files = crate::transaction::write_lock();
+        reconcile_locked(engine)?;
+    }
     let validation = validate_inner(engine, draft_id)?;
     if !validation.valid {
         return Err(invalid(
@@ -645,7 +680,7 @@ pub fn plan_install_plugin(engine: &FileEngine, draft_id: &str) -> AppResult<Dep
         ));
     }
     let draft = validation.draft;
-    let content = read_content(engine, &draft.path)?;
+    let content = read_content(engine, &draft.path, false)?;
     if validation.hashes.as_ref() != Some(&content.hashes) {
         return Err(AppError::Conflict("验证之后草稿已改变".into()));
     }
@@ -660,12 +695,11 @@ pub fn plan_install_plugin(engine: &FileEngine, draft_id: &str) -> AppResult<Dep
                 "目标包含未登记的包，不覆盖未知文件".into(),
             ));
         }
-        let old = read_content(engine, &target)?;
+        let old = read_content(engine, &target, false)?;
         let old_package = old.package(&draft.slug)?;
         let state = state.as_ref().unwrap();
         if state.validated
-            && serde_json::from_str::<serde_json::Value>(&state.adapter_json)?
-                == serde_json::to_value(&old_package.adapter)?
+            && plugins::matches_registered_adapter(&state.adapter_json, &old_package.adapter)?
         {
             let mut provenance = None;
             for row in deployment_rows(engine)?
@@ -769,8 +803,7 @@ fn disable(engine: &FileEngine, slug: &str, target: &Path) -> AppResult<bool> {
     Ok(count != 0)
 }
 
-fn reconcile_inner(engine: &FileEngine) -> AppResult<ReconcileReport> {
-    let _files = crate::transaction::write_lock();
+fn reconcile_locked(engine: &FileEngine) -> AppResult<ReconcileReport> {
     let mut groups: BTreeMap<String, Vec<DeploymentRow>> = BTreeMap::new();
     for row in deployment_rows(engine)? {
         groups.entry(row.slug.clone()).or_default().push(row);
@@ -810,7 +843,7 @@ fn reconcile_inner(engine: &FileEngine) -> AppResult<ReconcileReport> {
             });
             continue;
         }
-        let disk = read_content(engine, &target).and_then(|c| {
+        let disk = read_content(engine, &target, false).and_then(|c| {
             c.package(&slug)?;
             Ok(c)
         });
@@ -887,7 +920,103 @@ fn reconcile_inner(engine: &FileEngine) -> AppResult<ReconcileReport> {
 /// Registry writes for each package/Skill pair are atomic; files are never changed.
 pub fn reconcile_deployments(engine: &FileEngine) -> AppResult<ReconcileReport> {
     let _lock = lock();
-    reconcile_inner(engine)
+    let _files = crate::transaction::write_lock();
+    reconcile_locked(engine)
+}
+
+fn registered_plugin(engine: &FileEngine, slug: &str) -> AppResult<plugins::PluginInfo> {
+    plugins::list_plugins(&engine.db)?
+        .into_iter()
+        .find(|p| p.slug == slug)
+        .ok_or_else(|| AppError::NotFound(format!("适配包: {slug}")))
+}
+
+fn verified_installed_content(
+    engine: &FileEngine,
+    info: &plugins::PluginInfo,
+    target: &Path,
+) -> AppResult<Content> {
+    if !info.validated {
+        return Err(AppError::Denied("适配包未通过完整性校验".into()));
+    }
+    let content = read_content(engine, target, info.source == "builtin")?;
+    let package = content.package(&info.slug)?;
+    let registered: String = engine.db.conn().query_row(
+        "SELECT CASE WHEN length(CAST(adapter_json AS BLOB))<=?2 THEN adapter_json ELSE '' END FROM plugins WHERE slug=?1",
+        params![info.slug, ADAPTER_LIMIT],
+        |r| r.get(0),
+    )?;
+    if package.adapter.version != info.version
+        || !plugins::matches_registered_adapter(&registered, &package.adapter)?
+    {
+        return Err(AppError::Denied("适配包内容与已校验登记不一致".into()));
+    }
+    let proven = if info.source == "builtin" {
+        plugins::BUILTIN_PACKAGES
+            .iter()
+            .any(|(slug, adapter, skill)| {
+                *slug == info.slug
+                    && *adapter == content.adapter_json
+                    && *skill == content.skill_markdown
+            })
+    } else {
+        let mut matched = false;
+        for row in deployment_rows(engine)?
+            .iter()
+            .filter(|row| row.slug == info.slug && row.status == "committed")
+        {
+            if deployment_record(engine, row)?.content.hashes == content.hashes {
+                matched = true;
+                break;
+            }
+        }
+        matched
+    };
+    if !proven {
+        return Err(AppError::Denied(
+            "适配包缺少匹配的内置版本或已提交部署".into(),
+        ));
+    }
+    Ok(content)
+}
+
+/// Returns verified package files regardless of the user's activation setting.
+pub(crate) fn read_plugin_package(
+    engine: &FileEngine,
+    slug: &str,
+) -> AppResult<PluginPackageBaseline> {
+    plugins::validate_slug(slug)?;
+    let _lock = lock();
+    let _files = crate::transaction::write_lock();
+    reconcile_locked(engine)?;
+    let info = registered_plugin(engine, slug)?;
+    let builtin = info.source == "builtin";
+    if !builtin {
+        external_slug(engine, slug)?;
+    }
+    let target = install_path(engine, slug)?;
+    if Path::new(&info.install_path) != target {
+        return Err(AppError::Denied("适配包安装位置与登记不一致".into()));
+    }
+    let skill_registered: bool = engine.db.conn().query_row(
+        "SELECT EXISTS(SELECT 1 FROM skills WHERE name=?1 AND source=?2 AND location=?3)",
+        params![slug, info.source, target.join("SKILL.md").to_string_lossy()],
+        |r| r.get(0),
+    )?;
+    if !skill_registered {
+        return Err(AppError::Denied(
+            "适配包的 Skill 位置或来源与登记不一致".into(),
+        ));
+    }
+    let content = verified_installed_content(engine, &info, &target)?;
+    Ok(PluginPackageBaseline {
+        slug: info.slug,
+        version: info.version,
+        builtin,
+        enabled: info.enabled,
+        adapter_json: content.adapter_json,
+        skill_markdown: content.skill_markdown,
+    })
 }
 
 /// Desktop metadata control, not a package install or a filesystem mutation.
@@ -900,12 +1029,9 @@ pub fn set_enabled(
 ) -> AppResult<plugins::PluginInfo> {
     let _lock = lock();
     plugins::validate_slug(slug)?;
-    reconcile_inner(engine)?;
     let _files = crate::transaction::write_lock();
-    let info = plugins::list_plugins(&engine.db)?
-        .into_iter()
-        .find(|p| p.slug == slug)
-        .ok_or_else(|| AppError::NotFound(format!("适配包: {slug}")))?;
+    reconcile_locked(engine)?;
+    let info = registered_plugin(engine, slug)?;
     let target = engine.paths.plugins().join("games").join(slug);
     if !matches!(info.source.as_str(), "builtin" | SOURCE)
         || Path::new(&info.install_path) != target
@@ -915,46 +1041,7 @@ pub fn set_enabled(
         ));
     }
     if enabled {
-        let content = read_content(engine, &target)?;
-        let package = content.package(slug)?;
-        let registered: String = engine.db.conn().query_row(
-            "SELECT CASE WHEN length(CAST(adapter_json AS BLOB))<=?2 THEN adapter_json ELSE '' END FROM plugins WHERE slug=?1",
-            params![slug, ADAPTER_LIMIT],
-            |r| r.get(0),
-        )?;
-        if !info.validated
-            || package.adapter.version != info.version
-            || serde_json::from_str::<serde_json::Value>(&registered)?
-                != serde_json::to_value(&package.adapter)?
-        {
-            return Err(AppError::Denied("适配包内容与已校验登记不一致".into()));
-        }
-        let proven = if info.source == "builtin" {
-            plugins::BUILTIN_PACKAGES
-                .iter()
-                .any(|(name, adapter, skill)| {
-                    *name == slug
-                        && *adapter == content.adapter_json
-                        && *skill == content.skill_markdown
-                })
-        } else {
-            let mut matched = false;
-            for row in deployment_rows(engine)?
-                .iter()
-                .filter(|row| row.slug == slug && row.status == "committed")
-            {
-                if deployment_record(engine, row)?.content.hashes == content.hashes {
-                    matched = true;
-                    break;
-                }
-            }
-            matched
-        };
-        if !proven {
-            return Err(AppError::Denied(
-                "适配包缺少匹配的内置版本或已提交部署".into(),
-            ));
-        }
+        verified_installed_content(engine, &info, &target)?;
     }
     let count = engine.db.conn().execute(
         "UPDATE plugins SET enabled=?2,updated_at=?3 WHERE slug=?1 AND source=?4 AND install_path=?5",

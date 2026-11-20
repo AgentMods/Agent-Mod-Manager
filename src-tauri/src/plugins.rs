@@ -101,6 +101,7 @@ pub struct AdapterPath {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadOrderKind {
+    None,
     LoaderDependencies,
     BethesdaPlugins,
     Redmod,
@@ -135,6 +136,8 @@ pub struct GameAdapter {
     /// Required markers must all match; at least one marker must match.
     pub markers: Vec<Marker>,
     pub steam_app_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_url: Option<String>,
     pub install_roots: Vec<InstallRoot>,
     pub mod_types: Vec<ModType>,
     pub archive_rules: Vec<ArchiveRule>,
@@ -158,6 +161,27 @@ pub struct GamePackage {
     pub adapter: GameAdapter,
     pub skill: SkillMetadata,
     pub skill_markdown: String,
+}
+
+fn valid_cover_url(value: &str) -> bool {
+    if value.len() > 2048
+        || !value.starts_with("https://")
+        || value
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
+    {
+        return false;
+    }
+    url::Url::parse(value).is_ok_and(|url| {
+        matches!(url.host(), Some(url::Host::Domain(domain)) if {
+            let domain = domain.trim_end_matches('.');
+            domain.contains('.')
+                && ![".localhost", ".local", ".internal"].iter().any(|suffix| domain.ends_with(suffix))
+        }) && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && url.fragment().is_none()
+    })
 }
 
 fn invalid(message: impl Into<String>) -> AppError {
@@ -279,6 +303,13 @@ impl GameAdapter {
                 .map_or(true, |n| n == 0 || n.to_string() != *id)
         }) {
             return Err(invalid("steamAppId 必须为正整数的十进制字符串"));
+        }
+        if self
+            .cover_url
+            .as_deref()
+            .is_some_and(|url| !valid_cover_url(url))
+        {
+            return Err(invalid("coverUrl 须为不含凭据或片段的公网 HTTPS 图片地址"));
         }
         if self.markers.is_empty()
             || self.install_roots.is_empty()
@@ -687,25 +718,47 @@ pub struct PluginInfo {
     pub enabled: bool,
     pub validated: bool,
     pub install_path: String,
+    pub cover_url: Option<String>,
 }
 
 pub fn list_plugins(db: &Db) -> AppResult<Vec<PluginInfo>> {
     let conn = db.conn();
-    let mut statement = conn.prepare("SELECT slug,name,game_name,version,description,source,enabled,validated,install_path FROM plugins ORDER BY name,slug")?;
-    let rows = statement.query_map([], |r| {
+    let mut statement = conn.prepare("SELECT slug,name,game_name,version,description,source,enabled,validated,install_path,CASE WHEN length(CAST(adapter_json AS BLOB))<=?1 THEN adapter_json END FROM plugins ORDER BY name,slug")?;
+    let rows = statement.query_map([MAX_ADAPTER_BYTES], |r| {
+        let slug: String = r.get(0)?;
+        let version: String = r.get(3)?;
+        let validated: bool = r.get(7)?;
+        let cover_url = if validated {
+            r.get::<_, Option<String>>(9)?
+                .and_then(|json| serde_json::from_str::<GameAdapter>(&json).ok())
+                .filter(|adapter| adapter.slug == slug && adapter.version == version)
+                .and_then(|adapter| adapter.cover_url)
+                .filter(|url| valid_cover_url(url))
+        } else {
+            None
+        };
         Ok(PluginInfo {
-            slug: r.get(0)?,
+            slug,
             name: r.get(1)?,
             game_name: r.get(2)?,
-            version: r.get(3)?,
+            version,
             description: r.get(4)?,
             source: r.get(5)?,
             enabled: r.get(6)?,
-            validated: r.get(7)?,
+            validated,
             install_path: r.get(8)?,
+            cover_url,
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+pub(crate) fn matches_registered_adapter(json: &str, adapter: &GameAdapter) -> AppResult<bool> {
+    if json.is_empty() || json.len() > MAX_ADAPTER_BYTES {
+        return Ok(false);
+    }
+    let registered: GameAdapter = serde_json::from_str(json)?;
+    Ok(serde_json::to_value(registered)? == serde_json::to_value(adapter)?)
 }
 
 /// Revalidate stored JSON at use time; a database boolean alone is not trust.
@@ -755,6 +808,36 @@ mod tests {
             assert!(names.insert(p.adapter.slug.clone()));
             let json = serde_json::to_string(&p.adapter).unwrap();
             parse_package(&p.adapter.slug, &json, &p.skill_markdown).unwrap();
+        }
+    }
+
+    #[test]
+    fn covers_are_optional_and_only_public_https_addresses_are_accepted() {
+        for mut package in builtin_packages().unwrap() {
+            assert!(package
+                .adapter
+                .cover_url
+                .as_deref()
+                .is_some_and(valid_cover_url));
+            package.adapter.cover_url = None;
+            assert!(package.adapter.validate().is_ok());
+            assert!(serde_json::to_value(&package.adapter)
+                .unwrap()
+                .get("coverUrl")
+                .is_none());
+            for url in [
+                "file:///tmp/image.jpg",
+                "data:image/png;base64,AAAA",
+                "http://example.com/image.png",
+                "https://user:pass@example.com/image.png",
+                "https://127.0.0.1/image.jpg",
+                "https://sub.localhost/image.jpg",
+                "https://example.com:444/image.png",
+                "https://example.com/image.png#fragment",
+            ] {
+                package.adapter.cover_url = Some(url.into());
+                assert!(package.adapter.validate().is_err(), "{url}");
+            }
         }
     }
 

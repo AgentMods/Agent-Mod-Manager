@@ -37,7 +37,10 @@ impl Events {
         let created_at = util::now();
         let seq = {
             let conn = self.db.conn();
-            conn.execute("INSERT INTO agent_events (turn_id,conversation_id,message_id,kind,payload_json,created_at) VALUES (?1,?2,?3,?4,?5,?6)",params![turn,conv,message,kind,serde_json::to_string(&payload)?,created_at])?;
+            let changed = conn.execute("INSERT INTO agent_events (turn_id,conversation_id,message_id,kind,payload_json,created_at) SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS (SELECT 1 FROM conversations WHERE id=?2)",params![turn,conv,message,kind,serde_json::to_string(&payload)?,created_at])?;
+            if changed == 0 {
+                return Err(AppError::NotFound("会话".into()));
+            }
             conn.last_insert_rowid()
         };
         let event = AgentEvent {

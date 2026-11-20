@@ -53,7 +53,7 @@ type Diagnosis = {
   fabricDisk?: FabricDisk;
   bethesdaPlugins?: BethesdaEvidence;
 };
-type Adapter = { modTypes: {id: string; name: string; root: string; notes: string}[]; installRoots: {id: string; kind: string; notes: string}[] };
+type Adapter = { modTypes: { id: string; name: string; root: string; notes: string }[]; installRoots: { id: string; kind: string; notes: string }[] };
 const statuses: Record<string, string> = { installed: '已安装', enabled: '已启用', superseded: '已被替换', uninstalled: '已卸载', rolled_back: '已回滚', partially_restored: '部分文件已恢复', pending: '待执行', planned: '待审批', purged: '已永久删除' };
 
 function replacementTransaction(mod?: Installed) {
@@ -86,12 +86,12 @@ function ReplacementEffects({ plan }: { plan: FilePlan }) {
   return <div className="plan-preview flex min-w-0 flex-col gap-3">
     <p className="wrap-anywhere">原替换事务：{plan.summary}</p>
     <Table aria-label="回滚文件影响" className="table-fixed">
-      <colgroup><col className="w-[36%]"/><col/></colgroup>
+      <colgroup><col className="w-[36%]" /><col /></colgroup>
       <TableHeader><TableRow><TableHead scope="col">撤销效果</TableHead><TableHead scope="col">文件路径</TableHead></TableRow></TableHeader>
       <TableBody>{[...plan.entries].reverse().map(({ operation, before }, index) => {
         const effect = operation.op === 'move' ? (before ? '移回原位置并还原覆盖' : '移回原位置')
           : operation.op === 'copy' ? (before ? '还原覆盖前文件' : '移出新增文件')
-          : operation.op === 'mkdir' ? '移除本次创建的空目录' : '撤销原操作';
+            : operation.op === 'mkdir' ? '移除本次创建的空目录' : '撤销原操作';
         return <TableRow key={index}>
           <TableCell className="align-top whitespace-normal">{effect}</TableCell>
           <TableCell className="whitespace-normal">
@@ -108,7 +108,7 @@ function ReplacementEffects({ plan }: { plan: FilePlan }) {
 function DetailEmptyState({ title, action, loading = false }: { title: string; action?: ReactNode; loading?: boolean }) {
   return <Empty className="border">
     <EmptyHeader role={loading ? 'status' : undefined}>
-      <EmptyMedia variant="icon">{loading ? <Spinner/> : <InboxIcon aria-hidden="true"/>}</EmptyMedia>
+      <EmptyMedia variant="icon">{loading ? <Spinner /> : <InboxIcon aria-hidden="true" />}</EmptyMedia>
       <EmptyTitle role="heading" aria-level={2}>{title}</EmptyTitle>
     </EmptyHeader>
     {action && <EmptyContent>{action}</EmptyContent>}
@@ -118,8 +118,8 @@ function DetailEmptyState({ title, action, loading = false }: { title: string; a
 export default function GameDetailPage() {
   const gameId = useUI(s => s.gameId);
   const navigate = useUI(s => s.navigate);
-  if (!gameId) return <Page><PageHeader title="游戏详情"/><DetailEmptyState title="尚未选择游戏" action={<Button onClick={() => navigate('library')}><ArrowLeftIcon data-icon="inline-start"/>返回游戏库</Button>}/></Page>;
-  return <GameDetails key={gameId} gameId={gameId}/>;
+  if (!gameId) return <Page><PageHeader title="游戏详情" /><DetailEmptyState title="尚未选择游戏" action={<Button onClick={() => navigate('library')}><ArrowLeftIcon data-icon="inline-start" />返回游戏库</Button>} /></Page>;
+  return <GameDetails key={gameId} gameId={gameId} />;
 }
 
 function GameDetails({ gameId }: { gameId: string }) {
@@ -127,7 +127,7 @@ function GameDetails({ gameId }: { gameId: string }) {
   const client = useQueryClient();
   const reviewPlan = useUI(s => s.reviewPlan);
   const notify = useUI(s => s.notify);
-  const [tab, setTab] = useState('files');
+  const [tab, setTab] = useState('mods');
   const [location, setLocation] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [file, setFile] = useState<DirEntry | null>(null);
@@ -150,7 +150,7 @@ function GameDetails({ gameId }: { gameId: string }) {
   const [legacyLogEncoding, setLegacyLogEncoding] = useState<(typeof legacyLogEncodings)[number] | null>(null);
   const [diagnosis, setDiagnosis] = useState<Diagnosis | null>(null);
   const game = useBackendQuery<Game>(['game', gameId], 'get_game', { id: gameId }, !!gameId);
-  const adapter = useBackendQuery<Adapter>(['game-adapter', gameId], 'get_game_adapter', {gameId}, !!game.data?.adapterSlug);
+  const adapter = useBackendQuery<Adapter>(['game-adapter', gameId], 'get_game_adapter', { gameId }, !!game.data?.adapterSlug);
   const bootstrap = useBackendQuery<{ recoveryError: string | null }>(['bootstrap'], 'get_bootstrap_state');
   const writable = backendAvailable && !!bootstrap.data && !bootstrap.data.recoveryError;
   const path = location ?? game.data?.rootPath ?? '';
@@ -229,9 +229,9 @@ function GameDetails({ gameId }: { gameId: string }) {
   async function importArchive() {
     if (!writable || busy) return;
     await run(async () => {
-      const selected = await open({multiple: false, directory: false, title: '选择本地 Mod 归档', filters: [{name: 'Mod 归档', extensions: ['zip', 'jar', 'mrpack', '7z', 'gz', 'tgz']}]});
+      const selected = await open({ multiple: false, directory: false, title: '选择本地 Mod 归档', filters: [{ name: 'Mod 归档', extensions: ['zip', 'jar', 'mrpack', '7z', 'gz', 'tgz'] }] });
       if (typeof selected !== 'string') return;
-      const result = await api<{filename: string; artifactPath: string; sha256: string; plan: FilePlan}>('plan_import_archive', {path: selected});
+      const result = await api<{ filename: string; artifactPath: string; sha256: string; plan: FilePlan }>('plan_import_archive', { path: selected });
       setInstallOpen(false);
       reviewPlan(result.plan, () => {
         setArtifactPath(result.artifactPath); setArtifactHash(result.sha256); setFilename(result.filename); setFomodPreview(null); setFomodSelections({});
@@ -263,33 +263,32 @@ function GameDetails({ gameId }: { gameId: string }) {
 
   return <Page className="min-w-0" data-testid="game-detail-page">
     <div className="flex items-center gap-2 text-sm text-muted-foreground">
-      <IconButton title="返回游戏库" onClick={() => navigate('library')}><ArrowLeftIcon data-icon="inline-start"/></IconButton>
+      <IconButton title="返回游戏库" onClick={() => navigate('library')}><ArrowLeftIcon data-icon="inline-start" /></IconButton>
       <span>游戏库 / 游戏详情</span>
     </div>
-    <ErrorState error={game.error}/>
-    <ErrorState error={error}/>
+    <ErrorState error={game.error} />
+    <ErrorState error={error} />
     <Card>
       <CardHeader className="flex flex-wrap items-center justify-between gap-4">
         <div className="flex min-w-0 items-center gap-3">
           <div className="flex size-12 shrink-0 items-center justify-center rounded-lg border bg-muted">
-            <Gamepad2Icon className="size-6" aria-hidden="true"/>
+            <Gamepad2Icon className="size-6" aria-hidden="true" />
           </div>
           <div className="flex min-w-0 flex-col gap-1 wrap-anywhere">
-            <PageHeader title={game.data?.name ?? '正在读取游戏…'}/>
+            <PageHeader title={game.data?.name ?? '正在读取游戏…'} />
             <CardDescription>
-              <PathText className="block">{game.data?.rootPath ?? '—'}</PathText>
               <p>{game.data?.platform ?? '—'} · <span className="whitespace-nowrap">已装 Mod {game.data?.installedModCount ?? 0}</span> · <span className="whitespace-nowrap">已启用 {game.data?.enabledModCount ?? 0}</span></p>
             </CardDescription>
           </div>
         </div>
-        <Button disabled={!writable || busy} onClick={() => setInstallOpen(true)}><PackagePlusIcon data-icon="inline-start"/>安装归档</Button>
+        <Button disabled={!writable || busy} onClick={() => setInstallOpen(true)}><PackagePlusIcon data-icon="inline-start" />安装归档</Button>
       </CardHeader>
     </Card>
 
     <Tabs className="min-w-0 gap-4" value={tab} onValueChange={setTab}>
       <TabsList className="w-full sm:w-fit">
-        <TabsTrigger value="files">文件</TabsTrigger>
         <TabsTrigger value="mods">已装 Mod</TabsTrigger>
+        <TabsTrigger value="files">文件</TabsTrigger>
         <TabsTrigger value="snapshots">快照</TabsTrigger>
         <TabsTrigger value="diagnostics">诊断</TabsTrigger>
       </TabsList>
@@ -299,38 +298,38 @@ function GameDetails({ gameId }: { gameId: string }) {
           <Card className="min-w-0">
             <CardHeader>
               <div className="flex min-w-0 items-center gap-2">
-                <IconButton title="上一级目录" onClick={parent} disabled={!path || path === game.data?.rootPath}><ArrowUpIcon data-icon="inline-start"/></IconButton>
+                <IconButton title="上一级目录" onClick={parent} disabled={!path || path === game.data?.rootPath}><ArrowUpIcon data-icon="inline-start" /></IconButton>
                 <PathText className="min-w-0 flex-1">{path}</PathText>
-                <IconButton title="刷新目录" disabled={!backendAvailable} onClick={() => { void directory.refetch(); }}><RefreshCwIcon data-icon="inline-start"/></IconButton>
+                <IconButton title="刷新目录" disabled={!backendAvailable} onClick={() => { void directory.refetch(); }}><RefreshCwIcon data-icon="inline-start" /></IconButton>
               </div>
               <InputGroup>
-                <InputGroupAddon><SearchIcon/></InputGroupAddon>
-                <InputGroupInput placeholder="搜索当前目录…" value={search} onChange={e => setSearch(e.target.value)}/>
+                <InputGroupAddon><SearchIcon /></InputGroupAddon>
+                <InputGroupInput placeholder="搜索当前目录…" value={search} onChange={e => setSearch(e.target.value)} />
               </InputGroup>
             </CardHeader>
             <CardContent className="flex min-w-0 flex-col gap-3">
-              <ErrorState error={directory.error}/>
+              <ErrorState error={directory.error} />
               <div className="grid min-w-0 items-start gap-3 sm:grid-cols-[minmax(0,9rem)_minmax(0,1fr)]">
                 <aside className="min-w-0">
                   <ScrollArea className="min-w-0 rounded-md border [&_[data-slot=scroll-area-viewport]]:max-h-48 [&_[data-slot=scroll-area-viewport]>div]:block!">
                     <div className="flex min-w-0 flex-col gap-1 p-1">
                       <Button className="h-auto min-h-8 min-w-0 justify-start whitespace-normal" size="sm" variant={location === null ? 'secondary' : 'ghost'} onClick={() => { setLocation(null); setFile(null); }}>
-                        <FolderOpenIcon data-icon="inline-start"/><span className="min-w-0 wrap-anywhere text-left">游戏目录</span>
+                        <FolderOpenIcon data-icon="inline-start" /><span className="min-w-0 wrap-anywhere text-left">游戏目录</span>
                       </Button>
                       {Object.entries(roots.data ?? {}).map(([id, value]) => <Button className="h-auto min-h-8 min-w-0 justify-start whitespace-normal" size="sm" variant={location === value ? 'secondary' : 'ghost'} key={id} onClick={() => { setLocation(value); setFile(null); }}>
-                        <FolderIcon data-icon="inline-start"/><span className="min-w-0 wrap-anywhere text-left">{id}</span>
+                        <FolderIcon data-icon="inline-start" /><span className="min-w-0 wrap-anywhere text-left">{id}</span>
                       </Button>)}
                     </div>
                   </ScrollArea>
                 </aside>
                 <div className="flex min-w-0 flex-col gap-3">
                   <Table className="table-fixed" aria-busy={directory.isFetching}>
-                    <colgroup><col className="w-[46%]"/><col className="w-[22%]"/><col/></colgroup>
+                    <colgroup><col className="w-[46%]" /><col className="w-[22%]" /><col /></colgroup>
                     <TableHeader><TableRow><TableHead>名称</TableHead><TableHead>大小</TableHead><TableHead>修改时间</TableHead></TableRow></TableHeader>
                     <TableBody>{visibleEntries.map(item => <TableRow key={item.path} data-state={file?.path === item.path ? 'selected' : undefined} className="cursor-pointer" onClick={() => item.is_dir ? (setLocation(item.path), setFile(null)) : setFile(item)}>
                       <TableCell className="whitespace-normal">
                         <Button variant="ghost" size="sm" className="h-auto min-h-8 max-w-full justify-start whitespace-normal has-[>svg]:px-1">
-                          {item.is_dir ? <FolderIcon data-icon="inline-start"/> : <FileIcon data-icon="inline-start"/>}
+                          {item.is_dir ? <FolderIcon data-icon="inline-start" /> : <FileIcon data-icon="inline-start" />}
                           <span className="min-w-0 wrap-anywhere text-left">{item.name}</span>
                         </Button>
                       </TableCell>
@@ -338,7 +337,7 @@ function GameDetails({ gameId }: { gameId: string }) {
                       <TableCell className="whitespace-normal">{date(item.modified)}</TableCell>
                     </TableRow>)}</TableBody>
                   </Table>
-                  {!directory.data?.length && <DetailEmptyState loading={directory.isLoading} title={directory.isLoading ? '正在读取目录…' : '目录中没有可显示的文件'}/>}
+                  {!directory.data?.length && <DetailEmptyState loading={directory.isLoading} title={directory.isLoading ? '正在读取目录…' : '目录中没有可显示的文件'} />}
                 </div>
               </div>
             </CardContent>
@@ -353,9 +352,9 @@ function GameDetails({ gameId }: { gameId: string }) {
                     <PathText>{file.path}</PathText>
                     <p className="text-sm text-muted-foreground">{bytes(file.size)} · {date(file.modified)}</p>
                   </div>
-                  <ErrorState error={content.error}/>
+                  <ErrorState error={content.error} />
                   {content.data && !content.isError && <>
-                    <Separator/>
+                    <Separator />
                     <h3 className="text-sm font-medium">文件预览</h3>
                     <ScrollArea className="file-viewer min-w-0 overflow-hidden rounded-md border bg-muted p-0 [&_[data-slot=scroll-area-viewport]]:max-h-[420px] [&_[data-slot=scroll-area-viewport]>div]:block!">
                       <div className="flex min-w-0 flex-col gap-0.5 p-3 font-mono text-xs">
@@ -365,10 +364,10 @@ function GameDetails({ gameId }: { gameId: string }) {
                         </div>)}
                       </div>
                     </ScrollArea>
-                    {content.data.truncated && <Alert role="note" variant="warning"><TriangleAlertIcon/><AlertDescription>内容已截断</AlertDescription></Alert>}
+                    {content.data.truncated && <Alert role="note" variant="warning"><TriangleAlertIcon /><AlertDescription>内容已截断</AlertDescription></Alert>}
                   </>}
-                  <Button variant="destructive" className="self-start" disabled={!writable || busy} onClick={() => preview('trash_paths', { request: { paths: [file.path], game_id: gameId, reason: '用户从文件浏览器移除' } })}><Trash2Icon data-icon="inline-start"/>移入回收站</Button>
-                </> : <EmptyState title="未选择文件" icon={<FileIcon/>}/>}
+                  <Button variant="destructive" className="self-start" disabled={!writable || busy} onClick={() => preview('trash_paths', { request: { paths: [file.path], game_id: gameId, reason: '用户从文件浏览器移除' } })}><Trash2Icon data-icon="inline-start" />移入回收站</Button>
+                </> : <EmptyState title="未选择文件" icon={<FileIcon />} />}
               </CardContent>
             </Card>
           </aside>
@@ -376,10 +375,10 @@ function GameDetails({ gameId }: { gameId: string }) {
       </TabsContent>
 
       <TabsContent value="mods" className="flex min-w-0 flex-col gap-3">
-        <ErrorState error={installs.error}/>
+        <ErrorState error={installs.error} />
         <Card className="min-w-0 py-0">
           <Table aria-busy={installs.isFetching}>
-            <TableHeader><TableRow><TableHead>名称</TableHead><TableHead>版本</TableHead><TableHead>来源</TableHead><TableHead>状态</TableHead><TableHead>安装时间</TableHead><TableHead/></TableRow></TableHeader>
+            <TableHeader><TableRow><TableHead>名称</TableHead><TableHead>版本</TableHead><TableHead>来源</TableHead><TableHead>状态</TableHead><TableHead>安装时间</TableHead><TableHead /></TableRow></TableHeader>
             <TableBody>{(installs.data ?? []).map(mod => <TableRow key={mod.id}>
               <TableCell className="min-w-28 whitespace-normal"><strong className="wrap-anywhere">{mod.name}</strong><small className="block text-muted-foreground">{mod.files.length} 个文件</small></TableCell>
               <TableCell className="min-w-24 wrap-anywhere whitespace-normal">{mod.version ?? '—'}{mod.downloadOrigin && <PathText className="block">版本 ID：{mod.downloadOrigin.versionId}</PathText>}</TableCell>
@@ -389,13 +388,13 @@ function GameDetails({ gameId }: { gameId: string }) {
               <TableCell><Badge tone={mod.status === 'enabled' ? 'success' : 'warning'}>{statuses[mod.status] ?? mod.status}</Badge></TableCell>
               <TableCell>{date(mod.installedAt)}</TableCell>
               <TableCell><div className="flex justify-end gap-2">
-                <IconButton title={mod.status === 'partially_restored' ? '部分恢复：需先处理剩余回收站文件' : '预览卸载'} disabled={!writable || busy || mod.status !== 'enabled'} onClick={() => preview('plan_uninstall', { installId: mod.id })}><Trash2Icon data-icon="inline-start"/></IconButton>
-                {replacementTransaction(mod) && <IconButton title="预览回滚替换" disabled={!writable || busy || installs.isFetching} onClick={() => { void previewReplacementRollback(mod); }}><Undo2Icon data-icon="inline-start"/></IconButton>}
+                <IconButton title={mod.status === 'partially_restored' ? '部分恢复：需先处理剩余回收站文件' : '预览卸载'} disabled={!writable || busy || mod.status !== 'enabled'} onClick={() => preview('plan_uninstall', { installId: mod.id })}><Trash2Icon data-icon="inline-start" /></IconButton>
+                {replacementTransaction(mod) && <IconButton title="预览回滚替换" disabled={!writable || busy || installs.isFetching} onClick={() => { void previewReplacementRollback(mod); }}><Undo2Icon data-icon="inline-start" /></IconButton>}
               </div></TableCell>
             </TableRow>)}</TableBody>
           </Table>
         </Card>
-        {!installs.data?.length && !installs.error && <DetailEmptyState loading={installs.isLoading} title={installs.isLoading ? '正在读取 Mod…' : '尚未安装 Mod'} action={<Button disabled={!writable} onClick={() => setInstallOpen(true)}><PackagePlusIcon data-icon="inline-start"/>选择归档</Button>}/>}
+        {!installs.data?.length && !installs.error && <DetailEmptyState loading={installs.isLoading} title={installs.isLoading ? '正在读取 Mod…' : '尚未安装 Mod'} action={<Button disabled={!writable} onClick={() => setInstallOpen(true)}><PackagePlusIcon data-icon="inline-start" />选择归档</Button>} />}
       </TabsContent>
 
       <TabsContent value="snapshots" className="flex min-w-0 flex-col gap-3">
@@ -404,25 +403,25 @@ function GameDetails({ gameId }: { gameId: string }) {
             <div className="flex flex-wrap items-center gap-2">
               <Field className="min-w-0 flex-1 basis-40">
                 <FieldLabel htmlFor="snapshot-label" className="sr-only">快照名称</FieldLabel>
-                <Input id="snapshot-label" placeholder="快照名称" value={snapshotLabel} onChange={e => setSnapshotLabel(e.target.value)}/>
+                <Input id="snapshot-label" placeholder="快照名称" value={snapshotLabel} onChange={e => setSnapshotLabel(e.target.value)} />
               </Field>
               <Button variant="outline" disabled={!writable || busy || !snapshotLabel.trim()} onClick={() => run(async () => {
                 const [, plan] = await api<[Snapshot, FilePlan]>('snapshot_create', { gameId, label: snapshotLabel });
                 reviewPlan(plan, () => { void snapshots.refetch(); });
-              })}><CameraIcon data-icon="inline-start"/>预览创建快照</Button>
+              })}><CameraIcon data-icon="inline-start" />预览创建快照</Button>
             </div>
           </CardHeader>
           <CardContent className="flex min-w-0 flex-col gap-3">
-            <ErrorState error={snapshots.error}/>
+            <ErrorState error={snapshots.error} />
             <Table aria-busy={snapshots.isFetching}>
-              <TableHeader><TableRow><TableHead>名称</TableHead><TableHead>文件</TableHead><TableHead>大小</TableHead><TableHead>创建时间</TableHead><TableHead/></TableRow></TableHeader>
+              <TableHeader><TableRow><TableHead>名称</TableHead><TableHead>文件</TableHead><TableHead>大小</TableHead><TableHead>创建时间</TableHead><TableHead /></TableRow></TableHeader>
               <TableBody>{(snapshots.data ?? []).map(item => <TableRow key={item.id}>
                 <TableCell className="min-w-24 wrap-anywhere whitespace-normal">{item.label}</TableCell><TableCell>{item.file_count}</TableCell>
                 <TableCell>{bytes(item.total_size)}</TableCell><TableCell>{date(item.created_at)}</TableCell>
-                <TableCell><Button variant="outline" disabled={!writable || busy} onClick={() => preview('restore_snapshot', { gameId, snapshotId: item.id })}><Undo2Icon data-icon="inline-start"/>恢复预览</Button></TableCell>
+                <TableCell><Button variant="outline" disabled={!writable || busy} onClick={() => preview('restore_snapshot', { gameId, snapshotId: item.id })}><Undo2Icon data-icon="inline-start" />恢复预览</Button></TableCell>
               </TableRow>)}</TableBody>
             </Table>
-            {!snapshots.data?.length && <DetailEmptyState title="尚无快照"/>}
+            {!snapshots.data?.length && <DetailEmptyState title="尚无快照" />}
           </CardContent>
         </Card>
       </TabsContent>
@@ -432,7 +431,7 @@ function GameDetails({ gameId }: { gameId: string }) {
           <CardHeader className="flex flex-wrap items-end justify-between gap-4">
             <div className="flex min-w-0 flex-col gap-1">
               <CardTitle>游戏诊断</CardTitle>
-              <CardDescription>仅分析已登记目录与日志</CardDescription>
+              <CardDescription>仅分析管理中的目录与日志</CardDescription>
             </div>
             <div className="flex min-w-0 flex-wrap items-end gap-2">
               <Field className="w-auto gap-1">
@@ -447,7 +446,7 @@ function GameDetails({ gameId }: { gameId: string }) {
                 </NativeSelect>
               </Field>
               <Button variant="outline" disabled={!backendAvailable || busy} onClick={runDiagnosis}>
-                {busy ? <Spinner data-icon="inline-start"/> : <ShieldCheckIcon data-icon="inline-start"/>}
+                {busy ? <Spinner data-icon="inline-start" /> : <ShieldCheckIcon data-icon="inline-start" />}
                 {busy ? '正在诊断…' : '开始诊断'}
               </Button>
             </div>
@@ -455,9 +454,9 @@ function GameDetails({ gameId }: { gameId: string }) {
         </Card>
         {diagnosis ? <div className="grid min-w-0 items-start gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
           <section className="flex min-w-0 flex-col gap-4">
-            {diagnosis.fabricStartup && <FabricStartupEvidence report={diagnosis.fabricStartup}/>}
-            {diagnosis.fabricDisk && <FabricDiskEvidence report={diagnosis.fabricDisk}/>}
-            {diagnosis.bethesdaPlugins && <BethesdaPluginEvidence report={diagnosis.bethesdaPlugins}/>}
+            {diagnosis.fabricStartup && <FabricStartupEvidence report={diagnosis.fabricStartup} />}
+            {diagnosis.fabricDisk && <FabricDiskEvidence report={diagnosis.fabricDisk} />}
+            {diagnosis.bethesdaPlugins && <BethesdaPluginEvidence report={diagnosis.bethesdaPlugins} />}
             <Card className="min-w-0">
               <CardContent className="flex min-w-0 flex-col items-start gap-3">
                 <Badge>{diagnosis.status === 'findings' ? '已发现诊断线索' : '未确认故障原因'}</Badge>
@@ -470,7 +469,7 @@ function GameDetails({ gameId }: { gameId: string }) {
                   </Item>)}
                 </ItemGroup>}
                 {diagnosis.unknowns.map((text, i) => <Alert role="note" variant="warning" key={i}>
-                  <TriangleAlertIcon/><AlertDescription className="wrap-anywhere">{text}</AlertDescription>
+                  <TriangleAlertIcon /><AlertDescription className="wrap-anywhere">{text}</AlertDescription>
                 </Alert>)}
                 {diagnosis.repairSuggestions.length > 0 && <ItemGroup className="w-full min-w-0 gap-2">
                   {diagnosis.repairSuggestions.map((suggestion, i) => <Item role="listitem" variant="outline" size="sm" key={i}>
@@ -487,7 +486,7 @@ function GameDetails({ gameId }: { gameId: string }) {
             <Card>
               <CardHeader><CardTitle>诊断证据</CardTitle></CardHeader>
               <CardContent className="flex min-w-0 flex-col gap-3">
-                <DiagnosticSources files={diagnosis.logs?.files ?? []}/>
+                <DiagnosticSources files={diagnosis.logs?.files ?? []} />
                 {diagnosis.evidence.length > 0 && <ItemGroup className="gap-2">
                   {diagnosis.evidence.map((e, i) => <Item role="listitem" variant="muted" size="sm" key={i}>
                     <ItemContent className="min-w-0 wrap-anywhere"><PathText>{e.file}{e.line ? `:${e.line}` : ''}</PathText><p>{e.text}</p></ItemContent>
@@ -496,11 +495,11 @@ function GameDetails({ gameId }: { gameId: string }) {
               </CardContent>
             </Card>
           </aside>
-        </div> : <DetailEmptyState title="尚未运行诊断"/>}
+        </div> : <DetailEmptyState title="尚未运行诊断" />}
         <Card className="min-w-0">
           <CardHeader><CardTitle>用户管理目录</CardTitle></CardHeader>
           <CardContent className="flex min-w-0 flex-col gap-3">
-            <ErrorState error={roots.error}/>
+            <ErrorState error={roots.error} />
             {Object.keys(roots.data ?? {}).length > 0 && <ItemGroup className="gap-2">
               {Object.entries(roots.data ?? {}).map(([id, value]) => <Item role="listitem" size="sm" variant="outline" key={id}>
                 <ItemContent className="min-w-0"><ItemTitle className="max-w-full wrap-anywhere">{id}</ItemTitle><PathText>{value}</PathText></ItemContent>
@@ -509,17 +508,17 @@ function GameDetails({ gameId }: { gameId: string }) {
             <FieldGroup className="flex-row flex-wrap items-end gap-2">
               <Field className="min-w-0 flex-1 basis-36">
                 <FieldLabel htmlFor="managed-root-id" className="sr-only">适配包目录 ID</FieldLabel>
-                <Input id="managed-root-id" placeholder="适配包目录 ID" value={rootId} onChange={e => setRootId(e.target.value)}/>
+                <Input id="managed-root-id" placeholder="适配包目录 ID" value={rootId} onChange={e => setRootId(e.target.value)} />
               </Field>
               <Field className="min-w-0 flex-1 basis-52">
                 <FieldLabel htmlFor="managed-root-path" className="sr-only">本机目录完整路径</FieldLabel>
-                <Input id="managed-root-path" placeholder="本机目录完整路径" value={rootPath} onChange={e => setRootPath(e.target.value)}/>
+                <Input id="managed-root-path" placeholder="本机目录完整路径" value={rootPath} onChange={e => setRootPath(e.target.value)} />
               </Field>
               <Button variant="outline" disabled={!writable || busy || !rootId || !rootPath} onClick={() => run(async () => {
                 await api('register_user_root', { gameId, rootId, directory: rootPath });
                 await roots.refetch();
-                notify('用户目录已登记');
-              })}>确认登记目录</Button>
+                notify('用户目录已添加');
+              })}>添加目录</Button>
             </FieldGroup>
           </CardContent>
         </Card>
@@ -529,16 +528,16 @@ function GameDetails({ gameId }: { gameId: string }) {
     {rollback && <Modal title="回滚版本替换" onClose={() => { if (!busy) setRollback(null); }} actions={<>
       <Button variant="outline" disabled={busy} onClick={() => setRollback(null)}>取消</Button>
       <Button disabled={!writable || busy || installs.isFetching || !rollbackCurrent} onClick={() => { void confirmReplacementRollback(); }}>
-        {busy ? <Spinner data-icon="inline-start"/> : <Undo2Icon data-icon="inline-start"/>}
+        {busy ? <Spinner data-icon="inline-start" /> : <Undo2Icon data-icon="inline-start" />}
         {busy ? '正在回滚…' : '确认回滚'}
       </Button>
     </>}>
       <Alert role="note" variant="warning">
-        <TriangleAlertIcon/>
+        <TriangleAlertIcon />
         <AlertDescription className="wrap-anywhere">将撤销 {rollback.name}{rollback.version ? ` · ${rollback.version}` : ''} 的版本替换，以下为要撤销的文件影响。</AlertDescription>
       </Alert>
-      <ReplacementEffects plan={rollback.plan}/>
-      <ErrorState error={rollbackError || (!rollbackCurrent && '安装记录已变化，不能继续回滚此替换。')}/>
+      <ReplacementEffects plan={rollback.plan} />
+      <ErrorState error={rollbackError || (!rollbackCurrent && '安装记录已变化，不能继续回滚此替换。')} />
     </Modal>}
     {installOpen && <Modal title="归档安装预览" onClose={() => { if (!busy) setInstallOpen(false); }} actions={<>
       <Button variant="outline" disabled={busy} onClick={() => setInstallOpen(false)}>取消</Button>
@@ -549,24 +548,24 @@ function GameDetails({ gameId }: { gameId: string }) {
         reviewPlan(result.plan, refresh);
       })}>生成变更预览</Button>
     </>}>
-      <ErrorState error={error || adapter.error}/>
+      <ErrorState error={error || adapter.error} />
       <div className="flex flex-wrap gap-2">
-        <Button variant="outline" disabled={!writable || busy} onClick={() => { void importArchive(); }}><FolderOpenIcon data-icon="inline-start"/>导入本地归档</Button>
+        <Button variant="outline" disabled={!writable || busy} onClick={() => { void importArchive(); }}><FolderOpenIcon data-icon="inline-start" />导入本地归档</Button>
         <Button variant="outline" disabled={!writable || busy || !artifactPath.trim()} onClick={() => { void previewFomod(); }}>扫描 FOMOD 配置</Button>
       </div>
       <FieldGroup className="gap-4">
         <Field>
           <FieldLabel htmlFor="install-artifact-path">管理器内归档路径</FieldLabel>
-          <Input id="install-artifact-path" aria-label="管理器内归档路径" disabled={busy} value={artifactPath} placeholder="downloads 或 staging 内已完成的归档" onChange={e => { setArtifactPath(e.target.value); setArtifactHash(null); setFomodPreview(null); setFomodSelections({}); }}/>
+          <Input id="install-artifact-path" aria-label="管理器内归档路径" disabled={busy} value={artifactPath} placeholder="downloads 或 staging 内已完成的归档" onChange={e => { setArtifactPath(e.target.value); setArtifactHash(null); setFomodPreview(null); setFomodSelections({}); }} />
         </Field>
         <Field>
           <FieldLabel htmlFor="install-filename">原始文件名</FieldLabel>
-          <Input id="install-filename" aria-label="原始文件名" disabled={busy} value={filename} placeholder="例如 MyMod.zip" onChange={e => { setFilename(e.target.value); setArtifactHash(null); setFomodPreview(null); setFomodSelections({}); }}/>
+          <Input id="install-filename" aria-label="原始文件名" disabled={busy} value={filename} placeholder="例如 MyMod.zip" onChange={e => { setFilename(e.target.value); setArtifactHash(null); setFomodPreview(null); setFomodSelections({}); }} />
         </Field>
         <div className="grid min-w-0 gap-4 sm:grid-cols-2">
           <Field>
             <FieldLabel htmlFor="install-mod-name">Mod 名称</FieldLabel>
-            <Input id="install-mod-name" aria-label="Mod 名称" value={modName} onChange={e => setModName(e.target.value)}/>
+            <Input id="install-mod-name" aria-label="Mod 名称" value={modName} onChange={e => setModName(e.target.value)} />
           </Field>
           <Field className="min-w-0 [&>[data-slot=native-select-wrapper]]:w-full">
             <FieldLabel htmlFor="install-mod-type">适配包 Mod 类型</FieldLabel>
@@ -577,8 +576,8 @@ function GameDetails({ gameId }: { gameId: string }) {
           </Field>
         </div>
       </FieldGroup>
-      {installTypeNotes && <Alert role="note" variant="warning"><TriangleAlertIcon/><AlertDescription className="wrap-anywhere">{installTypeNotes}</AlertDescription></Alert>}
-      {fomodPreview && <FomodOptions preview={fomodPreview} selections={fomodSelections} disabled={busy} onChange={setFomodSelections}/>}
+      {installTypeNotes && <Alert role="note" variant="warning"><TriangleAlertIcon /><AlertDescription className="wrap-anywhere">{installTypeNotes}</AlertDescription></Alert>}
+      {fomodPreview && <FomodOptions preview={fomodPreview} selections={fomodSelections} disabled={busy} onChange={setFomodSelections} />}
     </Modal>}
   </Page>;
 }

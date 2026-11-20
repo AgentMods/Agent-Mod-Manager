@@ -64,10 +64,7 @@ pub fn register_user_root(
         return Err(AppError::Denied("请选择实际存在且非符号链接的目录".into()));
     }
     let path = path.canonicalize()?;
-    if path.parent().is_none()
-        || path.starts_with(&engine.paths.root)
-        || engine.paths.root.starts_with(&path)
-    {
+    if path.parent().is_none() || engine.paths.overlaps_storage(&path) {
         return Err(AppError::Denied(
             "用户管理根不能包含管理器数据或整个文件系统".into(),
         ));

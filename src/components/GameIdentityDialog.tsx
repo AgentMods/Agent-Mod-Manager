@@ -73,7 +73,7 @@ export function GameIdentityDialog({ directory, writable, onClose, onConfirmed }
 
   return <Modal title="联网识别游戏" onClose={() => { if (!busy) onClose(); }} className="sm:max-w-2xl" actions={<>
     <Button variant="outline" disabled={busy} onClick={onClose}>取消</Button>
-    <Button disabled={!canConfirm} onClick={() => { void confirm(); }}><CheckIcon data-icon="inline-start"/>确认登记</Button>
+    <Button disabled={!canConfirm} onClick={() => { void confirm(); }}><CheckIcon data-icon="inline-start"/>添加</Button>
   </>}>
     <ErrorState error={preview.error || error}/>
     {!preview.data ? <EmptyState title={preview.isLoading ? '正在检查本地目录…' : '无法检查目录'}/> : <div className="flex flex-col gap-4 text-sm">
@@ -106,7 +106,7 @@ export function GameIdentityDialog({ directory, writable, onClose, onConfirmed }
           </RadioGroup> : <EmptyState title="没有找到可确认的候选"/>}
           {selected !== null && <FieldGroup>
             <Field><FieldLabel htmlFor="identity-name">确认的游戏名称</FieldLabel><Input id="identity-name" aria-label="确认的游戏名称" maxLength={128} value={name} disabled={busy} onChange={event => { setName(event.target.value); setRegistrationConsent(false); }}/></Field>
-            <Label className="items-start font-normal"><Checkbox aria-label="确认游戏目录登记" checked={registrationConsent} disabled={busy || !writable} onCheckedChange={checked => setRegistrationConsent(checked === true)}/><span>我已核对候选，确认将此目录登记为游戏。不自动关联适配包或执行安装。</span></Label>
+            <Label className="items-start font-normal"><Checkbox aria-label="确认添加" checked={registrationConsent} disabled={busy || !writable} onCheckedChange={checked => setRegistrationConsent(checked === true)}/><span>我已核对候选，确认将此目录添加到游戏管理器。不自动关联适配包或执行安装。</span></Label>
           </FieldGroup>}
         </>}
       </section>}

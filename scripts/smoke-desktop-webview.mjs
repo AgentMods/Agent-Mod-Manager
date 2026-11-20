@@ -252,7 +252,7 @@ async function registerAndOpen(ui, root) {
   await ui.fill(`${main}//input[@aria-label="游戏目录"]`, root);
   await ui.click(button('检查目录'));
   const candidate = `${main}//div[./div/strong[${exact(game)}] and ./div/p[${pathIs(root)}]]`;
-  await ui.click(button('确认登记', candidate));
+  await ui.click(button('添加', candidate));
 
   // Registration opens the detail view automatically; reopen the persisted library entry.
   await ui.visible(textAt(main, game, 'h1'));

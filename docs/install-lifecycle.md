@@ -124,12 +124,11 @@ rewrites manifests, or changes database/file state.
 
 ## Modrinth Dependency Review
 
-In a Modrinth download's install dialog, select a registered game and request a
-dependency check. The lookup requests the download's exact upstream project and
-version IDs; it does not send the selected game's local ID or path. The desktop,
-Agent and local MCP command `check_modrinth_dependencies` compares those direct
-declarations with exact catalog origins in that game's install journal. The
-check itself is local and read-only. Missing declarations (`null`) are distinct
+Use `resolve_mod` with the download's exact upstream project and version IDs to
+look up direct declarations. Pass those declarations and the registered game ID
+to `check_modrinth_dependencies` via Agent, local MCP, or desktop IPC. This
+read-only check compares the declarations with exact catalog origins in the
+selected game's install journal. It distinguishes missing declarations (`null`)
 from an explicit empty list.
 
 A pinned match, a project-only match, another recorded version, and no recorded
@@ -144,11 +143,10 @@ records without catalog origins, other providers, present-day file integrity or
 whether the loader actually activated a Mod. No dependency is fetched or deployed
 as a side effect, and the check grants no file approval.
 
-In the desktop download install preview, expand **传递依赖核对** for a Modrinth
-archive and a registered Minecraft Java target. Supply the actual game version
-and loader. The backend resolves the root's exact project/version from the local
-download catalog, then compares each graph edge with that game's installed
-records. For a selected project-only dependency, the comparison uses the
+The desktop IPC `review_modrinth_dependency_graph` takes a completed Modrinth
+download, a registered Minecraft Java target, and its game version and loader.
+It resolves the root's exact project and version from the local download catalog
+and compares each graph edge with the game's installed records. For a selected project-only dependency, the comparison uses the
 resolved exact version, not merely any installed version of the project. A
 candidate or an exact ID entered by the user is revalidated against the provider.
 A chosen replacement is excluded only if it remains an enabled record for a

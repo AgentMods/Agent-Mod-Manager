@@ -18,7 +18,10 @@ pub struct AppServices {
 
 impl AppServices {
     pub fn initialize(root: PathBuf) -> AppResult<Self> {
-        let paths = AppPaths::new(root)?;
+        Self::initialize_paths(AppPaths::new(root)?)
+    }
+
+    pub(crate) fn initialize_paths(paths: AppPaths) -> AppResult<Self> {
         let file = tracing_appender::rolling::daily(paths.logs(), "manager.log");
         let (writer, guard) = tracing_appender::non_blocking(file);
         let logging = tracing_subscriber::registry()

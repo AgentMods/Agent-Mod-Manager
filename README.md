@@ -5,13 +5,13 @@ The full implementation goal is active. This repository is not release-ready;
 see [implementation status](docs/implementation-status.md) for verified work
 and remaining requirements.
 
-The current development build includes eight lazy-loaded application views,
-Skill management, declarative plugin draft/install controls, Brave web search,
+The current development build includes Skill management, declarative plugin
+draft/install controls, Brave web search,
 and a reviewed plugin-publication workflow. Checks on November 19, 2026 include
 594/594 passing Rust library tests, a successful `yarn build`, and 210/210
-Playwright checks. FOMOD archives now have an explicit, bounded configuration
-preview in both the local-archive and downloaded-artifact install flows;
-conditions and scripts are never auto-executed.
+Playwright checks. The desktop local-archive install flow includes a bounded
+FOMOD configuration preview. Players can search for and download Mods through
+Agent Chat.
 Unknown-game identification now has reviewed public searches, untrusted
 candidates, independent user confirmation and a 24-hour evidence cache. It does
 not infer an adapter or automatically install anything. See

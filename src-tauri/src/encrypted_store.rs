@@ -101,7 +101,7 @@ fn decrypt(key: &[u8; 32], name: &str, value: Value) -> AppResult<String> {
     String::from_utf8(bytes).map_err(|_| failure("凭据解密内容不是 UTF-8"))
 }
 
-fn private_directory(path: &Path) -> AppResult<()> {
+pub(crate) fn private_directory(path: &Path) -> AppResult<()> {
     if !path.exists() {
         let builder = fs::DirBuilder::new();
         #[cfg(unix)]
@@ -237,7 +237,11 @@ impl<R: Runtime> SecretStore for EncryptedStore<R> {
             }
             return Err(failure("加密凭据保存失败，未登记凭据引用"));
         }
-        fs::File::open(&self.path)?.sync_all()?;
+        // Windows FlushFileBuffers requires write access; a read-only handle fails with os error 5.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&self.path)?
+            .sync_all()?;
         Ok(())
     }
 }

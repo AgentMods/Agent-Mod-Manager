@@ -1,0 +1,197 @@
+import { useRef, useState } from "react";
+import { ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, PlusIcon, ShieldAlertIcon, ShieldIcon, SquareIcon } from "lucide-react";
+import { DropdownMenu as Menu, Popover, Slider } from "radix-ui";
+import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { InputGroup, InputGroupAddon, InputGroupTextarea } from "@/components/ui/input-group";
+import { reasoningEffortLabel } from "@/lib/reasoning-effort";
+import type { AgentModelSettings, PermissionMode, ReasoningEffort } from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+const popupPosition = { side: "top", align: "end", sideOffset: 8, collisionPadding: 12 } as const;
+const permissionLabels: Record<PermissionMode | "", string> = {
+  "": "会话设置",
+  request_approval: "逐次审批",
+  auto_approve: "游戏内自动批准",
+  full_trust: "完全信任",
+};
+
+interface AgentComposerProps {
+  input: string;
+  onInputChange: (value: string) => void;
+  onSend: () => void;
+  onCancel?: () => void;
+  disabled: boolean;
+  busy: boolean;
+  permission: PermissionMode | "";
+  inheritedPermission: PermissionMode;
+  onPermissionChange: (value: PermissionMode | "") => void;
+  model: string;
+  models: AgentModelSettings[];
+  onModelChange: (value: string) => void;
+  reasoningEffort: ReasoningEffort | null;
+  onReasoningChange: (value: ReasoningEffort | null) => void;
+}
+
+export function AgentComposer({
+  input, onInputChange, onSend, onCancel, disabled, busy, permission, inheritedPermission,
+  onPermissionChange, model, models, onModelChange, reasoningEffort, onReasoningChange,
+}: AgentComposerProps) {
+  const [picker, setPicker] = useState<"model" | "reasoning" | null>(null);
+  const controlsDisabled = disabled || busy;
+  const canSend = !controlsDisabled && Boolean(input.trim());
+  const selectedModel = models.find((entry) => entry.id === model);
+  const levels = selectedModel?.reasoning_levels ?? [];
+  const modelLabel = selectedModel?.display_name?.trim() || model || "未配置模型";
+  const effectivePermission = permission || inheritedPermission;
+  const elevated = effectivePermission === "full_trust";
+  const PermissionIcon = elevated ? ShieldAlertIcon : ShieldIcon;
+
+  return <form className="shrink-0 px-3 pb-3 pt-2 sm:px-8 sm:pb-5" onSubmit={(event) => {
+    event.preventDefault();
+    if (canSend) onSend();
+  }}>
+    <div className="mx-auto w-full max-w-5xl">
+      <InputGroup className="rounded-[22px] border-border shadow-sm bg-muted/55 dark:bg-secondary">
+        <InputGroupTextarea
+          aria-label="告诉 Agent 你想做什么"
+          placeholder="和 Agent 一起工作"
+          value={input}
+          className="max-h-[min(14rem,34dvh)] min-h-16 resize-none px-4 pt-3.5 pb-2 sm:min-h-20 sm:text-base"
+          disabled={disabled}
+          onChange={(event) => onInputChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+              event.preventDefault();
+              if (canSend) onSend();
+            }
+          }}
+        />
+        <InputGroupAddon align="block-end" className="cursor-default flex-wrap justify-between gap-1.5 px-2.5 pb-2.5 pt-0">
+          <div className="flex min-w-0 items-center gap-1">
+            <Button type="button" aria-label="添加上下文" size="icon-sm" variant="ghost" disabled>
+              <PlusIcon aria-hidden="true" />
+            </Button>
+            <DropdownMenu modal={false}>
+              <DropdownMenuTrigger asChild>
+                <Button type="button" size="sm" variant="ghost" aria-label="本轮权限策略"
+                  title={permission ? permissionLabels[permission] : `会话设置 · ${permissionLabels[effectivePermission]}`}
+                  className={cn("gap-1.5 rounded-full px-2 text-xs has-[>svg]:px-2", elevated && "text-warning")}
+                  disabled={controlsDisabled}>
+                  <PermissionIcon aria-hidden="true" className="size-4" />
+                  <span>{permissionLabels[effectivePermission]}</span>
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent {...popupPosition} align="start" className="min-w-44 rounded-xl">
+                <DropdownMenuRadioGroup value={permission} onValueChange={(next) => onPermissionChange(next as PermissionMode | "")}>
+                  {Object.entries(permissionLabels).map(([value, name]) => (
+                    <DropdownMenuRadioItem key={value} className="min-h-8" value={value}>{name}</DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+          <div className="ml-auto flex max-w-full min-w-0 items-center gap-2">
+            <div className="flex min-w-0 items-center rounded-full bg-background/80 dark:bg-background/50">
+              <DropdownMenu modal={false} open={!controlsDisabled && picker === "model"}
+                onOpenChange={(open) => setPicker((current) => open ? "model" : current === "model" ? null : current)}>
+                <DropdownMenuTrigger asChild>
+                  <Button type="button" size="sm" variant="ghost" aria-label="本轮模型" title={modelLabel}
+                    className="min-w-0 shrink rounded-full px-2.5 has-[>svg]:px-2.5"
+                    disabled={controlsDisabled || !models.length}>
+                    <span className="max-w-[min(30vw,13rem)] truncate">{modelLabel}</span>
+                    {!levels.length && <ChevronDownIcon aria-hidden="true" className="size-3 opacity-60" />}
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent {...popupPosition} aria-label="本轮模型"
+                  className="max-h-[min(23rem,var(--radix-dropdown-menu-content-available-height))] w-[min(19rem,calc(100vw-24px))] rounded-2xl p-1.5 shadow-lg">
+                  <DropdownMenuRadioGroup value={model} onValueChange={onModelChange}>
+                    {models.map(({id, display_name}) => (
+                      <Menu.RadioItem key={id} value={id} title={id}
+                        className="flex min-h-8 cursor-default items-center gap-3 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none data-highlighted:bg-muted data-[state=checked]:font-medium">
+                        <span className="min-w-0 flex-1 wrap-anywhere">{display_name?.trim() || id}</span>
+                        <Menu.ItemIndicator><CheckIcon aria-hidden="true" className="size-4 text-primary" /></Menu.ItemIndicator>
+                      </Menu.RadioItem>
+                    ))}
+                  </DropdownMenuRadioGroup>
+                </DropdownMenuContent>
+              </DropdownMenu>
+              {levels.length > 0 && <ReasoningPicker modelLabel={modelLabel} levels={levels} value={reasoningEffort}
+                disabled={controlsDisabled} open={!controlsDisabled && picker === "reasoning"}
+                onOpenChange={(open) => setPicker((current) => open ? "reasoning" : current === "reasoning" ? null : current)}
+                onOpenModel={() => setPicker("model")} onChange={onReasoningChange} />}
+            </div>
+            {onCancel ? <Button type="button" aria-label="停止生成" title="停止生成" variant="secondary" size="icon"
+              className="rounded-full bg-foreground text-background hover:bg-foreground/85" onClick={onCancel}>
+              <SquareIcon aria-hidden="true" className="size-3 fill-current" />
+            </Button> : <Button type="submit" aria-label="发送消息" title="发送消息" size="icon" className="rounded-full" disabled={!canSend}>
+              <ArrowUpIcon aria-hidden="true" />
+            </Button>}
+          </div>
+        </InputGroupAddon>
+      </InputGroup>
+    </div>
+  </form>;
+}
+
+function ReasoningPicker({ modelLabel, disabled, levels, value, open, onOpenChange, onOpenModel, onChange }: {
+  modelLabel: string;
+  disabled: boolean;
+  levels: ReasoningEffort[];
+  value: ReasoningEffort | null;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onOpenModel: () => void;
+  onChange: (value: ReasoningEffort | null) => void;
+}) {
+  const openingModel = useRef(false);
+  const selected = value ? levels.indexOf(value) + 1 : 0;
+  const accessibleLevel = value ? reasoningEffortLabel(value) : "服务默认";
+  const ultra = value === "ultra";
+  const levelLabel = ultra ? "Ultra" : accessibleLevel.split("（")[0];
+
+  return <Popover.Root open={open} onOpenChange={onOpenChange}>
+    <Popover.Trigger asChild>
+      <Button type="button" size="sm" variant="ghost" aria-label="本轮思考等级" title={`推理强度 · ${accessibleLevel}`} disabled={disabled}
+        className="gap-1 rounded-full pl-1 pr-2.5 text-xs text-muted-foreground has-[>svg]:pl-1 has-[>svg]:pr-2.5">
+        <span className="truncate">{levelLabel}</span>
+        <ChevronDownIcon aria-hidden="true" className="size-3 opacity-70" />
+      </Button>
+    </Popover.Trigger>
+    <Popover.Portal>
+      <Popover.Content {...popupPosition} aria-label="本轮思考等级" onCloseAutoFocus={(event) => {
+        if (openingModel.current) {
+          event.preventDefault();
+          openingModel.current = false;
+        }
+      }}
+        className="z-50 w-[min(19rem,calc(100vw-24px))] rounded-2xl border bg-popover p-4 text-center text-popover-foreground shadow-lg">
+        <p className={cn("text-base font-semibold", ultra ? "text-reasoning-ultra" : "text-primary")}>{levelLabel}</p>
+        <Button type="button" variant="ghost" size="xs" onClick={() => {
+          openingModel.current = true;
+          onOpenModel();
+        }}
+          className="max-w-full gap-1 text-muted-foreground" title={modelLabel}>
+          <span className="truncate">{modelLabel}</span><ChevronRightIcon aria-hidden="true" />
+        </Button>
+        <Slider.Root className="relative mt-2.5 flex h-8 w-full touch-none items-center select-none"
+          value={[selected]} min={0} max={levels.length} step={1} onValueChange={([index]) => onChange(levels[index - 1] ?? null)}>
+          <Slider.Track className="relative h-6 w-full rounded-full bg-secondary">
+            <Slider.Range className={cn("absolute h-full rounded-full", ultra ? "agent-ultra-range" : "bg-primary")} />
+          </Slider.Track>
+          {!ultra && <div aria-hidden="true" className="pointer-events-none absolute inset-x-3 flex justify-between">
+            {["default", ...levels].map((level) => <span key={level} className="size-1 rounded-full bg-popover-foreground/30" />)}
+          </div>}
+          <Slider.Thumb aria-label="推理强度" aria-valuetext={accessibleLevel}
+            className="block size-7 rounded-full border bg-white shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-popover" />
+        </Slider.Root>
+      </Popover.Content>
+    </Popover.Portal>
+  </Popover.Root>;
+}

@@ -25,6 +25,7 @@ function disk(status: FabricDisk['status'], jars: FabricDisk['jars'] = []): Fabr
 async function setup(page: Page) {
   await installMockTauri(page);
   await page.goto('/');
+  await page.getByRole('button', {name: '游戏库', exact: true}).click();
   const heading = page.getByRole('heading', { name: 'Minecraft Java Edition', exact: true });
   await page.getByRole('button').filter({ has: heading }).click();
   await page.getByRole('tab', { name: '诊断', exact: true }).click();

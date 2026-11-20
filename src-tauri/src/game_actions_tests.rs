@@ -575,7 +575,32 @@ fn mods_reports_unregistered_user_root_and_uses_explicit_registration() {
     let error = resolve_location(&f.engine, "g", "mods").unwrap_err();
     assert!(error
         .to_string()
-        .contains("请先登记用户管理根 world-datapacks"));
+        .contains("请先添加用户管理目录 world-datapacks"));
     game_roots::register_user_root(&f.engine, "g", "world-datapacks", &world).unwrap();
     assert_eq!(resolve_location(&f.engine, "g", "mods").unwrap(), mods);
+}
+
+#[test]
+fn selecting_a_package_checks_markers_and_keeps_the_game_registration() {
+    let f = Fixture::new();
+    crate::plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
+    assert!(set_game_adapter(&f.engine, "g", "minecraft-java").is_err());
+    assert_eq!(f.game().adapter_slug, None);
+    let adapter = minecraft_adapter();
+    let marker = adapter
+        .markers
+        .iter()
+        .find(|marker| matches!(marker.kind, crate::plugins::MarkerKind::Directory))
+        .unwrap();
+    make_dir(&f.root.join(&marker.path));
+    let updated = set_game_adapter(&f.engine, "g", "minecraft-java").unwrap();
+    assert_eq!(updated.id, "g");
+    assert_eq!(updated.name, "Original");
+    assert_eq!(updated.adapter_slug.as_deref(), Some("minecraft-java"));
+    assert_eq!(
+        updated.adapter_version.as_deref(),
+        Some(adapter.version.as_str())
+    );
+    assert_eq!(updated.metadata["keep"], json!({"value":1}));
+    assert_eq!(games::list_games(&f.engine.db).unwrap().len(), 1);
 }

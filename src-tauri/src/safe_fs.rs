@@ -223,6 +223,9 @@ mod platform {
     }
 
     pub(crate) fn identity(path: &Path) -> AppResult<Option<FileIdentity>> {
+        if path.has_root() && path.parent().is_none() {
+            return identity_at(&directory(path, false)?, OsStr::new("."));
+        }
         match parent(path, false) {
             Ok((dir, name)) => identity_at(&dir, name),
             Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),

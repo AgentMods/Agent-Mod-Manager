@@ -1,0 +1,15 @@
+"use client"
+import * as React from "react"
+import { CheckIcon, CopyIcon } from "lucide-react"
+import { cva, type VariantProps } from "class-variance-authority"
+import { cn } from "@/lib/utils"
+import { Button } from "@/components/ui/button"
+const codeBlockVariants = cva("group/code-block relative flex w-full min-w-0 flex-col overflow-hidden rounded-xl text-sm", { variants: { variant: { default: "bg-muted text-foreground ring-1 ring-foreground/5", destructive: "bg-destructive/5 text-destructive ring-1 ring-destructive/15" } }, defaultVariants: { variant: "default" } })
+function CodeBlock({ className, variant="default", size="default", ...props }: React.ComponentProps<"div"> & VariantProps<typeof codeBlockVariants> & {size?: "default"|"sm"}) { return <div data-slot="code-block" data-variant={variant} data-size={size} className={cn(codeBlockVariants({variant}), className)} {...props} /> }
+function CodeBlockHeader({className,...props}: React.ComponentProps<"div">) { return <div data-slot="code-block-header" className={cn("flex min-w-0 shrink-0 items-center gap-2 px-3 pt-3 text-muted-foreground", className)} {...props} /> }
+function CodeBlockTitle({className,...props}: React.ComponentProps<"div">) { return <div data-slot="code-block-title" className={cn("min-w-0 truncate font-sans text-xs font-medium text-foreground", className)} {...props} /> }
+function CodeBlockActions({className,...props}: React.ComponentProps<"div">) { return <div data-slot="code-block-actions" className={cn("ms-auto flex shrink-0 items-center gap-1", className)} {...props} /> }
+function CodeBlockCopyButton({value, className, onClick, ...props}: React.ComponentProps<typeof Button> & {value:string}) { const [copied,setCopied]=React.useState(false); React.useEffect(()=>{if(!copied)return; const timer=setTimeout(()=>setCopied(false),2000); return()=>clearTimeout(timer)},[copied]); return <Button data-slot="code-block-copy-button" type="button" variant="ghost" size="icon-xs" aria-label={copied?"已复制":"复制"} className={className} onClick={(e)=>{onClick?.(e); void navigator.clipboard?.writeText(value).then(()=>setCopied(true)).catch(()=>{})}} {...props}>{copied?<CheckIcon/>:<CopyIcon/>}<span className="sr-only">{copied?"已复制":"复制"}</span></Button> }
+function CodeBlockContent({className, children, wrap=false, ...props}: React.ComponentProps<"pre"> & {wrap?:boolean}) { return <pre data-slot="code-block-content" tabIndex={0} className={cn("min-h-0 min-w-0 overflow-auto px-3 py-3 text-start font-mono text-xs leading-relaxed outline-none", wrap && "whitespace-pre-wrap break-words", className)} {...props}><code data-slot="code-block-code">{children}</code></pre> }
+function CodeBlockFooter({className,...props}:React.ComponentProps<"div">){return <div data-slot="code-block-footer" className={cn("flex min-w-0 shrink-0 items-center gap-2 px-3 pb-3 text-muted-foreground",className)} {...props}/>}
+export {CodeBlock,CodeBlockHeader,CodeBlockTitle,CodeBlockActions,CodeBlockCopyButton,CodeBlockContent,CodeBlockFooter}

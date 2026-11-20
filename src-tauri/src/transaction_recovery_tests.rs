@@ -62,9 +62,7 @@ fn process_crash_worker() {
         return;
     };
     let fixture = std::env::current_dir().unwrap().canonicalize().unwrap();
-    let paths = AppPaths {
-        root: fixture.join("data"),
-    };
+    let paths = AppPaths::new(fixture.join("data")).unwrap();
     let game = fixture.join("game");
     assert!(paths.db_file().is_file());
     let engine = FileEngine::new(Db::open(&paths.db_file()).unwrap(), paths);

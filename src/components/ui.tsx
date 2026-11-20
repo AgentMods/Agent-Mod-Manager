@@ -83,11 +83,12 @@ export function date(value: string) {
  * Modal task dialog. Closes with Escape, the close button or an explicit action,
  * never by clicking outside, so a stray click cannot reject an approval.
  */
-export function Modal({ title, description, children, actions, onClose, className }: {
+export function Modal({ title, description, children, actions, onClose, onCloseAutoFocus, className }: {
   title: string; description?: string; children: ReactNode; actions?: ReactNode; onClose: () => void; className?: string;
+  onCloseAutoFocus?: ComponentProps<typeof DialogContent>["onCloseAutoFocus"];
 }) {
   return <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
-    <DialogContent onInteractOutside={(event) => event.preventDefault()}
+    <DialogContent onInteractOutside={(event) => event.preventDefault()} onCloseAutoFocus={onCloseAutoFocus}
       className={cn("flex max-h-[calc(100dvh-3rem)] flex-col gap-0 p-0 sm:max-w-[850px]", className)}>
       <DialogHeader className="border-b px-6 py-4 pr-12 text-left">
         <DialogTitle>{title}</DialogTitle>
