@@ -1,11 +1,11 @@
 const verbatimPrefix = "\\\\?\\";
 const windowsDrive = /^[A-Za-z]:[\\/]/;
-const dosDevice = /^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|CLOCK\$|(?:COM|LPT)[1-9¹²³])$/i;
+const dosDevice = /^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|CLOCK\$|(?:COM|LPT)[1-9¹²³])$/;
 
 function ordinaryWindowsComponents(tail: string) {
   return tail.replace(/\\$/, "").split("\\").every((name) =>
     name !== "" && !/[\/<>:"|?*\x00-\x1f\x7f-\x9f]/.test(name) && !/[. ]$/.test(name) &&
-    !dosDevice.test(name.split(".", 1)[0].replace(/ +$/, "")),
+    !dosDevice.test(name.split(".", 1)[0].replace(/ +$/, "").toUpperCase()),
   );
 }
 

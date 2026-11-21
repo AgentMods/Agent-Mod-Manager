@@ -41,7 +41,7 @@ export const useUI = create<UIState>((set) => ({
       prompt: target?.slug
         ? `我想修改「${target.name}」适配包（${target.slug}）。请先读取现有适配包，再和我确认要修改的内容。`
         : target
-          ? `请为管理中的游戏「${target.name}」创建适配包，包含游戏封面和游戏 Skill。请先和我确认识别标记与 Mod 安装规则。`
+          ? `请为管理中的游戏「${target.name}」创建适配包，包含游戏封面和游戏 Skill。请先和我确认识别标记与 Mod 安装规则，校验通过后安装并绑定到这款游戏。`
           : "我想创建一个游戏适配包，包含游戏封面和游戏 Skill。请先和我确认游戏名称及适配需求。",
     },
   }),

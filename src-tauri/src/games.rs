@@ -4,7 +4,7 @@
 //! legendary-gl/legendary legendary/{lfs,models}/egl.py (checked 2026-11-17).
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
-use crate::paths::user_path;
+use crate::paths::{display_path, user_path};
 use crate::plugins::{self, GameAdapter, MarkerKind, Platform};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -420,7 +420,7 @@ fn identify_at(
         .unwrap_or_else(|| {
             root.file_name()
                 .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| user_path(root).display().to_string())
+                .unwrap_or_else(|| display_path(root))
         });
     Ok(GameCandidate {
         root_path: path_text(&user_path(root))?,
@@ -466,7 +466,7 @@ pub fn identify_game(db: &Db, directory: &Path) -> AppResult<GameCandidate> {
 /// repeated root registration unless a different adapter is explicitly selected.
 pub fn register_game(db: &Db, directory: &Path, adapter_slug: Option<&str>) -> AppResult<Game> {
     let selection = adapter_slug.map_or(AdapterSelection::Automatic, AdapterSelection::Explicit);
-    register_game_inner(db, directory, selection, None)
+    register_game_inner(db, directory, selection)
 }
 
 /// The reviewed scan can include launcher evidence unavailable to a directory-only probe.
@@ -480,7 +480,6 @@ pub(crate) fn register_discovered_game(
         db,
         directory,
         AdapterSelection::Discovered(suggested_adapter_slug),
-        None,
     )
 }
 
@@ -490,21 +489,110 @@ enum AdapterSelection<'a> {
     Discovered(Option<&'a str>),
 }
 
-pub(crate) fn rebind_game(db: &Db, game: &Game, adapter_slug: &str) -> AppResult<Game> {
-    plugins::adapter_for(db, adapter_slug)?;
-    register_game_inner(
-        db,
-        Path::new(&game.root_path),
-        AdapterSelection::Explicit(adapter_slug),
-        Some(&game.id),
-    )
+/// Evidence and the exact identity to persist for a manual selection. The
+/// caller checks the registered root and serializes preview/commit under the
+/// write lock, so selecting a package never creates a new registration.
+pub(crate) struct GameAdapterSelection {
+    pub adapter: GameAdapter,
+    pub matched: AdapterMatch,
+    pub identification: Value,
+}
+
+pub(crate) fn inspect_game_adapter_selection(
+    db: &Db,
+    root: &Path,
+    slug: &str,
+) -> AppResult<GameAdapterSelection> {
+    // Unlike ordinary discovery, require the chosen package to be registered.
+    let adapter = plugins::adapter_for(db, slug)?;
+    let candidate = identify_at(
+        root,
+        &active_adapters(db)?,
+        vec![DiscoverySource::simple(DiscoveryKind::User)],
+    )?;
+    let matched = explicit_adapter_match(&candidate, slug)?.clone();
+    Ok(GameAdapterSelection {
+        adapter,
+        matched,
+        identification: serde_json::to_value(&candidate)?,
+    })
+}
+
+impl GameAdapterSelection {
+    pub(crate) fn platform(&self) -> &'static str {
+        platform_name(self.matched.platform)
+    }
+
+    pub(crate) fn already_applied(&self, game: &Game) -> bool {
+        game.adapter_slug.as_deref() == Some(&self.adapter.slug)
+            && game.adapter_version.as_deref() == Some(&self.adapter.version)
+            && game.slug == self.adapter.slug
+            && game.platform == self.platform()
+            && game.confidence == self.matched.confidence
+            && game.steam_app_id == self.adapter.steam_app_id
+            && game.metadata["registration"]["kind"] == "explicit"
+            // Compare with the same JSON number parsing as metadata_json.
+            && game.metadata.get("lastIdentification")
+                == serde_json::from_str::<Value>(&self.identification.to_string()).ok().as_ref()
+    }
+}
+
+pub(crate) fn rebind_game(
+    tx: &rusqlite::Transaction<'_>,
+    game: Game,
+    selected: &GameAdapterSelection,
+) -> AppResult<Game> {
+    if selected.already_applied(&game) {
+        return Ok(game);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut metadata = game.metadata;
+    update_registration_metadata(&mut metadata, selected.identification.clone(), &now)?;
+    tx.execute(
+        "UPDATE games SET slug=?1,platform=?2,adapter_slug=?1,adapter_version=?3,confidence=?4,
+         steam_app_id=?5,last_scanned_at=?6,metadata_json=?7,updated_at=?6 WHERE id=?8",
+        params![
+            selected.adapter.slug,
+            selected.platform(),
+            selected.adapter.version,
+            selected.matched.confidence,
+            selected.adapter.steam_app_id,
+            now,
+            metadata.to_string(),
+            game.id
+        ],
+    )?;
+    get_game_from(tx, &game.id)
+}
+
+fn explicit_adapter_match<'a>(
+    candidate: &'a GameCandidate,
+    slug: &str,
+) -> AppResult<&'a AdapterMatch> {
+    candidate
+        .matches
+        .iter()
+        .find(|m| m.slug == slug && !m.matched_markers.is_empty())
+        .ok_or_else(|| invalid("所选适配包没有任何实际匹配的磁盘标记"))
+}
+
+fn update_registration_metadata(
+    metadata: &mut Value,
+    identification: Value,
+    now: &str,
+) -> AppResult<()> {
+    if !metadata.is_object() {
+        return Err(invalid("现有游戏 metadata 必须是 JSON 对象"));
+    }
+    metadata["registration"] = json!({"kind":"explicit", "at":now});
+    metadata["lastIdentification"] = identification;
+    Ok(())
 }
 
 fn register_game_inner(
     db: &Db,
     directory: &Path,
     selection: AdapterSelection<'_>,
-    expected_game_id: Option<&str>,
 ) -> AppResult<Game> {
     let root = canonical_directory(directory)?;
     if root.parent().is_none() {
@@ -528,13 +616,7 @@ fn register_game_inner(
             .iter()
             .find(|a| a.slug == slug)
             .ok_or_else(|| AppError::NotFound(format!("未启用的适配包: {slug}")))?;
-        Some(
-            candidate
-                .matches
-                .iter()
-                .find(|m| m.slug == slug && !m.matched_markers.is_empty())
-                .ok_or_else(|| invalid("所选适配包没有任何实际匹配的磁盘标记"))?,
-        )
+        Some(explicit_adapter_match(&candidate, slug)?)
     } else {
         None
     };
@@ -549,9 +631,6 @@ fn register_game_inner(
             game_from_row,
         )
         .optional()?;
-    if expected_game_id.is_some_and(|id| existing.as_ref().is_none_or(|game| game.id != id)) {
-        return Err(AppError::Conflict("已登记的游戏目录已改变".into()));
-    }
     let retain_identity = !matches!(selection, AdapterSelection::Explicit(_))
         && existing.as_ref().is_some_and(|g| g.adapter_slug.is_some());
     let old = existing.as_ref();
@@ -598,11 +677,7 @@ fn register_game_inner(
         adapter.and_then(|a| a.steam_app_id.clone())
     };
     let mut metadata = old.map_or_else(|| json!({}), |g| g.metadata.clone());
-    if !metadata.is_object() {
-        return Err(invalid("现有游戏 metadata 必须是 JSON 对象"));
-    }
-    metadata["registration"] = json!({"kind":"explicit", "at":now});
-    metadata["lastIdentification"] = serde_json::to_value(&candidate)?;
+    update_registration_metadata(&mut metadata, serde_json::to_value(&candidate)?, &now)?;
     tx.execute(
         "INSERT INTO games (id,name,slug,root_path,platform,adapter_slug,adapter_version,confidence,steam_app_id,last_scanned_at,metadata_json,created_at,updated_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?10,?10)
@@ -1104,7 +1179,7 @@ impl Scanner<'_> {
         // Warnings are also bounded if a directory contains many broken files.
         if self.report.warnings.len() < 256 {
             self.report.warnings.push(ScanWarning {
-                path: user_path(path).display().to_string(),
+                path: display_path(path),
                 message: message.to_string(),
             });
         }
@@ -1347,7 +1422,7 @@ impl Scanner<'_> {
                     Ok(path) if path.starts_with(&common) && path != common => {
                         let source = DiscoverySource {
                             kind: DiscoveryKind::Steam,
-                            metadata_path: Some(user_path(&file).display().to_string()),
+                            metadata_path: Some(display_path(&file)),
                             display_name: Some(manifest.name),
                             steam_app_id: Some(manifest.app_id.to_string()),
                             complete_install: manifest
@@ -1415,7 +1490,7 @@ impl Scanner<'_> {
                             &manifest.install_location,
                             DiscoverySource {
                                 kind: DiscoveryKind::Epic,
-                                metadata_path: Some(user_path(&file).display().to_string()),
+                                metadata_path: Some(display_path(&file)),
                                 display_name: Some(manifest.display_name),
                                 steam_app_id: None,
                                 complete_install: Some(
@@ -1480,7 +1555,7 @@ impl Scanner<'_> {
                     &entry.install_path,
                     DiscoverySource {
                         kind: DiscoveryKind::Epic,
-                        metadata_path: Some(user_path(&canonical).display().to_string()),
+                        metadata_path: Some(display_path(&canonical)),
                         display_name: Some(entry.title),
                         steam_app_id: None,
                         complete_install: entry.needs_verification.then_some(false),
@@ -2354,7 +2429,7 @@ mod tests {
         assert_eq!(
             metadata,
             [item, installed]
-                .map(|p| user_path(&p.canonicalize().unwrap()).display().to_string())
+                .map(|p| display_path(&p.canonicalize().unwrap()))
                 .into()
         );
     }

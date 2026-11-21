@@ -253,3 +253,50 @@ test("归档预览和安装提交保留归档路径与原文件名", async ({ pa
   await expect(dialog.getByRole("alert")).toContainText("仅校验请求参数");
   expect((await argsFor(page, "plan_install"))[0].request).toMatchObject({ artifactPath, filename });
 });
+
+test("启动程序输入框显示普通路径，未编辑的已有值和选择值按原样提交", async ({ page }) => {
+  const stored = `${verbatimUnc}\\Old.exe`;
+  const picked = `${verbatimUnc}\\New.exe`;
+  await installMockTauri(page, { gameRootPath: verbatimUnc, gameLaunchPath: stored });
+  await page.goto("/");
+  await page.getByRole("button", { name: "游戏库", exact: true }).click();
+  await page.evaluate((picked) => {
+    const target = window as any;
+    const transport = target.__TAURI_INTERNALS__;
+    const invoke = transport.invoke;
+    transport.invoke = async (command: string, args: any) => {
+      if (command === "plugin:dialog|open" && args.options?.title === "选择游戏启动程序") return picked;
+      if (command === "update_game") {
+        target.__AMM_TEST__.calls.push({ command, args });
+        return null;
+      }
+      return invoke(command, args);
+    };
+  }, picked);
+  const dialog = page.getByRole("dialog", { name: "编辑游戏", exact: true });
+  const input = dialog.getByRole("textbox", { name: "启动程序", exact: true });
+  const save = dialog.getByRole("button", { name: "保存", exact: true });
+  async function openEditor() {
+    await page.getByRole("button", { name: "更多操作", exact: true }).click();
+    await page.getByRole("menuitem", { name: "编辑", exact: true }).click();
+  }
+  await openEditor();
+  await expect(input).toHaveValue(`${ordinaryUnc}\\Old.exe`);
+  await save.click();
+  await expect(dialog).toBeHidden();
+  await openEditor();
+  await dialog.getByRole("button", { name: "选择", exact: true }).click();
+  await expect(input).toHaveValue(`${ordinaryUnc}\\New.exe`);
+  await save.click();
+  await expect(dialog).toBeHidden();
+  await openEditor();
+  // Typed text is not reprojected mid-edit, so the user can include a verbatim prefix.
+  const special = `${verbatimUnc}\\Typed.exe `;
+  await input.fill(verbatimUnc);
+  await expect(input).toHaveValue(verbatimUnc);
+  await input.fill(special);
+  await expect(input).toHaveValue(special);
+  await save.click();
+  await expect(dialog).toBeHidden();
+  expect((await argsFor(page, "update_game")).map((args: any) => args.launchPath)).toEqual([stored, picked, special]);
+});

@@ -24,6 +24,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 const storedLaunchPath = (game: Game) => typeof game.metadata?.launchPath === "string" ? game.metadata.launchPath : "";
+const launchPathDraft = (raw: string) => ({ raw, text: displayPath(raw) });
 
 function GameCard({ game, coverUrl, disabled, busy, onOpen, onLaunch, onLocation, onEdit, onRemove, onChooseAdapter, onCreateAdapter }: {
   game: Game; coverUrl: string | null; disabled: boolean; busy: string | null;
@@ -68,7 +69,7 @@ function GameCard({ game, coverUrl, disabled, busy, onOpen, onLaunch, onLocation
 
 function EditGameDialog({ game, onClose, onSaved }: { game: Game; onClose: () => void; onSaved: () => Promise<void> }) {
   const [name, setName] = useState(game.name);
-  const [launchPath, setLaunchPath] = useState(storedLaunchPath(game));
+  const [launchPath, setLaunchPath] = useState(() => launchPathDraft(storedLaunchPath(game)));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const trimmed = name.trim();
@@ -77,14 +78,14 @@ function EditGameDialog({ game, onClose, onSaved }: { game: Game; onClose: () =>
     try {
       const windows = navigator.userAgent.includes("Windows");
       const selected = await open({ multiple: false, directory: false, defaultPath: game.rootPath, title: "选择游戏启动程序", filters: windows ? [{ name: "可执行文件", extensions: ["exe"] }] : undefined });
-      if (typeof selected === "string") setLaunchPath(selected);
+      if (typeof selected === "string") setLaunchPath(launchPathDraft(selected));
     } catch (failure) { setError(failure); }
   }
   async function save() {
     if (busy || !trimmed) return;
     setBusy(true); setError(null);
     try {
-      await api<Game>("update_game", { id: game.id, name: trimmed, launchPath: launchPath.trim() ? launchPath : null });
+      await api<Game>("update_game", { id: game.id, name: trimmed, launchPath: launchPath.raw.trim() ? launchPath.raw : null });
       await onSaved(); onClose();
     } catch (failure) { setError(failure); }
     finally { setBusy(false); }
@@ -103,9 +104,9 @@ function EditGameDialog({ game, onClose, onSaved }: { game: Game; onClose: () =>
       <Field>
         <FieldLabel htmlFor="game-launch-path">启动程序</FieldLabel>
         <InputGroup>
-          <InputGroupInput id="game-launch-path" value={launchPath} placeholder={game.steamAppId ? "留空则通过 Steam 启动" : "选择游戏的可执行文件"} disabled={busy} onChange={(event) => setLaunchPath(event.target.value)} />
+          <InputGroupInput id="game-launch-path" value={launchPath.text} placeholder={game.steamAppId ? "留空则通过 Steam 启动" : "选择游戏的可执行文件"} disabled={busy} onChange={(event) => setLaunchPath({ raw: event.target.value, text: event.target.value })} />
           <InputGroupAddon align="inline-end">
-            {launchPath && <InputGroupButton size="icon-xs" aria-label="清除启动程序" disabled={busy} onClick={() => setLaunchPath("")}><XIcon /></InputGroupButton>}
+            {launchPath.text && <InputGroupButton size="icon-xs" aria-label="清除启动程序" disabled={busy} onClick={() => setLaunchPath(launchPathDraft(""))}><XIcon /></InputGroupButton>}
             <InputGroupButton disabled={busy || !backendAvailable} onClick={() => { void choose(); }}><FolderOpenIcon />选择</InputGroupButton>
           </InputGroupAddon>
         </InputGroup>

@@ -4,6 +4,7 @@ use super::{
 };
 use crate::{
     db::Db,
+    paths::user_path,
     transaction::{FileOp, FilePlan},
 };
 use serde_json::json;
@@ -628,6 +629,207 @@ fn selecting_a_package_checks_markers_and_keeps_the_game_registration() {
 }
 
 #[test]
+fn adapter_binding_preview_round_trips_and_preserves_unrelated_edits() {
+    let f = Fixture::new();
+    make_minecraft_selectable(&f);
+    f.engine.db.conn().execute_batch(
+        "UPDATE games SET slug='stardew-valley',adapter_slug='stardew-valley',adapter_version='0.1.0',
+                         installed_mod_count=2,enabled_mod_count=1 WHERE id='g';",
+    ).unwrap();
+    let before = serde_json::to_value(f.game()).unwrap();
+    let before_files = transaction::fingerprint(&f.root).unwrap();
+    let binding = prepare_game_adapter_binding(&f.engine, "g", "minecraft-java").unwrap();
+    let preview = serde_json::to_value(&binding).unwrap();
+    assert_eq!(preview["gameId"], "g");
+    assert_eq!(preview["gameName"], "Original");
+    assert_eq!(preview["rootPath"], paths::display_path(&f.root));
+    #[cfg(windows)]
+    assert_ne!(preview["rootPath"], f.root.to_str().unwrap());
+    assert_eq!(preview["currentAdapterSlug"], "stardew-valley");
+    assert_eq!(preview["currentAdapterVersion"], "0.1.0");
+    assert_eq!(preview["targetAdapterSlug"], "minecraft-java");
+    assert_eq!(preview["targetAdapterName"], minecraft_adapter().name);
+    assert_eq!(preview["targetAdapterVersion"], minecraft_adapter().version);
+    assert_eq!(preview["matchedMarkers"], json!(["versions"]));
+    assert_eq!(preview["missingRequiredMarkers"], json!([]));
+    assert_eq!(preview.as_object().unwrap().len(), 11);
+    assert_eq!(serde_json::to_value(f.game()).unwrap(), before);
+
+    assert_eq!(transaction::fingerprint(&f.root).unwrap(), before_files);
+    let world = make_dir(&f.outside.join("world"));
+    let launch = executable(&f.root.join("game.exe"));
+    let before_files_with_launch = transaction::fingerprint(&f.root).unwrap();
+    update_game(&f.engine, "g", "Original", launch.to_str()).unwrap();
+    f.engine
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO game_user_roots(game_id,root_id,path,created_at)
+         VALUES ('g','world-datapacks',?1,'now')",
+            [world.to_str().unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_value::<GameAdapterBinding>(preview.clone()).unwrap(),
+        binding
+    );
+    let mut tampered = preview.clone();
+    tampered["targetAdapterVersion"] = json!("999.0.0");
+    let tampered = serde_json::from_value(tampered).unwrap();
+    assert!(matches!(
+        apply_game_adapter_binding(&f.engine, &tampered),
+        Err(AppError::Conflict(_))
+    ));
+    let updated =
+        apply_game_adapter_binding(&f.engine, &serde_json::from_value(preview).unwrap()).unwrap();
+    assert_eq!(updated.adapter_slug.as_deref(), Some("minecraft-java"));
+    assert_eq!(updated.installed_mod_count, 2);
+    assert_eq!(updated.enabled_mod_count, 1);
+    assert_eq!(updated.metadata["keep"], json!({"value":1}));
+    assert_eq!(updated.metadata["launchPath"], launch.to_str().unwrap());
+    assert_eq!(
+        game_roots::registered_user_roots(&f.engine.db, "g").unwrap()["world-datapacks"],
+        world
+    );
+    assert_eq!(
+        transaction::fingerprint(&f.root).unwrap(),
+        before_files_with_launch
+    );
+    assert!(matches!(
+        apply_game_adapter_binding(&f.engine, &binding),
+        Err(AppError::Conflict(_))
+    ));
+
+    let repeat = prepare_game_adapter_binding(&f.engine, "g", "minecraft-java").unwrap();
+    let repeated = apply_game_adapter_binding(&f.engine, &repeat).unwrap();
+    assert_eq!(repeated.updated_at, updated.updated_at);
+    assert_eq!(repeated.last_scanned_at, updated.last_scanned_at);
+    assert_eq!(repeated.metadata, updated.metadata);
+    let manual = set_game_adapter(&f.engine, "g", "minecraft-java").unwrap();
+    assert_eq!(manual.updated_at, updated.updated_at);
+}
+
+#[test]
+fn adapter_binding_revalidates_game_match_and_exact_package() {
+    let f = Fixture::new();
+    make_minecraft_selectable(&f);
+    let preview = || prepare_game_adapter_binding(&f.engine, "g", "minecraft-java").unwrap();
+    let reviewed = preview();
+    update_game(&f.engine, "g", "Renamed after review", None).unwrap();
+    assert!(matches!(
+        apply_game_adapter_binding(&f.engine, &reviewed),
+        Err(AppError::Conflict(_))
+    ));
+    let reviewed = preview();
+    make_dir(&f.root.join("saves"));
+    assert!(matches!(
+        apply_game_adapter_binding(&f.engine, &reviewed),
+        Err(AppError::Conflict(_))
+    ));
+    let reviewed = preview();
+    f.engine.db.conn().execute_batch(
+        "UPDATE plugins SET adapter_json=json_set(adapter_json,'$.uninstallNotes[0]','changed package contents')
+         WHERE slug='minecraft-java';",
+    ).unwrap();
+    assert!(matches!(
+        apply_game_adapter_binding(&f.engine, &reviewed),
+        Err(AppError::Conflict(_))
+    ));
+    let reviewed = preview();
+    f.engine.db.conn().execute_batch(
+        "UPDATE plugins SET version='2.0.0', adapter_json=json_set(adapter_json,'$.version','2.0.0')
+         WHERE slug='minecraft-java';",
+    ).unwrap();
+    assert!(matches!(
+        apply_game_adapter_binding(&f.engine, &reviewed),
+        Err(AppError::Conflict(_))
+    ));
+    let reviewed = preview();
+    f.engine
+        .db
+        .conn()
+        .execute_batch("UPDATE plugins SET enabled=0 WHERE slug='minecraft-java';")
+        .unwrap();
+    assert!(matches!(
+        apply_game_adapter_binding(&f.engine, &reviewed),
+        Err(AppError::Denied(_))
+    ));
+    assert!(f.game().adapter_slug.is_none());
+}
+
+#[test]
+fn adapter_binding_rechecks_blockers_without_blocking_its_own_active_turn() {
+    let f = Fixture::new();
+    make_minecraft_selectable(&f);
+    f.engine.db.conn().execute_batch(
+        "INSERT INTO conversations(id,game_id,created_at,updated_at) VALUES ('c','g','now','now');
+         INSERT INTO agent_turns(id,conversation_id,status,created_at) VALUES ('turn','c','running','now');
+         INSERT INTO tool_calls(id,conversation_id,name,status,started_at)
+           VALUES ('binding','c','set_game_adapter','running','now');",
+    ).unwrap();
+    let reviewed = prepare_game_adapter_binding(&f.engine, "g", "minecraft-java").unwrap();
+    f.engine
+        .db
+        .conn()
+        .execute_batch(
+            "INSERT INTO approvals(id,conversation_id,tool_call_id,kind,title,status,created_at)
+         VALUES ('own','c','binding','tool','Bind adapter','approved','now'),
+                ('other','c',NULL,'tool','Other approval','pending','now');",
+        )
+        .unwrap();
+    assert!(apply_game_adapter_binding(&f.engine, &reviewed)
+        .unwrap_err()
+        .to_string()
+        .contains("待审批或待执行"));
+    f.engine
+        .db
+        .conn()
+        .execute_batch("UPDATE approvals SET status='rejected' WHERE id='other';")
+        .unwrap();
+    let plan = f
+        .engine
+        .plan_internal(
+            vec![FileOp::Mkdir {
+                dst: f.root.join("not-created"),
+            }],
+            "Unfinished plan".into(),
+        )
+        .unwrap();
+    assert!(apply_game_adapter_binding(&f.engine, &reviewed)
+        .unwrap_err()
+        .to_string()
+        .contains("待审批或待执行"));
+    f.engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE file_transactions SET status='recovery_failed' WHERE id=?1",
+            [&plan.id],
+        )
+        .unwrap();
+    assert!(apply_game_adapter_binding(&f.engine, &reviewed)
+        .unwrap_err()
+        .to_string()
+        .contains("待恢复"));
+    f.engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE file_transactions SET status='failed' WHERE id=?1",
+            [&plan.id],
+        )
+        .unwrap();
+    assert_eq!(
+        apply_game_adapter_binding(&f.engine, &reviewed)
+            .unwrap()
+            .adapter_slug
+            .as_deref(),
+        Some("minecraft-java")
+    );
+    assert!(!f.root.join("not-created").exists());
+}
+
+#[test]
 fn remove_game_adapter_preserves_identity_registered_roots_mods_and_files() {
     let f = Fixture::new();
     make_minecraft_selectable(&f);
@@ -1105,8 +1307,8 @@ fn conflicts_list_plan_identity_details_and_registered_root_overlap() {
     assert_eq!(copy.status, "planned");
     assert_eq!(copy.summary, "Copy review");
     assert_eq!(copy.detail.as_deref(), Some("计划操作：复制 (copy) ×1"));
-    assert!(copy.paths.contains(&user_path(&src).display().to_string()));
-    assert!(copy.paths.contains(&user_path(&dst).display().to_string()));
+    assert!(copy.paths.contains(&paths::display_path(&src)));
+    assert!(copy.paths.contains(&paths::display_path(&dst)));
     assert!(copy.can_resolve);
     assert!(by_id(&explicit.id).is_some());
     assert!(by_id(&unrelated.id).is_none());
@@ -1194,7 +1396,7 @@ fn removing_game_can_discard_standalone_mkdir_without_touching_files() {
         conflict.detail.as_deref(),
         Some("计划操作：新建目录 (mkdir) ×1")
     );
-    assert_eq!(conflict.paths, [user_path(&target).display().to_string()]);
+    assert_eq!(conflict.paths, [paths::display_path(&target)]);
     assert!(conflict.can_resolve);
     assert!(!target.exists());
 

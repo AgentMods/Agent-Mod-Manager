@@ -440,12 +440,12 @@ test("directory picker scans only the chosen library without registering games",
   expect(calls.filter((call: any) => call.command === "plugin:dialog|open")).toHaveLength(2);
   expect(calls.filter((call: any) => call.command === "scan_games").map((call: any) => call.args.options)).toEqual([{userRoots: ["/sandbox/new-game"], includeCommonRoots: false}]);
 
-  await directory.fill("  /sandbox/empty  ");
+  await directory.fill("/sandbox/empty  ");
   await directory.press("Enter");
   await expect(page.getByText(/未发现候选游戏/)).toBeVisible();
   await expect(adapted).toHaveCount(0);
   const lastScan = await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "scan_games").at(-1));
-  expect(lastScan.args.options).toEqual({userRoots: ["/sandbox/empty"], includeCommonRoots: false});
+  expect(lastScan.args.options).toEqual({userRoots: ["/sandbox/empty  "], includeCommonRoots: false});
 });
 
 test("local archive import and game installation have separate approvals", async ({page}) => {

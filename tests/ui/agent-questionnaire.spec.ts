@@ -80,7 +80,7 @@ test("questionnaire walks steps, keeps draft answers, and submits ordered choice
   await expect(details).toBeInViewport({ratio: 0.95});
 });
 
-test("legacy question uses a single inline text step and submits a plain answer", async ({page}) => {
+test("legacy question uses a single text step and submits a plain answer", async ({page}) => {
   await installMockTauri(page, {askUser: {preview: {question: "请输入安装目录。"}}});
   await askAgent(page);
   const card = page.getByRole("region", {name: "Agent 等待你的回答"});
@@ -98,6 +98,49 @@ test("legacy question uses a single inline text step and submits a plain answer"
   })})]);
 });
 
+test("live questionnaire occupies the bottom input area and stays with its conversation", async ({page}) => {
+  const longOptions = Array.from({length: 5}, (_, i) => `${i + 1}. ${"其他平台及其支持的游戏版本。".repeat(12)}`);
+  const questions = [{...structured.questions[0], options: ["Windows PC", ...longOptions]}, ...structured.questions.slice(1)];
+  await installMockTauri(page, {askUser: {preview: {title, questions}}});
+  await askAgent(page);
+
+  const form = page.getByRole("region", {name: title});
+  const composer = page.getByRole("textbox", {name: "告诉 Agent 你想做什么"});
+  await expect(form).toBeVisible();
+  await expect(composer).toHaveCount(0);
+  await expect(page.getByRole("button", {name: "停止生成", exact: true})).toBeVisible();
+  await expect(form.getByRole("radio", {name: "Windows PC"})).toBeVisible();
+  await expect(form.getByRole("button", {name: "下一步", exact: true})).toBeDisabled();
+  await expect(form.getByRole("button", {name: "跳过", exact: true})).toBeVisible();
+
+  const viewport = page.viewportSize();
+  const bounds = await form.boundingBox();
+  expect(viewport).not.toBeNull();
+  expect(bounds).not.toBeNull();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport!.width);
+  await expect(form.getByRole("button", {name: "跳过", exact: true})).toBeInViewport();
+  await expect(form.getByRole("button", {name: "下一步", exact: true})).toBeInViewport();
+
+  const nextButton = form.getByRole("button", {name: "下一步", exact: true});
+  const beforeScroll = await nextButton.boundingBox();
+  await form.getByRole("radio", {name: "自己填写"}).scrollIntoViewIfNeeded();
+  expect(await nextButton.boundingBox()).toEqual(beforeScroll);
+
+  const conversationTitle = await page.evaluate(() => {
+    const fixture = (window as any).__AMM_TEST__;
+    const request = fixture.calls.find((call: any) => call.command === "start_turn");
+    return fixture.conversations.find((conversation: any) => conversation.id === request.args.request.conversationId).title;
+  });
+  await page.getByRole("button", {name: "新建对话", exact: true}).click();
+  await expect(form).toHaveCount(0);
+  await expect(composer).toBeVisible();
+  await page.getByRole("button", {name: conversationTitle, exact: true}).click();
+  await expect(form).toBeVisible();
+  await expect(form.getByText("1 / 3", {exact: true})).toBeVisible();
+  await expect(composer).toHaveCount(0);
+});
+
 test("cancelling a turn disables its unfinished questionnaire", async ({page}) => {
   await installMockTauri(page, {askUser: {preview: structured}});
   await askAgent(page);
@@ -105,6 +148,7 @@ test("cancelling a turn disables its unfinished questionnaire", async ({page}) =
   await expect(card.getByRole("button", {name: "跳过"})).toBeVisible();
   await page.getByRole("button", {name: "停止生成"}).click();
   const trace = page.getByRole("button", {name: /已询问 3 个问题.*已取消/});
+  await expect(page.getByRole("textbox", {name: "告诉 Agent 你想做什么"})).toBeVisible();
   await expect(trace).toHaveAttribute("aria-expanded", "false");
   await trace.click();
   await expect(page.locator("dd")).toHaveText(["未回答", "未回答", "未回答"]);

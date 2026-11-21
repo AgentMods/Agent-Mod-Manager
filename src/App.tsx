@@ -77,7 +77,21 @@ export default function App() {
   useEffect(() => syncAgentEvents(visibleConversation, (id, events) => {
     void client.invalidateQueries({ queryKey: ["conversation", id] });
     void client.invalidateQueries({ queryKey: ["conversations"] });
-    if (events.some((event) => event.kind === "tool-start" &&
+    const boundGameIds = new Set(events.flatMap((event) => {
+      if (event.kind !== "tool-result" || event.payload.name !== "set_game_adapter" || event.payload.status !== "done") return [];
+      const result = event.payload.result;
+      if (!result || typeof result !== "object" || !("gameId" in result)) return [];
+      const gameId = result.gameId;
+      return typeof gameId === "string" && gameId.length > 0 ? [gameId] : [];
+    }));
+    if (boundGameIds.size) {
+      void client.invalidateQueries({ queryKey: ["games"] });
+      for (const gameId of boundGameIds) {
+        void client.invalidateQueries({ queryKey: ["game", gameId] });
+        void client.invalidateQueries({ queryKey: ["game-adapter", gameId] });
+      }
+    }
+    if (events.some((event) => event.kind === "tool-result" && event.payload.status === "done" &&
       ["write_plugin_draft", "install_plugin"].includes(String(event.payload.name)))) {
       for (const key of ["plugin-drafts", "plugins", "game-adapter", "skills"]) {
         void client.invalidateQueries({ queryKey: [key] });

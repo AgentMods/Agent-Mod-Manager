@@ -333,7 +333,12 @@ async fn loopback_random_port_auth_origin_host_token_storage_and_rotation() {
 
 #[tokio::test]
 async fn tools_are_allowlisted_and_real_reads_reuse_desktop_file_guards() {
-    let fixture = fixture_with_native_tools(&["read_file", "plan_file_ops", "download_web_mod"]);
+    let fixture = fixture_with_native_tools(&[
+        "read_file",
+        "plan_file_ops",
+        "download_web_mod",
+        "set_game_adapter",
+    ]);
     let count = Arc::new(AtomicUsize::new(0));
     for name in [
         "mcp__remote__write",
@@ -376,6 +381,7 @@ async fn tools_are_allowlisted_and_real_reads_reuse_desktop_file_guards() {
         "start_process",
         "amm_approve",
         "download_web_mod",
+        "set_game_adapter",
     ] {
         assert_eq!(
             call(&client, name, json!({"approved":true})).await.is_error,

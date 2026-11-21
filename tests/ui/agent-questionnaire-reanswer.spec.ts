@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import { installMockTauri } from "./mock-tauri";
 
 const title = "确认游戏适配信息";
@@ -36,6 +36,17 @@ async function openHistoryPage(page: Page) {
     useUI.getState().navigate("history");
   });
   await expect(page.getByTestId("history-page")).toBeVisible();
+}
+
+async function expectQuestionnaireFitsViewport(page: Page, form: Locator) {
+  const viewport = page.viewportSize();
+  const bounds = await form.boundingBox();
+  expect(viewport).not.toBeNull();
+  expect(bounds).not.toBeNull();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport!.width);
+  expect(viewport!.height - (bounds!.y + bounds!.height)).toBeLessThanOrEqual(24);
+  await expect(form).toBeInViewport({ ratio: 0.99 });
 }
 
 async function startQuestionnaire(page: Page, terminal: "cancelled" | "expired" | "skipped" | "rejected") {
@@ -86,12 +97,16 @@ for (const terminal of ["cancelled", "expired", "skipped", "rejected"] as const)
       .map((event: any) => event.payload.status));
     const reanswer = page.getByRole("button", { name: "重新回答", exact: true });
     await expect(reanswer).toBeVisible();
+    expect((await reanswer.boundingBox())!.height).toBeGreaterThanOrEqual(36);
+    const composer = page.getByRole("textbox", { name: "告诉 Agent 你想做什么" });
+    await expect(composer).toBeVisible();
+    await composer.fill("保留在输入框里的草稿");
     await reanswer.click();
 
     const form = page.getByRole("region", { name: questionTitle });
     await expect(form).toBeVisible();
-    const composer = page.getByRole("textbox", { name: "告诉 Agent 你想做什么" });
-    await composer.fill("保留在输入框里的草稿");
+    await expectQuestionnaireFitsViewport(page, form);
+    await expect(composer).toHaveCount(0);
     const rejectFirst = terminal === "cancelled";
     await stubReanswerStart(page, rejectFirst);
     if (terminal === "rejected") {
@@ -105,11 +120,12 @@ for (const terminal of ["cancelled", "expired", "skipped", "rejected"] as const)
     if (rejectFirst) {
       await expect(form).toBeVisible();
       await expect(form.getByRole("radio", { name: "参考本机文件" })).toBeChecked();
-      await expect(composer).toHaveValue("保留在输入框里的草稿");
+      await expect(composer).toHaveCount(0);
       await expect(form.getByRole("button", { name: "提交回答", exact: true })).toBeEnabled();
       await form.getByRole("button", { name: "提交回答", exact: true }).click();
     }
     await expect(form).toHaveCount(0);
+    await expect(composer).toBeVisible();
     await expect(composer).toHaveValue("保留在输入框里的草稿");
     const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
     const turns = calls.filter((call: any) => call.command === "start_turn");
@@ -140,6 +156,29 @@ for (const terminal of ["cancelled", "expired", "skipped", "rejected"] as const)
       .map((event: any) => event.payload.status))).toEqual(oldApprovalBefore);
   });
 }
+
+test("取消历史问卷重新回答会恢复普通输入区和原草稿", async ({ page }) => {
+  const { summary, questionTitle } = await startQuestionnaire(page, "cancelled");
+  const composer = page.getByRole("textbox", { name: "告诉 Agent 你想做什么" });
+  await expect(composer).toBeVisible();
+  await composer.fill("取消后仍保留这段草稿");
+
+  const reanswer = page.getByRole("button", { name: "重新回答", exact: true });
+  await expect(reanswer).toBeVisible();
+  await reanswer.click();
+  const form = page.getByRole("region", { name: questionTitle });
+  await expect(form).toBeVisible();
+  await expect(composer).toHaveCount(0);
+  await expect(form.getByRole("button", { name: "取消重新回答", exact: true })).toBeVisible();
+  await form.getByRole("button", { name: "取消重新回答", exact: true }).click();
+
+  await expect(form).toHaveCount(0);
+  await expect(summary).toBeVisible();
+  await expect(composer).toBeVisible();
+  await expect(composer).toHaveValue("取消后仍保留这段草稿");
+  const starts = await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "start_turn"));
+  expect(starts).toHaveLength(1);
+});
 
 test("已回答问卷作为历史记录只读，归档会话不能重新回答或发送消息", async ({ page }) => {
   await installMockTauri(page, { askUser: { preview } });

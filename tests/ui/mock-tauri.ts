@@ -7,7 +7,7 @@ type AskUserPreviewFixture = {title?: string; questions: AskUserQuestionFixture[
 // Test-only IPC transport. It is never imported by the shipped application.
 export async function installMockTauri(page: Page, {
   fomodSelection = "requires_user", onboarding = false, onboardingStarted = false, failRegistration = false,
-  gameRootPath = "/sandbox/minecraft", gameWithoutAdapter = false, gameWithoutMods = false, adapterDisabled = false, holdAgentTurn = false,
+  gameRootPath = "/sandbox/minecraft", gameLaunchPath, gameWithoutAdapter = false, gameWithoutMods = false, adapterDisabled = false, holdAgentTurn = false,
   gamePlanConflicts = [],
   duplicatePluginDraftSlug = false, failPluginDraftDeletion = false, seedPublishedPluginRecord = false,
   providerModels = ["fixture-thinking", "fixture-standard"],
@@ -19,6 +19,7 @@ export async function installMockTauri(page: Page, {
   onboardingStarted?: boolean;
   failRegistration?: boolean;
   gameRootPath?: string;
+  gameLaunchPath?: string;
   gameWithoutAdapter?: boolean;
   gameWithoutMods?: boolean;
   adapterDisabled?: boolean;
@@ -31,7 +32,7 @@ export async function installMockTauri(page: Page, {
   askUser?: {preview: AskUserPreviewFixture; approvalId?: string; toolCallId?: string; deferResult?: boolean};
   storage?: {dataRoot: string; parent: string; previousError?: string; rejectFirstMigration?: boolean};
 } = {}) {
-  await page.addInitScript(({fomodSelection, onboarding, onboardingStarted, failRegistration, gameRootPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, holdAgentTurn, gamePlanConflicts, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, askUser, storage}) => {
+  await page.addInitScript(({fomodSelection, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, holdAgentTurn, gamePlanConflicts, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, askUser, storage}) => {
     type Args = Record<string, any>;
     const now = "2026-11-18T00:00:00Z";
     const callbacks = new Map<number, (value: any) => void>();
@@ -49,7 +50,7 @@ export async function installMockTauri(page: Page, {
       id: "game-fixture", name: "Minecraft Java Edition", slug: "minecraft-java",
       rootPath: gameRootPath, platform: "windows", adapterSlug: "minecraft-java",
       adapterVersion: "1.0.0", confidence: 1, coverPath: null, steamAppId: null,
-      lastScannedAt: now, installedModCount: gameWithoutMods ? 0 : 1, enabledModCount: gameWithoutMods ? 0 : 1, metadata: {}, createdAt: now, updatedAt: now,
+      lastScannedAt: now, installedModCount: gameWithoutMods ? 0 : 1, enabledModCount: gameWithoutMods ? 0 : 1, metadata: gameLaunchPath === undefined ? {} : {launchPath: gameLaunchPath}, createdAt: now, updatedAt: now,
     };
     const games: Args[] = onboarding && !onboardingStarted ? [] : [
       gameWithoutAdapter ? {...initialGame, adapterSlug: null, adapterVersion: null} : initialGame,
@@ -568,5 +569,5 @@ export async function installMockTauri(page: Page, {
         seq = Math.max(seq, ...values.map((event) => event.seq).filter(Number.isSafeInteger));
       },
     };
-  }, {fomodSelection, onboarding, onboardingStarted, failRegistration, gameRootPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, holdAgentTurn, gamePlanConflicts, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, askUser, storage});
+  }, {fomodSelection, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, holdAgentTurn, gamePlanConflicts, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, askUser, storage});
 }

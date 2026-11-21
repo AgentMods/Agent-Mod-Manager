@@ -25,6 +25,89 @@ pub fn register(registry: &ToolRegistry) -> AppResult<()> {
     )
 }
 
+/// Preserve complete results in the audit log and send the model the fields
+/// it needs to validate, deploy, or bind the package.
+pub(super) fn model_receipt(name: &str, result: &Value) -> Option<Value> {
+    match name {
+        "write_plugin_draft" => {
+            let draft = &result["preview"]["draft"];
+            Some(json!({
+                "status": result["status"],
+                "draftId": draft["id"],
+                "slug": draft["slug"],
+                "draftPath": draft["path"],
+                "transactionId": result["plan"]["id"],
+                "reconciliation": result["reconciliation"],
+            }))
+        }
+        "validate_plugin" => Some(json!({
+            "draftId": result["draft"]["id"],
+            "slug": result["draft"]["slug"],
+            "valid": result["valid"],
+            "transactionStatus": result["transactionStatus"],
+            "hashes": result["hashes"],
+            "issues": result["issues"],
+            "warnings": result["warnings"],
+        })),
+        "install_plugin" => {
+            let deployment = &result["preview"]["deployment"];
+            Some(json!({
+                "status": result["status"],
+                "draftId": deployment["draftId"],
+                "slug": deployment["slug"],
+                "version": deployment["version"],
+                "transactionId": result["plan"]["id"],
+                "warnings": result["preview"]["warnings"],
+                "reconciliation": result["reconciliation"],
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Only shorten the model's in-memory transcript when a committed draft can
+/// be reread from its receipt. SQLite retains the original call arguments.
+pub(super) fn abbreviate_committed_drafts(messages: &mut [Value]) -> bool {
+    let mut changed = false;
+    for group in messages.chunk_by_mut(|_, next| next["role"] == "tool") {
+        let Some((assistant, results)) = group.split_first_mut() else {
+            continue;
+        };
+        let Some(calls) = assistant
+            .get_mut("tool_calls")
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for call in calls
+            .iter_mut()
+            .filter(|call| call["function"]["name"] == "write_plugin_draft")
+        {
+            let receipt = results
+                .iter()
+                .find(|result| result["tool_call_id"] == call["id"])
+                .and_then(|result| result["content"].as_str())
+                .and_then(|text| serde_json::from_str::<Value>(text).ok());
+            let Some(receipt) =
+                receipt.filter(|r| r["status"] == "committed" && r["draftPath"].is_string())
+            else {
+                continue;
+            };
+            let abbreviated = json!({
+                "slug": receipt["slug"],
+                "adapter_json": "[原文已保存到回执 draftPath 下的 adapter.json]",
+                "skill_markdown": "[原文已保存到回执 draftPath 下的 SKILL.md]",
+            })
+            .to_string();
+            if call["function"]["arguments"] != abbreviated {
+                call["function"]["arguments"] = abbreviated.into();
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 struct PluginTool {
     name: &'static str,
 }
@@ -68,7 +151,7 @@ impl AgentTool for PluginTool {
                 json!({"draft_id":{"type":"string"}}), vec!["draft_id"], Effect::Read,
             ),
             _ => (
-                "安装新外部适配包或更新同 slug 的已安装外部包。审查两个文件的完整原文和覆盖影响，批准后事务提交并登记。更新会保留已校验包及其 Skill 的启用设置。内置包须以新 slug 安装。",
+                "安装新外部适配包或更新同 slug 的已安装外部包。审查两个文件的完整原文和覆盖影响，批准后事务提交并登记。更新会保留已校验包及其 Skill 的启用设置。内置包须以新 slug 安装。为指定的已登记游戏部署后，继续使用 set_game_adapter 绑定该游戏。",
                 json!({"draft_id":{"type":"string"}}), vec!["draft_id"], Effect::ManagerWrite,
             ),
         };

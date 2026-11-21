@@ -3,6 +3,27 @@
 Updated: 2026-11-21. The full project goal remains active. This is an
 implementation and verification snapshot, not a release-completion claim.
 
+**Agent adapter binding (2026-11-21, Windows).** A game card's authoring chat
+can create, validate, install and bind an external package in one turn. The
+`set_game_adapter` tool uses the conversation's registered game, or an explicit
+game ID in a general chat. It shares the library's disk-marker and pending-task
+checks and revalidates the reviewed binding at commit. Full Trust can complete
+the operation directly. The other permission modes request approval in chat.
+Successful tool results refresh the library and game detail when the turn ends.
+A loopback model fixture covered the full authoring flow under the default
+context budget, and approval tests covered applying an existing package and
+rejecting the change. Nine Playwright cases passed across three viewport sizes.
+
+**User-visible filesystem paths (2026-11-21).** Game discovery, registered games,
+file browsing, storage settings and native tool previews display ordinary Windows
+paths such as `E:\Games` and `\\server\share`. Files that require the verbatim
+namespace keep their original spelling. Database roots and transaction journals
+retain their canonical paths. The Windows Rust library suite passed 713 tests
+with 8 ignored. Across three viewports, 85 UI tests for paths, discovery, file
+browsing, library actions and storage settings passed, with 2 skipped. Strict
+Clippy and the frontend production build passed. A Linux container also exercised browsing path helpers against real filenames
+with case differences, embedded backslashes and trailing spaces.
+
 **Game detail file tree (2026-11-21, Windows).** The Files tab uses the shadcn
 File Tree pattern with on-demand folder reads and search across expanded folders.
 Refreshing reloads the expanded branches and the selected preview. The browser
@@ -214,17 +235,18 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   restores the original text in the composer. Sending an edit or retrying a
   reply opens a new conversation with the context preceding that turn. The
   original conversation remains available in the conversation list.
-- Agent `ask_user` requests appear inline as a questionnaire: one step per
-  question, with single-choice options, free text, back/next, and skip. The
-  existing approval transport waits for the response and preserves skipped
-  steps as `null`. Legacy single questions render as a one-step text card.
-  Completed questionnaires collapse to a question count. Expanding the trace
-  reveals the original questions and submitted answers in order, including
-  skipped steps and cancelled requests. Conversation replay restores the
-  answers from persisted tool results. Cancelled, expired or entirely skipped
-  questionnaires in an unarchived chat offer **重新回答**. Submitting opens a new
-  turn in the same chat with the original questions and the user's answers; it
-  does not revive the old approval, rewrite its record, or clear a composer draft.
+- Agent `ask_user` requests open a questionnaire in the bottom message composer.
+  Each step supports single-choice options or free text, back/next, and skip.
+  Long questions scroll above the step controls. Live questions retain the
+  stop-generation action. The approval transport preserves skipped steps as
+  `null`. Legacy single questions render as a one-step text card.
+  Completed questionnaires collapse to a question count in the transcript.
+  Expanding it reveals the questions and answers in order, including skipped
+  steps and cancelled requests. Replay restores answers from persisted results.
+  Cancelled, expired or entirely skipped questionnaires in an unarchived chat
+  offer a full-size **重新回答** button. It opens the same bottom panel and sends
+  the answers as a new turn in the original chat. Submitting or cancelling
+  restores the composer with its draft text and attachments.
 - Conversation rows show just a color-coded status icon at the right, with its
   label available on hover, keyboard focus, and to assistive technology. **进行中** marks
   an active turn; an outstanding questionnaire shows **等待回答** and an operation

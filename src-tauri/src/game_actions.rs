@@ -4,7 +4,7 @@ use crate::{
     game_roots,
     games::{self, Game},
     install::INSTALL_STATE,
-    paths::user_path,
+    paths,
     plugins::{GameAdapter, Platform, RootKind},
     storage::AppPaths,
     transaction::{self, FileEngine, FileOp, FilePlan},
@@ -67,20 +67,141 @@ pub(crate) fn update_game(
     Ok(game)
 }
 
+/// The reviewed choice. Paths here are display paths; execution always uses
+/// the registered canonical game root, which is covered by the state digest.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GameAdapterBinding {
+    pub game_id: String,
+    pub game_name: String,
+    pub root_path: String,
+    pub current_adapter_slug: Option<String>,
+    pub current_adapter_version: Option<String>,
+    pub target_adapter_slug: String,
+    pub target_adapter_name: String,
+    pub target_adapter_version: String,
+    pub matched_markers: Vec<String>,
+    pub missing_required_markers: Vec<String>,
+    state_sha256: String,
+}
+
 pub(crate) fn set_game_adapter(engine: &FileEngine, id: &str, slug: &str) -> AppResult<Game> {
+    commit_game_adapter_binding(engine, id, slug, None)
+}
+
+pub(crate) fn prepare_game_adapter_binding(
+    engine: &FileEngine,
+    game_id: &str,
+    slug: &str,
+) -> AppResult<GameAdapterBinding> {
+    let _guard = transaction::write_lock();
+    let (root, selected) = inspect_registered_binding(engine, game_id, slug)?;
+    let conn = engine.db.conn();
+    let game = games::get_game_from(&conn, game_id)?;
+    binding_preview(&conn, &game, &root, &selected)
+}
+
+pub(crate) fn apply_game_adapter_binding(
+    engine: &FileEngine,
+    binding: &GameAdapterBinding,
+) -> AppResult<Game> {
+    commit_game_adapter_binding(
+        engine,
+        &binding.game_id,
+        &binding.target_adapter_slug,
+        Some(binding),
+    )
+}
+
+fn commit_game_adapter_binding(
+    engine: &FileEngine,
+    game_id: &str,
+    slug: &str,
+    approved: Option<&GameAdapterBinding>,
+) -> AppResult<Game> {
+    // Reconciliation has its own lock ordering and does not change game bindings.
     crate::plugin_workflow::reconcile_deployments(engine)?;
     let _guard = transaction::write_lock();
+    let (root, selected) = inspect_registered_binding(engine, game_id, slug)?;
+    let mut conn = engine.db.conn();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let game = games::get_game_from(&tx, game_id)?;
+    let current = binding_preview(&tx, &game, &root, &selected)?;
+    if approved.is_some_and(|reviewed| *reviewed != current) {
+        return Err(AppError::Conflict(
+            "游戏登记、适配包或匹配结果已改变，请重新预览并审批绑定".into(),
+        ));
+    }
+    // The same selection supplies both the reviewed effects and the mutation.
+    // Its exact adapter and selected match, not just their display fields,
+    // have been checked against the approval. No binding input is taken from args.
+    let updated = games::rebind_game(&tx, game, &selected)?;
+    tx.commit()?;
+    Ok(updated)
+}
+
+fn inspect_registered_binding(
+    engine: &FileEngine,
+    id: &str,
+    slug: &str,
+) -> AppResult<(PathBuf, games::GameAdapterSelection)> {
     let game = games::get_game(&engine.db, id)?;
     let root = checked_game_root(&engine.paths, Path::new(&game.root_path))?;
-    let conn = engine.db.conn();
+    if root.parent().is_none() {
+        return Err(AppError::Invalid(
+            "不能将整个文件系统根登记为游戏目录".into(),
+        ));
+    }
+    let selected = games::inspect_game_adapter_selection(&engine.db, &root, slug)?;
+    Ok((root, selected))
+}
+
+fn binding_preview(
+    conn: &Connection,
+    game: &Game,
+    root: &Path,
+    selected: &games::GameAdapterSelection,
+) -> AppResult<GameAdapterBinding> {
+    if Path::new(&game.root_path) != root {
+        return Err(AppError::Conflict("已登记的游戏目录已改变".into()));
+    }
+    if !game.metadata.is_object() {
+        return Err(AppError::Invalid(
+            "现有游戏 metadata 必须是 JSON 对象".into(),
+        ));
+    }
     check_adapter_change(
-        &conn,
-        id,
-        root,
+        conn,
+        &game.id,
+        root.to_owned(),
         "该游戏仍有待审批或待执行的计划，请处理后再选择适配包",
     )?;
-    drop(conn);
-    games::rebind_game(&engine.db, &game, slug)
+    // Only binding-relevant state can stale approval. Unrelated metadata and
+    // user-root edits are preserved; the conflict check still uses live roots.
+    let state = serde_json::to_vec(&(
+        &game.root_path,
+        &game.created_at,
+        &game.slug,
+        &game.platform,
+        &game.steam_app_id,
+        game.confidence.to_bits(),
+        &selected.adapter,
+        &selected.matched,
+    ))?;
+    let state_sha256 = util::sha256_reader(&mut state.as_slice())?;
+    Ok(GameAdapterBinding {
+        game_id: game.id.clone(),
+        game_name: game.name.clone(),
+        root_path: paths::display_path(root),
+        current_adapter_slug: game.adapter_slug.clone(),
+        current_adapter_version: game.adapter_version.clone(),
+        target_adapter_slug: selected.adapter.slug.clone(),
+        target_adapter_name: selected.adapter.name.clone(),
+        target_adapter_version: selected.adapter.version.clone(),
+        matched_markers: selected.matched.matched_markers.clone(),
+        missing_required_markers: selected.matched.missing_required_markers.clone(),
+        state_sha256,
+    })
 }
 
 pub(crate) fn remove_game_adapter(engine: &FileEngine, id: &str) -> AppResult<Game> {
@@ -611,10 +732,7 @@ fn plan_paths(plan: Option<&FilePlan>) -> BTreeSet<&Path> {
 }
 
 fn display_plan_paths(paths: &BTreeSet<&Path>) -> Vec<String> {
-    paths
-        .iter()
-        .map(|path| user_path(path).display().to_string())
-        .collect()
+    paths.iter().map(|path| paths::display_path(path)).collect()
 }
 
 /// Plans can outlive their files. Compare their recorded components without
@@ -631,10 +749,11 @@ fn recorded_contains(root: &Path, path: &Path) -> bool {
         {
             return false;
         }
-        let root = user_path(root);
+        let root = paths::user_path(root);
         // Only shorten the ancestor being compared. A verbatim-only leaf can
         // still be below a safely representable registered root.
-        path.ancestors().any(|ancestor| user_path(ancestor) == root)
+        path.ancestors()
+            .any(|ancestor| paths::user_path(ancestor) == root)
     }
     #[cfg(not(windows))]
     false

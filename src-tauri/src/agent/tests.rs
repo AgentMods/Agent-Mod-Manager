@@ -20,6 +20,9 @@ use tokio::{
 #[path = "attachment_tests.rs"]
 mod agent_attachment;
 
+#[path = "game_adapter_flow_tests.rs"]
+mod game_adapter_flow;
+
 #[path = "live_modrinth_tests.rs"]
 mod live_modrinth;
 

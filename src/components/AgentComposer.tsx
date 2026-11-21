@@ -4,7 +4,7 @@ import { DropdownMenu as Menu, Popover, Slider } from "radix-ui";
 import { Button } from "@/components/ui/button";
 import { AttachmentGroup } from "@/components/ui/attachment";
 import { AttachmentConverterSetup, ComposerAttachment } from "./AgentAttachments";
-import { MAX_ATTACHMENTS, MAX_MESSAGE_ATTACHMENT_BYTES, usePrepareAttachments, type DraftAttachment } from "@/lib/agent-attachments";
+import { MAX_ATTACHMENTS, MAX_MESSAGE_ATTACHMENT_BYTES, type DraftAttachment } from "@/lib/agent-attachments";
 import { toast } from "sonner";
 import {
   DropdownMenu,
@@ -60,8 +60,6 @@ export function AgentComposer({
   const tooLarge = ready.reduce((total, item) => total + item.bytes, 0) > MAX_MESSAGE_ATTACHMENT_BYTES;
   const canSend = !controlsDisabled && !tooLarge && ready.length === attachments.length && (Boolean(input.trim()) || ready.length > 0);
 
-  usePrepareAttachments(attachments, updateAttachments);
-
   function retryFailed(id?: string) {
     updateAttachments((current) => current.map((item) => item.state === "error" && (id ? item.id === id : item.needsConsent)
       ? { id: item.id, state: "processing", file: item.file } : item));
@@ -83,122 +81,120 @@ export function AgentComposer({
   const elevated = effectivePermission === "full_trust";
   const PermissionIcon = elevated ? ShieldAlertIcon : ShieldIcon;
 
-  return <form className="shrink-0 px-3 pb-3 pt-2 sm:px-8 sm:pb-5" onSubmit={(event) => {
+  return <form onSubmit={(event) => {
     event.preventDefault();
     if (canSend) onSend(ready.map((item) => item.attachment));
   }}>
-    <div className="mx-auto w-full max-w-5xl">
-      {onCancelEdit && <div className="mb-1 flex items-center justify-between gap-2 px-2 text-xs text-muted-foreground">
-        <span>正在编辑消息 · 发送后开启新分支</span>
-        <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={onCancelEdit}>取消编辑</Button>
-      </div>}
-      <input ref={filePicker} type="file" aria-label="选择附件" hidden multiple disabled={controlsDisabled} onChange={(event) => {
-        const files = Array.from(event.currentTarget.files ?? []);
-        event.currentTarget.value = "";
-        addFiles(files);
-      }} />
-      <InputGroup className="rounded-[22px] border-border shadow-sm bg-muted/55 dark:bg-secondary">
-        {attachments.length > 0 && <InputGroupAddon align="block-start" className="min-w-0 flex-col items-stretch gap-1 px-3 pt-2 pb-0">
-          <AttachmentGroup aria-label="待发送附件" aria-live="polite" className="max-h-[25dvh] flex-wrap gap-1.5 overflow-y-auto">
-            {attachments.map((draft) => <ComposerAttachment key={draft.id} draft={draft} disabled={controlsDisabled}
-              onRemove={() => updateAttachments((current) => current.filter((item) => item.id !== draft.id))}
-              onRetry={() => retryFailed(draft.id)} />)}
-          </AttachmentGroup>
-          {needsSetup && <Button type="button" size="xs" variant="outline" className="self-start" disabled={controlsDisabled} onClick={() => setSetupOpen(true)}>启动 MarkItDown MCP</Button>}
-          {needsSetup && setupOpen && <AttachmentConverterSetup onClose={() => setSetupOpen(false)} onStarted={() => {
-            setSetupOpen(false);
-            retryFailed();
-          }} />}
-          {tooLarge && <span role="alert" className="text-xs text-destructive">附件合计超过 20 MiB，请移除部分附件后分次发送。</span>}
-        </InputGroupAddon>}
-        <InputGroupTextarea
-          ref={inputRef}
-          aria-label="告诉 Agent 你想做什么"
-          placeholder="和 Agent 一起工作"
-          value={input}
-          className="max-h-[min(14rem,34dvh)] min-h-16 resize-none px-4 pt-3.5 pb-2 sm:min-h-20 sm:text-base"
-          disabled={disabled}
-          onChange={(event) => onInputChange(event.target.value)}
-          onPaste={(event) => {
-            const data = event.clipboardData;
-            const files = data.files.length ? Array.from(data.files) : Array.from(data.items)
-              .filter((item) => item.kind === "file").map((item) => item.getAsFile()).filter((file) => file !== null);
-            if (!files.length) return;
+    {onCancelEdit && <div className="mb-1 flex items-center justify-between gap-2 px-2 text-xs text-muted-foreground">
+      <span>正在编辑消息 · 发送后开启新分支</span>
+      <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={onCancelEdit}>取消编辑</Button>
+    </div>}
+    <input ref={filePicker} type="file" aria-label="选择附件" hidden multiple disabled={controlsDisabled} onChange={(event) => {
+      const files = Array.from(event.currentTarget.files ?? []);
+      event.currentTarget.value = "";
+      addFiles(files);
+    }} />
+    <InputGroup className="rounded-[22px] border-border shadow-sm bg-muted/55 dark:bg-secondary">
+      {attachments.length > 0 && <InputGroupAddon align="block-start" className="min-w-0 flex-col items-stretch gap-1 px-3 pt-2 pb-0">
+        <AttachmentGroup aria-label="待发送附件" aria-live="polite" className="max-h-[25dvh] flex-wrap gap-1.5 overflow-y-auto">
+          {attachments.map((draft) => <ComposerAttachment key={draft.id} draft={draft} disabled={controlsDisabled}
+            onRemove={() => updateAttachments((current) => current.filter((item) => item.id !== draft.id))}
+            onRetry={() => retryFailed(draft.id)} />)}
+        </AttachmentGroup>
+        {needsSetup && <Button type="button" size="xs" variant="outline" className="self-start" disabled={controlsDisabled} onClick={() => setSetupOpen(true)}>启动 MarkItDown MCP</Button>}
+        {needsSetup && setupOpen && <AttachmentConverterSetup onClose={() => setSetupOpen(false)} onStarted={() => {
+          setSetupOpen(false);
+          retryFailed();
+        }} />}
+        {tooLarge && <span role="alert" className="text-xs text-destructive">附件合计超过 20 MiB，请移除部分附件后分次发送。</span>}
+      </InputGroupAddon>}
+      <InputGroupTextarea
+        ref={inputRef}
+        aria-label="告诉 Agent 你想做什么"
+        placeholder="和 Agent 一起工作"
+        value={input}
+        className="max-h-[min(14rem,34dvh)] min-h-16 resize-none px-4 pt-3.5 pb-2 sm:min-h-20 sm:text-base"
+        disabled={disabled}
+        onChange={(event) => onInputChange(event.target.value)}
+        onPaste={(event) => {
+          const data = event.clipboardData;
+          const files = data.files.length ? Array.from(data.files) : Array.from(data.items)
+            .filter((item) => item.kind === "file").map((item) => item.getAsFile()).filter((file) => file !== null);
+          if (!files.length) return;
+          event.preventDefault();
+          addFiles(files);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
             event.preventDefault();
-            addFiles(files);
-          }}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-              event.preventDefault();
-              if (canSend) event.currentTarget.form?.requestSubmit();
-            }
-          }}
-        />
-        <InputGroupAddon align="block-end" className="cursor-default flex-wrap justify-between gap-1.5 px-2.5 pb-2.5 pt-0">
-          <div className="flex min-w-0 items-center gap-1">
-            <Button type="button" aria-label="添加附件" title="添加附件（图片也可直接粘贴）" size="icon-sm" variant="ghost"
-              disabled={controlsDisabled} onClick={() => filePicker.current?.click()}>
-              <PlusIcon aria-hidden="true" />
-            </Button>
-            <DropdownMenu modal={false}>
+            if (canSend) event.currentTarget.form?.requestSubmit();
+          }
+        }}
+      />
+      <InputGroupAddon align="block-end" className="cursor-default flex-wrap justify-between gap-1.5 px-2.5 pb-2.5 pt-0">
+        <div className="flex min-w-0 items-center gap-1">
+          <Button type="button" aria-label="添加附件" title="添加附件（图片也可直接粘贴）" size="icon-sm" variant="ghost"
+            disabled={controlsDisabled} onClick={() => filePicker.current?.click()}>
+            <PlusIcon aria-hidden="true" />
+          </Button>
+          <DropdownMenu modal={false}>
+            <DropdownMenuTrigger asChild>
+              <Button type="button" size="sm" variant="ghost" aria-label="本轮权限策略"
+                title={permission ? permissionLabels[permission] : `会话设置 · ${permissionLabels[effectivePermission]}`}
+                className={cn("gap-1.5 rounded-full px-2 text-xs has-[>svg]:px-2", elevated && "text-warning")}
+                disabled={controlsDisabled}>
+                <PermissionIcon aria-hidden="true" className="size-4" />
+                <span>{permissionLabels[effectivePermission]}</span>
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent {...popupPosition} align="start" className="min-w-44 rounded-xl">
+              <DropdownMenuRadioGroup value={permission} onValueChange={(next) => onPermissionChange(next as PermissionMode | "")}>
+                {Object.entries(permissionLabels).map(([value, name]) => (
+                  <DropdownMenuRadioItem key={value} className="min-h-8" value={value}>{name}</DropdownMenuRadioItem>
+                ))}
+              </DropdownMenuRadioGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+        <div className="ml-auto flex max-w-full min-w-0 items-center gap-2">
+          <div className="flex min-w-0 items-center rounded-full bg-background/80 dark:bg-background/50">
+            <DropdownMenu modal={false} open={!controlsDisabled && picker === "model"}
+              onOpenChange={(open) => setPicker((current) => open ? "model" : current === "model" ? null : current)}>
               <DropdownMenuTrigger asChild>
-                <Button type="button" size="sm" variant="ghost" aria-label="本轮权限策略"
-                  title={permission ? permissionLabels[permission] : `会话设置 · ${permissionLabels[effectivePermission]}`}
-                  className={cn("gap-1.5 rounded-full px-2 text-xs has-[>svg]:px-2", elevated && "text-warning")}
-                  disabled={controlsDisabled}>
-                  <PermissionIcon aria-hidden="true" className="size-4" />
-                  <span>{permissionLabels[effectivePermission]}</span>
+                <Button type="button" size="sm" variant="ghost" aria-label="本轮模型" title={modelLabel}
+                  className="min-w-0 shrink rounded-full px-2.5 has-[>svg]:px-2.5"
+                  disabled={controlsDisabled || !models.length}>
+                  <span className="max-w-[min(30vw,13rem)] truncate">{modelLabel}</span>
+                  {!levels.length && <ChevronDownIcon aria-hidden="true" className="size-3 opacity-60" />}
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent {...popupPosition} align="start" className="min-w-44 rounded-xl">
-                <DropdownMenuRadioGroup value={permission} onValueChange={(next) => onPermissionChange(next as PermissionMode | "")}>
-                  {Object.entries(permissionLabels).map(([value, name]) => (
-                    <DropdownMenuRadioItem key={value} className="min-h-8" value={value}>{name}</DropdownMenuRadioItem>
+              <DropdownMenuContent {...popupPosition} aria-label="本轮模型"
+                className="max-h-[min(23rem,var(--radix-dropdown-menu-content-available-height))] w-[min(19rem,calc(100vw-24px))] rounded-2xl p-1.5 shadow-lg">
+                <DropdownMenuRadioGroup value={model} onValueChange={onModelChange}>
+                  {models.map(({id, display_name}) => (
+                    <Menu.RadioItem key={id} value={id} title={id}
+                      className="flex min-h-8 cursor-default items-center gap-3 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none data-highlighted:bg-muted data-[state=checked]:font-medium">
+                      <span className="min-w-0 flex-1 wrap-anywhere">{display_name?.trim() || id}</span>
+                      <Menu.ItemIndicator><CheckIcon aria-hidden="true" className="size-4 text-primary" /></Menu.ItemIndicator>
+                    </Menu.RadioItem>
                   ))}
                 </DropdownMenuRadioGroup>
               </DropdownMenuContent>
             </DropdownMenu>
+            {levels.length > 0 && <ReasoningPicker modelLabel={modelLabel} levels={levels} value={reasoningEffort}
+              disabled={controlsDisabled} open={!controlsDisabled && picker === "reasoning"}
+              onOpenChange={(open) => setPicker((current) => open ? "reasoning" : current === "reasoning" ? null : current)}
+              onOpenModel={() => setPicker("model")} onChange={onReasoningChange} />}
           </div>
-          <div className="ml-auto flex max-w-full min-w-0 items-center gap-2">
-            <div className="flex min-w-0 items-center rounded-full bg-background/80 dark:bg-background/50">
-              <DropdownMenu modal={false} open={!controlsDisabled && picker === "model"}
-                onOpenChange={(open) => setPicker((current) => open ? "model" : current === "model" ? null : current)}>
-                <DropdownMenuTrigger asChild>
-                  <Button type="button" size="sm" variant="ghost" aria-label="本轮模型" title={modelLabel}
-                    className="min-w-0 shrink rounded-full px-2.5 has-[>svg]:px-2.5"
-                    disabled={controlsDisabled || !models.length}>
-                    <span className="max-w-[min(30vw,13rem)] truncate">{modelLabel}</span>
-                    {!levels.length && <ChevronDownIcon aria-hidden="true" className="size-3 opacity-60" />}
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent {...popupPosition} aria-label="本轮模型"
-                  className="max-h-[min(23rem,var(--radix-dropdown-menu-content-available-height))] w-[min(19rem,calc(100vw-24px))] rounded-2xl p-1.5 shadow-lg">
-                  <DropdownMenuRadioGroup value={model} onValueChange={onModelChange}>
-                    {models.map(({id, display_name}) => (
-                      <Menu.RadioItem key={id} value={id} title={id}
-                        className="flex min-h-8 cursor-default items-center gap-3 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none data-highlighted:bg-muted data-[state=checked]:font-medium">
-                        <span className="min-w-0 flex-1 wrap-anywhere">{display_name?.trim() || id}</span>
-                        <Menu.ItemIndicator><CheckIcon aria-hidden="true" className="size-4 text-primary" /></Menu.ItemIndicator>
-                      </Menu.RadioItem>
-                    ))}
-                  </DropdownMenuRadioGroup>
-                </DropdownMenuContent>
-              </DropdownMenu>
-              {levels.length > 0 && <ReasoningPicker modelLabel={modelLabel} levels={levels} value={reasoningEffort}
-                disabled={controlsDisabled} open={!controlsDisabled && picker === "reasoning"}
-                onOpenChange={(open) => setPicker((current) => open ? "reasoning" : current === "reasoning" ? null : current)}
-                onOpenModel={() => setPicker("model")} onChange={onReasoningChange} />}
-            </div>
-            {onCancel ? <Button type="button" aria-label="停止生成" title="停止生成" variant="secondary" size="icon"
-              className="rounded-full bg-foreground text-background hover:bg-foreground/85" onClick={onCancel}>
-              <SquareIcon aria-hidden="true" className="size-3 fill-current" />
-            </Button> : <Button type="submit" aria-label="发送消息" title="发送消息" size="icon" className="rounded-full" disabled={!canSend}>
-              <ArrowUpIcon aria-hidden="true" />
-            </Button>}
-          </div>
-        </InputGroupAddon>
-      </InputGroup>
-    </div>
+          {onCancel ? <Button type="button" aria-label="停止生成" title="停止生成" variant="secondary" size="icon"
+            className="rounded-full bg-foreground text-background hover:bg-foreground/85" onClick={onCancel}>
+            <SquareIcon aria-hidden="true" className="size-3 fill-current" />
+          </Button> : <Button type="submit" aria-label="发送消息" title="发送消息" size="icon" className="rounded-full" disabled={!canSend}>
+            <ArrowUpIcon aria-hidden="true" />
+          </Button>}
+        </div>
+      </InputGroupAddon>
+    </InputGroup>
   </form>;
 }
 

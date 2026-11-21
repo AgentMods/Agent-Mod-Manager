@@ -19,11 +19,11 @@ import {
   Settings2Icon,
   TriangleAlertIcon,
 } from "lucide-react";
-import { api, backendAvailable, useBackendQuery } from "@/lib/api";
+import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { activeTurn, isQuestionRequest, replayConversation, trackAgentTurn, useAgent } from "../lib/agent-store";
 import { useUI } from "../lib/store";
 import type { AgentAttachment, AgentEvent, AppSettings, ComposerPreferences, Conversation, Game, Message as ChatMessage, PermissionMode, ReasoningEffort } from "../lib/types";
-import { readyAttachment, type DraftAttachment } from "@/lib/agent-attachments";
+import { readyAttachment, usePrepareAttachments, type DraftAttachment } from "@/lib/agent-attachments";
 import { AttachmentGroup } from "@/components/ui/attachment";
 import { MessageAttachment } from "./AgentAttachments";
 import { Badge, ErrorState } from "./ui";
@@ -45,7 +45,7 @@ import {
 import { cn } from "@/lib/utils";
 import { AgentComposer } from "./AgentComposer";
 import { AgentConversationList } from "./AgentConversationList";
-import { AgentQuestionnaire, questionOutcome } from "./AgentQuestionnaire";
+import { AgentQuestionnaire, describeQuestionnaire, QuestionnaireTrace, type Answer } from "./AgentQuestionnaire";
 
 const EMPTY_EVENTS: AgentEvent[] = [];
 const EMPTY_CONVERSATIONS: Conversation[] = [];
@@ -74,6 +74,8 @@ export function AgentChat() {
   const submittingRef = useRef(false);
   const composerInput = useRef<HTMLTextAreaElement>(null);
   const [edit, setEdit] = useState<(typeof composer & { conversationId: string; messageId: string }) | null>(null);
+  const [reanswerRequest, setReanswerRequest] = useState<AgentEvent | null>(null);
+  const [submittedAnswers, setSubmittedAnswers] = useState(() => new Map<AgentEvent, Answer[]>());
   const [error, setError] = useState<unknown>(null);
   const [permission, setPermission] = useState<PermissionMode | "">("");
   const [effortSelection, setEffortSelection] = useState<{ model: string; level: ReasoningEffort } | null>(null);
@@ -99,6 +101,11 @@ export function AgentChat() {
   const busy = submitting || !!turn;
   const activeEdit = edit?.conversationId === conversationId ? edit : null;
   const draft = activeEdit ?? composer;
+  function updateAttachments(apply: (items: DraftAttachment[]) => DraftAttachment[]) {
+    if (activeEdit) setEdit((current) => current?.messageId === activeEdit.messageId ? { ...current, attachments: apply(current.attachments) } : current);
+    else setComposer((current) => ({ ...current, attachments: apply(current.attachments) }));
+  }
+  usePrepareAttachments(draft.attachments, updateAttachments);
   const restoredPreferences = useRef(false);
 
   // Restore the last-used model, reasoning level and permission policy once per
@@ -164,6 +171,7 @@ export function AgentChat() {
 
   const selectConversation = useCallback((id: string | null) => {
     setConversation(id);
+    setReanswerRequest(null);
     setEdit(null);
     setComposer(emptyDraft());
     setError(null);
@@ -229,30 +237,55 @@ export function AgentChat() {
     return started; // A failed refresh cannot undo a successfully started turn.
   }
 
-  async function cancel() {
-    if (!turn || !conversationId) return;
-    try { await api("cancel_turn", { conversationId, turnId: turn }); }
+  async function cancel(turnId = turn) {
+    if (!turnId || !conversationId) return;
+    try { await api("cancel_turn", { conversationId, turnId }); }
     catch (failure) { setError(failure); }
   }
 
   const archivedConversation = !!detail.data?.conversation.archived;
-  const { questions, answering, tools, toolsByMessage, questionsByMessage } = useMemo(() => {
-    const questions = milestones.filter(isQuestionRequest).map((request) => ({
-      request,
-      outcome: questionOutcome(request, milestones) ?? (archivedConversation ? { kind: "closed" as const, label: "对话已归档" } : null),
-    }));
+  const { questions, pendingQuestion, tools, toolsByMessage, questionsByMessage } = useMemo(() => {
+    const questions = milestones.filter(isQuestionRequest).map((request) =>
+      describeQuestionnaire(request, milestones, archivedConversation, submittedAnswers.get(request)));
     const questionTools = new Set(questions.map(({ request }) => request.payload.toolCallId));
     const tools = milestones.filter((event) => event.kind === "tool-start" && !questionTools.has(event.payload.toolCallId));
     return {
-      questions, tools, answering: questions.some(({ outcome }) => !outcome),
+      questions, tools, pendingQuestion: questions.find(({ outcome, valid }) => !outcome && valid),
       toolsByMessage: groupByMessage(tools, (event) => event.messageId),
       questionsByMessage: groupByMessage(questions, ({ request }) => request.messageId),
     };
-  }, [milestones, archivedConversation]);
-  const renderQuestion = ({ request, outcome }: (typeof questions)[number]) => <AgentQuestionnaire
-    key={String(request.payload.approvalId)} request={request} outcome={outcome} turnBusy={busy}
-    onReanswer={backendAvailable && detail.data?.conversation.id === request.conversationId && !archivedConversation
-      ? (content) => send(content, { questionnaire: true }) : undefined} />;
+  }, [milestones, archivedConversation, submittedAnswers]);
+  const writableChat = backendAvailable && detail.data?.conversation.id === conversationId && !archivedConversation;
+  const activeQuestion = pendingQuestion ?? (writableChat ? questions.find(({ request, canReanswer }) => request === reanswerRequest && canReanswer) : undefined);
+  const activeRequest = activeQuestion?.request;
+  const previousRequest = useRef<AgentEvent | undefined>(undefined);
+  useEffect(() => {
+    if (!activeRequest && previousRequest.current?.conversationId === conversationId && document.activeElement === document.body) {
+      composerInput.current?.focus({ preventScroll: true });
+    }
+    previousRequest.current = activeRequest;
+  }, [activeRequest, conversationId]);
+
+  async function submitAnswers(questionnaire: (typeof questions)[number], answers: Answer[]) {
+    const { request, outcome, structured, questions: steps, title } = questionnaire;
+    if (outcome) {
+      // Historical answers start a new turn in the same chat. The original approval is final.
+      const lines = steps.map((item, index) => `${index + 1}. ${item!.question}\n回答：${answers[index] ?? "已跳过"}`);
+      const started = await send(`补充回答：${title}\n\n${lines.join("\n\n")}`, { questionnaire: true });
+      if (!started) throw new Error("当前对话正在处理其他请求，请稍后提交。");
+      setReanswerRequest((current) => current === request ? null : current);
+      return;
+    }
+    await api("respond_approval", { conversationId: request.conversationId, approvalId: request.payload.approvalId,
+      response: { approved: structured || answers[0] !== null, answer: structured ? JSON.stringify(answers) : answers[0] } });
+    // The approval is final even if its tool result arrives on a later replay.
+    setSubmittedAnswers((current) => new Map(current).set(request, answers));
+    void replayConversation(request.conversationId).catch((failure) => toast.error(errorText(failure)));
+  }
+
+  const renderQuestion = (questionnaire: (typeof questions)[number]) => <QuestionnaireTrace
+    key={questionnaire.request.seq} questionnaire={questionnaire} disabled={busy || !!activeQuestion}
+    onReanswer={writableChat ? () => setReanswerRequest(questionnaire.request) : undefined} />;
   const title = detail.data?.conversation.title || "Agent 对话";
   const conversationGame = detail.data ? detail.data.conversation.game_id : gameId;
   const gameName = adapterChat?.label ?? (games.data?.find((game) => game.id === conversationGame)?.name || "全部游戏");
@@ -296,7 +329,7 @@ export function AgentChat() {
         </div>
         <div className="flex max-w-[45%] flex-col items-end gap-0.5">
           <Badge className="min-w-0" tone={busy ? "warning" : "neutral"}>
-            <span className="truncate">{answering ? "等待你的回答" : busy ? "运行中" : selectedModelLabel || "未配置模型"}</span>
+            <span className="truncate">{pendingQuestion ? "等待你的回答" : busy ? "运行中" : selectedModelLabel || "未配置模型"}</span>
           </Badge>
           {totalTokens !== undefined && <span className="whitespace-nowrap text-xs text-muted-foreground tabular-nums">{totalTokens.toLocaleString()} tokens</span>}
         </div>
@@ -320,7 +353,7 @@ export function AgentChat() {
             const hasContent = Boolean(message.content.trim());
             const attachments = message.attachments ?? [];
             const hasAttachments = attachments.length > 0;
-            const canAct = backendAvailable && !!conversationId && !busy && !archivedConversation;
+            const canAct = backendAvailable && !!conversationId && !busy && !activeQuestion && !archivedConversation;
             return <Fragment key={message.id}>
               <article className={cn("chat-message", message.role)}>
                 <Message align={isAssistant ? "start" : "end"}>
@@ -358,44 +391,50 @@ export function AgentChat() {
           {tools.filter((event) => !event.messageId || !visibleIds.has(event.messageId)).map((event) => <ToolTrace key={event.seq} event={event} events={milestones} />)}
           {questions.filter(({ request }) => !request.messageId || !visibleIds.has(request.messageId)).map(renderQuestion)}
           {unlinkedErrors.map(({ seq, message }) => <div className="chat-message" key={seq}><TurnError message={message} /></div>)}
-          {busy && !answering && <Trace className="max-w-3xl"><TraceLine status="running"><TraceIcon><LoaderCircleIcon className="animate-spin" /></TraceIcon><TraceTitle>正在处理请求</TraceTitle></TraceLine></Trace>}
+          {busy && !pendingQuestion && <Trace className="max-w-3xl"><TraceLine status="running"><TraceIcon><LoaderCircleIcon className="animate-spin" /></TraceIcon><TraceTitle>正在处理请求</TraceTitle></TraceLine></Trace>}
           <ErrorState error={error || detail.error} />
           <div ref={end} />
         </div>
       </div>
 
-      <AgentComposer
-        input={draft.text}
-        inputRef={composerInput}
-        attachments={draft.attachments}
-        updateAttachments={(apply) => {
-          if (activeEdit) setEdit((current) => current?.messageId === activeEdit.messageId ? { ...current, attachments: apply(current.attachments) } : current);
-          else setComposer((current) => ({ ...current, attachments: apply(current.attachments) }));
-        }}
-        onCancelEdit={activeEdit ? () => setEdit(null) : undefined}
-        onInputChange={(text) => {
-          if (activeEdit) setEdit((current) => current && { ...current, text });
-          else setComposer((current) => ({ ...current, text }));
-        }}
-        onSend={(attachments) => {
-          const restart = activeEdit ? { messageId: activeEdit.messageId, edit: true } : undefined;
-          void send(draft.text.trim(), { attachments: attachments.length || activeEdit ? attachments : undefined, restart });
-        }}
-        onCancel={turn ? () => { void cancel(); } : undefined}
-        disabled={!backendAvailable || archivedConversation}
-        busy={busy}
-        permission={permission}
-        inheritedPermission={detail.data?.conversation.permission_mode ?? settings.data?.permission_mode ?? "request_approval"}
-        onPermissionChange={setPermission}
-        model={selectedModel}
-        models={models}
-        onModelChange={(nextModel) => {
-          setModelSelection(nextModel === model ? "" : nextModel);
-          setEffortSelection(null);
-        }}
-        reasoningEffort={reasoningEffort}
-        onReasoningChange={(level) => setEffortSelection(level ? { model: selectedModel, level } : null)}
-      />
+      <div className={cn("flex min-h-0 shrink-0 flex-col px-3 pt-2 pb-3 sm:px-8 sm:pb-5", activeQuestion && "max-h-[75%]")}>
+        <div className="mx-auto flex min-h-0 w-full max-w-5xl flex-col">
+          {activeQuestion ? <AgentQuestionnaire
+            key={`${activeQuestion.request.conversationId}:${activeQuestion.request.seq}:${pendingQuestion ? "live" : "follow-up"}`}
+            questionnaire={activeQuestion} disabled={!pendingQuestion && busy}
+            onSubmit={(answers) => submitAnswers(activeQuestion, answers)}
+            onCancel={pendingQuestion ? () => void cancel(pendingQuestion.request.turnId) : () => setReanswerRequest(null)}
+          /> : <AgentComposer
+            input={draft.text}
+            inputRef={composerInput}
+            attachments={draft.attachments}
+            updateAttachments={updateAttachments}
+            onCancelEdit={activeEdit ? () => setEdit(null) : undefined}
+            onInputChange={(text) => {
+              if (activeEdit) setEdit((current) => current && { ...current, text });
+              else setComposer((current) => ({ ...current, text }));
+            }}
+            onSend={(attachments) => {
+              const restart = activeEdit ? { messageId: activeEdit.messageId, edit: true } : undefined;
+              void send(draft.text.trim(), { attachments: attachments.length || activeEdit ? attachments : undefined, restart });
+            }}
+            onCancel={turn ? () => { void cancel(); } : undefined}
+            disabled={!backendAvailable || archivedConversation}
+            busy={busy}
+            permission={permission}
+            inheritedPermission={detail.data?.conversation.permission_mode ?? settings.data?.permission_mode ?? "request_approval"}
+            onPermissionChange={setPermission}
+            model={selectedModel}
+            models={models}
+            onModelChange={(nextModel) => {
+              setModelSelection(nextModel === model ? "" : nextModel);
+              setEffortSelection(null);
+            }}
+            reasoningEffort={reasoningEffort}
+            onReasoningChange={(level) => setEffortSelection(level ? { model: selectedModel, level } : null)}
+          />}
+        </div>
+      </div>
     </section>
   </div>;
 }
