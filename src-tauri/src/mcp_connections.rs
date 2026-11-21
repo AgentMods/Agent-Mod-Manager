@@ -29,7 +29,10 @@ pub struct McpConnections {
     runtime: McpRuntime,
 }
 enum Slot {
-    Starting(CancellationToken),
+    Starting {
+        cancel: CancellationToken,
+        finished: CancellationToken,
+    },
     Running {
         client: Box<McpClient>,
         names: Vec<String>,
@@ -38,6 +41,7 @@ enum Slot {
 enum Start {
     Confirmed(bool),
     Remembered,
+    Attachment,
     ManagedLocal,
 }
 #[derive(Serialize)]
@@ -60,7 +64,7 @@ impl McpConnections {
             .await
             .iter()
             .filter_map(|(server, slot)| match slot {
-                Slot::Starting(_) => None,
+                Slot::Starting { .. } => None,
                 Slot::Running { names, .. } => Some(ConnectionInfo {
                     server_id: server.clone(),
                     tools: names.clone(),
@@ -84,6 +88,7 @@ impl McpConnections {
             Start::Confirmed(accepts_unsandboxed_stdio),
         )
         .await
+        .map(|(info, _)| info)
     }
 
     pub(crate) async fn restore_requested(
@@ -122,6 +127,45 @@ impl McpConnections {
         let config = McpServers::new(settings.db.clone()).get(id)?;
         self.start(settings, registry, config, Start::Remembered)
             .await
+            .map(|(info, _)| info)
+    }
+
+    /// Resolve only the user-authorized, built-in local converter for desktop uploads.
+    pub(crate) async fn markitdown_client(
+        &self,
+        settings: &Settings,
+        registry: &ToolRegistry,
+    ) -> AppResult<McpClient> {
+        use crate::mcp::{
+            client::{namespaced_tool_name, MARKDOWN_TOOL},
+            config::MARKITDOWN_ID,
+            McpTransport,
+        };
+        let servers = McpServers::new(settings.db.clone());
+        let config = servers.get(MARKITDOWN_ID).map_err(|err| match err {
+            AppError::NotFound(_) => AppError::NotFound(
+                "缺少内置 MarkItDown MCP，请重启应用恢复预设后，在「设置 → MCP 服务」中启动它。"
+                    .into(),
+            ),
+            other => other,
+        })?;
+        if !config.builtin || config.transport != McpTransport::Stdio {
+            return Err(AppError::Invalid("聊天附件需要内置的 stdio MarkItDown MCP。请在「设置 → MCP 服务」中恢复该预设并启动。".into()));
+        }
+        let (info, client) = self
+            .start(settings.clone(), registry, config, Start::Attachment)
+            .await
+            .map_err(|err| match err {
+                AppError::Denied(_) => AppError::Denied("此 MarkItDown MCP 配置需要启动授权。请确认 stdio 进程使用当前用户的系统权限，或前往「设置 → MCP 服务」启动它。".into()),
+                other => AppError::Other(format!("无法使用 MarkItDown MCP。请在「设置 → MCP 服务」中检查连接后重试。{other}")),
+            })?;
+        if !info
+            .tools
+            .contains(&namespaced_tool_name(MARKITDOWN_ID, MARKDOWN_TOOL))
+        {
+            return Err(AppError::Unsupported("MarkItDown MCP 未提供 convert_to_markdown。请在「设置 → MCP 服务」中检查内置预设并重新启动。".into()));
+        }
+        Ok(client)
     }
 
     async fn start(
@@ -130,13 +174,43 @@ impl McpConnections {
         registry: &ToolRegistry,
         expected: ServerConfig,
         start: Start,
-    ) -> AppResult<ConnectionInfo> {
+    ) -> AppResult<(ConnectionInfo, McpClient)> {
         let servers = McpServers::new(settings.db.clone());
         let cancel = CancellationToken::new();
+        let finished = CancellationToken::new();
+        let _notify_waiters = finished.clone().drop_guard();
         let consent = {
             let mut slots = self.slots.lock().await;
-            if slots.contains_key(&expected.id) {
-                return Err(AppError::Conflict("MCP 正在启动或已连接".into()));
+            if let Some(slot) = slots.get(&expected.id) {
+                if !matches!(start, Start::Attachment) {
+                    return Err(AppError::Conflict("MCP 正在启动或已连接".into()));
+                }
+                // Concurrent uploads and desktop restore share one handshake. A waiter never
+                // retries a failed or revoked launch and cannot hold up an explicit stop.
+                if let Slot::Starting { finished, cancel } = slot {
+                    let (finished, cancel) = (finished.clone(), cancel.clone());
+                    drop(slots);
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err(AppError::Cancelled),
+                        _ = finished.cancelled() => (),
+                    }
+                    slots = self.slots.lock().await;
+                }
+                if let Some(Slot::Running { client, names }) = slots.get(&expected.id) {
+                    if client.server_config() == &expected {
+                        return Ok((
+                            ConnectionInfo {
+                                server_id: expected.id,
+                                tools: names.clone(),
+                            },
+                            client.as_ref().clone(),
+                        ));
+                    }
+                }
+                return Err(AppError::Conflict(
+                    "连接已停止、启动失败或配置已更改。请在「设置 → MCP 服务」中检查 MarkItDown 状态后重试。".into(),
+                ));
             }
             if slots.len() >= 8 {
                 return Err(AppError::Invalid("最多同时连接8个MCP服务器".into()));
@@ -150,15 +224,45 @@ impl McpConnections {
                 Start::Confirmed(accepted) => {
                     ConnectionConsent::after_user_confirmation(&expected, accepted)?
                 }
-                Start::Remembered => ConnectionConsent::from_remembered(&servers, &expected)?,
+                Start::Remembered | Start::Attachment => {
+                    ConnectionConsent::from_remembered(&servers, &expected)?
+                }
                 Start::ManagedLocal => {
                     ConnectionConsent::after_user_confirmation(&expected, false)?
                 }
             };
-            slots.insert(expected.id.clone(), Slot::Starting(cancel.clone()));
+            slots.insert(
+                expected.id.clone(),
+                Slot::Starting {
+                    cancel: cancel.clone(),
+                    finished,
+                },
+            );
             consent
         };
-        // Do not hold the lifecycle lock while a remote handshake or stdio download runs.
+        let remember = matches!(start, Start::Confirmed(_));
+        self.finish_start(settings, registry, expected, remember, cancel, consent)
+            .await
+            .map_err(|err| match err {
+                // Authorization succeeded. Filesystem/transport denials must never reopen the consent dialog.
+                AppError::Denied(reason) if matches!(start, Start::Attachment) => {
+                    AppError::Other(reason)
+                }
+                other => other,
+            })
+    }
+
+    // Never hold the lifecycle lock through a remote handshake or a stdio download.
+    async fn finish_start(
+        &self,
+        settings: Settings,
+        registry: &ToolRegistry,
+        expected: ServerConfig,
+        remember: bool,
+        cancel: CancellationToken,
+        consent: ConnectionConsent,
+    ) -> AppResult<(ConnectionInfo, McpClient)> {
+        let servers = McpServers::new(settings.db.clone());
         let prepared = async {
             let client = McpClient::connect(
                 servers.clone(),
@@ -192,7 +296,7 @@ impl McpConnections {
         let (client, tools) = prepared?;
         let names: Vec<_> = tools.iter().map(|t| t.definition().name).collect();
         let result = registry.register_batch(tools).and_then(|()| {
-            if matches!(start, Start::Confirmed(_)) {
+            if remember {
                 if let Err(err) = servers.remember_start(&expected) {
                     registry.unregister(&names);
                     return Err(err);
@@ -212,11 +316,11 @@ impl McpConnections {
         slots.insert(
             expected.id,
             Slot::Running {
-                client: Box::new(client),
+                client: Box::new(client.clone()),
                 names,
             },
         );
-        Ok(info)
+        Ok((info, client))
     }
 
     /// Commit stop/edit/remove and revoke the slot together so a queued restore cannot undo it.
@@ -230,7 +334,7 @@ impl McpConnections {
         // Never leave live tools running just because persistence is unavailable.
         let changed = change();
         match slots.remove(id) {
-            Some(Slot::Starting(cancel)) => cancel.cancel(),
+            Some(Slot::Starting { cancel, .. }) => cancel.cancel(),
             Some(Slot::Running { client, names }) => {
                 registry.unregister(&names);
                 client.disconnect();
@@ -271,7 +375,7 @@ impl McpConnections {
             .start(settings, registry, config, Start::ManagedLocal)
             .await
         {
-            Ok(info) => Ok(info),
+            Ok((info, _)) => Ok(info),
             Err(err) => {
                 let _ = servers.remove(LOCAL_SERVER_ID);
                 Err(err)

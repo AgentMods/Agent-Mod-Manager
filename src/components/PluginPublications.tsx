@@ -1,3 +1,4 @@
+import { displayPath } from "@/lib/paths";
 import { useEffect, useLayoutEffect, useState } from 'react';
 import { CircleAlertIcon, CircleCheckIcon, EyeIcon, FileArchiveIcon, RefreshCwIcon, UploadIcon } from 'lucide-react';
 import { api, backendAvailable, useBackendQuery } from '@/lib/api';
@@ -172,7 +173,7 @@ export function PluginPublications({ draft, showHistory, writable, onDraftClose 
       <div><Badge tone={tone(selected)}>{status(selected)}</Badge></div>
       {((selected.state === 'unknown' && !checkable) || selected.state === 'error') && <Alert variant="warning" className=""><AlertDescription>{selected.state === 'unknown' ? '请在 Mod 客栈核对文件和作品，当前记录不会自动重发。' : '当前发布记录已终止，未自动重发。'}</AlertDescription></Alert>}
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
-        <dt className="text-muted-foreground">目的地</dt><dd><PathText>{pack.destination}</PathText></dd>
+        <dt className="text-muted-foreground">目的地</dt><dd><PathText>{displayPath(pack.destination)}</PathText></dd>
         <dt className="text-muted-foreground">公开状态</dt><dd>{pack.workStatus}</dd>
         <dt className="text-muted-foreground">标题</dt><dd>{pack.title}</dd>
         <dt className="text-muted-foreground">摘要</dt><dd className="break-words whitespace-pre-wrap">{pack.summary || '-'}</dd>

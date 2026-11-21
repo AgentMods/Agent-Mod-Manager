@@ -65,6 +65,13 @@ impl Fixture {
         ).unwrap();
     }
 }
+// Construct the spelling a stored record supplied, including literal `..`.
+// Joining onto a Windows verbatim root would resolve these components first.
+fn recorded_path(root: &Path, segments: &[&str]) -> String {
+    let sep = std::path::MAIN_SEPARATOR_STR;
+    format!("{}{sep}{}", root.display(), segments.join(sep))
+}
+
 fn write(path: &Path, bytes: impl AsRef<[u8]>) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
@@ -1257,7 +1264,7 @@ fn noncanonical_database_roots_are_rejected() {
         .conn()
         .execute(
             "UPDATE games SET root_path=?1 WHERE id=?2",
-            params![f.root.join("child/..").to_str().unwrap(), f.game.id],
+            params![recorded_path(&f.root, &["child", ".."]), f.game.id],
         )
         .unwrap();
     assert!(matches!(f.read_error(), AppError::Denied(_)));
@@ -1768,7 +1775,7 @@ fn records_cannot_authorize_relative_outside_manager_or_other_game_paths() {
         f.base.join("outside-missing.jar"),
         f.engine.paths.root.join("manager-missing.jar"),
         other.join("mods/other-missing.jar"),
-        f.root.join("mods/../missing.jar")
+        recorded_path(&f.root, &["mods", "..", "missing.jar"])
     ]);
     f.install("malicious", "enabled", &files.to_string(), "[]");
     let result = f.diagnose(&ReadOptions::default());

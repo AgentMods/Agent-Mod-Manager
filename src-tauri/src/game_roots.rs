@@ -64,6 +64,9 @@ pub fn register_user_root(
         return Err(AppError::Denied("请选择实际存在且非符号链接的目录".into()));
     }
     let path = path.canonicalize()?;
+    let recorded_path = path
+        .to_str()
+        .ok_or_else(|| AppError::Invalid("用户管理根目录名无法无损表示为 UTF-8".into()))?;
     if path.parent().is_none() || engine.paths.overlaps_storage(&path) {
         return Err(AppError::Denied(
             "用户管理根不能包含管理器数据或整个文件系统".into(),
@@ -78,7 +81,7 @@ pub fn register_user_root(
     }
     engine.db.conn().execute(
         "INSERT INTO game_user_roots(game_id,root_id,path,created_at) VALUES (?1,?2,?3,?4) ON CONFLICT(game_id,root_id) DO NOTHING",
-        params![game_id,root_id,path.to_string_lossy(),util::now()],
+        params![game_id,root_id,recorded_path,util::now()],
     )?;
     Ok(path)
 }

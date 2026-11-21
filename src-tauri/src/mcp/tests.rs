@@ -71,8 +71,32 @@ fn assert_playwright_windows_args(args: &[String]) {
     assert_eq!(args, expected);
 }
 
+fn markitdown_args() -> Vec<String> {
+    [
+        "--with",
+        "azure-ai-contentunderstanding==1.2.0b3",
+        "markitdown-mcp==0.0.1a8",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn markitdown_legacy_mirror_args() -> Vec<String> {
+    [
+        "--default-index",
+        "https://pypi.tuna.tsinghua.edu.cn/simple",
+        "--with",
+        "azure-ai-contentunderstanding==1.2.0b3",
+        "markitdown-mcp==0.0.1a8",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 #[test]
-fn sqlite_crud_presets_and_secret_references() {
+fn sqlite_crud_presets_markitdown_inherits_uvx_default_and_secret_references() {
     let (_dir, servers, settings, _) = fixture();
     servers.seed_presets().unwrap();
     servers.seed_presets().unwrap();
@@ -81,6 +105,9 @@ fn sqlite_crud_presets_and_secret_references() {
     assert!(presets
         .iter()
         .all(|server| !server.enabled && server.builtin));
+    let markitdown = servers.get("markitdown").unwrap();
+    assert_eq!(markitdown.command.as_deref(), Some("uvx"));
+    assert_eq!(markitdown.args, markitdown_args());
     let http = servers.get("glossmod_http").unwrap();
     assert_eq!(
         http.url.as_deref(),
@@ -159,37 +186,82 @@ fn microsoft_mcp_presets_are_credential_free_and_preserve_existing_config() {
     let markitdown = servers.get("markitdown").unwrap();
     assert_eq!(markitdown.transport, McpTransport::Stdio);
     assert_eq!(markitdown.command.as_deref(), Some("uvx"));
-    assert_eq!(
-        markitdown.args,
-        [
-            "--default-index",
-            "https://pypi.tuna.tsinghua.edu.cn/simple",
-            "--with",
-            "azure-ai-contentunderstanding==1.2.0b3",
-            "markitdown-mcp==0.0.1a8"
-        ]
-    );
+    assert_eq!(markitdown.args, markitdown_args());
     assert!(markitdown.env_secret_refs.is_empty() && markitdown.bearer_secret_ref.is_none());
     assert!(!markitdown.enabled && markitdown.builtin);
     assert!(ConnectionConsent::after_user_confirmation(&markitdown, false).is_err());
 }
 
 #[test]
-fn markitdown_mirror_upgrade_is_one_time_and_requires_new_consent() {
+fn markitdown_v2_through_v5_stock_upgrade_clears_consent_once_and_v5_user_edit_persists() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("legacy.sqlite");
-    let old_args = vec![
-        "--with".to_string(),
-        "azure-ai-contentunderstanding==1.2.0b3".into(),
-        "markitdown-mcp==0.0.1a8".into(),
-    ];
+    for version in 2..=5 {
+        let path = dir.path().join(format!("v{version}.sqlite"));
+        let servers = McpServers::new(Db::open(&path).unwrap());
+        servers.seed_presets().unwrap();
+        let mut legacy = servers.get("markitdown").unwrap();
+        legacy.args = markitdown_legacy_mirror_args();
+        legacy.enabled = true;
+        servers.update(&legacy).unwrap();
+        servers.remember_start(&legacy).unwrap();
+        servers
+            .db
+            .conn()
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        drop(servers);
+
+        let servers = McpServers::new(Db::open(&path).unwrap());
+        let migrated = servers.get("markitdown").unwrap();
+        assert_eq!(migrated.args, markitdown_args(), "schema v{version}");
+        assert_eq!(migrated.command, legacy.command, "schema v{version}");
+        assert!(migrated.enabled && migrated.builtin, "schema v{version}");
+        assert!(
+            servers.startup_requests().unwrap().is_empty(),
+            "schema v{version}"
+        );
+        assert!(
+            ConnectionConsent::from_remembered(&servers, &migrated).is_err(),
+            "schema v{version}"
+        );
+
+        // Seeding again must not reapply the migration or restore consent.
+        servers.seed_presets().unwrap();
+        assert_eq!(servers.get("markitdown").unwrap(), migrated);
+
+        // A user's explicit mirror edit after v5 migration is retained on later startups.
+        let (expected, expected_startup) = if version == 5 {
+            let mut restored = migrated.clone();
+            restored.args = markitdown_legacy_mirror_args();
+            servers.update(&restored).unwrap();
+            servers.remember_start(&restored).unwrap();
+            (restored, vec!["markitdown".to_owned()])
+        } else {
+            (migrated.clone(), Vec::new())
+        };
+        drop(servers);
+        let reopened = McpServers::new(Db::open(&path).unwrap());
+        reopened.seed_presets().unwrap();
+        assert_eq!(reopened.get("markitdown").unwrap(), expected);
+        assert_eq!(reopened.startup_requests().unwrap(), expected_startup);
+        assert_eq!(
+            ConnectionConsent::from_remembered(&reopened, &expected).is_ok(),
+            version == 5
+        );
+    }
+}
+
+#[test]
+fn markitdown_direct_v1_upgrade_keeps_package_only_config_and_revokes_bare_uvx_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v1.sqlite");
     let servers = McpServers::new(Db::open(&path).unwrap());
     servers.seed_presets().unwrap();
-    let mut old = servers.get("markitdown").unwrap();
-    old.args.clone_from(&old_args);
-    old.enabled = true;
-    servers.update(&old).unwrap();
-    servers.remember_start(&old).unwrap();
+    let mut legacy = servers.get("markitdown").unwrap();
+    legacy.args = markitdown_args();
+    legacy.enabled = true;
+    servers.update(&legacy).unwrap();
+    servers.remember_start(&legacy).unwrap();
     servers
         .db
         .conn()
@@ -199,35 +271,51 @@ fn markitdown_mirror_upgrade_is_one_time_and_requires_new_consent() {
 
     let servers = McpServers::new(Db::open(&path).unwrap());
     let migrated = servers.get("markitdown").unwrap();
-    assert_eq!(
-        &migrated.args[..2],
-        &[
-            "--default-index",
-            "https://pypi.tuna.tsinghua.edu.cn/simple"
-        ]
-    );
-    assert_eq!(&migrated.args[2..], old_args.as_slice());
+    assert_eq!(migrated.args, markitdown_args());
     assert!(migrated.enabled && migrated.builtin);
     assert!(servers.startup_requests().unwrap().is_empty());
-    servers.update(&old).unwrap(); // Explicit opt-out must survive another launch.
-    drop(servers);
-    let servers = McpServers::new(Db::open(&path).unwrap());
-    servers.seed_presets().unwrap();
-    assert_eq!(servers.get("markitdown").unwrap(), old);
+    assert!(ConnectionConsent::from_remembered(&servers, &migrated).is_err());
+}
 
-    // A v1 install with its own launcher must not be touched or lose its consent.
-    old.command = Some("my-uv-wrapper".into());
-    servers.update(&old).unwrap();
-    servers.remember_start(&old).unwrap();
-    servers
-        .db
-        .conn()
-        .pragma_update(None, "user_version", 1)
-        .unwrap();
-    drop(servers);
-    let servers = McpServers::new(Db::open(&path).unwrap());
-    assert_eq!(servers.get("markitdown").unwrap(), old);
-    assert_eq!(servers.startup_requests().unwrap(), ["markitdown"]);
+#[test]
+fn markitdown_v5_custom_launches_preserve_values_and_existing_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    for customization in ["custom_mirror", "extra_args", "custom_command"] {
+        let path = dir.path().join(format!("{customization}.sqlite"));
+        let servers = McpServers::new(Db::open(&path).unwrap());
+        servers.seed_presets().unwrap();
+        let mut customized = servers.get("markitdown").unwrap();
+        customized.args = markitdown_legacy_mirror_args();
+        match customization {
+            "custom_mirror" => {
+                customized.args[1] = "https://pypi.example.test/simple".into();
+            }
+            "extra_args" => customized.args.push("--no-cache".into()),
+            "custom_command" => customized.command = Some("custom-uvx".into()),
+            _ => unreachable!(),
+        }
+        customized.enabled = true;
+        servers.update(&customized).unwrap();
+        servers.remember_start(&customized).unwrap();
+        servers
+            .db
+            .conn()
+            .pragma_update(None, "user_version", 5)
+            .unwrap();
+        drop(servers);
+
+        let servers = McpServers::new(Db::open(&path).unwrap());
+        assert_eq!(
+            servers.get("markitdown").unwrap(),
+            customized,
+            "{customization}"
+        );
+        assert_eq!(servers.startup_requests().unwrap(), ["markitdown"]);
+        assert!(
+            ConnectionConsent::from_remembered(&servers, &customized).is_ok(),
+            "{customization}"
+        );
+    }
 }
 
 #[test]
@@ -849,7 +937,8 @@ async fn live_markitdown_preset_initializes_and_lists_conversion_tool() {
         &config.id,
         consent,
         &McpRuntime::bundled(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/mcp-runtime/runtime.zip"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("resources/mcp-runtime/runtime.zip"),
             dir.path().canonicalize().unwrap().join("runtime-cache"),
         ),
         &context.cancel,
@@ -1133,4 +1222,80 @@ fn migrating_enabled_legacy_server_does_not_grant_startup_consent() {
     let reopened = McpServers::new(Db::open(&ctx.engine.paths.db_file()).unwrap());
     assert_eq!(reopened.get("legacy").unwrap(), config);
     assert!(reopened.startup_requests().unwrap().is_empty());
+}
+/// Exercise the real archive, native MCP command builder and npm-generated child shim offline.
+#[tokio::test]
+#[ignore = "requires yarn prepare:mcp-runtime for this target"]
+async fn bundled_npx_connects_offline_without_system_node() {
+    let (dir, servers, settings, ctx) = fixture();
+    let base = dir.path().canonicalize().unwrap();
+    let runtime = McpRuntime::bundled(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/mcp-runtime/runtime.zip"),
+        base.join("runtime"),
+    );
+    let package = base.join("local package");
+    std::fs::create_dir(&package).unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{"name":"amm-smoke","version":"1.0.0","bin":{"amm-smoke":"server.js"}}"#,
+    )
+    .unwrap();
+    let script = package.join("server.js");
+    std::fs::write(&script, r#"#!/usr/bin/env node
+const rl = require('node:readline').createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.id === undefined) return;
+  const result = msg.method === 'initialize'
+    ? {protocolVersion:msg.params.protocolVersion, capabilities:{tools:{}}, serverInfo:{name:'fixture',version:'1'}}
+    : {tools:[{name:'probe', description:JSON.stringify([process.execPath, process.env.npm_config_registry]), inputSchema:{type:'object'}}]};
+  console.log(JSON.stringify({jsonrpc:'2.0', id:msg.id, result}));
+});
+"#).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let mut config = ServerConfig::stdio(
+        "packaged_node",
+        "Packaged Node",
+        "npx",
+        vec![
+            "--yes".into(),
+            "--offline".into(),
+            format!(
+                "--cache={}",
+                dunce::simplified(&base).join("npm-cache").display()
+            ),
+            format!("--package=file:{}", dunce::simplified(&package).display()),
+            "--".into(),
+            "amm-smoke".into(),
+        ],
+    );
+    config.enabled = true;
+    servers.create(&config).unwrap();
+    let consent = ConnectionConsent::after_user_confirmation(&config, true).unwrap();
+    let client = McpClient::connect(
+        servers,
+        &settings,
+        &config.id,
+        consent,
+        &runtime,
+        &ctx.cancel,
+    )
+    .await
+    .unwrap();
+    let tools = client.list_tools(&ctx.cancel).await.unwrap();
+    client.disconnect_and_wait().await.unwrap();
+    assert_eq!(tools.len(), 1);
+    let [node, registry]: [String; 2] = serde_json::from_str(&tools[0].description).unwrap();
+    assert!(std::path::Path::new(&node)
+        .canonicalize()
+        .unwrap()
+        .starts_with(base.join("runtime")));
+    assert_eq!(
+        registry.trim_end_matches('/'),
+        "https://registry.npmmirror.com"
+    );
 }

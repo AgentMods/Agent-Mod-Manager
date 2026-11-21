@@ -1,3 +1,4 @@
+import { displayPath } from "@/lib/paths";
 import { Badge, PathText, date } from '@/components/ui';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
@@ -40,7 +41,7 @@ export function FabricStartupEvidence({ report }: { report: FabricStartup }) {
           {report.loaderVersion && <><dt>Fabric Loader</dt><dd><PathText>{report.loaderVersion}</PathText></dd></>}
         </dl>}
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-sm text-muted-foreground">
-          <PathText>{report.file}{report.startupLine !== null && `:${report.startupLine}`}</PathText>
+          <PathText>{displayPath(report.file)}{report.startupLine !== null && `:${report.startupLine}`}</PathText>
           {report.selectionLine !== null && <span>清单第 {report.selectionLine} 行</span>}
           {report.failureLine !== null && <span>失败第 {report.failureLine} 行</span>}
           {report.modifiedAt && <span>日志更新时间 <time dateTime={report.modifiedAt}>{date(report.modifiedAt)}</time></span>}

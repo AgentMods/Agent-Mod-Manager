@@ -67,7 +67,7 @@ Presets configure third-party services; they do not bundle the runtimes:
   Uses a separate temporary browser profile;
   it does not attach to an existing signed-in browser. No API key is needed.
 - [MarkItDown MCP](https://github.com/microsoft/markitdown/tree/main/packages/markitdown-mcp):
-  `uvx --default-index https://pypi.tuna.tsinghua.edu.cn/simple --with azure-ai-contentunderstanding==1.2.0b3 markitdown-mcp==0.0.1a8`,
+  `uvx --with azure-ai-contentunderstanding==1.2.0b3 markitdown-mcp==0.0.1a8`,
   with bundled uv and a compatible Python (uv may download it). The explicit dependency pin lets uv resolve the
   prerelease required by MarkItDown without allowing all prerelease packages.
   Converts documents to Markdown via stdio, without an API key. Its `file:`
@@ -77,11 +77,14 @@ Enable and connect from Settings. For stdio, verify the displayed command and
 acknowledge its OS permissions before connecting. Bare `npx`, `npx.cmd`, `npx.exe`, `uvx` and `uvx.exe` (case-insensitive) use
 application-owned launchers. Their child environments select npmmirror
 (`npm_config_registry`) or the Tsinghua PyPI mirror (`UV_DEFAULT_INDEX`).
-Explicit CLI registry options take precedence. MarkItDown retains its explicit index.
+Explicit CLI registry options take precedence. MarkItDown inherits the bundled uvx default.
 Other commands, including absolute paths, keep their own executable and package configuration.
 MCP packages, Python interpreter downloads and browsers are separate from the launchers.
 Schema v4 revokes old auto-start consent for affected bare aliases, including custom connections,
 while preserving commands, arguments and credentials.
+Schema v6 removes the redundant index argument from the stock MarkItDown preset.
+Users who had enabled automatic startup confirm the updated command once. Custom commands,
+arguments and package indexes are preserved.
 
 Schema v3 switches only an unmodified built-in Windows Playwright preset to Edge.
 If it was set to start automatically, start it manually once to confirm the new

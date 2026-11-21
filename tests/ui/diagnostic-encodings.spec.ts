@@ -35,7 +35,7 @@ async function setup(page: Page) {
         unknowns: [legacy ? '未验证加载器兼容性。' : '旧版日志编码无法确认。'],
         evidence: legacy ? [{ file: legacyFile, line: 4, text: '旧版日志中的依赖线索。' }] : [],
         logs: { files: [
-          { file: '/sandbox/minecraft/logs/latest.log', kind: 'log', status: 'read', encoding: 'utf-8', truncated: false, notes: [] },
+          { file: String.raw`/sandbox/minecraft/logs/log\latest.log`, kind: 'log', status: 'read', encoding: 'utf-8', truncated: false, notes: [] },
           { file: 'C:\\sandbox\\logs\\boot.log', kind: 'log', status: 'read', encoding: 'utf-16le', truncated: true, notes: ['仅读取文件前缀。'] },
           { file: legacyFile, kind: 'log', status: legacy ? 'read' : 'unknown_encoding', encoding: legacy ? encoding : null, truncated: false,
             notes: [legacy ? '按请求的旧编码回退读取。' : '未指定旧编码回退。'] },
@@ -70,6 +70,7 @@ test('log fallback is optional, clears old evidence, and reports the actual sour
   await expect(evidence.getByText('日志 · 编码未知', { exact: true })).toBeVisible();
   await expect(evidence.getByText('未指定旧编码回退。', { exact: true })).toBeVisible();
   await expect(evidence.getByText('boot.log', { exact: true })).toBeVisible();
+  await expect(evidence.getByText(String.raw`log\latest.log`, { exact: true })).toBeVisible();
   await expect(evidence).not.toContainText('C:\\sandbox');
 
   await selector.selectOption('gbk');

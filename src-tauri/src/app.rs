@@ -18,10 +18,13 @@ pub struct AppServices {
 
 impl AppServices {
     pub fn initialize(root: PathBuf) -> AppResult<Self> {
-        Self::initialize_paths(AppPaths::new(root)?)
+        Self::initialize_paths(AppPaths::new(root)?, Default::default())
     }
 
-    pub(crate) fn initialize_paths(paths: AppPaths) -> AppResult<Self> {
+    pub(crate) fn initialize_paths(
+        paths: AppPaths,
+        runtime: crate::mcp::McpRuntime,
+    ) -> AppResult<Self> {
         let file = tracing_appender::rolling::daily(paths.logs(), "manager.log");
         let (writer, guard) = tracing_appender::non_blocking(file);
         let logging = tracing_subscriber::registry()
@@ -66,7 +69,7 @@ impl AppServices {
             engine,
             recovery_error,
             recovered,
-            mcp_connections: Default::default(),
+            mcp_connections: crate::mcp_connections::McpConnections::with_runtime(runtime),
             downloads: Default::default(),
             _log_guard: if logging { Some(guard) } else { None },
         })

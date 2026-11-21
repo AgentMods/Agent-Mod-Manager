@@ -107,7 +107,7 @@ impl AgentTool for WebDownloadTool {
             .download_web(&request, context.cancel.clone(), progress)
             .await?;
         crate::artifacts::record_web(&context.engine, &artifact)?;
-        Ok(json!(artifact))
+        Ok(json!(artifact.into_user_paths()))
     }
 }
 

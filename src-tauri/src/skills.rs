@@ -101,6 +101,7 @@ pub enum SkillKind {
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub location: PathBuf,
     pub source: String,
     pub enabled: bool,
@@ -156,9 +157,11 @@ pub enum SkillAction {
 pub struct SkillPreview {
     pub name: String,
     pub description: String,
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub location: PathBuf,
     pub action: SkillAction,
     pub sha256: String,
+    #[serde(serialize_with = "crate::transaction::serialize_user_plan")]
     pub plan: FilePlan,
     pub warnings: Vec<String>,
 }
@@ -244,7 +247,7 @@ fn checked_path(engine: &FileEngine, path: &Path) -> AppResult<PathBuf> {
         || !path.starts_with(root)
         || path.components().any(|c| matches!(c, Component::ParentDir))
     {
-        return Err(AppError::PathEscape(path.display().to_string()));
+        return Err(AppError::PathEscape(crate::paths::display_path(path)));
     }
     let mut current = root.clone();
     for component in path

@@ -696,7 +696,7 @@ fn write_static(paths: &AppPaths, target: &Path, bytes: &[u8]) -> AppResult<()> 
         if !meta.file_type().is_file() {
             return Err(AppError::Denied(format!(
                 "拒绝覆盖非普通包文件: {}",
-                target.display()
+                crate::paths::display_path(target)
             )));
         }
         if fs::read(target)? == bytes {
@@ -717,6 +717,7 @@ pub struct PluginInfo {
     pub source: String,
     pub enabled: bool,
     pub validated: bool,
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub install_path: String,
     pub cover_url: Option<String>,
 }

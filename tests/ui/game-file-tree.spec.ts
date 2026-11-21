@@ -105,7 +105,7 @@ test("搜索已展开目录中的条目并显示祖先，不读取未展开目�
   await detail.getByRole("button", { name: "ui", exact: true }).click();
   await expect(detail.getByRole("button", { name: "layout.json", exact: true })).toBeVisible();
 
-  const search = detail.getByRole("textbox", { name: "搜索已展开目录", exact: true });
+  const search = detail.getByRole("searchbox", { name: "搜索已展开目录", exact: true });
   await search.fill("layout");
   await expect(detail.getByRole("button", { name: "config", exact: true })).toBeVisible();
   await expect(detail.getByRole("button", { name: "ui", exact: true })).toBeVisible();

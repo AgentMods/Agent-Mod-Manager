@@ -34,7 +34,10 @@ pub const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 pub const MAX_RESULT_BYTES: usize = 1024 * 1024;
 pub const MAX_ARGUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MARKDOWN_TOOL: &str = "convert_to_markdown";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const TIMEOUT_MESSAGE: &str = "MCP request timed out; external effects may already have occurred";
+const RESULT_LIMIT_MESSAGE: &str = "MCP result exceeds limits";
 
 /// For stdio, the initialize deadline also covers anything the launcher must
 /// install before an MCP server exists. This never extends tool call timeouts.
@@ -427,6 +430,37 @@ impl McpClient {
         result
     }
 
+    /// The desktop upload command supplies only its own staged file. Keep arbitrary tool calls private.
+    pub(crate) async fn call_attachment_converter(
+        &self,
+        file: &tempfile::TempPath,
+    ) -> AppResult<Value> {
+        let uri = url::Url::from_file_path(dunce::simplified(file))
+            .ok()
+            .filter(|uri| uri.host().is_none())
+            .ok_or_else(|| {
+                AppError::Invalid(
+                    "附件临时目录必须是本机的绝对路径，请检查系统临时目录设置。".into(),
+                )
+            })?;
+        self.call_tool(
+            MARKDOWN_TOOL,
+            serde_json::json!({"uri": uri.as_str()}),
+            &CancellationToken::new(),
+        )
+        .await
+        .map_err(|err| match err {
+            AppError::Other(message) if message == TIMEOUT_MESSAGE => AppError::Other(format!(
+                "MarkItDown 转换超过 {} 秒。请拆分文档，在「设置 → MCP 服务」中重新启动 MarkItDown 后重试。",
+                REQUEST_TIMEOUT.as_secs()
+            )),
+            AppError::Invalid(message) if message == RESULT_LIMIT_MESSAGE => AppError::Invalid(
+                "MarkItDown 返回的 MCP 消息超过 1 MiB。请拆分文档，在「设置 → MCP 服务」中重新启动 MarkItDown 后重试。".into()
+            ),
+            _ => AppError::Other("MarkItDown MCP 调用失败。请在「设置 → MCP 服务」中停止并重新启动 MarkItDown，然后重试。".into()),
+        })
+    }
+
     /// Internal bridge entry point. Approval belongs to AgentRuntime; there is
     /// deliberately no public unauthenticated call_tool endpoint for IPC/Agent.
     pub(super) async fn call_tool(
@@ -458,11 +492,11 @@ impl McpClient {
                     let value = serde_json::to_value(result)
                         .map_err(|_| AppError::Other("Cannot serialize MCP result".into()))?;
                     if serde_json::to_vec(&value)?.len() > MAX_RESULT_BYTES {
-                        return Err(AppError::Invalid("MCP result exceeds limits".into()));
+                        return Err(AppError::Invalid(RESULT_LIMIT_MESSAGE.into()));
                     }
                     let value = self.session.secrets.redact_value(value)?;
                     if serde_json::to_vec(&value)?.len() > MAX_RESULT_BYTES {
-                        return Err(AppError::Invalid("MCP result exceeds limits".into()));
+                        return Err(AppError::Invalid(RESULT_LIMIT_MESSAGE.into()));
                     }
                     Ok(value)
                 })();
@@ -505,7 +539,7 @@ async fn bounded<T, E>(
         result = tokio::time::timeout(timeout, operation) => match result {
             Ok(Ok(value)) => Ok(value),
             Ok(Err(_)) => Err(AppError::Other("MCP request failed (remote details suppressed)".into())),
-            Err(_) => Err(AppError::Other("MCP request timed out; external effects may already have occurred".into())),
+            Err(_) => Err(AppError::Other(TIMEOUT_MESSAGE.into())),
         }
     }
 }

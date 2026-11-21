@@ -222,7 +222,7 @@ impl Replacement {
                     {
                         return Err(conflict(format!(
                             "目标已被修改、存在未登记文件或路径别名：{}",
-                            dst.display()
+                            crate::paths::display_path(dst)
                         )));
                     }
                     touched.insert(key);
@@ -236,7 +236,7 @@ impl Replacement {
                     {
                         return Err(conflict(format!(
                             "旧版本文件已修改或不能移入回收站：{}",
-                            src.display()
+                            crate::paths::display_path(src)
                         )));
                     }
                 }
@@ -331,7 +331,7 @@ pub(crate) fn validate_rollback(engine: &FileEngine, transaction_id: &str) -> Ap
         if fingerprint(dst)? != entry.source {
             return Err(conflict(format!(
                 "替换后的文件已修改或丢失，不能回滚：{}",
-                dst.display()
+                crate::paths::display_path(dst)
             )));
         }
         match &entry.operation {
@@ -343,7 +343,7 @@ pub(crate) fn validate_rollback(engine: &FileEngine, transaction_id: &str) -> Ap
                 if fingerprint(src)?.is_some() {
                     return Err(conflict(format!(
                         "被替换文件的原位置已被占用：{}",
-                        src.display()
+                        crate::paths::display_path(src)
                     )));
                 }
                 touched.insert(path_key(src));

@@ -10,7 +10,7 @@ use std::{
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-pub(super) const PYPI_INDEX: &str = "https://pypi.tuna.tsinghua.edu.cn/simple";
+const PYPI_INDEX: &str = "https://pypi.tuna.tsinghua.edu.cn/simple";
 const NPM_REGISTRY: &str = "https://registry.npmmirror.com";
 const NPX_CLI: &str = "npm/bin/npx-cli.js";
 const NODE: &str = if cfg!(windows) { "node.exe" } else { "node" };

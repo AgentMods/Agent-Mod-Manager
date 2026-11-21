@@ -1,3 +1,4 @@
+import { displayToolArguments, displayToolResult } from "@/lib/agent-path-presentation";
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -21,7 +22,10 @@ import {
 import { api, backendAvailable, useBackendQuery } from "@/lib/api";
 import { activeTurn, isQuestionRequest, replayConversation, trackAgentTurn, useAgent } from "../lib/agent-store";
 import { useUI } from "../lib/store";
-import type { AgentEvent, AppSettings, ComposerPreferences, Conversation, Game, Message as ChatMessage, PermissionMode, ReasoningEffort } from "../lib/types";
+import type { AgentAttachment, AgentEvent, AppSettings, ComposerPreferences, Conversation, Game, Message as ChatMessage, PermissionMode, ReasoningEffort } from "../lib/types";
+import { readyAttachment, type DraftAttachment } from "@/lib/agent-attachments";
+import { AttachmentGroup } from "@/components/ui/attachment";
+import { MessageAttachment } from "./AgentAttachments";
 import { Badge, ErrorState } from "./ui";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
@@ -45,6 +49,7 @@ import { AgentQuestionnaire, questionOutcome } from "./AgentQuestionnaire";
 
 const EMPTY_EVENTS: AgentEvent[] = [];
 const EMPTY_CONVERSATIONS: Conversation[] = [];
+const emptyDraft = (text = "") => ({ text, attachments: [] as DraftAttachment[] });
 
 function groupByMessage<T>(items: T[], messageId: (item: T) => string | null) {
   const groups = new Map<string | null, T[]>();
@@ -64,11 +69,11 @@ export function AgentChat() {
   const gameId = adapterChat ? adapterChat.gameId : selectedGameId;
   const setConversation = useUI((s) => s.setConversation);
   const client = useQueryClient();
-  const [composer, setComposer] = useState({ seed: adapterChat, text: adapterChat?.prompt ?? "" });
+  const [composer, setComposer] = useState(() => emptyDraft(adapterChat?.prompt));
   const [submitting, setSubmitting] = useState(false);
   const submittingRef = useRef(false);
   const composerInput = useRef<HTMLTextAreaElement>(null);
-  const [edit, setEdit] = useState<{ conversationId: string; messageId: string; text: string } | null>(null);
+  const [edit, setEdit] = useState<(typeof composer & { conversationId: string; messageId: string }) | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [permission, setPermission] = useState<PermissionMode | "">("");
   const [effortSelection, setEffortSelection] = useState<{ model: string; level: ReasoningEffort } | null>(null);
@@ -93,7 +98,7 @@ export function AgentChat() {
   const end = useRef<HTMLDivElement>(null);
   const busy = submitting || !!turn;
   const activeEdit = edit?.conversationId === conversationId ? edit : null;
-  const input = activeEdit?.text ?? composer.text;
+  const draft = activeEdit ?? composer;
   const restoredPreferences = useRef(false);
 
   // Restore the last-used model, reasoning level and permission policy once per
@@ -111,7 +116,7 @@ export function AgentChat() {
   }, [preferences.data, model]);
 
   useEffect(() => {
-    setComposer({ seed: adapterChat, text: adapterChat?.prompt ?? "" });
+    setComposer(emptyDraft(adapterChat?.prompt));
   }, [adapterChat]);
 
   useEffect(() => {
@@ -160,19 +165,19 @@ export function AgentChat() {
   const selectConversation = useCallback((id: string | null) => {
     setConversation(id);
     setEdit(null);
-    setComposer({ seed: null, text: "" });
+    setComposer(emptyDraft());
     setError(null);
   }, [setConversation]);
 
   function editMessage(message: ChatMessage) {
     if (!conversationId || busy) return;
-    setEdit({ conversationId, messageId: message.id, text: message.content });
+    setEdit({ conversationId, messageId: message.id, text: message.content, attachments: (message.attachments ?? []).map((value) => readyAttachment(value)) });
     composerInput.current?.focus();
   }
 
-  async function send(content: string, options: { restart?: { messageId: string; edit: boolean }; questionnaire?: boolean } = {}) {
-    const { restart, questionnaire } = options;
-    if (busy || submittingRef.current || (!restart && !content) || archivedConversation) return false;
+  async function send(content: string, options: { attachments?: AgentAttachment[]; restart?: { messageId: string; edit: boolean }; questionnaire?: boolean } = {}) {
+    const { attachments, restart, questionnaire } = options;
+    if (busy || submittingRef.current || (!restart && !content && !attachments?.length) || archivedConversation) return false;
     submittingRef.current = true;
     setSubmitting(true); setError(null);
     // The native request may finish starting after the user opens a different chat.
@@ -191,7 +196,7 @@ export function AgentChat() {
         }
         void client.invalidateQueries({ queryKey: ["conversations"] });
       }
-      const request = { conversationId: id, content, permissionMode: permission || null, model: selectedModel && selectedModel !== model ? selectedModel : null, reasoningEffort };
+      const request = { conversationId: id, content, ...(attachments && { attachments }), permissionMode: permission || null, model: selectedModel && selectedModel !== model ? selectedModel : null, reasoningEffort };
       if (restart) {
         id = await api<string>("restart_turn", { request, ...restart });
         trackAgentTurn(id);
@@ -209,7 +214,8 @@ export function AgentChat() {
       if (stillSelected() && !questionnaire) {
         setConversation(id);
         setEdit(null);
-        if (!restart || restart.edit) setComposer({ seed: adapterChat, text: "" });
+        if (!restart || restart.edit) setComposer(emptyDraft());
+        else setComposer((current) => ({ ...current, attachments: [] }));
       }
       await replayConversation(id);
       await client.invalidateQueries({ queryKey: ["conversation", id] });
@@ -312,6 +318,8 @@ export function AgentChat() {
             const failure = errors.get(message.id);
             const isAssistant = message.role === "assistant";
             const hasContent = Boolean(message.content.trim());
+            const attachments = message.attachments ?? [];
+            const hasAttachments = attachments.length > 0;
             const canAct = backendAvailable && !!conversationId && !busy && !archivedConversation;
             return <Fragment key={message.id}>
               <article className={cn("chat-message", message.role)}>
@@ -321,16 +329,19 @@ export function AgentChat() {
                     <Bubble variant={isAssistant ? "ghost" : "default"} align={isAssistant ? "start" : "end"} className={isAssistant ? "max-w-full" : undefined}>
                       <BubbleContent className={cn("markdown min-w-0 break-words", !isAssistant && "rounded-2xl px-4 py-2.5")}>
                         <div data-message-id={message.id} className="flex flex-col gap-3 [&_a]:text-primary [&_a]:underline [&_a]:underline-offset-4 [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:font-mono [&_code]:text-xs [&_ol]:list-decimal [&_ol]:pl-5 [&_p]:leading-relaxed [&_pre]:max-w-full [&_pre]:overflow-auto [&_pre]:rounded-md [&_pre]:border [&_pre]:bg-muted [&_pre]:p-3 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_table]:w-full [&_table]:border-collapse [&_td]:border [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:px-2 [&_th]:py-1 [&_th]:text-left [&_ul]:list-disc [&_ul]:pl-5">
-                          <MessageMarkdown content={message.content} onError={setError} />
+                          {hasAttachments && <AttachmentGroup aria-label="消息附件" className="flex-wrap gap-1.5">
+                            {attachments.map((value, index) => <MessageAttachment key={index} value={value} />)}
+                          </AttachmentGroup>}
+                          {hasContent && <MessageMarkdown content={message.content} onError={setError} />}
                         </div>
                       </BubbleContent>
                     </Bubble>
                     {toolsByMessage.get(message.id)?.map((event) => <ToolTrace key={event.seq} event={event} events={milestones} />)}
                     {questionsByMessage.get(message.id)?.map(renderQuestion)}
                     {isAssistant && <TurnError message={failure} />}
-                    {(hasContent || failure) && <MessageFooter className="mt-1" role="group" aria-label="消息操作">
+                    {(hasContent || hasAttachments || failure) && <MessageFooter className="mt-1" role="group" aria-label="消息操作">
                       {hasContent && <CopyMessage content={message.content} />}
-                      {!isAssistant && hasContent && <MessageAction label="编辑消息" disabled={!canAct} onClick={() => editMessage(message)}>
+                      {!isAssistant && (hasContent || hasAttachments) && <MessageAction label="编辑消息" disabled={!canAct} onClick={() => editMessage(message)}>
                         <PencilIcon aria-hidden="true" />
                       </MessageAction>}
                       {(isAssistant || failure) && <MessageAction label="重试" disabled={!canAct} onClick={() => void send("", { restart: { messageId: message.id, edit: false } })}>
@@ -354,16 +365,21 @@ export function AgentChat() {
       </div>
 
       <AgentComposer
-        input={input}
+        input={draft.text}
         inputRef={composerInput}
+        attachments={draft.attachments}
+        updateAttachments={(apply) => {
+          if (activeEdit) setEdit((current) => current?.messageId === activeEdit.messageId ? { ...current, attachments: apply(current.attachments) } : current);
+          else setComposer((current) => ({ ...current, attachments: apply(current.attachments) }));
+        }}
         onCancelEdit={activeEdit ? () => setEdit(null) : undefined}
         onInputChange={(text) => {
-          if (activeEdit) setEdit({ ...activeEdit, text });
-          else setComposer({ seed: adapterChat, text });
+          if (activeEdit) setEdit((current) => current && { ...current, text });
+          else setComposer((current) => ({ ...current, text }));
         }}
-        onSend={() => {
-          const text = input.trim();
-          if (text) void send(text, activeEdit ? { restart: { messageId: activeEdit.messageId, edit: true } } : undefined);
+        onSend={(attachments) => {
+          const restart = activeEdit ? { messageId: activeEdit.messageId, edit: true } : undefined;
+          void send(draft.text.trim(), { attachments: attachments.length || activeEdit ? attachments : undefined, restart });
         }}
         onCancel={turn ? () => { void cancel(); } : undefined}
         disabled={!backendAvailable || archivedConversation}
@@ -462,7 +478,10 @@ const ToolTrace = memo(function ToolTrace({ event, events }: { event: AgentEvent
   const pending = !!approval && !resolved && !result;
   const status = failed ? "error" : pending ? "pending" : !result && !denied ? "running" : undefined;
   const label = failed ? "执行失败" : denied ? "已拒绝" : pending ? "等待审批" : result ? "已执行" : "正在执行";
-  const payload = useMemo(() => JSON.stringify({ arguments: event.payload.arguments, ...(result ? { result: result.payload.result } : {}) }, null, 2), [event, result]);
+  const payload = useMemo(() => JSON.stringify({
+    arguments: displayToolArguments(event.payload.name, event.payload.arguments),
+    ...(result ? { result: displayToolResult(event.payload.name, result.payload.result) } : {}),
+  }, null, 2), [event, result]);
   return <Trace>
     <TraceCollapsible defaultOpen={pending || failed}>
       <TraceCollapsibleTrigger>

@@ -1,4 +1,3 @@
-use crate::games;
 use crate::sources::{
     resolutions::{resolution_id as parse_resolution_id, ResolutionResult, ResolutionScope},
     DependencyGraph, DependencyGraphRequest, ResolveRequest, SearchQuery, SearchResult, SourceKeys,
@@ -11,6 +10,7 @@ use crate::{
     transaction::{FileOp, FilePlan},
     trash,
 };
+use crate::{games, paths::user_path};
 use tauri::{AppHandle, State};
 use tauri_plugin_opener::OpenerExt;
 
@@ -74,6 +74,7 @@ pub async fn download_mod(
             }),
         )
         .await
+        .map(crate::download::DownloadArtifact::into_user_paths)
 }
 #[tauri::command]
 pub fn cancel_download(state: State<'_, AppServices>, task_id: String) -> AppResult<()> {
@@ -83,7 +84,14 @@ pub fn cancel_download(state: State<'_, AppServices>, task_id: String) -> AppRes
 pub async fn list_downloads(
     state: State<'_, AppServices>,
 ) -> AppResult<Vec<crate::artifacts::ArtifactRecord>> {
-    blocking(state.engine.clone(), |e| crate::artifacts::list(&e.db)).await
+    blocking(state.engine.clone(), |e| {
+        let mut records = crate::artifacts::list(&e.db)?;
+        for record in &mut records {
+            record.artifact.path = user_path(&record.artifact.path).into_owned();
+        }
+        Ok(records)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -529,6 +537,7 @@ pub async fn search_game_identity(
         &tokio_util::sync::CancellationToken::new(),
     )
     .await
+    .map(crate::game_identity::GameIdentitySearch::into_user_paths)
 }
 
 // Root registration is desktop-owned, never an Agent/MCP tool.
@@ -562,6 +571,7 @@ pub async fn register_game(
     state: State<'_, AppServices>,
     directory: std::path::PathBuf,
     adapter_slug: Option<String>,
+    from_discovery: Option<bool>,
 ) -> AppResult<games::Game> {
     blocking(state.engine.clone(), move |e| {
         let _guard = crate::transaction::write_lock();
@@ -571,7 +581,11 @@ pub async fn register_game(
                 "游戏目录与管理器数据目录不能互相包含".into(),
             ));
         }
-        games::register_game(&e.db, &directory, adapter_slug.as_deref())
+        if from_discovery == Some(true) {
+            games::register_discovered_game(&e.db, &directory, adapter_slug.as_deref())
+        } else {
+            games::register_game(&e.db, &directory, adapter_slug.as_deref())
+        }
     })
     .await
 }
@@ -598,6 +612,63 @@ pub async fn set_game_adapter(
     blocking(state.engine.clone(), move |engine| {
         crate::game_actions::set_game_adapter(&engine, &id, &adapter_slug)
     })
+    .await
+}
+
+#[tauri::command]
+pub async fn remove_game_adapter(
+    state: State<'_, AppServices>,
+    id: String,
+) -> AppResult<games::Game> {
+    blocking(state.engine.clone(), move |engine| {
+        crate::game_actions::remove_game_adapter(&engine, &id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_game_conflicts(
+    state: State<'_, AppServices>,
+    game_id: String,
+    change: Option<crate::game_actions::GameChange>,
+) -> AppResult<Vec<crate::game_actions::GamePlanConflict>> {
+    blocking(state.engine.clone(), move |engine| {
+        crate::game_actions::list_game_conflicts(&engine, &game_id, change.unwrap_or_default())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn resolve_game_conflict(
+    state: State<'_, AppServices>,
+    agent: State<'_, AgentRuntime>,
+    game_id: String,
+    conflict_id: String,
+    change: Option<crate::game_actions::GameChange>,
+    confirm_approved: Option<bool>,
+) -> AppResult<()> {
+    blocking(
+        (state.engine.clone(), agent.inner().clone()),
+        move |(engine, agent)| {
+            crate::game_actions::resolve_game_conflict(
+                &engine,
+                &game_id,
+                &conflict_id,
+                change.unwrap_or_default(),
+                confirm_approved.unwrap_or(false),
+                |conversation_id, approval_id| {
+                    agent.respond_approval(
+                        conversation_id,
+                        approval_id,
+                        ApprovalResponse {
+                            approved: false,
+                            answer: serde_json::Value::Null,
+                        },
+                    )
+                },
+            )
+        },
+    )
     .await
 }
 
@@ -630,7 +701,8 @@ pub async fn open_game_location(
                 .reveal_item_in_dir(&directory)
                 .map_err(|error| AppError::Other(format!("无法打开目录: {error}")));
         }
-        let directory = directory
+        let directory = user_path(&directory)
+            .into_owned()
             .into_os_string()
             .into_string()
             .map_err(|_| AppError::Invalid("目录路径包含无法表示的字符".into()))?;
@@ -680,7 +752,7 @@ pub(crate) async fn get_bootstrap_state(
 ) -> AppResult<serde_json::Value> {
     let (completed, first_run, resumable) = agent.settings.onboarding_state()?;
     Ok(serde_json::json!({
-        "dataRoot": state.engine.paths.root,
+        "dataRoot": user_path(&state.engine.paths.root),
         "storageMigrationError": storage.failure()?,
         "recoveredTransactions": state.recovered,
         "recoveryError": state.recovery_error,
@@ -960,6 +1032,7 @@ pub async fn plan_file_ops(
         e.plan_file_ops(operations, summary)
     })
     .await
+    .map(FilePlan::into_user_paths)
 }
 
 #[tauri::command]
@@ -968,6 +1041,7 @@ pub async fn get_file_plan(state: State<'_, AppServices>, plan_id: String) -> Ap
         e.get_plan(&plan_id)
     })
     .await
+    .map(FilePlan::into_user_paths)
 }
 
 /// Desktop confirmation endpoint. Agent tools must use the separate approval
@@ -983,6 +1057,7 @@ pub async fn apply_plan(state: State<'_, AppServices>, plan_id: String) -> AppRe
         Ok(result)
     })
     .await
+    .map(FilePlan::into_user_paths)
 }
 
 #[tauri::command]
@@ -1005,6 +1080,12 @@ pub async fn list_installs(
         crate::install::list_installs(&e, &game_id)
     })
     .await
+    .map(|items| {
+        items
+            .into_iter()
+            .map(crate::install::InstalledMod::into_user_paths)
+            .collect()
+    })
 }
 
 #[tauri::command]
@@ -1047,6 +1128,7 @@ pub async fn plan_uninstall(
         crate::install::plan_uninstall(&e, &install_id)
     })
     .await
+    .map(FilePlan::into_user_paths)
 }
 
 #[tauri::command]
@@ -1075,6 +1157,7 @@ pub async fn register_user_root(
         crate::game_roots::register_user_root(&e, &game_id, &root_id, &directory)
     })
     .await
+    .map(|path| user_path(&path).into_owned())
 }
 
 #[tauri::command]
@@ -1086,6 +1169,12 @@ pub async fn list_user_roots(
         crate::game_roots::registered_user_roots(&e.db, &game_id)
     })
     .await
+    .map(|roots| {
+        roots
+            .into_iter()
+            .map(|(id, path)| (id, user_path(&path).into_owned()))
+            .collect()
+    })
 }
 
 #[tauri::command]
@@ -1097,6 +1186,7 @@ pub async fn trash_paths(
         trash::plan_trash(&e, &request)
     })
     .await
+    .map(FilePlan::into_user_paths)
 }
 
 #[tauri::command]
@@ -1108,6 +1198,12 @@ pub async fn list_trash(
         trash::list_trash(&e.db, include_restored)
     })
     .await
+    .map(|items| {
+        items
+            .into_iter()
+            .map(trash::TrashItem::into_user_paths)
+            .collect()
+    })
 }
 
 #[tauri::command]
@@ -1120,6 +1216,7 @@ pub async fn restore_trash(
         trash::plan_restore(&e, &ids, overwrite)
     })
     .await
+    .map(FilePlan::into_user_paths)
 }
 
 #[tauri::command]
@@ -1132,6 +1229,7 @@ pub async fn snapshot_create(
         snapshot::plan_create(&e, &game_id, &label)
     })
     .await
+    .map(|(snapshot, plan)| (snapshot.into_user_paths(), plan.into_user_paths()))
 }
 
 #[tauri::command]
@@ -1143,6 +1241,12 @@ pub async fn list_snapshots(
         snapshot::list_snapshots(&e, &game_id)
     })
     .await
+    .map(|items| {
+        items
+            .into_iter()
+            .map(snapshot::Snapshot::into_user_paths)
+            .collect()
+    })
 }
 
 #[tauri::command]
@@ -1155,4 +1259,5 @@ pub async fn restore_snapshot(
         snapshot::plan_restore(&e, &game_id, &snapshot_id)
     })
     .await
+    .map(FilePlan::into_user_paths)
 }

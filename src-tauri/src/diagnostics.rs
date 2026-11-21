@@ -131,6 +131,7 @@ pub struct LogLine {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiagnosticFile {
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub file: String,
     pub kind: FileKind,
     pub status: ReadStatus,
@@ -232,12 +233,15 @@ fn context(engine: &FileEngine, game_id: &str) -> AppResult<Context> {
 
 fn stable_directory(path: &Path) -> AppResult<()> {
     if !path.is_absolute()
+        || path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
         || !fs::symlink_metadata(path)?.file_type().is_dir()
         || path.canonicalize()? != path
     {
         return Err(AppError::Denied(format!(
             "管理根缺失、不是 canonical 目录或已被替换: {}",
-            path.display()
+            paths::display_path(path)
         )));
     }
     Ok(())
@@ -288,14 +292,14 @@ impl Context {
                 .components()
                 .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
         {
-            return Err(AppError::PathEscape(path.display().to_string()));
+            return Err(AppError::PathEscape(paths::display_path(path)));
         }
         let base = self
             .allowed
             .iter()
             .filter(|r| path.starts_with(r))
             .max_by_key(|p| p.components().count())
-            .ok_or_else(|| AppError::PathEscape(path.display().to_string()))?;
+            .ok_or_else(|| AppError::PathEscape(paths::display_path(path)))?;
         stable_directory(base)?;
         let mut current = base.clone();
         for part in path
@@ -308,7 +312,7 @@ impl Context {
                 Ok(m) if m.file_type().is_symlink() => {
                     return Err(AppError::Denied(format!(
                         "诊断不跟随符号链接: {}",
-                        current.display()
+                        paths::display_path(&current)
                     )))
                 }
                 Ok(_) => {}
@@ -653,6 +657,7 @@ pub enum CauseKind {
 #[serde(rename_all = "camelCase")]
 pub struct Evidence {
     pub id: String,
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub file: String,
     /// Physical one-based file line. None for a stat or DB observation.
     pub line: Option<usize>,

@@ -2,7 +2,7 @@ use super::policy::Effect;
 use crate::{
     error::{AppError, AppResult},
     games, snapshot,
-    transaction::{FileEngine, FileOp, FilePlan},
+    transaction::{serialize_user_plan, FileEngine, FileOp, FilePlan},
     trash,
 };
 use serde_json::{json, Value};
@@ -345,7 +345,10 @@ impl AgentTool for Builtin {
                 Effect::Read
             };
             Ok(PreparedTool {
-                preview: plan.as_ref().map(|p| json!(p)).unwrap_or(args),
+                preview: match &plan {
+                    Some(plan) => serialize_user_plan(plan, serde_json::value::Serializer)?,
+                    None => args,
+                },
                 effect,
                 plan,
             })
@@ -371,7 +374,7 @@ impl AgentTool for Builtin {
                 crate::install::reconcile(&engine.db)?;
                 crate::plugin_workflow::reconcile_deployments(&engine)?;
                 crate::skills::reconcile_deployments(&engine)?;
-                return Ok(json!(applied));
+                return Ok(json!(applied.into_user_paths()));
             }
             match name.as_str() {
                 "scan_games" => Ok(json!(games::scan_games(
@@ -394,10 +397,13 @@ impl AgentTool for Builtin {
                     &engine,
                     &PathBuf::from(text(&args, "path")?)
                 )?)),
-                "plan_file_ops" => Ok(json!(engine.plan_file_ops(
-                    serde_json::from_value::<Vec<FileOp>>(args["operations"].clone())?,
-                    text(&args, "summary")?.into()
-                )?)),
+                "plan_file_ops" => {
+                    let plan = engine.plan_file_ops(
+                        serde_json::from_value::<Vec<FileOp>>(args["operations"].clone())?,
+                        text(&args, "summary")?.into(),
+                    )?;
+                    Ok(json!(plan.into_user_paths()))
+                }
                 "read_skill" => {
                     let name = text(&args, "name")?;
                     let detail = crate::skills::get_skill(&engine, name)?;

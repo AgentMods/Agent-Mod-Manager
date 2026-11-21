@@ -48,9 +48,6 @@ impl Db {
         let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < SCHEMA_VERSION {
             let tx = c.transaction()?;
-            if version < 2 {
-                crate::mcp::config::migrate_markitdown_index(&tx)?;
-            }
             #[cfg(windows)]
             if version < 3 {
                 crate::mcp::config::migrate_playwright_browser(&tx)?;
@@ -64,6 +61,20 @@ impl Db {
                     [],
                 )?;
             }
+            if version < 5 {
+                let has_attachments: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name='attachments_json')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if !has_attachments {
+                    tx.execute("ALTER TABLE messages ADD COLUMN attachments_json TEXT", [])?;
+                }
+            }
+            // v1 already used the package-only arguments. v6 supersedes v2's index addition.
+            if version < 6 {
+                crate::mcp::config::migrate_markitdown_to_launcher_index(&tx)?;
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
@@ -75,7 +86,7 @@ impl Db {
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS games (
@@ -340,6 +351,7 @@ CREATE TABLE IF NOT EXISTS messages (
   role TEXT NOT NULL,
   content TEXT NOT NULL DEFAULT '',
   reasoning TEXT,
+  attachments_json TEXT,
   tool_calls_json TEXT,
   tool_call_id TEXT,
   name TEXT,

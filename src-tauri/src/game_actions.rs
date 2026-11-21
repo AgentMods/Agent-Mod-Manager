@@ -4,14 +4,15 @@ use crate::{
     game_roots,
     games::{self, Game},
     install::INSTALL_STATE,
+    paths::user_path,
     plugins::{GameAdapter, Platform, RootKind},
     storage::AppPaths,
-    transaction::{self, FileEngine, FilePlan},
+    transaction::{self, FileEngine, FileOp, FilePlan},
     util,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -72,6 +73,51 @@ pub(crate) fn set_game_adapter(engine: &FileEngine, id: &str, slug: &str) -> App
     let game = games::get_game(&engine.db, id)?;
     let root = checked_game_root(&engine.paths, Path::new(&game.root_path))?;
     let conn = engine.db.conn();
+    check_adapter_change(
+        &conn,
+        id,
+        root,
+        "该游戏仍有待审批或待执行的计划，请处理后再选择适配包",
+    )?;
+    drop(conn);
+    games::rebind_game(&engine.db, &game, slug)
+}
+
+pub(crate) fn remove_game_adapter(engine: &FileEngine, id: &str) -> AppResult<Game> {
+    let _guard = transaction::write_lock();
+    let mut conn = engine.db.conn();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let game = games::get_game_from(&tx, id)?;
+    // This is a database-only change: use the recorded roots for conflict checks
+    // even if the game directory or the old package is no longer available.
+    check_adapter_change(
+        &tx,
+        id,
+        PathBuf::from(&game.root_path),
+        "该游戏仍有待审批或待执行的计划，请处理后再解绑适配包",
+    )?;
+    // Registered user roots belong to the game, not the binding. Keep them for
+    // existing installations and historical restoration paths.
+    let changed = tx.execute(
+        "UPDATE games SET adapter_slug=NULL, adapter_version=NULL, updated_at=?1
+         WHERE id=?2 AND (adapter_slug IS NOT NULL OR adapter_version IS NOT NULL)",
+        params![util::now(), id],
+    )?;
+    let updated = if changed == 0 {
+        game
+    } else {
+        games::get_game_from(&tx, id)?
+    };
+    tx.commit()?;
+    Ok(updated)
+}
+
+fn check_adapter_change(
+    conn: &Connection,
+    id: &str,
+    root: PathBuf,
+    pending_review_message: &str,
+) -> AppResult<()> {
     let recovery_pending: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM file_transactions WHERE status IN ('applying','rolling_back','recovery_failed'))",
         [],
@@ -80,13 +126,10 @@ pub(crate) fn set_game_adapter(engine: &FileEngine, id: &str, slug: &str) -> App
     if recovery_pending {
         return Err(AppError::Conflict("请先处理待恢复的文件事务".into()));
     }
-    if has_pending_review(&conn, id, root, GameChange::SelectAdapter)? {
-        return Err(AppError::Conflict(
-            "该游戏仍有待审批或待执行的计划，请处理后再选择适配包".into(),
-        ));
+    if has_pending_review(conn, id, root, GameChange::SelectAdapter)? {
+        return Err(AppError::Conflict(pending_review_message.into()));
     }
-    drop(conn);
-    games::rebind_game(&engine.db, &game, slug)
+    Ok(())
 }
 
 pub(crate) fn remove_game(engine: &FileEngine, id: &str) -> AppResult<()> {
@@ -144,9 +187,167 @@ pub(crate) fn remove_game(engine: &FileEngine, id: &str) -> AppResult<()> {
     Ok(())
 }
 
-enum GameChange {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameChange {
+    #[default]
     SelectAdapter,
     Remove,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ConflictKind {
+    FilePlan,
+    Approval,
+    Recovery,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GamePlanConflict {
+    id: String,
+    kind: ConflictKind,
+    status: String,
+    title: String,
+    summary: String,
+    paths: Vec<String>,
+    detail: Option<String>,
+    plan_id: Option<String>,
+    can_resolve: bool,
+    resolution_hint: Option<String>,
+}
+
+struct ConflictTask {
+    info: GamePlanConflict,
+    target: ConflictTarget,
+}
+
+enum ConflictTarget {
+    Plan,
+    Approval {
+        conversation_id: Option<String>,
+        tool_call_id: Option<String>,
+        running: bool,
+    },
+    Recovery,
+    Unverified,
+}
+
+pub(crate) fn list_game_conflicts(
+    engine: &FileEngine,
+    game_id: &str,
+    change: GameChange,
+) -> AppResult<Vec<GamePlanConflict>> {
+    let conn = engine.db.conn();
+    let game = games::get_game_from(&conn, game_id)?;
+    Ok(
+        collect_conflicts(&conn, game_id, game.root_path.into(), change, true, None)?
+            .into_iter()
+            .map(|task| task.info)
+            .collect(),
+    )
+}
+
+pub(crate) fn resolve_game_conflict(
+    engine: &FileEngine,
+    game_id: &str,
+    conflict_id: &str,
+    change: GameChange,
+    confirm_approved: bool,
+    reject_live_approval: impl FnOnce(&str, &str) -> AppResult<()>,
+) -> AppResult<()> {
+    let _guard = transaction::write_lock();
+    let mut conn = engine.db.conn();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let game = games::get_game_from(&tx, game_id)?;
+    let mut matches = collect_conflicts(
+        &tx,
+        game_id,
+        game.root_path.into(),
+        change,
+        true,
+        Some(conflict_id),
+    )?
+    .into_iter();
+    let task = matches
+        .next()
+        .ok_or_else(|| AppError::NotFound("冲突不属于此游戏、已处理或不存在".into()))?;
+    if matches.next().is_some() {
+        return Err(AppError::Conflict("冲突 ID 不唯一，无法安全解除".into()));
+    }
+    match task.target {
+        ConflictTarget::Recovery => {
+            return Err(AppError::Conflict(
+                "待恢复的文件事务不能解除，请先恢复事务".into(),
+            ));
+        }
+        ConflictTarget::Unverified => {
+            return Err(AppError::Conflict(
+                "无法核对文件计划的游戏归属，不能解除".into(),
+            ));
+        }
+        ConflictTarget::Plan => {
+            if task.info.status == "approved" && !confirm_approved {
+                return Err(AppError::Conflict(
+                    "计划已批准，必须明确确认后才能解除".into(),
+                ));
+            }
+            // Use the existing terminal failure state: reconciliation already knows how
+            // to release its reservations. Preserve the preview and record the reason.
+            let changed = tx.execute(
+                "UPDATE file_transactions SET status='failed', finished_at=?1, error=?2
+                 WHERE id=?3 AND status=?4 AND status IN ('planned','approved')",
+                params![
+                    util::now(),
+                    "用户解除文件计划，未执行文件操作",
+                    conflict_id,
+                    task.info.status
+                ],
+            )?;
+            if changed != 1 {
+                return Err(AppError::Conflict("计划状态已变化，请刷新后重试".into()));
+            }
+        }
+        ConflictTarget::Approval {
+            conversation_id,
+            tool_call_id,
+            running,
+        } => {
+            // The durable row alone cannot stop a live Agent waiter. Deliver a
+            // rejection through the same one-shot response path before persisting it.
+            // While the DB is locked a live approval not found in the response map
+            // may be initializing or have already received a response; don't race it.
+            let response = conversation_id
+                .as_deref()
+                .map(|conv| reject_live_approval(conv, conflict_id));
+            match response {
+                Some(Ok(())) => {}
+                Some(Err(AppError::NotFound(_))) | None if !running => {}
+                Some(Err(AppError::NotFound(_))) | None => {
+                    return Err(AppError::Conflict(
+                        "审批正在初始化或已收到答复，请刷新后重试".into(),
+                    ));
+                }
+                Some(Err(error)) => return Err(error),
+            }
+            let changed = tx.execute(
+                "UPDATE approvals SET status='rejected', resolved_at=?1 WHERE id=?2 AND status='pending'",
+                params![util::now(), conflict_id],
+            )?;
+            if changed != 1 {
+                return Err(AppError::Conflict("审批状态已变化，请刷新后重试".into()));
+            }
+            if let Some(call) = tool_call_id {
+                tx.execute(
+                    "UPDATE tool_calls SET approval_status='rejected' WHERE id=?1 AND approval_status='pending'",
+                    [call],
+                )?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
 }
 
 fn has_pending_review(
@@ -155,67 +356,298 @@ fn has_pending_review(
     root: PathBuf,
     change: GameChange,
 ) -> AppResult<bool> {
-    let explicit: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM file_transactions f
-           WHERE f.status IN ('planned','approved') AND (
-             f.game_id=?1
-             OR EXISTS(SELECT 1 FROM snapshots s JOIN snapshot_transactions st ON st.snapshot_id=s.id
-                       WHERE s.game_id=?1 AND st.transaction_id=f.id)
-             OR EXISTS(SELECT 1 FROM trash_items t WHERE t.game_id=?1 AND t.transaction_id=f.id)))
-         OR EXISTS(SELECT 1 FROM approvals a
-           LEFT JOIN conversations c ON c.id=a.conversation_id
-           LEFT JOIN tool_calls t ON t.id=a.tool_call_id
-           WHERE a.status='pending' AND
-             (c.game_id=?1 OR (json_valid(t.arguments_json) AND
-               (json_extract(t.arguments_json,'$.game_id')=?1 OR
-                json_extract(t.arguments_json,'$.gameId')=?1 OR
-                json_extract(t.arguments_json,'$.request.gameId')=?1))))",
-        [id],
-        |row| row.get(0),
-    )?;
-    if explicit {
-        return Ok(true);
+    let tasks = collect_conflicts(conn, id, root, change, false, None)?;
+    if !tasks.is_empty()
+        && tasks
+            .iter()
+            .all(|task| matches!(task.target, ConflictTarget::Unverified))
+    {
+        return Err(AppError::Conflict(
+            "存在无法核对归属的未完成文件计划，请先处理该计划".into(),
+        ));
     }
+    Ok(!tasks.is_empty())
+}
 
-    // Generic previews (including trash and snapshot plans) carry paths but
-    // may have no game_id. Compare both endpoints with the registered roots.
+// A snapshot or trash record can bind a transaction without setting f.game_id.
+const SCOPED_PLANS: &str = "WITH linked_plans(id) AS (
+    SELECT st.transaction_id FROM snapshots s JOIN snapshot_transactions st ON st.snapshot_id=s.id
+     WHERE s.game_id=?1
+    UNION ALL SELECT t.transaction_id FROM trash_items t WHERE t.game_id=?1 AND t.transaction_id IS NOT NULL
+  ), scoped_plans AS (
+    SELECT f.*, (coalesce(f.game_id=?1,0) OR f.id IN (SELECT id FROM linked_plans)) AS explicit
+    FROM file_transactions f
+  )";
+
+fn collect_conflicts(
+    conn: &Connection,
+    game_id: &str,
+    root: PathBuf,
+    change: GameChange,
+    include_recovery: bool,
+    conflict_id: Option<&str>,
+) -> AppResult<Vec<ConflictTask>> {
     let mut roots = vec![root];
     let mut stmt = conn.prepare("SELECT path FROM game_user_roots WHERE game_id=?1")?;
-    for path in stmt.query_map([id], |row| row.get::<_, String>(0))? {
+    for path in stmt.query_map([game_id], |row| row.get::<_, String>(0))? {
         roots.push(path?.into());
     }
-    let overlaps_root = |path: &Path| {
-        roots
-            .iter()
-            .any(|root| path.starts_with(root) || root.starts_with(path))
-    };
-    // Selecting an adapter does not revoke any root. A standalone file preview
-    // uses fixed paths, not adapter rules, and cannot run without approval.
-    // Removal *does* revoke roots, so even those previews must block it.
+    let mut tasks = Vec::new();
+
+    // Adapter changes preserve roots. Unapproved standalone file previews do
+    // not depend on the adapter, but do block removal of the registration.
     let include_file_previews = matches!(change, GameChange::Remove);
-    let mut stmt = conn.prepare(
-        "SELECT plan_json FROM file_transactions
-           WHERE game_id IS NULL AND status IN ('planned','approved')
-             AND (?1 OR status='approved' OR kind NOT IN ('files','local_agent_files'))
-         UNION ALL
-         SELECT f.plan_json FROM approvals a JOIN file_transactions f
-           ON f.id=CASE WHEN json_valid(a.payload_json) THEN coalesce(
-               json_extract(a.payload_json,'$.originalPlan.id'),
-               json_extract(a.payload_json,'$.plan.id'),
-               json_extract(a.payload_json,'$.id')) END
-           WHERE a.status='pending'",
-    )?;
-    for json in stmt.query_map([include_file_previews], |row| row.get::<_, String>(0))? {
-        let plan: FilePlan = serde_json::from_str(&json?).map_err(|_| {
-            AppError::Conflict("存在无法核对归属的未完成文件计划，请先处理该计划".into())
-        })?;
-        if plan.entries.iter().any(|entry| {
-            overlaps_root(entry.operation.dst()) || entry.operation.src().is_some_and(overlaps_root)
-        }) {
-            return Ok(true);
+    let mut stmt = conn.prepare(&format!(
+        "{SCOPED_PLANS}
+         SELECT id, status, kind, summary, explicit, plan_json, error FROM scoped_plans
+          WHERE (?4 IS NULL OR id=?4) AND (
+            (status IN ('planned','approved') AND (explicit OR
+              (game_id IS NULL AND (?2 OR status='approved' OR kind NOT IN ('files','local_agent_files')))))
+            OR (?3 AND status IN ('applying','rolling_back','recovery_failed')))
+          ORDER BY created_at DESC, id"
+    ))?;
+    let mut rows = stmt.query(params![
+        game_id,
+        include_file_previews,
+        include_recovery,
+        conflict_id
+    ])?;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        let status: String = row.get(1)?;
+        let kind: String = row.get(2)?;
+        let summary: String = row.get(3)?;
+        let explicit: bool = row.get(4)?;
+        let json: String = row.get(5)?;
+        let recovery = is_recovery(&status);
+        let plan = stored_plan(&json, &id);
+        let paths = plan_paths(plan.as_ref());
+        let associated = explicit || overlaps_game(&paths, &roots);
+        if !recovery && !associated && plan.is_some() {
+            continue;
         }
+        let (target, resolution_hint) = if recovery {
+            (
+                ConflictTarget::Recovery,
+                Some("请先恢复事务；游戏库不能解除待恢复的事务。"),
+            )
+        } else if !associated {
+            (
+                ConflictTarget::Unverified,
+                Some("无法读取计划并核对游戏归属，不能安全解除。"),
+            )
+        } else if status == "approved" {
+            (
+                ConflictTarget::Plan,
+                Some("此计划已批准，须明确确认后才能解除。"),
+            )
+        } else {
+            (ConflictTarget::Plan, None)
+        };
+        tasks.push(ConflictTask {
+            info: GamePlanConflict {
+                plan_id: Some(id.clone()),
+                id,
+                kind: if recovery {
+                    ConflictKind::Recovery
+                } else {
+                    ConflictKind::FilePlan
+                },
+                status,
+                title: if recovery {
+                    "待恢复的文件事务"
+                } else {
+                    "文件计划"
+                }
+                .into(),
+                summary: if recovery && !associated {
+                    match change {
+                        GameChange::SelectAdapter => {
+                            "其他文件事务的恢复尚未完成，暂时不能更改适配包绑定。"
+                        }
+                        GameChange::Remove => "其他文件事务的恢复尚未完成，暂时不能移除游戏。",
+                    }
+                    .into()
+                } else {
+                    summary
+                },
+                paths: if associated {
+                    display_plan_paths(&paths)
+                } else {
+                    Vec::new()
+                },
+                detail: if recovery && !associated {
+                    None
+                } else {
+                    plan_detail(row.get(6)?, plan.as_ref())
+                        .or_else(|| Some(format!("计划类型：{kind}")))
+                },
+                can_resolve: matches!(target, ConflictTarget::Plan),
+                resolution_hint: resolution_hint.map(str::to_owned),
+            },
+            target,
+        });
     }
-    Ok(false)
+
+    let mut stmt = conn.prepare(&format!(
+        "{SCOPED_PLANS}
+         SELECT a.id, a.title, a.detail, a.conversation_id, a.tool_call_id,
+                coalesce(t.status='running',0), f.id, f.status, f.summary, f.plan_json,
+                coalesce(c.game_id=?1 OR CASE WHEN json_valid(t.arguments_json) THEN
+                  (json_extract(t.arguments_json,'$.game_id')=?1 OR
+                   json_extract(t.arguments_json,'$.gameId')=?1 OR
+                   json_extract(t.arguments_json,'$.request.gameId')=?1) END,0)
+                  OR coalesce(f.explicit,0)
+         FROM approvals a
+         LEFT JOIN conversations c ON c.id=a.conversation_id
+         LEFT JOIN tool_calls t ON t.id=a.tool_call_id
+         LEFT JOIN scoped_plans f ON f.id=CASE WHEN json_valid(a.payload_json) THEN coalesce(
+                json_extract(a.payload_json,'$.originalPlan.id'),
+                json_extract(a.payload_json,'$.plan.id'),
+                json_extract(a.payload_json,'$.id')) END
+         WHERE a.status='pending' AND (?2 IS NULL OR a.id=?2)
+         ORDER BY a.created_at DESC, a.id"
+    ))?;
+    let mut rows = stmt.query(params![game_id, conflict_id])?;
+    while let Some(row) = rows.next()? {
+        let explicit: bool = row.get(10)?;
+        let plan_id: Option<String> = row.get(6)?;
+        let json: Option<String> = row.get(9)?;
+        let plan = json
+            .as_deref()
+            .zip(plan_id.as_deref())
+            .and_then(|(json, id)| stored_plan(json, id));
+        let paths = plan_paths(plan.as_ref());
+        let associated = explicit || overlaps_game(&paths, &roots);
+        if !associated && (plan_id.is_none() || plan.is_some()) {
+            continue;
+        }
+        let recovering = row
+            .get::<_, Option<String>>(7)?
+            .is_some_and(|status| is_recovery(&status));
+        let target = if recovering {
+            ConflictTarget::Recovery
+        } else if !associated {
+            ConflictTarget::Unverified
+        } else {
+            ConflictTarget::Approval {
+                conversation_id: row.get(3)?,
+                tool_call_id: row.get(4)?,
+                running: row.get(5)?,
+            }
+        };
+        let title: String = row.get(1)?;
+        tasks.push(ConflictTask {
+            info: GamePlanConflict {
+                id: row.get(0)?,
+                kind: ConflictKind::Approval,
+                status: "pending".into(),
+                summary: row
+                    .get::<_, Option<String>>(8)?
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| title.clone()),
+                title,
+                paths: display_plan_paths(&paths),
+                detail: plan_detail(row.get(2)?, plan.as_ref()),
+                plan_id,
+                can_resolve: matches!(target, ConflictTarget::Approval { .. }),
+                resolution_hint: Some(
+                    match target {
+                        ConflictTarget::Recovery => "关联的文件事务尚待恢复，不能在此解除。",
+                        ConflictTarget::Unverified => "无法核对关联计划的游戏归属，不能安全解除。",
+                        _ => "解除会拒绝审批，不会执行计划或回滚文件。",
+                    }
+                    .into(),
+                ),
+            },
+            target,
+        });
+    }
+    Ok(tasks)
+}
+
+fn is_recovery(status: &str) -> bool {
+    matches!(status, "applying" | "rolling_back" | "recovery_failed")
+}
+
+fn stored_plan(json: &str, id: &str) -> Option<FilePlan> {
+    serde_json::from_str::<FilePlan>(json)
+        .ok()
+        .filter(|plan| plan.id == id)
+}
+
+fn plan_detail(detail: Option<String>, plan: Option<&FilePlan>) -> Option<String> {
+    let detail = detail.filter(|s| !s.is_empty());
+    let mut operations = BTreeMap::new();
+    for entry in plan.into_iter().flat_map(|plan| &plan.entries) {
+        let label = match &entry.operation {
+            FileOp::Copy { .. } => "复制 (copy)",
+            FileOp::Move { .. } => "移动 (move)",
+            FileOp::Mkdir { .. } => "新建目录 (mkdir)",
+            FileOp::WriteText { .. } => "写入文本 (write_text)",
+        };
+        *operations.entry(label).or_insert(0) += 1;
+    }
+    if operations.is_empty() {
+        return detail;
+    }
+    let operations = operations
+        .into_iter()
+        .map(|(label, count)| format!("{label} ×{count}"))
+        .collect::<Vec<_>>()
+        .join("、");
+    Some(match detail {
+        Some(detail) => format!("{detail}；计划操作：{operations}"),
+        None => format!("计划操作：{operations}"),
+    })
+}
+
+fn plan_paths(plan: Option<&FilePlan>) -> BTreeSet<&Path> {
+    plan.into_iter()
+        .flat_map(|plan| &plan.entries)
+        .flat_map(|entry| [Some(entry.operation.dst()), entry.operation.src()])
+        .flatten()
+        .collect()
+}
+
+fn display_plan_paths(paths: &BTreeSet<&Path>) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| user_path(path).display().to_string())
+        .collect()
+}
+
+/// Plans can outlive their files. Compare their recorded components without
+/// resolving today's links or folding names on case-sensitive volumes.
+fn recorded_contains(root: &Path, path: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if path
+            .components()
+            .any(|c| c == std::path::Component::ParentDir)
+        {
+            return false;
+        }
+        let root = user_path(root);
+        // Only shorten the ancestor being compared. A verbatim-only leaf can
+        // still be below a safely representable registered root.
+        path.ancestors().any(|ancestor| user_path(ancestor) == root)
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+fn overlaps_game(paths: &BTreeSet<&Path>, roots: &[PathBuf]) -> bool {
+    paths.iter().any(|path| {
+        path.is_absolute()
+            && roots.iter().any(|root| {
+                root.is_absolute()
+                    && (recorded_contains(root, path) || recorded_contains(path, root))
+            })
+    })
 }
 
 fn checked_game_root(paths: &AppPaths, root: &Path) -> AppResult<PathBuf> {
@@ -287,7 +719,7 @@ fn resolve_mods_directory(
                 && install_root.kind == RootKind::RegisteredUser
                 && !registered.contains_key(root_id)
             {
-                return Err(AppError::Denied(format!("请先登记用户管理根 {root_id}")));
+                return Err(AppError::Denied(format!("请先添加用户管理目录 {root_id}")));
             }
             let directory = adapter
                 .resolve_root(root_id, platform, root, registered, &managed_roots)

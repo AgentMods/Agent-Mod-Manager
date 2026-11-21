@@ -1,3 +1,4 @@
+import { displayPath } from "@/lib/paths";
 import { useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2Icon, FileCode2Icon, PackageIcon, PlusIcon, RefreshCwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, Trash2Icon, UploadIcon } from 'lucide-react';
@@ -158,7 +159,7 @@ export default function PluginsPage() {
                   <dt className="text-muted-foreground">游戏</dt><dd>{selected.gameName}</dd>
                   <dt className="text-muted-foreground">版本</dt><dd>{selected.version}</dd>
                   <dt className="text-muted-foreground">来源</dt><dd>{selected.source === "builtin" ? "内置" : selected.source === "external" ? "本地导入" : selected.source}</dd>
-                  <dt className="text-muted-foreground">安装目录</dt><dd><PathText>{selected.installPath}</PathText></dd>
+                  <dt className="text-muted-foreground">安装目录</dt><dd><PathText>{displayPath(selected.installPath)}</PathText></dd>
                 </dl>
                 <Label className="font-normal">
                   <Checkbox data-testid="plugin-enabled-toggle" aria-label={`启用适配包 ${selected.name}`} checked={selected.enabled} disabled={busy || !writable} onCheckedChange={checked => { void setEnabled(selected, checked === true); }} />
@@ -181,7 +182,7 @@ export default function PluginsPage() {
         <Table>
           <TableHeader><TableRow><TableHead>草稿</TableHead><TableHead>创建时间</TableHead><TableHead>事务</TableHead><TableHead className="text-right">操作</TableHead></TableRow></TableHeader>
           <TableBody>{drafts.data.map(draft => <TableRow key={draft.id}>
-            <TableCell className="whitespace-normal"><strong className="font-medium">{draft.slug}</strong><PathText className="block">{draft.path}</PathText></TableCell>
+            <TableCell className="whitespace-normal"><strong className="font-medium">{draft.slug}</strong><PathText className="block">{displayPath(draft.path)}</PathText></TableCell>
             <TableCell>{date(draft.createdAt)}</TableCell>
             <TableCell><PathText>{draft.writeTransactionId}</PathText></TableCell>
             <TableCell><div className="flex flex-wrap justify-end gap-2 xl:flex-nowrap">
@@ -204,7 +205,7 @@ export default function PluginsPage() {
           <AlertDialogTitle>删除草稿？</AlertDialogTitle>
           <AlertDialogDescription className="wrap-anywhere">将「{deleteTarget.slug}」的这份草稿移入回收站，可在回收站恢复。其他草稿、已安装的适配包和发布记录会保留。</AlertDialogDescription>
         </AlertDialogHeader>
-        <div className="flex min-w-0 flex-col gap-1"><span className="text-sm">创建于 {date(deleteTarget.createdAt)}</span><PathText>{deleteTarget.path}</PathText></div>
+        <div className="flex min-w-0 flex-col gap-1"><span className="text-sm">创建于 {date(deleteTarget.createdAt)}</span><PathText>{displayPath(deleteTarget.path)}</PathText></div>
         <ErrorState error={deleteError} />
         <AlertDialogFooter>
           <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>

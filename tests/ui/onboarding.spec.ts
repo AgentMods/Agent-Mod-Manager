@@ -13,6 +13,9 @@ test.describe("首次启动引导", () => {
     const broken = page.getByRole("listitem").filter({hasText: "Broken Fixture"});
     await expect(fixture).toContainText("/sandbox/steam/Fixture");
     await expect(fixture).toContainText("92% 匹配");
+    await expect(broken.getByText("未匹配", {exact: true})).toBeVisible();
+    await expect(broken).toContainText("未知平台 · 建议适配包：无");
+    await expect(broken).not.toContainText("60% 匹配");
     await expect(fixture).toContainText("这是一个测试扫描候选，请确认目录后再添加");
     await expect(page.getByText("已检查 3 个目录、18 个条目")).toBeVisible();
 
@@ -30,7 +33,23 @@ test.describe("首次启动引导", () => {
     await expect(broken.getByRole("button", {name: "添加"})).toBeEnabled();
     const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls.map((call: any) => call.command));
     expect(calls.filter((command: string) => command === "start_onboarding")).toHaveLength(1);
-    expect((await registrations()).map((call: any) => call.args.directory)).toEqual(["/sandbox/steam/Broken", "/sandbox/steam/Fixture"]);
+    expect((await registrations()).map((call: any) => call.args)).toEqual([
+      {directory: "/sandbox/steam/Broken", adapterSlug: null, fromDiscovery: true},
+      {directory: "/sandbox/steam/Fixture", adapterSlug: "minecraft-java", fromDiscovery: true},
+    ]);
+  });
+
+  test("引导页添加无建议的扫描候选时不绑定适配包", async ({page}) => {
+    await installMockTauri(page, {onboarding: true});
+    await page.goto("/");
+    await page.getByRole("button", {name: "扫描已安装游戏"}).click();
+    const broken = page.getByRole("listitem").filter({hasText: "Broken Fixture"});
+    await broken.getByRole("checkbox", {name: "选择 Broken Fixture"}).check();
+    await broken.getByRole("button", {name: "添加", exact: true}).click();
+    await expect(broken.getByText("管理中", {exact: true})).toBeVisible();
+    await page.getByRole("button", {name: "退出引导"}).click();
+    const game = page.locator('[data-slot="card"]').filter({has: page.getByText("Broken", {exact: true})});
+    await expect(game.getByRole("button", {name: "创建适配包"})).toBeVisible();
   });
 
   test("配置 Agent 时密钥走 set_secret，完成导览后进入游戏库", async ({page}) => {

@@ -190,7 +190,7 @@ impl AgentTool for SourceTool {
                     )
                     .await?;
                 crate::artifacts::record(&context.engine, &artifact, &resolved)?;
-                Ok(json!(artifact))
+                Ok(json!(artifact.into_user_paths()))
             }
             _ => Err(AppError::NotFound(self.name.clone())),
         }

@@ -1,8 +1,10 @@
+import { McpLaunchDetails } from "@/components/McpLaunchDetails";
+import { startMcpConnection, type McpConfig } from "@/lib/mcp-connection";
+import { appendPathLeaf, displayPath } from "@/lib/paths";
 import { Fragment, useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useQueryClient } from "@tanstack/react-query";
 import { open } from "@tauri-apps/plugin-dialog";
-import { join } from "@tauri-apps/api/path";
 import { FolderOpenIcon } from "lucide-react";
 import { BoxIcon, DownloadIcon, FileTextIcon, KeyRoundIcon, MoonIcon, PencilIcon, PlayIcon, PlusIcon, RotateCcwIcon, SaveIcon, SearchIcon, ServerIcon, SquareIcon, SunIcon, Trash2Icon } from "lucide-react";
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
@@ -25,7 +27,6 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 
-type McpConfig = { id: string; name: string; transport: "stdio" | "streamable_http"; command: string | null; args: string[]; url: string | null; env_secret_refs: Record<string, string>; bearer_secret_ref: string | null; enabled: boolean; builtin: boolean };
 type LocalStatus = { startupRequested: boolean; running: boolean; stopping: boolean; endpoint: string | null; tokenRef: string; activeCalls: number };
 type Connection = { serverId: string; tools: string[] };
 
@@ -140,9 +141,7 @@ function McpSettings() {
   async function start(config: McpConfig, acceptsUnsandboxedStdio: boolean) {
     setPending(config.id); forget(config.id);
     try {
-      const expected = config.enabled ? config : { ...config, enabled: true };
-      if (!config.enabled) await api("mcp_update", { config: expected });
-      await api("mcp_connect", { expectedConfig: expected, acceptsUnsandboxedStdio });
+      await startMcpConnection(config, acceptsUnsandboxedStdio);
       await refresh(); setConfirm(null); notify(`${config.name} 已启动`);
     } catch (failure) {
       setFailures((current) => ({ ...current, [config.id]: errorText(failure) }));
@@ -228,15 +227,7 @@ function McpSettings() {
         <p className="text-sm">允许持有本机令牌的外部 Agent 调用受控工具。文件写入沿用桌面权限策略，审批只能在桌面完成。开启成功且未手动停止时，下次启动应用会自动尝试开启。</p>
         <ErrorState error={error} />
       </> : <>
-        <PathText className="rounded-md border bg-muted p-3">{[confirm.command, ...confirm.args].join(" ")}</PathText>
-        {Object.keys(confirm.env_secret_refs).length > 0 && <p className="text-xs text-muted-foreground">环境变量：{Object.keys(confirm.env_secret_refs).join("、")}</p>}
-        <p className="text-sm">该进程会以当前用户的系统权限运行。确认后，相同配置会在下次打开应用时自动启动，直到你手动停止或编辑连接。</p>
-        {/^(uvx|uvx\.exe)$/i.test(confirm.command ?? "") && <p className="text-sm text-muted-foreground">
-          使用应用内置的 uvx，默认从清华 PyPI 镜像安装包。首次准备 Python 或下载依赖可能需要数分钟。可在启动参数中用 <code>--default-index</code> 指定其他源，不会更改系统设置。
-        </p>}
-        {/^(npx|npx\.cmd|npx\.exe)$/i.test(confirm.command ?? "") && <p className="text-sm text-muted-foreground">
-          使用应用内置的 Node.js 和 npx，默认从 npmmirror 安装包。可在包名前用 <code>--registry=地址</code> 指定其他源，不会更改系统设置。
-        </p>}
+        <McpLaunchDetails config={confirm} />
         <ErrorState error={failures[confirm.id]} />
       </>}
     </Modal>}
@@ -299,7 +290,7 @@ function AppearanceSettings() {
     setStorageError(null);
     try {
       const parent = await open({ directory: true, multiple: false, title: "选择存储位置" });
-      if (parent) setDestination({ parent, path: await join(parent, "Agent Mod Manager") });
+      if (typeof parent === "string" && parent) setDestination({ parent, path: appendPathLeaf(parent, "Agent Mod Manager") });
     } catch (error) {
       setStorageError(error);
     }
@@ -329,7 +320,7 @@ function AppearanceSettings() {
     <Card>
       <CardHeader><CardTitle>存储</CardTitle><CardDescription>管理器数据（数据库、快照、回收站、下载）所在目录。</CardDescription></CardHeader>
       <CardContent className="flex flex-col items-start gap-4">
-        <PathText>{bootstrap.data?.dataRoot ? storagePathLabel(bootstrap.data.dataRoot) : "未连接桌面服务"}</PathText>
+        <PathText>{bootstrap.data?.dataRoot ? displayPath(bootstrap.data.dataRoot) : "未连接桌面服务"}</PathText>
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" disabled={!backendAvailable || !bootstrap.data || restarting} onClick={chooseStorage}><FolderOpenIcon data-icon="inline-start" />更改存储目录</Button>
           <Button variant="outline" disabled={!backendAvailable || !bootstrap.data || restarting} onClick={() => navigate("onboarding")}><RotateCcwIcon data-icon="inline-start" />重新查看新手引导</Button>
@@ -342,7 +333,7 @@ function AppearanceSettings() {
             <AlertDialogTitle>迁移存储目录</AlertDialogTitle>
             <AlertDialogDescription>应用将重启并把管理器数据复制到下方的新目录。原目录会保留为备份。</AlertDialogDescription>
           </AlertDialogHeader>
-          {destination && <PathText>{storagePathLabel(destination.path)}</PathText>}
+          {destination && <PathText>{displayPath(destination.path)}</PathText>}
           <ErrorState error={storageError} />
           <AlertDialogFooter>
             <AlertDialogCancel disabled={restarting}>取消</AlertDialogCancel>
@@ -355,10 +346,6 @@ function AppearanceSettings() {
       </AlertDialog>
     </Card>
   </div>;
-}
-
-function storagePathLabel(path: string) {
-  return path.replace(/^\\\\\?\\UNC\\/i, "\\\\").replace(/^\\\\\?\\(?=[A-Za-z]:\\)/, "");
 }
 
 type SkillInfo = {

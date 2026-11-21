@@ -89,6 +89,19 @@ pub struct InstalledMod {
     pub installed_at: String,
 }
 
+impl InstalledMod {
+    pub(crate) fn into_user_paths(mut self) -> Self {
+        self.install_root = paths::user_path(&self.install_root).into_owned();
+        for file in &mut self.files {
+            file.path = paths::user_path(&file.path).into_owned();
+        }
+        if let Some(serde_json::Value::String(path)) = self.metadata.get_mut("artifactPath") {
+            paths::set_user_path_text(path);
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallInspection {
@@ -103,6 +116,7 @@ pub struct InstallInspection {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallFileInspection {
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub path: PathBuf,
     pub expected_fingerprint: Fingerprint,
     pub current_fingerprint: Option<Fingerprint>,
@@ -132,9 +146,11 @@ pub struct InstallPreview {
     pub install_id: String,
     pub game_id: String,
     pub mod_type: String,
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub install_root: PathBuf,
     pub artifact_sha256: String,
     pub download_origin: Option<DownloadOrigin>,
+    #[serde(serialize_with = "crate::transaction::serialize_user_plan")]
     pub plan: FilePlan,
     pub warnings: Vec<String>,
     pub ignored_files: Vec<String>,
@@ -1086,7 +1102,7 @@ pub fn plan_uninstall(engine: &FileEngine, id: &str) -> AppResult<FilePlan> {
         {
             return Err(AppError::Conflict(format!(
                 "其他已装模组也引用 {}，请先解决覆盖关系",
-                file.path.display()
+                paths::display_path(&file.path)
             )));
         }
         let expected = Fingerprint {
@@ -1097,7 +1113,7 @@ pub fn plan_uninstall(engine: &FileEngine, id: &str) -> AppResult<FilePlan> {
         if fingerprint(&file.path)? != Some(expected) {
             return Err(AppError::Conflict(format!(
                 "安装后文件已修改或丢失，保留现场: {}",
-                file.path.display()
+                paths::display_path(&file.path)
             )));
         }
     }

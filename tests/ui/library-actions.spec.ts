@@ -4,6 +4,12 @@ import { installMockTauri } from "./mock-tauri";
 const calls = (page: Page, command: string) => page.evaluate((name) => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === name), command);
 const card = (page: Page, name: string) => page.locator('[data-slot="card"]').filter({has: page.getByRole("heading", {name, exact: true})});
 
+async function openAdapterDialog(page: Page) {
+  await card(page, "Minecraft Java Edition").getByRole("button", {name: "更多操作"}).click();
+  await page.getByRole("menuitem", {name: "选择适配包", exact: true}).click();
+  return page.getByRole("dialog", {name: "选择适配包", exact: true});
+}
+
 test.describe("游戏卡片操作", () => {
   test("卡片只显示名称、平台与 Mod 数量，不显示安装目录", async ({page}) => {
     await installMockTauri(page);
@@ -135,6 +141,126 @@ test.describe("游戏卡片操作", () => {
     await expect(page.getByText("尚无管理中的游戏", {exact: true})).toBeVisible();
     expect((await calls(page, "remove_game")).map((call: any) => call.args)).toEqual([{id: "game-fixture-game"}]);
   });
+
+  test("待执行 Mod 计划阻止移除，可查看并解除，但必须再次单独确认移除", async ({page}) => {
+    await installMockTauri(page, {
+      gameWithoutMods: true,
+      gamePlanConflicts: [{
+        id: "plan-pending-mod-install",
+        kind: "file_plan",
+        status: "planned",
+        title: "待执行 Mod 安装计划",
+        summary: "安装 Example Mod 到 Minecraft Java Edition",
+        paths: ["/sandbox/minecraft/mods/ExampleMod.jar", "/sandbox/minecraft/mods"],
+        detail: "该计划尚未执行，解除只会取消计划。",
+        planId: "plan-pending-mod-install",
+        canResolve: true,
+        resolutionHint: null,
+        blockedChanges: ["remove"],
+      }],
+    });
+    await page.goto("/");
+    await page.getByRole("button", {name: "游戏库", exact: true}).click();
+
+    const game = card(page, "Minecraft Java Edition");
+    await expect(game).toContainText("0 个 Mod");
+    await game.getByRole("button", {name: "更多操作", exact: true}).click();
+    await page.getByRole("menuitem", {name: "移除", exact: true}).click();
+
+    const dialog = page.getByRole("alertdialog", {name: "移除游戏", exact: true});
+    await expect(dialog).toBeVisible();
+    const conflict = dialog.getByRole("listitem").filter({hasText: "待执行 Mod 安装计划"});
+    await expect(conflict).toContainText("安装 Example Mod 到 Minecraft Java Edition");
+    await expect(conflict).toContainText("/sandbox/minecraft/mods/ExampleMod.jar");
+    await expect(conflict).toContainText("待执行");
+    await conflict.getByRole("button", {name: "查看", exact: true}).click();
+    await expect(conflict).toContainText("该计划尚未执行，解除只会取消计划。");
+    await expect(conflict).toContainText("/sandbox/minecraft/mods");
+    await expect(conflict).toContainText("任务 ID：plan-pending-mod-install");
+
+    const conflictQueries = await calls(page, "list_game_conflicts");
+    expect(conflictQueries.some((call: any) => call.args.gameId === "game-fixture" && call.args.change === "remove")).toBe(true);
+    expect(await calls(page, "remove_game")).toHaveLength(0);
+    await conflict.getByRole("button", {name: "解除", exact: true}).click();
+    await expect(dialog.getByRole("listitem")).toHaveCount(0);
+    expect((await calls(page, "resolve_game_conflict")).map((call: any) => call.args)).toEqual([
+      expect.objectContaining({gameId: "game-fixture", conflictId: "plan-pending-mod-install", change: "remove"}),
+    ]);
+
+    // Resolving a planned task cancels only that plan; it must not resume the destructive action.
+    expect(await calls(page, "remove_game")).toHaveLength(0);
+    expect(await calls(page, "apply_file_ops")).toHaveLength(0);
+    expect(await calls(page, "plan_install")).toHaveLength(0);
+    const removeButton = dialog.getByRole("button", {name: "移除", exact: true});
+    await expect(removeButton).toBeEnabled();
+    await removeButton.click();
+    await expect(dialog).not.toBeVisible();
+    await expect(game).toHaveCount(0);
+    await expect(page.getByText("尚无管理中的游戏", {exact: true})).toBeVisible();
+    expect((await calls(page, "remove_game")).map((call: any) => call.args)).toEqual([{id: "game-fixture"}]);
+    expect(await calls(page, "apply_file_ops")).toHaveLength(0);
+    expect(await calls(page, "plan_install")).toHaveLength(0);
+  });
+
+  test("取消移除会保留适配包，确认移除后可重新绑定", async ({page}) => {
+    await installMockTauri(page);
+    await page.goto("/");
+    await page.getByRole("button", {name: "游戏库", exact: true}).click();
+    const game = card(page, "Minecraft Java Edition");
+    const dialog = await openAdapterDialog(page);
+    const adapter = dialog.getByLabel("游戏适配包");
+    const remove = dialog.getByRole("button", {name: "移除适配包", exact: true});
+
+    await adapter.selectOption({label: "移除适配包"});
+    await dialog.getByRole("button", {name: "取消"}).click();
+    await expect(dialog).toBeHidden();
+    expect(await calls(page, "remove_game_adapter")).toHaveLength(0);
+
+    await openAdapterDialog(page);
+    await expect(adapter).toHaveValue("minecraft-java");
+    await adapter.selectOption({label: "移除适配包"});
+    await remove.click();
+    await expect(dialog).toBeHidden();
+    await expect(game.getByRole("button", {name: "创建适配包"})).toBeVisible();
+    await expect(game).toContainText("windows · 1 个 Mod");
+    expect((await calls(page, "remove_game_adapter")).map((call: any) => call.args)).toEqual([{id: "game-fixture"}]);
+
+    await openAdapterDialog(page);
+    await expect(adapter).toHaveValue("");
+    await expect(adapter.getByRole("option", {name: "移除适配包"})).toHaveCount(0);
+    await expect(dialog.getByRole("button", {name: "应用适配包"})).toBeDisabled();
+    await adapter.selectOption("minecraft-java");
+    await dialog.getByRole("button", {name: "应用适配包"}).click();
+    await expect(dialog).toBeHidden();
+    await expect(game.getByRole("button", {name: "创建适配包"})).toHaveCount(0);
+  });
+
+  test("当前适配包停用后仍可移除", async ({page}) => {
+    await installMockTauri(page, {adapterDisabled: true});
+    await page.goto("/");
+    await page.getByRole("button", {name: "游戏库", exact: true}).click();
+    const dialog = await openAdapterDialog(page);
+    await dialog.getByLabel("游戏适配包").selectOption({label: "移除适配包"});
+    await dialog.getByRole("button", {name: "移除适配包", exact: true}).click();
+    await expect(dialog).toBeHidden();
+    await expect(card(page, "Minecraft Java Edition").getByRole("button", {name: "创建适配包"})).toBeVisible();
+  });
+
+  test("待处理任务阻止移除适配包，解除冲突后仍需确认", async ({page}) => {
+    await installMockTauri(page, {gamePlanConflicts: [{id: "plan-pending", kind: "file_plan", status: "planned", title: "更新 Minecraft 文件", paths: [], canResolve: true}]});
+    await page.goto("/");
+    await page.getByRole("button", {name: "游戏库", exact: true}).click();
+    const dialog = await openAdapterDialog(page);
+    await dialog.getByLabel("游戏适配包").selectOption({label: "移除适配包"});
+    const remove = dialog.getByRole("button", {name: "移除适配包", exact: true});
+    await expect(remove).toBeDisabled();
+    await dialog.getByRole("button", {name: "解除", exact: true}).click();
+    await expect(remove).toBeEnabled();
+    expect(await calls(page, "remove_game_adapter")).toHaveLength(0);
+    await remove.click();
+    await expect(dialog).toBeHidden();
+  });
+
   test("浏览器预览中所有卡片操作保持禁用", async ({page}) => {
     await page.goto("/");
     await page.getByRole("button", {name: "游戏库", exact: true}).click();

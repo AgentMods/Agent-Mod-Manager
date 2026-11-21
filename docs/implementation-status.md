@@ -1,7 +1,14 @@
 # Agent Mod Manager implementation status
 
-Updated: 2026-11-20. The full project goal remains active. This is an
+Updated: 2026-11-21. The full project goal remains active. This is an
 implementation and verification snapshot, not a release-completion claim.
+
+**Game detail file tree (2026-11-21, Windows).** The Files tab uses the shadcn
+File Tree pattern with on-demand folder reads and search across expanded folders.
+Refreshing reloads the expanded branches and the selected preview. The browser
+can switch between the game directory and its registered user roots. Mocked IPC
+checks across 390, 1280 and 1440 px cover expansion, keyboard selection, search,
+root switching, refresh, and preview cleanup after a reviewed trash operation.
 
 **Desktop Agent filesystem access (2026-11-21, Windows).** Six local file-tool
 regression tests passed, including listing a registered game's parent, creating
@@ -134,6 +141,9 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   draft, validation and installation transactions. Local updates keep the slug.
   Built-in packages can be copied under a new slug. The desktop library applies
   a selected installed package to a registered game after checking its markers.
+  Players can also detach the current package in the same selector, even if it
+  is disabled. Detaching keeps the game, its installed Mods and the package
+  available for later use. Both changes run the same pending-task checks.
   A standalone, unapproved file preview (such as creating a Mod directory)
   does not block binding or run as a side effect. Pending reviews, approved
   operations on the game, game-linked plans and recovery still block binding;
@@ -155,8 +165,11 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   grant write access or execute launcher metadata. In the game library, picking
   a folder scans it immediately; a typed path scans on Enter or “扫描此目录”.
   This scoped scan excludes common launcher locations, can surface unadapted
-  installation candidates, and still requires explicit registration. A unique
-  full adapter match is labeled “已适配” with a green check.
+  installation candidates, and still requires explicit registration. An automatic
+  adapter match requires at least 80% confidence and an unambiguous result.
+  Other candidates use the launcher or directory name. Adding a scan result
+  attaches an adapter only if a fresh directory check confirms the same suggestion.
+  A unique full adapter match is labeled “已适配” with a green check.
 - First-run onboarding: desktop-only bootstrap detection with persisted
   `onboarding_completed`, explicit scan-candidate registration, Agent settings
   setup with encrypted API-key storage, and a three-stage feature tour. The
@@ -446,8 +459,15 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   opt-in configurations. Desktop bundles carry Node.js/npm/npx and uv/uvx. A confirmed
   bare launcher uses the packaged runtime with a child-only npm or PyPI mirror
   (npmmirror or Tsinghua). Explicit executable paths retain their own configuration.
-  The Windows Playwright preset selects installed Edge, and MarkItDown retains its
-  explicit index argument. Schema v4 clears prior auto-start consent for bare aliases.
+  The Windows Playwright preset selects installed Edge. MarkItDown inherits the bundled
+  uvx index. Schema v6 removes the redundant index flag and URL from the unedited
+  historical preset and expires its old startup consent. Custom configurations are preserved.
+  Schema v4 clears prior auto-start consent for bare aliases.
+  On 2026-11-21 both Windows x64 release installers (NSIS and MSI) were built and
+  their extracted runtime archives matched by SHA-256. Both ran an npm package and a
+  Python wheel offline with isolated caches. The native Rust npx smoke also completed
+  MCP initialization and tool discovery. The Linux x64 archive passed both package
+  tests on WSL Ubuntu. The macOS arm64 archive was inspected but not executed locally.
   `uvx` has a ten-minute startup deadline for dependency installation; other
   stdio processes still have two minutes and HTTP still has twenty seconds.
   On Windows the old PyPI command timed out downloading `pdfminer-six` before
@@ -884,9 +904,9 @@ All requirements in the original approved plan remain in scope.
 - Removal atomically drops the registration and its user-root mappings and
   detaches conversations. Shared root registrations, history, and disk files
   are retained. Active installations, unfinished reviews, and unrecovered file
-  transactions block removal. Abandoned previews that remain `planned` can
-  still block removal because the existing plan lifecycle has no general discard
-  command.
+  transactions block removal. The removal dialog lists the blocking tasks and
+  their paths, including standalone file previews under the registered roots.
+  Players can cancel an eligible task there, then confirm removal separately.
 - Directory opening resolves the game root or the first existing guarded Mod
   directory in adapter order. macOS Finder reveals a resolved `.app` directory
   as a package. Directory lookup creates no folders.

@@ -105,7 +105,7 @@ impl AppPaths {
             } else if target.starts_with(root) {
                 return Err(AppError::Denied(format!(
                     "已登记管理根缺失或已被链接替换: {}",
-                    root.display()
+                    crate::paths::display_path(root)
                 )));
             }
         }
@@ -140,7 +140,7 @@ impl AppPaths {
         if !meta.file_type().is_dir() || directory.canonicalize()? != directory {
             return Err(AppError::Denied(format!(
                 "管理器目录已被链接或其他文件替换: {}",
-                directory.display()
+                crate::paths::display_path(directory)
             )));
         }
         Ok(())
@@ -156,7 +156,7 @@ impl AppPaths {
         }
         Err(AppError::PathEscape(format!(
             "{} 不属于任何已登记的游戏目录，只能先加入游戏库",
-            canon.display()
+            crate::paths::display_path(&canon)
         )))
     }
 }

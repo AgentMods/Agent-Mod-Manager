@@ -1,3 +1,4 @@
+import { displayPath } from "@/lib/paths";
 import { useLayoutEffect, useState } from 'react';
 import { CheckIcon, GlobeIcon, SearchIcon } from 'lucide-react';
 import { api, useBackendQuery } from '@/lib/api';
@@ -78,7 +79,7 @@ export function GameIdentityDialog({ directory, writable, onClose, onConfirmed }
     <ErrorState error={preview.error || error}/>
     {!preview.data ? <EmptyState title={preview.isLoading ? '正在检查本地目录…' : '无法检查目录'}/> : <div className="flex flex-col gap-4 text-sm">
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2">
-        <dt className="text-muted-foreground">本地目录</dt><dd><PathText>{preview.data.rootPath}</PathText></dd>
+        <dt className="text-muted-foreground">本地目录</dt><dd><PathText>{displayPath(preview.data.rootPath)}</PathText></dd>
         <dt className="text-muted-foreground">搜索目的地</dt><dd>Brave Search API</dd>
         <dt className="text-muted-foreground">发送内容</dt><dd>仅下方搜索词</dd>
       </dl>

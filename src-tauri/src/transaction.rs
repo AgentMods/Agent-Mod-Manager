@@ -54,6 +54,16 @@ impl FileOp {
             _ => None,
         }
     }
+    fn set_user_paths(&mut self) {
+        let dst = match self {
+            Self::Copy { src, dst } | Self::Move { src, dst } => {
+                *src = paths::user_path(src).into_owned();
+                dst
+            }
+            Self::Mkdir { dst } | Self::WriteText { dst, .. } => dst,
+        };
+        *dst = paths::user_path(dst).into_owned();
+    }
     fn name(&self) -> &'static str {
         match self {
             Self::Copy { .. } => "copy",
@@ -84,7 +94,7 @@ fn fingerprint_checked(path: &Path, protect_descendants: bool) -> AppResult<Opti
     if meta.file_type().is_symlink() || (!meta.is_file() && !meta.is_dir()) {
         return Err(AppError::Denied(format!(
             "不支持链接或特殊文件: {}",
-            path.display()
+            paths::display_path(path)
         )));
     }
     if meta.is_file() {
@@ -131,7 +141,7 @@ fn fingerprint_leaf(path: &Path) -> AppResult<Fingerprint> {
     if meta.file_type().is_symlink() || (!meta.is_file() && !meta.is_dir()) {
         return Err(AppError::Denied(format!(
             "目录包含链接或特殊文件: {}",
-            path.display()
+            paths::display_path(path)
         )));
     }
     Ok(Fingerprint {
@@ -162,6 +172,26 @@ pub struct FilePlan {
     pub created_at: String,
     #[serde(default)]
     pub requires_review: bool,
+}
+
+impl FilePlan {
+    /// Format operation paths for tool results, IPC responses, and approval previews.
+    pub fn into_user_paths(mut self) -> Self {
+        for entry in &mut self.entries {
+            entry.operation.set_user_paths();
+        }
+        self
+    }
+}
+
+/// Serialize a plan embedded in a display DTO. Stored plans use ordinary serialization.
+pub(crate) fn serialize_user_plan<S: serde::Serializer>(
+    plan: &FilePlan,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    #[cfg(windows)]
+    let plan = plan.clone().into_user_paths();
+    plan.serialize(s)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,7 +242,7 @@ impl JournalRename {
 fn ownership_conflict(path: &Path) -> AppError {
     AppError::Conflict(format!(
         "不能确认事务文件的身份，已保留原位等待恢复: {}",
-        path.display()
+        paths::display_path(path)
     ))
 }
 
@@ -228,7 +258,7 @@ fn check_fingerprint(path: &Path, expected: &Option<Fingerprint>) -> AppResult<(
     if fingerprint(path)? != *expected {
         return Err(AppError::Conflict(format!(
             "事务文件内容已变化: {}",
-            path.display()
+            paths::display_path(path)
         )));
     }
     Ok(())
@@ -237,7 +267,7 @@ fn check_fingerprint(path: &Path, expected: &Option<Fingerprint>) -> AppResult<(
 fn create_parent(path: &Path) -> AppResult<()> {
     let parent = path
         .parent()
-        .ok_or_else(|| AppError::PathEscape(path.display().to_string()))?;
+        .ok_or_else(|| AppError::PathEscape(paths::display_path(path)))?;
     safe_fs::create_dir_all(parent)
 }
 
@@ -361,7 +391,7 @@ impl FileEngine {
                 .find(|p| p.is_dir())
                 .map(|p| p.join(".amm-retained").join(id).join(name))
                 .ok_or_else(|| AppError::Invalid("外部路径没有可用的父目录".into())),
-            None => Err(AppError::PathEscape(path.display().to_string())),
+            None => Err(AppError::PathEscape(paths::display_path(path))),
         }
     }
 
@@ -414,7 +444,7 @@ impl FileEngine {
             {
                 return Err(AppError::Denied(format!(
                     "管理器内部路径不可由文件工具修改: {}",
-                    target.display()
+                    paths::display_path(&target)
                 )));
             }
         }
@@ -434,7 +464,7 @@ impl FileEngine {
         if resolved != path {
             return Err(AppError::Conflict(format!(
                 "计划路径的链接或父目录已改变: {}",
-                path.display()
+                paths::display_path(path)
             )));
         }
         Ok(resolved)
@@ -522,7 +552,7 @@ impl FileEngine {
                 .as_ref()
                 .map(|s| {
                     fingerprint_checked(s, self.local_agent_files && !internal)?
-                        .ok_or_else(|| AppError::NotFound(s.display().to_string()))
+                        .ok_or_else(|| AppError::NotFound(paths::display_path(s)))
                 })
                 .transpose()?
                 .or(inline_source);
@@ -539,7 +569,7 @@ impl FileEngine {
             if matches!(op, FileOp::Mkdir { .. }) && before.is_some() {
                 return Err(AppError::Conflict(format!(
                     "目录已经存在: {}",
-                    dst.display()
+                    paths::display_path(&dst)
                 )));
             }
             if before.as_ref().is_some_and(|s| s.kind == "dir") {
@@ -1074,7 +1104,7 @@ impl FileEngine {
                         Ok(_) => {
                             return Err(AppError::Conflict(format!(
                                 "回滚目标被占用: {}",
-                                return_to.display()
+                                paths::display_path(return_to)
                             )))
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1087,7 +1117,7 @@ impl FileEngine {
                 {
                     return Err(AppError::Conflict(format!(
                         "回滚目录包含新增内容: {}",
-                        to.display()
+                        paths::display_path(&to)
                     )));
                 }
                 if step.expected_content.is_some() {
@@ -1173,7 +1203,7 @@ impl FileEngine {
                 if step.retain_at.is_some() {
                     return Err(AppError::Conflict(format!(
                         "回滚目录包含新增内容: {}",
-                        to.display()
+                        paths::display_path(&to)
                     )));
                 }
                 continue;
@@ -1225,6 +1255,43 @@ pub(crate) mod tests {
         let game = game.canonicalize().unwrap();
         db.conn().execute("INSERT INTO games (id,name,slug,root_path,created_at,updated_at) VALUES ('g','Game','game',?1,'now','now')",[game.display().to_string()]).unwrap();
         (dir, FileEngine::new(db, paths), game)
+    }
+
+    #[test]
+    fn user_plan_formats_only_operation_paths_and_preserves_the_stored_plan() {
+        use serde_json::json;
+
+        let raw_src = r"\\?\UNC\server\share\input";
+        let raw_dst = r"\\?\C:\game\output";
+        let make_plan = |src: &str, dst: &str| {
+            let entries = [
+                json!({"op": "copy", "src": src, "dst": dst}),
+                json!({"op": "move", "src": src, "dst": dst}),
+                json!({"op": "mkdir", "dst": dst}),
+                json!({"op": "write_text", "dst": dst, "content": raw_dst}),
+            ]
+            .map(|operation| {
+                json!({
+                    "operation": operation, "impact": raw_src, "before": null,
+                    "source": {"kind": "file", "size": 1, "sha256": "a".repeat(64)}
+                })
+            });
+            json!({"id": "txn1", "summary": raw_dst, "entries": entries,
+                "total_bytes": 2, "created_at": "now", "requires_review": true})
+        };
+        let stored = make_plan(raw_src, raw_dst);
+        let plan: FilePlan = serde_json::from_value(stored.clone()).unwrap();
+        let expected = if cfg!(windows) {
+            make_plan(r"\\server\share\input", r"C:\game\output")
+        } else {
+            stored.clone()
+        };
+        assert_eq!(json!(plan.clone().into_user_paths()), expected);
+        assert_eq!(
+            serialize_user_plan(&plan, serde_json::value::Serializer).unwrap(),
+            expected
+        );
+        assert_eq!(json!(plan), stored);
     }
 
     #[test]

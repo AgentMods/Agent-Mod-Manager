@@ -349,7 +349,10 @@ fn is_device_name(bytes: &[u8]) -> bool {
 }
 
 fn invalid_path(path: &Path) -> AppError {
-    AppError::Denied(format!("无效或不安全的 Windows 路径: {}", path.display()))
+    AppError::Denied(format!(
+        "无效或不安全的 Windows 路径: {}",
+        crate::paths::display_path(path)
+    ))
 }
 
 pub(super) fn nt_error(status: i32) -> AppError {

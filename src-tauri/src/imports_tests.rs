@@ -86,11 +86,16 @@ fn preview_is_inert_camel_case_and_native_apply_enables_separate_install() {
     assert!(engine.get_plan(&preview.plan.id).unwrap().requires_review);
     assert!(!preview.warnings.is_empty());
     let json = serde_json::to_value(&preview).unwrap();
+    let returned_path = PathBuf::from(json["artifactPath"].as_str().unwrap());
     assert_eq!(
         json["artifactPath"],
-        preview.artifact_path.to_str().unwrap()
+        paths::display_path(&preview.artifact_path)
     );
-    assert_eq!(json["sourcePath"], source.to_str().unwrap());
+    assert_eq!(json["sourcePath"], paths::display_path(&source));
+    assert_eq!(
+        json["plan"]["entries"][0]["operation"]["dst"],
+        json["artifactPath"]
+    );
     assert!(json.get("artifact_path").is_none());
     let scratch = copy_source(&preview);
     assert!(scratch.starts_with(engine.paths.staging().join("import-scratch")));
@@ -119,7 +124,11 @@ fn preview_is_inert_camel_case_and_native_apply_enables_separate_install() {
     assert_eq!(fs::read(&preview.artifact_path).unwrap(), original);
     assert_eq!(fs::read(&source).unwrap(), original);
     assert!(scratch.exists());
-    let install = install::plan_install(&engine, &request(&game, &preview)).unwrap();
+    let install_request = install::InstallRequest {
+        artifact_path: returned_path,
+        ..request(&game, &preview)
+    };
+    let install = install::plan_install(&engine, &install_request).unwrap();
     assert!(install.plan.requires_review);
     assert!(!game_root.join("mods/Example.jar").exists());
     engine.approve_plan(&install.plan.id).unwrap();
@@ -207,7 +216,10 @@ fn filenames_are_portable_and_match_the_install_contract() {
             let (_temp, engine, _) = setup();
             assert!(plan_import_archive(&engine, path).is_err(), "{name:?}");
         } else {
-            assert!(filename(path).is_err(), "{name:?}");
+            // Within a directory, `a:stream.zip` is the selected filename on Windows.
+            // In isolation, the same spelling starts with a drive-relative prefix.
+            let selected = format!("selection{}{name}", std::path::MAIN_SEPARATOR);
+            assert!(filename(Path::new(&selected)).is_err(), "{name:?}");
         }
     }
     assert!(filename(Path::new(&format!("{}.zip", "x".repeat(177)))).is_err());

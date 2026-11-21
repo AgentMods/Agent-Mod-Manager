@@ -2,6 +2,10 @@ import { useRef, useState, type Ref } from "react";
 import { ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, PlusIcon, ShieldAlertIcon, ShieldIcon, SquareIcon } from "lucide-react";
 import { DropdownMenu as Menu, Popover, Slider } from "radix-ui";
 import { Button } from "@/components/ui/button";
+import { AttachmentGroup } from "@/components/ui/attachment";
+import { AttachmentConverterSetup, ComposerAttachment } from "./AgentAttachments";
+import { MAX_ATTACHMENTS, MAX_MESSAGE_ATTACHMENT_BYTES, usePrepareAttachments, type DraftAttachment } from "@/lib/agent-attachments";
+import { toast } from "sonner";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -11,7 +15,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { InputGroup, InputGroupAddon, InputGroupTextarea } from "@/components/ui/input-group";
 import { reasoningEffortLabel } from "@/lib/reasoning-effort";
-import type { AgentModelSettings, PermissionMode, ReasoningEffort } from "@/lib/types";
+import type { AgentAttachment, AgentModelSettings, PermissionMode, ReasoningEffort } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const popupPosition = { side: "top", align: "end", sideOffset: 8, collisionPadding: 12 } as const;
@@ -27,7 +31,9 @@ interface AgentComposerProps {
   inputRef?: Ref<HTMLTextAreaElement>;
   onCancelEdit?: () => void;
   onInputChange: (value: string) => void;
-  onSend: () => void;
+  attachments: DraftAttachment[];
+  updateAttachments: (apply: (current: DraftAttachment[]) => DraftAttachment[]) => void;
+  onSend: (attachments: AgentAttachment[]) => void;
   onCancel?: () => void;
   disabled: boolean;
   busy: boolean;
@@ -42,12 +48,34 @@ interface AgentComposerProps {
 }
 
 export function AgentComposer({
-  input, inputRef, onCancelEdit, onInputChange, onSend, onCancel, disabled, busy, permission, inheritedPermission,
+  input, inputRef, onCancelEdit, onInputChange, attachments, updateAttachments, onSend, onCancel, disabled, busy, permission, inheritedPermission,
   onPermissionChange, model, models, onModelChange, reasoningEffort, onReasoningChange,
 }: AgentComposerProps) {
   const [picker, setPicker] = useState<"model" | "reasoning" | null>(null);
+  const filePicker = useRef<HTMLInputElement>(null);
+  const [setupOpen, setSetupOpen] = useState(false);
+  const needsSetup = attachments.some((item) => item.state === "error" && item.needsConsent);
   const controlsDisabled = disabled || busy;
-  const canSend = !controlsDisabled && Boolean(input.trim());
+  const ready = attachments.filter((item) => item.state === "ready");
+  const tooLarge = ready.reduce((total, item) => total + item.bytes, 0) > MAX_MESSAGE_ATTACHMENT_BYTES;
+  const canSend = !controlsDisabled && !tooLarge && ready.length === attachments.length && (Boolean(input.trim()) || ready.length > 0);
+
+  usePrepareAttachments(attachments, updateAttachments);
+
+  function retryFailed(id?: string) {
+    updateAttachments((current) => current.map((item) => item.state === "error" && (id ? item.id === id : item.needsConsent)
+      ? { id: item.id, state: "processing", file: item.file } : item));
+  }
+
+  function addFiles(files: File[]) {
+    if (controlsDisabled || !files.length) return;
+    if (attachments.length + files.length > MAX_ATTACHMENTS) {
+      toast.error(`每条消息最多添加 ${MAX_ATTACHMENTS} 个附件。`);
+      return;
+    }
+    const pending = files.map((file) => ({ id: crypto.randomUUID(), file, state: "processing" as const }));
+    updateAttachments((current) => [...current, ...pending]);
+  }
   const selectedModel = models.find((entry) => entry.id === model);
   const levels = selectedModel?.reasoning_levels ?? [];
   const modelLabel = selectedModel?.display_name?.trim() || model || "未配置模型";
@@ -57,14 +85,32 @@ export function AgentComposer({
 
   return <form className="shrink-0 px-3 pb-3 pt-2 sm:px-8 sm:pb-5" onSubmit={(event) => {
     event.preventDefault();
-    if (canSend) onSend();
+    if (canSend) onSend(ready.map((item) => item.attachment));
   }}>
     <div className="mx-auto w-full max-w-5xl">
       {onCancelEdit && <div className="mb-1 flex items-center justify-between gap-2 px-2 text-xs text-muted-foreground">
         <span>正在编辑消息 · 发送后开启新分支</span>
         <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={onCancelEdit}>取消编辑</Button>
       </div>}
+      <input ref={filePicker} type="file" aria-label="选择附件" hidden multiple disabled={controlsDisabled} onChange={(event) => {
+        const files = Array.from(event.currentTarget.files ?? []);
+        event.currentTarget.value = "";
+        addFiles(files);
+      }} />
       <InputGroup className="rounded-[22px] border-border shadow-sm bg-muted/55 dark:bg-secondary">
+        {attachments.length > 0 && <InputGroupAddon align="block-start" className="min-w-0 flex-col items-stretch gap-1 px-3 pt-2 pb-0">
+          <AttachmentGroup aria-label="待发送附件" aria-live="polite" className="max-h-[25dvh] flex-wrap gap-1.5 overflow-y-auto">
+            {attachments.map((draft) => <ComposerAttachment key={draft.id} draft={draft} disabled={controlsDisabled}
+              onRemove={() => updateAttachments((current) => current.filter((item) => item.id !== draft.id))}
+              onRetry={() => retryFailed(draft.id)} />)}
+          </AttachmentGroup>
+          {needsSetup && <Button type="button" size="xs" variant="outline" className="self-start" disabled={controlsDisabled} onClick={() => setSetupOpen(true)}>启动 MarkItDown MCP</Button>}
+          {needsSetup && setupOpen && <AttachmentConverterSetup onClose={() => setSetupOpen(false)} onStarted={() => {
+            setSetupOpen(false);
+            retryFailed();
+          }} />}
+          {tooLarge && <span role="alert" className="text-xs text-destructive">附件合计超过 20 MiB，请移除部分附件后分次发送。</span>}
+        </InputGroupAddon>}
         <InputGroupTextarea
           ref={inputRef}
           aria-label="告诉 Agent 你想做什么"
@@ -73,16 +119,25 @@ export function AgentComposer({
           className="max-h-[min(14rem,34dvh)] min-h-16 resize-none px-4 pt-3.5 pb-2 sm:min-h-20 sm:text-base"
           disabled={disabled}
           onChange={(event) => onInputChange(event.target.value)}
+          onPaste={(event) => {
+            const data = event.clipboardData;
+            const files = data.files.length ? Array.from(data.files) : Array.from(data.items)
+              .filter((item) => item.kind === "file").map((item) => item.getAsFile()).filter((file) => file !== null);
+            if (!files.length) return;
+            event.preventDefault();
+            addFiles(files);
+          }}
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
               event.preventDefault();
-              if (canSend) onSend();
+              if (canSend) event.currentTarget.form?.requestSubmit();
             }
           }}
         />
         <InputGroupAddon align="block-end" className="cursor-default flex-wrap justify-between gap-1.5 px-2.5 pb-2.5 pt-0">
           <div className="flex min-w-0 items-center gap-1">
-            <Button type="button" aria-label="添加上下文" size="icon-sm" variant="ghost" disabled>
+            <Button type="button" aria-label="添加附件" title="添加附件（图片也可直接粘贴）" size="icon-sm" variant="ghost"
+              disabled={controlsDisabled} onClick={() => filePicker.current?.click()}>
               <PlusIcon aria-hidden="true" />
             </Button>
             <DropdownMenu modal={false}>

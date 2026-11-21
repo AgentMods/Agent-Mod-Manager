@@ -1,5 +1,72 @@
 use crate::error::{AppError, AppResult};
+use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
+
+/// Spelling for a local path shown or returned to a user. Keep canonical paths for
+/// filesystem guards, database identities and transaction journals.
+pub(crate) fn user_path(path: &Path) -> Cow<'_, Path> {
+    #[cfg(windows)]
+    if let Some(short) = path.to_str().and_then(ordinary_windows_path) {
+        return short;
+    }
+    Cow::Borrowed(path)
+}
+
+pub(crate) fn display_path(path: &Path) -> String {
+    user_path(path).display().to_string()
+}
+
+pub(crate) fn serialize_user_path<S: serde::Serializer, P: AsRef<Path> + ?Sized>(
+    path: &P,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(user_path(path.as_ref()).as_ref(), serializer)
+}
+
+pub(crate) fn set_user_path_text(text: &mut String) {
+    let path = Path::new(text);
+    let shown = user_path(path);
+    if shown.as_os_str() != path.as_os_str() {
+        *text = shown.to_string_lossy().into_owned();
+    }
+}
+
+#[cfg(any(windows, test))]
+fn ordinary_windows_path(text: &str) -> Option<Cow<'_, Path>> {
+    let body = text.strip_prefix(r"\\?\")?;
+    let bytes = body.as_bytes();
+    let unc = body
+        .get(..4)
+        .is_some_and(|s| s.eq_ignore_ascii_case(r"UNC\"));
+    let components = if unc {
+        let tail = &body[4..];
+        let (server, share_and_rest) = tail.split_once('\\')?;
+        if server.is_empty() || share_and_rest.is_empty() || share_and_rest.starts_with('\\') {
+            return None;
+        }
+        tail
+    } else if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && &bytes[1..3] == br":\" {
+        &body[3..]
+    } else {
+        return None;
+    };
+    // Dots and trailing spaces can be literal names in the verbatim namespace.
+    // Only remove the prefix when a path copied from the UI names the same object.
+    if !components.is_empty()
+        && !components
+            .strip_suffix('\\')
+            .unwrap_or(components)
+            .split('\\')
+            .all(|name| valid_windows_component(name) && !windows_device_name(name))
+    {
+        return None;
+    }
+    Some(if unc {
+        Cow::Owned(PathBuf::from(format!(r"\\{components}")))
+    } else {
+        Cow::Borrowed(Path::new(body))
+    })
+}
 
 /// Normalize a path lexically: resolve `.` and `..` without touching the filesystem.
 pub fn lexical_normalize(p: &Path) -> PathBuf {
@@ -46,7 +113,7 @@ pub fn canonicalize_lenient(p: &Path) -> AppResult<PathBuf> {
                     Ok(meta) if !meta.is_dir() => {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::NotADirectory,
-                            format!("{} 不是目录", resolved.display()),
+                            format!("{} 不是目录", display_path(&resolved)),
                         )
                         .into());
                     }
@@ -68,7 +135,7 @@ pub fn canonicalize_lenient(p: &Path) -> AppResult<PathBuf> {
                         if components.peek().is_some() && !std::fs::metadata(&resolved)?.is_dir() {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::NotADirectory,
-                                format!("{} 不是目录", resolved.display()),
+                                format!("{} 不是目录", display_path(&resolved)),
                             )
                             .into());
                         }
@@ -116,12 +183,40 @@ pub fn ensure_within(target: &Path, roots: &[PathBuf]) -> AppResult<PathBuf> {
             return Ok(canon);
         }
     }
-    let shown: Vec<String> = roots.iter().map(|r| r.display().to_string()).collect();
+    let shown: Vec<String> = roots.iter().map(|r| display_path(r)).collect();
     Err(AppError::PathEscape(format!(
         "{} 不在允许的目录内 ({})",
-        canon.display(),
+        display_path(&canon),
         shown.join(", ")
     )))
+}
+
+fn valid_windows_component(name: &str) -> bool {
+    !name.is_empty()
+        && !name
+            .chars()
+            .any(|c| c.is_control() || "/<>:\"|?*".contains(c))
+        && !name.ends_with(['.', ' '])
+}
+
+fn windows_device_name(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(' ')
+        .to_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
+    ) || ["COM", "LPT"].iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|n| {
+            matches!(
+                n,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    })
 }
 
 /// Reject any archive entry whose relative path tries to escape the destination.
@@ -144,29 +239,10 @@ pub fn safe_join(base: &Path, entry: &str) -> AppResult<PathBuf> {
             p => {
                 // Apply Windows rules on every host so a preview on Unix cannot
                 // approve an archive that becomes a device or ADS on Windows.
-                if p.chars().any(|c| c.is_control() || "<>:\"|?*".contains(c))
-                    || p.ends_with(['.', ' '])
-                {
+                if !valid_windows_component(p) {
                     return Err(AppError::UnsafeArchive(format!("不安全的条目名: {entry}")));
                 }
-                let stem = p
-                    .split('.')
-                    .next()
-                    .unwrap_or(p)
-                    .trim_end_matches(' ')
-                    .to_uppercase();
-                let device = matches!(
-                    stem.as_str(),
-                    "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$"
-                ) || ["COM", "LPT"].iter().any(|prefix| {
-                    stem.strip_prefix(prefix).is_some_and(|n| {
-                        matches!(
-                            n,
-                            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
-                        )
-                    })
-                });
-                if device {
+                if windows_device_name(p) {
                     return Err(AppError::UnsafeArchive(format!("设备名称条目: {entry}")));
                 }
                 rel.push(p);
@@ -205,6 +281,42 @@ pub fn strip_single_root(entries: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_user_paths_only_shorten_equivalent_drive_and_share_names() {
+        for (raw, shown) in [
+            (r"\\?\E:\Games\我的游戏", r"E:\Games\我的游戏"),
+            (r"\\?\C:\", r"C:\"),
+            (r"\\?\UNC\nas\Mods", r"\\nas\Mods"),
+            (r"\\?\UNC\Nas\Share\Games\", r"\\Nas\Share\Games\"),
+        ] {
+            assert_eq!(ordinary_windows_path(raw).unwrap().as_os_str(), shown);
+            assert!(ordinary_windows_path(shown).is_none());
+        }
+        for raw in [
+            r"\\?\Volume{abc}\folder",
+            r"\\.\PIPE\service",
+            r"\\?\UNC\host",
+            r"\\?\UNC\.\share",
+            r"\\?\UNC\host\share\NUL.txt",
+            r"\\?\C:\Games\a.",
+            r"\\?\C:\Games\a ",
+            r"\\?\C:\Games\..\b",
+            r"\\?\C:\Games\.\b",
+            r"\\?\C:\Games\a/b",
+            r"\\?\C:\COM¹.log",
+        ] {
+            assert!(ordinary_windows_path(raw).is_none(), "{raw}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_user_paths_preserve_literal_backslashes_and_case() {
+        for raw in [r"/Games/Mods\Data", r"/games/mods\data", r"\\?\C:\Games"] {
+            assert_eq!(user_path(Path::new(raw)).as_os_str(), raw);
+        }
+    }
 
     #[test]
     fn normalize_removes_dotdot() {

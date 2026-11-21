@@ -11,6 +11,7 @@ import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Spinner } from '@/components/ui/spinner';
 import { api, backendAvailable } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import { displayPath } from '@/lib/paths';
 
 type FileRoot = { name: string; path: string };
 type DirEntry = FileRoot & { is_dir: boolean; size: number; modified: string };
@@ -32,6 +33,7 @@ function buildTree(root: FileRoot, directories: Map<string, UseQueryResult<DirEn
       for (const entry of listing.isError ? [] : listing.data ?? []) {
         const matches = entry.name.toLowerCase().includes(search);
         if (entry.is_dir) {
+          if (reachable.has(entry.path)) continue;
           const child = visit(entry, entry.modified);
           if (matches || child.children.length || child.error || child.loading) children.push(child);
         } else {
@@ -47,7 +49,7 @@ function buildTree(root: FileRoot, directories: Map<string, UseQueryResult<DirEn
 
 const rowClass = 'w-full min-w-0 justify-start gap-2 font-normal focus-visible:ring-inset';
 const sizeClass = 'hidden w-16 shrink-0 text-right text-xs tabular-nums text-muted-foreground @xs:block';
-const dateClass = 'hidden w-32 shrink-0 text-right text-xs tabular-nums text-muted-foreground @2xl:block';
+const dateClass = 'hidden w-32 shrink-0 text-right text-xs tabular-nums text-muted-foreground @xl:block';
 
 function FileTreeNode({ node, selected, onSelect, onToggle, searching }: {
   node: FileNode | FolderNode; selected: string | null; onSelect: (path: string) => void;
@@ -57,7 +59,7 @@ function FileTreeNode({ node, selected, onSelect, onToggle, searching }: {
     const { entry } = node;
     return <Button type="button" variant="ghost" size="sm" aria-label={entry.name} title={entry.name}
       aria-current={selected === entry.path ? true : undefined} onClick={() => onSelect(entry.path)}
-      className={cn(rowClass, 'aria-current:bg-accent aria-current:text-accent-foreground')}>
+      className={cn(rowClass, 'aria-[current=true]:bg-accent aria-[current=true]:text-accent-foreground')}>
       <FileIcon aria-hidden="true" className="ml-5 text-muted-foreground" />
       <span className="min-w-0 flex-1 truncate text-left">{entry.name}</span>
       <span className={sizeClass}>{bytes(entry.size)}</span><span className={dateClass}>{date(entry.modified)}</span>
@@ -66,7 +68,7 @@ function FileTreeNode({ node, selected, onSelect, onToggle, searching }: {
   const Folder = node.open ? FolderOpenIcon : FolderIcon;
   return <Collapsible open={node.open} onOpenChange={open => onToggle(node.path, open)}>
     <CollapsibleTrigger asChild>
-      <Button type="button" variant="ghost" size="sm" className={rowClass} aria-label={node.name} title={node.path}>
+      <Button type="button" variant="ghost" size="sm" className={rowClass} aria-label={node.name} title={displayPath(node.path)}>
         <ChevronRightIcon aria-hidden="true" className={cn('size-3 text-muted-foreground transition-transform motion-reduce:transition-none', node.open && 'rotate-90')} />
         <Folder aria-hidden="true" /><span className="min-w-0 flex-1 truncate text-left font-medium">{node.name}</span>
         <span className={sizeClass}>—</span><span className={dateClass}>{node.modified && date(node.modified)}</span>
@@ -122,12 +124,12 @@ export function GameFileBrowser({ root, roots, onRootChange, active, busy, writa
     if (file) void client.invalidateQueries({ queryKey: ['file', file.path], exact: true });
   }
   return <div className="grid min-w-0 items-start gap-4 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
-    <Card className="min-w-0 gap-4">
-      <CardHeader className="gap-3">
+    <Card className="min-w-0 gap-4 py-4">
+      <CardHeader className="gap-3 px-4">
         <div className="flex min-w-0 items-start justify-between gap-2">
           <div className="flex min-w-0 flex-col gap-2">
             <CardTitle className="flex items-center gap-2"><FolderTreeIcon aria-hidden="true" className="size-4" />文件浏览器</CardTitle>
-            <PathText>{root.path}</PathText>
+            <PathText>{displayPath(root.path)}</PathText>
           </div>
           <IconButton title="刷新目录" disabled={!backendAvailable || fetching || expanded.length === 0} onClick={refresh}>
             <RefreshCwIcon className={fetching ? 'motion-safe:animate-spin' : undefined} />
@@ -135,14 +137,14 @@ export function GameFileBrowser({ root, roots, onRootChange, active, busy, writa
         </div>
         <div className="flex min-w-0 flex-wrap gap-2">
           {roots.length > 1 && <NativeSelect aria-label="浏览根目录" value={root.path} onChange={event => onRootChange(event.target.value)}>
-            {roots.map(option => <NativeSelectOption key={option.name} value={option.path}>{option.name}</NativeSelectOption>)}
+            {roots.map(option => <NativeSelectOption key={option.path + option.name} value={option.path}>{option.name}</NativeSelectOption>)}
           </NativeSelect>}
           <InputGroup className="min-w-32 flex-1"><InputGroupAddon><SearchIcon /></InputGroupAddon>
             <InputGroupInput type="search" aria-label="搜索已展开目录" placeholder="搜索已展开目录…" value={search} onChange={event => setSearch(event.target.value)} />
           </InputGroup>
         </div>
       </CardHeader>
-      <CardContent>
+      <CardContent className="px-4">
         <div className="@container min-w-0 overflow-hidden rounded-md border">
           <div aria-hidden="true" className="flex items-center gap-2 border-b bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
             <span className="flex-1">名称</span><span className={sizeClass}>大小</span><span className={dateClass}>修改时间</span>

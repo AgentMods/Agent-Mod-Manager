@@ -38,6 +38,7 @@ fn invalid(message: impl Into<String>) -> AppError {
 pub struct DraftInfo {
     pub id: String,
     pub slug: String,
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub path: PathBuf,
     pub write_transaction_id: String,
     pub created_at: String,
@@ -46,6 +47,7 @@ pub struct DraftInfo {
 #[serde(rename_all = "camelCase")]
 pub struct DraftPreview {
     pub draft: DraftInfo,
+    #[serde(serialize_with = "crate::transaction::serialize_user_plan")]
     pub plan: FilePlan,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -85,8 +87,10 @@ pub struct DeploymentPreview {
     pub draft_id: String,
     pub slug: String,
     pub version: String,
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub install_path: PathBuf,
     pub hashes: PackageHashes,
+    #[serde(serialize_with = "crate::transaction::serialize_user_plan")]
     pub plan: FilePlan,
 }
 #[derive(Debug, Clone, Default, Serialize)]
@@ -160,7 +164,7 @@ fn checked_path(engine: &FileEngine, path: &Path) -> AppResult<PathBuf> {
         || !path.starts_with(root)
         || path.components().any(|c| matches!(c, Component::ParentDir))
     {
-        return Err(AppError::PathEscape(path.display().to_string()));
+        return Err(AppError::PathEscape(paths::display_path(path)));
     }
     let mut current = root.clone();
     for part in path
@@ -173,7 +177,7 @@ fn checked_path(engine: &FileEngine, path: &Path) -> AppResult<PathBuf> {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(AppError::Denied(format!(
                     "拒绝包路径符号链接: {}",
-                    current.display()
+                    paths::display_path(&current)
                 )))
             }
             Ok(_) => {}

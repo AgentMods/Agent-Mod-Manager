@@ -44,6 +44,8 @@ pub(crate) fn migrate_playwright_browser(conn: &rusqlite::Connection) -> AppResu
     Ok(())
 }
 
+pub(crate) const MARKITDOWN_ID: &str = "markitdown";
+
 // Allow the specific prerelease required by MarkItDown's all extra, not all prereleases.
 const MARKITDOWN_PACKAGES: [&str; 3] = [
     "--with",
@@ -51,26 +53,24 @@ const MARKITDOWN_PACKAGES: [&str; 3] = [
     "markitdown-mcp==0.0.1a8",
 ];
 
-fn markitdown_args() -> Vec<String> {
-    ["--default-index", super::runtime::PYPI_INDEX]
-        .into_iter()
-        .chain(MARKITDOWN_PACKAGES)
-        .map(str::to_owned)
-        .collect()
-}
-
-/// Schema v2: change only an untouched built-in launch specification. The
-/// mirror is part of the visible command, so any prior launch consent expires.
-/// Running once (not on every seed) lets users opt back into the upstream index.
-pub(crate) fn migrate_markitdown_index(conn: &rusqlite::Connection) -> AppResult<()> {
+/// Schema v6: remove the explicit index from the unedited historical preset.
+/// Keep this snapshot independent of future changes to the default packages or mirror.
+pub(crate) fn migrate_markitdown_to_launcher_index(conn: &rusqlite::Connection) -> AppResult<()> {
+    let previous = [
+        "--default-index",
+        "https://pypi.tuna.tsinghua.edu.cn/simple",
+        "--with",
+        "azure-ai-contentunderstanding==1.2.0b3",
+        "markitdown-mcp==0.0.1a8",
+    ];
     conn.execute(
         "UPDATE mcp_servers SET args_json=?1, startup_digest=NULL
          WHERE id='markitdown' AND builtin=1 AND name='MarkItDown MCP'
            AND transport='stdio' AND command='uvx' AND args_json=?2
            AND url IS NULL AND env_json='{}' AND secret_ref IS NULL",
         params![
-            serde_json::to_string(&markitdown_args())?,
-            serde_json::to_string(&MARKITDOWN_PACKAGES)?
+            serde_json::to_string(&previous[2..])?,
+            serde_json::to_string(&previous)?
         ],
     )?;
     Ok(())
@@ -394,8 +394,12 @@ impl McpServers {
             NPX_COMMAND,
             playwright_args(),
         );
-        let markitdown =
-            ServerConfig::stdio("markitdown", "MarkItDown MCP", "uvx", markitdown_args());
+        let markitdown = ServerConfig::stdio(
+            MARKITDOWN_ID,
+            "MarkItDown MCP",
+            "uvx",
+            MARKITDOWN_PACKAGES.map(String::from).into(),
+        );
         for config in [http, stdio, playwright, markitdown] {
             match self.insert(&config, true) {
                 Ok(()) => {}

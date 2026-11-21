@@ -4,6 +4,7 @@
 //! legendary-gl/legendary legendary/{lfs,models}/egl.py (checked 2026-11-17).
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
+use crate::paths::user_path;
 use crate::plugins::{self, GameAdapter, MarkerKind, Platform};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,7 @@ const MAX_KV_DEPTH: usize = 32;
 const MAX_KV_TOKENS: usize = 65_536;
 const MAX_KV_STRING: usize = 65_536;
 const MAX_LIBRARIES: usize = 64;
-pub const HIGH_CONFIDENCE: f64 = 0.85;
+pub const HIGH_CONFIDENCE: f64 = 0.80;
 
 fn invalid(message: impl Into<String>) -> AppError {
     AppError::Invalid(message.into())
@@ -30,6 +31,8 @@ pub struct Game {
     pub id: String,
     pub name: String,
     pub slug: String,
+    /// The database spelling is also the file engine's trusted root.
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub root_path: String,
     /// Detected payload layout, not a claim that the game runs natively here.
     pub platform: String,
@@ -41,12 +44,37 @@ pub struct Game {
     pub last_scanned_at: Option<String>,
     pub installed_mod_count: i64,
     pub enabled_mod_count: i64,
+    #[cfg_attr(windows, serde(serialize_with = "serialize_game_metadata"))]
     pub metadata: Value,
     pub created_at: String,
     pub updated_at: String,
 }
 
 const GAME_COLUMNS: &str = "id,name,slug,root_path,platform,adapter_slug,adapter_version,confidence,cover_path,steam_app_id,last_scanned_at,installed_mod_count,enabled_mod_count,metadata_json,created_at,updated_at";
+
+// Older registrations contain canonical paths in this otherwise opaque JSON.
+#[cfg(windows)]
+fn serialize_game_metadata<S: serde::Serializer>(
+    metadata: &Value,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    fn display_field(value: Option<&mut Value>) {
+        if let Some(Value::String(text)) = value {
+            crate::paths::set_user_path_text(text);
+        }
+    }
+    let mut metadata = metadata.clone();
+    display_field(metadata.get_mut("launchPath"));
+    if let Some(candidate) = metadata.get_mut("lastIdentification") {
+        display_field(candidate.get_mut("rootPath"));
+        if let Some(sources) = candidate.get_mut("sources").and_then(Value::as_array_mut) {
+            for source in sources {
+                display_field(source.get_mut("metadataPath"));
+            }
+        }
+    }
+    metadata.serialize(serializer)
+}
 
 fn game_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Game> {
     let metadata: String = row.get(13)?;
@@ -331,6 +359,10 @@ fn score_adapter(
     })
 }
 
+fn auto_match(best: Option<&AdapterMatch>, ambiguous: bool) -> Option<&AdapterMatch> {
+    best.filter(|m| m.confidence >= HIGH_CONFIDENCE && !ambiguous)
+}
+
 fn identify_at(
     root: &Path,
     adapters: &[GameAdapter],
@@ -362,9 +394,10 @@ fn identify_at(
     let ambiguous = matches
         .get(1)
         .is_some_and(|other| confidence - other.confidence < 0.15);
+    let suggested = auto_match(best, ambiguous);
     let status = if best.is_none() {
         IdentificationStatus::Unidentified
-    } else if confidence >= HIGH_CONFIDENCE && !ambiguous {
+    } else if suggested.is_some() {
         IdentificationStatus::HighConfidence
     } else {
         IdentificationStatus::Candidate
@@ -373,29 +406,31 @@ fn identify_at(
     if ambiguous {
         warnings.push("多个适配包具有接近的得分，需要人工选择".into());
     }
-    if let Some(best) = best {
-        if best.platform != host_platform() {
+    if let Some(matched) = suggested {
+        if matched.platform != host_platform() {
             warnings.push(format!(
                 "标记显示 {} 布局；尚未确认当前主机的运行环境",
-                platform_name(best.platform)
+                platform_name(matched.platform)
             ));
         }
     }
-    let name = best
+    let name = suggested
         .map(|m| m.name.clone())
         .or_else(|| sources.iter().find_map(|s| s.display_name.clone()))
         .unwrap_or_else(|| {
             root.file_name()
                 .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| root.display().to_string())
+                .unwrap_or_else(|| user_path(root).display().to_string())
         });
     Ok(GameCandidate {
-        root_path: path_text(root)?,
+        root_path: path_text(&user_path(root))?,
         name,
         confidence,
         status,
-        suggested_adapter_slug: best.map(|m| m.slug.clone()),
-        platform: best.map_or("unknown", |m| platform_name(m.platform)).into(),
+        suggested_adapter_slug: suggested.map(|m| m.slug.clone()),
+        platform: suggested
+            .map_or("unknown", |m| platform_name(m.platform))
+            .into(),
         matches,
         sources,
         requires_confirmation: true,
@@ -408,11 +443,20 @@ fn identify_at(
 /// markers and near-tied matches never produce a high-confidence identity.
 pub fn identify_game(db: &Db, directory: &Path) -> AppResult<GameCandidate> {
     let root = canonical_directory(directory)?;
-    identify_at(
+    let mut candidate = identify_at(
         &root,
         &active_adapters(db)?,
         vec![DiscoverySource::simple(DiscoveryKind::User)],
-    )
+    )?;
+    candidate.registered_game_id = db
+        .conn()
+        .query_row(
+            "SELECT id FROM games WHERE root_path=?1",
+            [path_text(&root)?],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(candidate)
 }
 
 /// Explicit user-selected root registration. Passing an adapter slug also
@@ -421,7 +465,29 @@ pub fn identify_game(db: &Db, directory: &Path) -> AppResult<GameCandidate> {
 /// Existing install counts, cover, creation time, metadata and identity survive
 /// repeated root registration unless a different adapter is explicitly selected.
 pub fn register_game(db: &Db, directory: &Path, adapter_slug: Option<&str>) -> AppResult<Game> {
-    register_game_inner(db, directory, adapter_slug, None)
+    let selection = adapter_slug.map_or(AdapterSelection::Automatic, AdapterSelection::Explicit);
+    register_game_inner(db, directory, selection, None)
+}
+
+/// The reviewed scan can include launcher evidence unavailable to a directory-only probe.
+/// Attach an adapter only when both probes suggest the same identity.
+pub(crate) fn register_discovered_game(
+    db: &Db,
+    directory: &Path,
+    suggested_adapter_slug: Option<&str>,
+) -> AppResult<Game> {
+    register_game_inner(
+        db,
+        directory,
+        AdapterSelection::Discovered(suggested_adapter_slug),
+        None,
+    )
+}
+
+enum AdapterSelection<'a> {
+    Automatic,
+    Explicit(&'a str),
+    Discovered(Option<&'a str>),
 }
 
 pub(crate) fn rebind_game(db: &Db, game: &Game, adapter_slug: &str) -> AppResult<Game> {
@@ -429,7 +495,7 @@ pub(crate) fn rebind_game(db: &Db, game: &Game, adapter_slug: &str) -> AppResult
     register_game_inner(
         db,
         Path::new(&game.root_path),
-        Some(adapter_slug),
+        AdapterSelection::Explicit(adapter_slug),
         Some(&game.id),
     )
 }
@@ -437,7 +503,7 @@ pub(crate) fn rebind_game(db: &Db, game: &Game, adapter_slug: &str) -> AppResult
 fn register_game_inner(
     db: &Db,
     directory: &Path,
-    adapter_slug: Option<&str>,
+    selection: AdapterSelection<'_>,
     expected_game_id: Option<&str>,
 ) -> AppResult<Game> {
     let root = canonical_directory(directory)?;
@@ -450,7 +516,13 @@ fn register_game_inner(
         &adapters,
         vec![DiscoverySource::simple(DiscoveryKind::User)],
     )?;
-    let selected = if let Some(slug) = adapter_slug {
+    let suggested = candidate.suggested_adapter_slug.as_deref();
+    let selected_slug = match selection {
+        AdapterSelection::Automatic => suggested,
+        AdapterSelection::Explicit(slug) => Some(slug),
+        AdapterSelection::Discovered(reviewed) => suggested.filter(|slug| Some(*slug) == reviewed),
+    };
+    let selected = if let Some(slug) = selected_slug {
         plugins::validate_slug(slug)?;
         adapters
             .iter()
@@ -463,8 +535,6 @@ fn register_game_inner(
                 .find(|m| m.slug == slug && !m.matched_markers.is_empty())
                 .ok_or_else(|| invalid("所选适配包没有任何实际匹配的磁盘标记"))?,
         )
-    } else if candidate.status == IdentificationStatus::HighConfidence {
-        candidate.matches.first()
     } else {
         None
     };
@@ -482,8 +552,8 @@ fn register_game_inner(
     if expected_game_id.is_some_and(|id| existing.as_ref().is_none_or(|game| game.id != id)) {
         return Err(AppError::Conflict("已登记的游戏目录已改变".into()));
     }
-    let retain_identity =
-        adapter_slug.is_none() && existing.as_ref().is_some_and(|g| g.adapter_slug.is_some());
+    let retain_identity = !matches!(selection, AdapterSelection::Explicit(_))
+        && existing.as_ref().is_some_and(|g| g.adapter_slug.is_some());
     let old = existing.as_ref();
     let adapter = selected.and_then(|m| adapters.iter().find(|a| a.slug == m.slug));
     let slug = if retain_identity {
@@ -990,6 +1060,13 @@ struct Scanner<'a> {
     report: ScanReport,
     probes: BTreeMap<PathBuf, Vec<DiscoverySource>>,
     user_install_hints: BTreeSet<PathBuf>,
+    tree_listings: BTreeMap<PathBuf, TreeListing>,
+}
+
+#[derive(Default)]
+struct TreeListing {
+    children: Vec<PathBuf>,
+    install_hint: bool,
 }
 
 // Filename evidence for an unadapted installation, not an adapter match or a launch target.
@@ -1027,7 +1104,7 @@ impl Scanner<'_> {
         // Warnings are also bounded if a directory contains many broken files.
         if self.report.warnings.len() < 256 {
             self.report.warnings.push(ScanWarning {
-                path: path.display().to_string(),
+                path: user_path(path).display().to_string(),
                 message: message.to_string(),
             });
         }
@@ -1050,17 +1127,24 @@ impl Scanner<'_> {
                 return;
             }
         };
-        if let Some(sources) = self.probes.get_mut(&root) {
-            if !sources.contains(&source) {
-                sources.push(source);
-            }
-            return;
+        if self.has_probe_capacity(&root) {
+            self.record_probe(root, source);
         }
-        if self.probes.len() >= self.options.max_directories {
-            self.limit(path);
-            return;
+    }
+
+    fn has_probe_capacity(&mut self, root: &Path) -> bool {
+        if self.probes.len() >= self.options.max_directories && !self.probes.contains_key(root) {
+            self.limit(root);
+            return false;
         }
-        self.probes.insert(root, vec![source]);
+        true
+    }
+
+    fn record_probe(&mut self, root: PathBuf, source: DiscoverySource) {
+        let sources = self.probes.entry(root).or_default();
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
     }
     fn entries(&mut self, path: &Path) -> Vec<fs::DirEntry> {
         let mut result = Vec::new();
@@ -1086,68 +1170,94 @@ impl Scanner<'_> {
         result.sort_by_key(fs::DirEntry::file_name);
         result
     }
-    fn tree(&mut self, path: &Path, kind: DiscoveryKind, depth: u8) {
-        let base = match canonical_directory(path) {
-            Ok(base) => base,
-            Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                if kind == DiscoveryKind::User {
-                    self.warn(path, "所选扫描目录不存在");
+    fn trees<'a>(
+        &mut self,
+        roots: impl Iterator<Item = &'a PathBuf>,
+        kind: DiscoveryKind,
+        depth: u8,
+    ) {
+        // Seed all roots before visiting children. An overlapping user-selected
+        // directory then gets its own full depth and immediate-child hints.
+        let mut queue = VecDeque::new();
+        for path in roots {
+            match canonical_directory(path) {
+                Ok(base) => queue.push_back((base, 0)),
+                Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if kind == DiscoveryKind::User {
+                        self.warn(path, "所选扫描目录不存在");
+                    }
                 }
-                return;
+                Err(e) => self.warn(path, e),
             }
-            Err(e) => {
-                self.warn(path, e);
-                return;
-            }
-        };
-        let mut queue = VecDeque::from([(base, 0)]);
+        }
         let mut seen = BTreeSet::new();
         while let Some((path, level)) = queue.pop_front() {
             if !seen.insert(path.clone()) {
                 continue;
             }
-            if self.probes.len() >= self.options.max_directories && !self.probes.contains_key(&path)
-            {
-                self.limit(&path);
-                break;
+            if !self.has_probe_capacity(&path) {
+                continue;
             }
-            self.probe(&path, DiscoverySource::simple(kind.clone()));
+            // Children came from a listing under a canonical parent. Do not
+            // switch to a different root if a directory has since become a link.
+            match canonical_directory(&path) {
+                Ok(current) if current == path => {}
+                Ok(_) => {
+                    self.warn(&path, "目录已被链接替换，跳过扫描");
+                    continue;
+                }
+                Err(e) => {
+                    self.warn(&path, e);
+                    continue;
+                }
+            }
+            self.record_probe(path.clone(), DiscoverySource::simple(kind.clone()));
             // Only treat launch files at a chosen root or its immediate children as hints;
             // nested tool, installer and engine directories are not separate games.
             let check_hints = kind == DiscoveryKind::User && level <= 1;
             if level >= depth && !check_hints {
                 continue;
             }
-            if self.probes.len() >= self.options.max_directories {
-                self.limit(&path);
-                break;
-            }
-            for entry in self.entries(&path) {
-                // No recursive following of symlinks/reparse points. A root
-                // directly chosen by the user may itself be canonicalized.
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
-                };
-                if check_hints && install_hint(&path, &entry, file_type) {
-                    self.user_install_hints.insert(path.clone());
-                }
-                if level < depth && file_type.is_dir() && !file_type.is_symlink() {
-                    let name = entry.file_name();
-                    if matches!(
-                        name.to_str(),
-                        Some(
-                            ".git"
-                                | ".egstore"
-                                | "node_modules"
-                                | "compatdata"
-                                | "workshop"
-                                | "downloading"
-                        )
-                    ) {
+            if !self.tree_listings.contains_key(&path) {
+                let mut listing = TreeListing::default();
+                for entry in self.entries(&path) {
+                    // No recursive following of symlinks/reparse points. A root
+                    // directly chosen by the user may itself be canonicalized.
+                    let Ok(file_type) = entry.file_type() else {
                         continue;
+                    };
+                    listing.install_hint |= install_hint(&path, &entry, file_type);
+                    if file_type.is_dir() && !file_type.is_symlink() {
+                        let name = entry.file_name();
+                        if matches!(
+                            name.to_str(),
+                            Some(
+                                ".git"
+                                    | ".egstore"
+                                    | "node_modules"
+                                    | "compatdata"
+                                    | "workshop"
+                                    | "downloading"
+                            )
+                        ) {
+                            continue;
+                        }
+                        listing.children.push(entry.path());
                     }
-                    queue.push_back((entry.path(), level + 1));
                 }
+                self.tree_listings.insert(path.clone(), listing);
+            }
+            let listing = &self.tree_listings[&path];
+            if check_hints && listing.install_hint {
+                self.user_install_hints.insert(path);
+            }
+            if level < depth {
+                queue.extend(
+                    listing
+                        .children
+                        .iter()
+                        .map(|child| (child.clone(), level + 1)),
+                );
             }
         }
     }
@@ -1155,12 +1265,7 @@ impl Scanner<'_> {
         let mut queue: VecDeque<_> = initial.iter().cloned().collect();
         let mut seen = BTreeSet::new();
         while let Some(path) = queue.pop_front() {
-            let path = if path.file_name().is_some_and(|n| n == "steamapps") {
-                path.parent().unwrap_or(&path).to_path_buf()
-            } else {
-                path
-            };
-            let library = match canonical_directory(&path) {
+            let mut library = match canonical_directory(&path) {
                 Ok(path) => path,
                 Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
@@ -1168,6 +1273,9 @@ impl Scanner<'_> {
                     continue;
                 }
             };
+            if library.file_name().is_some_and(|n| n == "steamapps") {
+                library.pop();
+            }
             if seen.contains(&library) {
                 continue;
             }
@@ -1239,7 +1347,7 @@ impl Scanner<'_> {
                     Ok(path) if path.starts_with(&common) && path != common => {
                         let source = DiscoverySource {
                             kind: DiscoveryKind::Steam,
-                            metadata_path: Some(file.display().to_string()),
+                            metadata_path: Some(user_path(&file).display().to_string()),
                             display_name: Some(manifest.name),
                             steam_app_id: Some(manifest.app_id.to_string()),
                             complete_install: manifest
@@ -1273,12 +1381,20 @@ impl Scanner<'_> {
         }
     }
     fn epic_manifests(&mut self, directories: &[PathBuf]) {
+        let mut seen = BTreeSet::new();
         for directory in directories {
-            if !directory.is_absolute() {
-                self.warn(directory, "Epic 元数据目录必须是绝对路径");
+            let directory = match canonical_directory(directory) {
+                Ok(path) => path,
+                Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    self.warn(directory, e);
+                    continue;
+                }
+            };
+            if !seen.insert(directory.clone()) {
                 continue;
             }
-            for entry in self.entries(directory) {
+            for entry in self.entries(&directory) {
                 if entry.path().extension().is_none_or(|s| s != "item") {
                     continue;
                 }
@@ -1299,7 +1415,7 @@ impl Scanner<'_> {
                             &manifest.install_location,
                             DiscoverySource {
                                 kind: DiscoveryKind::Epic,
-                                metadata_path: Some(file.display().to_string()),
+                                metadata_path: Some(user_path(&file).display().to_string()),
                                 display_name: Some(manifest.display_name),
                                 steam_app_id: None,
                                 complete_install: Some(
@@ -1314,7 +1430,20 @@ impl Scanner<'_> {
         }
     }
     fn legendary(&mut self, files: &[PathBuf]) {
+        let mut seen = BTreeSet::new();
         for file in files {
+            let canonical = match file.canonicalize() {
+                Ok(path) => path,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    self.warn(file, e);
+                    continue;
+                }
+            };
+            if seen.contains(&canonical) {
+                continue;
+            }
+            // Validate the supplied file itself so a link cannot stand in for a manifest.
             let entries = match read_metadata(file).and_then(|s| {
                 serde_json::from_str::<BTreeMap<String, Value>>(&s).map_err(AppError::from)
             }) {
@@ -1325,6 +1454,7 @@ impl Scanner<'_> {
                     continue;
                 }
             };
+            seen.insert(canonical.clone());
             for entry in entries.into_values() {
                 if self.report.entries_checked >= self.options.max_entries {
                     self.limit(file);
@@ -1350,7 +1480,7 @@ impl Scanner<'_> {
                     &entry.install_path,
                     DiscoverySource {
                         kind: DiscoveryKind::Epic,
-                        metadata_path: Some(file.display().to_string()),
+                        metadata_path: Some(user_path(&canonical).display().to_string()),
                         display_name: Some(entry.title),
                         steam_app_id: None,
                         complete_install: entry.needs_verification.then_some(false),
@@ -1414,10 +1544,17 @@ pub fn scan_games(db: &Db, options: &ScanOptions) -> AppResult<ScanReport> {
         }
     }
     let adapters = active_adapters(db)?;
-    let existing: BTreeMap<_, _> = list_games(db)?
-        .into_iter()
-        .map(|g| (g.root_path, g.id))
-        .collect();
+    let existing = {
+        let conn = db.conn();
+        let mut stmt = conn.prepare("SELECT root_path,id FROM games")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                PathBuf::from(row.get::<_, String>(0)?),
+                row.get::<_, String>(1)?,
+            ))
+        })?;
+        rows.collect::<Result<BTreeMap<_, _>, _>>()?
+    };
     let common = if options.include_common_roots {
         common_roots()
     } else {
@@ -1429,6 +1566,7 @@ pub fn scan_games(db: &Db, options: &ScanOptions) -> AppResult<ScanReport> {
         report: ScanReport::default(),
         probes: BTreeMap::new(),
         user_install_hints: BTreeSet::new(),
+        tree_listings: BTreeMap::new(),
     };
     scanner.steam(
         &options
@@ -1454,19 +1592,23 @@ pub fn scan_games(db: &Db, options: &ScanOptions) -> AppResult<ScanReport> {
             .cloned()
             .collect::<Vec<_>>(),
     );
-    for root in &options.user_roots {
-        scanner.tree(root, DiscoveryKind::User, options.max_depth);
-    }
-    for root in options.epic_roots.iter().chain(&common.epic) {
-        scanner.tree(root, DiscoveryKind::Epic, options.max_depth);
-    }
+    scanner.trees(
+        options.user_roots.iter(),
+        DiscoveryKind::User,
+        options.max_depth,
+    );
+    scanner.trees(
+        options.epic_roots.iter().chain(&common.epic),
+        DiscoveryKind::Epic,
+        options.max_depth,
+    );
     for root in &common.game_instances {
         scanner.probe(root, DiscoverySource::simple(DiscoveryKind::Common));
     }
     scanner.report.directories_checked = scanner.probes.len();
     for (root, sources) in &scanner.probes {
         let mut candidate = identify_at(root, scanner.adapters, sources.clone())?;
-        candidate.registered_game_id = existing.get(&candidate.root_path).cloned();
+        candidate.registered_game_id = existing.get(root).cloned();
         if candidate.matches.is_empty() && !sources.iter().any(|s| s.metadata_path.is_some()) {
             if scanner.user_install_hints.contains(root) {
                 candidate
@@ -1512,6 +1654,26 @@ mod tests {
     }
     fn acf(id: &str, directory: &str) -> String {
         format!("\"AppState\" {{ \"appid\" \"{id}\" \"name\" \"A game\" \"installdir\" \"{directory}\" \"StateFlags\" \"4\" }}")
+    }
+
+    fn match_with_confidence(confidence: f64) -> AdapterMatch {
+        AdapterMatch {
+            slug: "fixture-game".into(),
+            name: "Fixture Game".into(),
+            version: "1.0.0".into(),
+            platform: host_platform(),
+            confidence,
+            matched_markers: vec!["game.exe".into()],
+            missing_required_markers: vec![],
+            distinctive_file_matched: true,
+            reasons: vec![],
+        }
+    }
+
+    fn bg3(root: &Path) {
+        make_file(root, "bin/bg3.exe");
+        make_file(root, "bin/bg3_dx11.exe");
+        fs::create_dir_all(root.join("Data")).unwrap();
     }
 
     #[test]
@@ -1626,6 +1788,143 @@ mod tests {
     }
 
     #[test]
+    fn auto_match_requires_at_least_80_percent_and_a_unique_best_match() {
+        assert_eq!(HIGH_CONFIDENCE, 0.80);
+
+        let below_threshold = match_with_confidence(0.799_999);
+        assert!(auto_match(Some(&below_threshold), false).is_none());
+
+        let at_threshold = match_with_confidence(0.80);
+        assert_eq!(
+            auto_match(Some(&at_threshold), false).map(|matched| matched.slug.as_str()),
+            Some("fixture-game")
+        );
+        assert!(auto_match(Some(&at_threshold), true).is_none());
+        assert!(auto_match(None, false).is_none());
+    }
+
+    #[test]
+    fn generic_bg3_data_marker_keeps_8_percent_evidence_without_guessing_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db(&temp);
+        let game = temp.path().join("unrelated-folder");
+        fs::create_dir_all(game.join("Data")).unwrap();
+
+        let identified = identify_game(&db, &game).unwrap();
+        assert_eq!(identified.status, IdentificationStatus::Candidate);
+        assert_eq!(identified.name, "unrelated-folder");
+        assert_eq!(identified.platform, "unknown");
+        assert_eq!(identified.suggested_adapter_slug, None);
+        assert!(identified.requires_confirmation);
+        assert!((identified.confidence - (0.7 / 9.0)).abs() < 1e-12);
+        let weak_match = identified
+            .matches
+            .iter()
+            .find(|matched| matched.slug == "baldurs-gate-3")
+            .expect("the raw weak adapter evidence remains available");
+        assert!((weak_match.confidence - identified.confidence).abs() < 1e-12);
+        assert_eq!(weak_match.matched_markers, ["Data"]);
+        assert!(!weak_match.distinctive_file_matched);
+
+        let report = scan_games(
+            &db,
+            &ScanOptions {
+                user_roots: vec![game.clone()],
+                max_depth: 0,
+                ..scan_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.candidates.len(), 1);
+        let scanned = &report.candidates[0];
+        assert_eq!(scanned.status, IdentificationStatus::Candidate);
+        assert_eq!(scanned.name, "unrelated-folder");
+        assert_eq!(scanned.platform, "unknown");
+        assert_eq!(scanned.suggested_adapter_slug, None);
+        assert!((scanned.confidence - identified.confidence).abs() < 1e-12);
+        assert_eq!(scanned.matches[0].slug, "baldurs-gate-3");
+        assert!(scanned.registered_game_id.is_none());
+        assert!(scanned.requires_confirmation);
+        assert!(list_games(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn discovered_registration_respects_a_launcher_downgrade() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db(&temp);
+        let steam = temp.path().join("Steam");
+        let game = steam.join("steamapps/common/game-root");
+        bg3(&game);
+        // The files match BG3, but the manifest belongs to a different app.
+        fs::write(
+            steam.join("steamapps/appmanifest_123.acf"),
+            acf("123", "game-root"),
+        )
+        .unwrap();
+        let report = scan_games(
+            &db,
+            &ScanOptions {
+                steam_roots: vec![steam],
+                ..scan_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.candidates.len(), 1);
+        let scanned = &report.candidates[0];
+        assert_eq!(scanned.name, "A game");
+        assert_eq!(scanned.suggested_adapter_slug, None);
+        assert!(scanned.confidence < HIGH_CONFIDENCE);
+        assert_eq!(identify_game(&db, &game).unwrap().confidence, 1.0);
+        let registered =
+            register_discovered_game(&db, &game, scanned.suggested_adapter_slug.as_deref())
+                .unwrap();
+        assert_eq!(registered.adapter_slug, None);
+        assert_eq!(registered.adapter_version, None);
+        assert_eq!(registered.confidence, 0.0);
+        assert_eq!(registered.slug, "unknown");
+        assert_eq!(list_games(&db).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn discovered_registration_rechecks_a_stale_strong_suggestion_before_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db(&temp);
+        let game = temp.path().join("game-root");
+        bg3(&game);
+
+        let report = scan_games(
+            &db,
+            &ScanOptions {
+                user_roots: vec![game.clone()],
+                max_depth: 0,
+                ..scan_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(
+            report.candidates[0].suggested_adapter_slug.as_deref(),
+            Some("baldurs-gate-3")
+        );
+        assert_eq!(
+            report.candidates[0].status,
+            IdentificationStatus::HighConfidence
+        );
+
+        fs::remove_file(game.join("bin/bg3_dx11.exe")).unwrap();
+        let registered = register_discovered_game(
+            &db,
+            &game,
+            report.candidates[0].suggested_adapter_slug.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(registered.adapter_slug, None);
+        assert_eq!(registered.adapter_version, None);
+        assert_eq!(registered.confidence, 0.0);
+        assert_eq!(registered.slug, "unknown");
+    }
+
+    #[test]
     fn all_six_adapter_layouts_are_identified_without_claiming_native_runtime_support() {
         let temp = tempfile::tempdir().unwrap();
         let db = db(&temp);
@@ -1640,15 +1939,22 @@ mod tests {
                 }
             }
             let result = identify_game(&db, &root).unwrap();
-            assert_eq!(
-                result.suggested_adapter_slug.as_deref(),
-                Some(adapter.slug.as_str())
-            );
             assert!(result.requires_confirmation);
             if adapter.slug == "minecraft-java" {
                 assert_eq!(result.status, IdentificationStatus::Candidate);
+                assert_eq!(result.suggested_adapter_slug, None);
+                assert_eq!(result.platform, "unknown");
+                assert!(result.confidence < HIGH_CONFIDENCE);
+                assert!(result
+                    .matches
+                    .iter()
+                    .any(|matched| matched.slug == adapter.slug));
             } else {
                 assert_eq!(result.status, IdentificationStatus::HighConfidence);
+                assert_eq!(
+                    result.suggested_adapter_slug.as_deref(),
+                    Some(adapter.slug.as_str())
+                );
             }
         }
     }
@@ -1664,6 +1970,8 @@ mod tests {
         second.slug = "other-layout".into();
         let result = identify_at(&root, &[first, second], vec![]).unwrap();
         assert_eq!(result.status, IdentificationStatus::Candidate);
+        assert_eq!(result.suggested_adapter_slug, None);
+        assert_eq!(result.name, "game");
         assert_eq!(result.matches.len(), 2);
         assert!(!result.warnings.is_empty());
     }
@@ -1812,9 +2120,7 @@ mod tests {
         assert_eq!(report.candidates.len(), 1);
         assert_eq!(
             report.candidates[0].root_path,
-            game.join("Contents/MacOS")
-                .canonicalize()
-                .unwrap()
+            user_path(&game.join("Contents/MacOS").canonicalize().unwrap())
                 .to_str()
                 .unwrap()
         );
@@ -1964,6 +2270,182 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn overlapping_tree_scans_keep_each_roots_depth_and_count_entries_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db(&temp);
+        let library = temp.path().join("library");
+        let nested = library.join("nested");
+        make_file(&nested, "Portable/game.exe");
+        let result = scan_games(
+            &db,
+            &ScanOptions {
+                user_roots: vec![library.clone(), nested.clone(), library.join(".")],
+                epic_roots: vec![nested.clone(), library],
+                max_depth: 1,
+                max_directories: 3,
+                max_entries: 3,
+                ..scan_options()
+            },
+        )
+        .unwrap();
+        assert!(!result.truncated);
+        assert_eq!((result.directories_checked, result.entries_checked), (3, 3));
+        assert_eq!(result.candidates.len(), 1);
+        let portable = &result.candidates[0];
+        assert_eq!(portable.name, "Portable");
+        assert_eq!(portable.sources.len(), 2);
+        assert!(portable
+            .sources
+            .iter()
+            .any(|s| s.kind == DiscoveryKind::User));
+        assert!(portable
+            .sources
+            .iter()
+            .any(|s| s.kind == DiscoveryKind::Epic));
+    }
+
+    #[test]
+    fn duplicate_launcher_inputs_count_once_and_return_display_metadata_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db(&temp);
+        let manifest_dir = temp.path().join("Manifests");
+        let game = temp.path().join("Arcade");
+        fs::create_dir_all(&manifest_dir).unwrap();
+        fs::create_dir(&game).unwrap();
+        let item = manifest_dir.join("Arcade.item");
+        fs::write(
+            &item,
+            json!({"DisplayName":"Arcade", "InstallLocation":game}).to_string(),
+        )
+        .unwrap();
+        let installed = temp.path().join("installed.json");
+        fs::write(
+            &installed,
+            json!({"id":{"title":"Arcade", "install_path":game}}).to_string(),
+        )
+        .unwrap();
+        let result = scan_games(
+            &db,
+            &ScanOptions {
+                epic_manifest_dirs: vec![
+                    manifest_dir.clone(),
+                    manifest_dir.canonicalize().unwrap(),
+                ],
+                legendary_installed_files: vec![
+                    installed.clone(),
+                    installed.canonicalize().unwrap(),
+                ],
+                max_entries: 2,
+                ..scan_options()
+            },
+        )
+        .unwrap();
+        assert!(!result.truncated);
+        assert_eq!(result.entries_checked, 2);
+        assert_eq!(result.candidates.len(), 1);
+        let metadata: BTreeSet<_> = result.candidates[0]
+            .sources
+            .iter()
+            .map(|s| s.metadata_path.as_deref().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            metadata,
+            [item, installed]
+                .map(|p| user_path(&p.canonicalize().unwrap()).display().to_string())
+                .into()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_registration_matches_display_paths_with_native_case_and_separators() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db(&temp);
+        let game = temp.path().join("Arcade");
+        fs::create_dir(&game).unwrap();
+        let canonical = game.canonicalize().unwrap();
+        assert!(canonical.to_str().unwrap().starts_with(r"\\?\"));
+        let raw = canonical.to_str().unwrap();
+        let display = path_text(&user_path(&canonical)).unwrap();
+        assert_ne!(raw, display);
+        let metadata = json!({"lastIdentification":{"rootPath":raw, "sources":[{"metadataPath":raw}]}, "custom":raw});
+        db.conn().execute("INSERT INTO games (id,name,slug,root_path,metadata_json,created_at,updated_at) VALUES ('legacy','Arcade','unknown',?1,?2,'old','old')", params![raw,metadata.to_string()]).unwrap();
+        let variant = game.with_file_name("aRCaDE");
+        let input = if variant.exists() { variant } else { game };
+        let input = PathBuf::from(user_path(&input).to_str().unwrap().replace('\\', "/"));
+        let identified = identify_game(&db, &input).unwrap();
+        assert_eq!(identified.root_path, display);
+        assert_eq!(identified.registered_game_id.as_deref(), Some("legacy"));
+        let report = scan_games(
+            &db,
+            &ScanOptions {
+                user_roots: vec![input, canonical.clone()],
+                ..scan_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.candidates.len(), 1);
+        let candidate = &report.candidates[0];
+        assert_eq!(candidate.root_path, display);
+        assert_eq!(candidate.registered_game_id.as_deref(), Some("legacy"));
+        let stored = get_game(&db, "legacy").unwrap();
+        assert_eq!(stored.root_path, raw);
+        assert_eq!(stored.metadata, metadata);
+        let dto = serde_json::to_value(stored).unwrap();
+        assert_eq!(dto["rootPath"], display);
+        assert_eq!(dto["metadata"]["lastIdentification"]["rootPath"], display);
+        assert_eq!(
+            dto["metadata"]["lastIdentification"]["sources"][0]["metadataPath"],
+            display
+        );
+        assert_eq!(dto["metadata"]["custom"], raw);
+        let registered =
+            register_discovered_game(&db, Path::new(&candidate.root_path), None).unwrap();
+        assert_eq!(registered.id, "legacy");
+        assert_eq!(registered.root_path, raw);
+        assert_eq!(list_games(&db).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_backslashes_and_case_distinct_installations_keep_separate_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db(&temp);
+        let library = temp.path().join("library");
+        let first = library.join(r"game\Name");
+        let mut roots = vec![first.clone(), library.join("game/Name")];
+        fs::create_dir_all(&first).unwrap();
+        let case_variant = library.join(r"Game\Name");
+        if !case_variant.exists() {
+            roots.push(case_variant);
+        }
+        let mut ids = BTreeSet::new();
+        for root in &roots {
+            fs::create_dir_all(root).unwrap();
+            assert!(ids.insert(register_game(&db, root, None).unwrap().id));
+        }
+        let result = scan_games(
+            &db,
+            &ScanOptions {
+                user_roots: roots,
+                max_depth: 0,
+                ..scan_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.candidates.len(), ids.len());
+        for candidate in result.candidates {
+            assert!(ids.remove(&candidate.registered_game_id.unwrap()));
+            assert_eq!(
+                identify_game(&db, Path::new(&candidate.root_path))
+                    .unwrap()
+                    .root_path,
+                candidate.root_path
+            );
+        }
     }
 
     #[test]

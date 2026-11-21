@@ -1,3 +1,4 @@
+import { displayPath } from "@/lib/paths";
 import { Badge, EmptyState, PathText } from '@/components/ui';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Item, ItemActions, ItemContent, ItemGroup, ItemTitle } from '@/components/ui/item';
@@ -51,7 +52,7 @@ export function FabricDiskEvidence({ report }: { report: FabricDisk }) {
         {label && <Badge tone={report.status === 'partial' || report.status === 'unavailable' ? 'warning' : undefined}>{label}</Badge>}
       </CardHeader>
       <CardContent className="flex min-w-0 flex-col gap-3">
-        <p><PathText>{report.directory}</PathText></p>
+        <p><PathText>{displayPath(report.directory)}</PathText></p>
         {report.jars.length > 0 ? <details open className="min-w-0 rounded-md border p-3">
           <summary className="cursor-pointer rounded-sm text-sm font-medium focus-visible:outline-2 focus-visible:outline-ring">磁盘 JAR 对照（{report.jars.length}）</summary>
           <ItemGroup aria-label="Fabric JAR 对照清单" className="mt-3 gap-2">

@@ -55,7 +55,7 @@ pub fn copy_dir(src: &Path, dst: &Path) -> AppResult<()> {
         } else {
             return Err(AppError::Denied(format!(
                 "拒绝复制链接或特殊文件: {}",
-                entry.path().display()
+                crate::paths::display_path(entry.path())
             )));
         }
     }
@@ -136,7 +136,7 @@ pub fn list_dir_shallow(root: &Path, limit: usize) -> AppResult<Vec<DirEntryInfo
         let meta = entry.metadata().ok();
         out.push(DirEntryInfo {
             name: entry.file_name().to_string_lossy().to_string(),
-            path: path.display().to_string(),
+            path: crate::paths::display_path(&path),
             is_dir: meta.as_ref().map(|m| m.is_dir()).unwrap_or(false),
             size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
             modified: meta

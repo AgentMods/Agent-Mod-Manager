@@ -82,6 +82,13 @@ pub struct DownloadArtifact {
     pub warnings: Vec<String>,
 }
 
+impl DownloadArtifact {
+    pub(crate) fn into_user_paths(mut self) -> Self {
+        self.path = crate::paths::user_path(&self.path).into_owned();
+        self
+    }
+}
+
 #[derive(Clone)]
 pub struct DownloadManager {
     root: PathBuf,

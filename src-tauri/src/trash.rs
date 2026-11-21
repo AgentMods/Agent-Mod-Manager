@@ -30,6 +30,14 @@ pub struct TrashItem {
     pub restore_requires_rollback: bool,
 }
 
+impl TrashItem {
+    pub(crate) fn into_user_paths(mut self) -> Self {
+        crate::paths::set_user_path_text(&mut self.original_path);
+        crate::paths::set_user_path_text(&mut self.trash_path);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrashRequest {
     pub paths: Vec<String>,
@@ -196,7 +204,10 @@ pub fn plan_restore(engine: &FileEngine, ids: &[String], overwrite: bool) -> App
             .paths
             .guard(Path::new(&item.original_path), &engine.roots()?)?;
         if dst.exists() && !overwrite {
-            return Err(AppError::Conflict(format!("目标已存在: {}", dst.display())));
+            return Err(AppError::Conflict(format!(
+                "目标已存在: {}",
+                crate::paths::display_path(&dst)
+            )));
         }
         ops.push(FileOp::Move { src, dst });
     }

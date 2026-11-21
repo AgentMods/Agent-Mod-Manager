@@ -186,9 +186,9 @@ fn rename(src: &Path, dst: &Path, expected: Option<&FileIdentity>) -> AppResult<
     // A simple name with a NULL destination handle is a same-directory rename.
     let destination = (old_parent != new_parent).then_some(to.file());
     match rename_to(&source, destination, &name) {
-        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(AppError::Conflict(format!("目标已存在: {}", dst.display())))
-        }
+        Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(
+            AppError::Conflict(format!("目标已存在: {}", crate::paths::display_path(dst))),
+        ),
         result => result,
     }
 }

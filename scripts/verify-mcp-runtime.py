@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 import stat
 import subprocess
@@ -49,8 +50,18 @@ def verify(archive_path, work):
     home = work / 'home'
     home.mkdir()
     env = {k: os.environ[k] for k in ('SYSTEMROOT', 'WINDIR') if k in os.environ}
-    # The only other PATH entries contain system shell tools used by package bin wrappers.
-    os_bins = [str(Path(env['SYSTEMROOT']) / 'System32')] if os.name == 'nt' else ['/bin', '/usr/bin']
+    if os.name == 'nt':
+        os_bins = [str(Path(env['SYSTEMROOT']) / 'System32')]
+    else:
+        # Expose shell tools used by package wrappers, excluding system node/npm/uv.
+        shell_dir = work / 'shell'
+        shell_dir.mkdir()
+        for name in ('sh', 'realpath', 'dirname'):
+            source = shutil.which(name)
+            if source is None:
+                raise RuntimeError(f'Missing system utility: {name}')
+            (shell_dir / name).symlink_to(source)
+        os_bins = [str(shell_dir)]
     env.update(PATH=os.pathsep.join([str(bin_dir), *os_bins]), HOME=str(home), USERPROFILE=str(home),
                TEMP=str(work), TMP=str(work), TMPDIR=str(work), npm_config_cache=str(work / 'npm-cache'),
                UV_CACHE_DIR=str(work / 'uv-cache'), UV_PYTHON_DOWNLOADS='never',

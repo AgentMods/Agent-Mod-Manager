@@ -8,6 +8,7 @@ import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/componen
 import { Separator } from '@/components/ui/separator';
 import { Spinner } from '@/components/ui/spinner';
 import { useBackendQuery } from '@/lib/api';
+import { displayPath } from '@/lib/paths';
 
 type GameFileDetailsProps = {
   file: { name: string; path: string; size: number; modified: string } | null;
@@ -20,7 +21,7 @@ type FileContent = { lines: { line: number; text: string }[]; truncated: boolean
 
 async function copyPath(path: string) {
   try {
-    await navigator.clipboard.writeText(path);
+    await navigator.clipboard.writeText(displayPath(path));
     toast.success('已复制文件路径');
   } catch {
     toast.error('复制文件路径失败，请重试');
@@ -48,7 +49,7 @@ export function GameFileDetails({ file, busy, writable, onTrash }: GameFileDetai
           <dd className="wrap-anywhere font-medium">{file.name}</dd>
           <dt className="text-muted-foreground">路径</dt>
           <dd className="flex min-w-0 items-center gap-1 rounded-md border bg-muted px-2 py-0.5">
-            <PathText className="min-w-0 flex-1" dir="ltr">{file.path}</PathText>
+            <PathText className="min-w-0 flex-1" dir="ltr">{displayPath(file.path)}</PathText>
             <IconButton type="button" size="icon-sm" title="复制文件路径" onClick={() => void copyPath(file.path)}>
               <CopyIcon aria-hidden="true" />
             </IconButton>

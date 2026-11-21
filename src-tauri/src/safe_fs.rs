@@ -17,7 +17,10 @@ pub(crate) struct FileIdentity {
 }
 
 fn wrong_identity(path: &Path) -> AppError {
-    AppError::Conflict(format!("文件对象已改变: {}", path.display()))
+    AppError::Conflict(format!(
+        "文件对象已改变: {}",
+        crate::paths::display_path(path)
+    ))
 }
 
 #[cfg(not(windows))]
@@ -59,7 +62,7 @@ mod platform {
     fn invalid_path(path: &Path) -> AppError {
         AppError::Denied(format!(
             "操作路径必须是无链接的绝对路径: {}",
-            path.display()
+            crate::paths::display_path(path)
         ))
     }
 

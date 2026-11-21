@@ -37,7 +37,8 @@ No real mod was downloaded or published during these checks.
 
 ## Development
 
-Use Node.js 22 or newer, **Yarn 1.22.22**, Rust 1.88 or newer, and the native
+Use Node.js 22 or newer, **Yarn 1.22.22**, Python 3.11 or newer (to prepare the bundled
+MCP runtimes), Rust 1.88 or newer, and the native
 Tauri build prerequisites for the operating system.
 
 ```sh

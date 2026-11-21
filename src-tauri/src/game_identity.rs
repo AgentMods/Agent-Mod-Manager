@@ -66,6 +66,13 @@ pub struct GameIdentitySearch {
     pub created_at: String,
 }
 
+impl GameIdentitySearch {
+    pub(crate) fn into_user_paths(mut self) -> Self {
+        crate::paths::set_user_path_text(&mut self.root_path);
+        self
+    }
+}
+
 fn invalid(message: &str) -> AppError {
     AppError::Invalid(message.into())
 }
@@ -385,7 +392,7 @@ pub fn preview(engine: &FileEngine, directory: &Path) -> AppResult<GameIdentityP
         String::new()
     };
     Ok(GameIdentityPreview {
-        root_path: scan.root.to_string_lossy().into_owned(), fingerprint: scan.fingerprint,
+        root_path: crate::paths::display_path(&scan.root), fingerprint: scan.fingerprint,
         local_candidate: candidate, signals: scan.signals, suggested_query,
         warnings: vec!["仅将你确认的公开搜索词发送给 Brave；本地名称信号留在本机。网页候选未经验证，不会自动关联适配包。".into()],
     })

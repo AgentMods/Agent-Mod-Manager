@@ -34,6 +34,7 @@ pub enum FabricStatus {
 #[serde(rename_all = "camelCase")]
 pub struct FabricEvidence {
     pub(super) status: FabricStatus,
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub(super) file: String,
     pub(super) modified_at: Option<String>,
     pub(super) game_version: Option<String>,

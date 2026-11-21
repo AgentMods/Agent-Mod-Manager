@@ -1,4 +1,5 @@
 pub mod agent;
+mod agent_attachment;
 pub mod app;
 pub mod archive;
 pub mod artifacts;
@@ -89,6 +90,9 @@ pub fn run() {
             commands::get_game,
             commands::update_game,
             commands::set_game_adapter,
+            commands::remove_game_adapter,
+            commands::list_game_conflicts,
+            commands::resolve_game_conflict,
             commands::remove_game,
             commands::open_game_location,
             commands::launch_game,
@@ -107,6 +111,7 @@ pub fn run() {
             commands::review_modrinth_dependency_graph,
             commands::plan_uninstall,
             commands::rollback_transaction,
+            agent_attachment::convert_agent_attachment,
             commands::start_turn,
             commands::restart_turn,
             commands::cancel_turn,
@@ -156,13 +161,12 @@ pub fn run() {
             let credentials = encrypted_store::open(app.handle(), location.default_root())?;
             let root = location.startup_root()?;
             let paths = storage::AppPaths::new(root)?.with_control_root(location.default_root());
-            let mut services = app::AppServices::initialize_paths(paths)?;
             // Keep executables outside relocatable game data and Agent-accessible roots.
-            services.mcp_connections =
-                mcp_connections::McpConnections::with_runtime(mcp::McpRuntime::bundled(
-                    app.path().resource_dir()?.join("mcp-runtime/runtime.zip"),
-                    location.default_root().join("private/mcp-runtime"),
-                ));
+            let runtime = mcp::McpRuntime::bundled(
+                app.path().resource_dir()?.join("mcp-runtime/runtime.zip"),
+                location.default_root().join("private/mcp-runtime"),
+            );
+            let services = app::AppServices::initialize_paths(paths, runtime)?;
             app.manage(location);
             let handle = app.handle().clone();
             let agent = agent::runtime::AgentRuntime::new(

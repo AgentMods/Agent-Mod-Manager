@@ -69,7 +69,10 @@ impl Fixture {
                 json!({"operations":ops,"summary":"fixture"}),
             )
             .await?;
-        Ok(result["id"].as_str().unwrap().into())
+        let id = result["id"].as_str().unwrap();
+        let stored = ctx.file_engine().get_plan(id).unwrap();
+        assert_eq!(result, json!(stored.into_user_paths()));
+        Ok(id.into())
     }
     async fn apply_after_review(&self, id: &str, effect: Effect) {
         let ctx = self.agent();
@@ -79,7 +82,11 @@ impl Fixture {
         assert_eq!(prepared.effect, effect);
         assert!(PermissionMode::AutoApprove.needs_approval(effect));
         assert!(!PermissionMode::FullTrust.needs_approval(effect));
-        assert_eq!(tool.execute(&ctx, args, prepared).await.unwrap()["id"], id);
+        let stored = ctx.file_engine().get_plan(id).unwrap();
+        assert_eq!(json!(prepared.plan.as_ref().unwrap()), json!(stored));
+        let displayed = json!(stored.into_user_paths());
+        assert_eq!(prepared.preview, displayed);
+        assert_eq!(tool.execute(&ctx, args, prepared).await.unwrap(), displayed);
     }
     fn reopen(&self) -> FileEngine {
         let paths = self.engine.paths.as_ref().clone();

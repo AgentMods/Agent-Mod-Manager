@@ -261,6 +261,41 @@ test("library prefills adapter creation for an unbound game and displays its bou
   expect(calls.some((call: any) => call.command === "start_turn")).toBe(false);
 });
 
+test("library explains adapter conflicts and lets the player release pending tasks", async ({page}) => {
+  await installMockTauri(page, {
+    gameWithoutAdapter: true,
+    gamePlanConflicts: [
+      {id: "txn-pbz-mods", kind: "file_plan", status: "planned", title: "文件任务", summary: "创建 Mods 目录", paths: ["/sandbox/minecraft/Content/Paks/~mods"], detail: "这项任务尚未执行，不会自动修改游戏文件。", canResolve: true, resolutionHint: null},
+      {id: "approval-pbz", kind: "approval", status: "pending", title: "安装 PBZ", summary: "等待确认安装计划", paths: [], detail: "这是一个等待审批的安装任务。", canResolve: true, resolutionHint: null},
+    ],
+  });
+  await page.goto("/");
+  await page.getByRole("button", {name: "游戏库", exact: true}).click();
+  const card = page.getByTestId("library-page").locator('[data-slot="card"]').filter({has: page.getByRole("heading", {name: "Minecraft Java Edition", exact: true})});
+  await card.getByRole("button", {name: "更多操作", exact: true}).click();
+  await page.getByRole("menuitem", {name: "选择适配包", exact: true}).click();
+  const dialog = page.getByRole("dialog", {name: "选择适配包", exact: true});
+  await expect(dialog).toContainText("适配包选择已阻止");
+  await expect(dialog).toContainText("创建 Mods 目录");
+  await expect(dialog).toContainText("/sandbox/minecraft/Content/Paks/~mods");
+  await expect(dialog.getByRole("button", {name: "应用适配包", exact: true})).toBeDisabled();
+  await dialog.getByRole("button", {name: "查看", exact: true}).first().click();
+  await expect(dialog).toContainText("这项任务尚未执行");
+  await dialog.getByRole("button", {name: "解除", exact: true}).first().click();
+  await expect(dialog).not.toContainText("创建 Mods 目录");
+  await dialog.getByRole("button", {name: "解除", exact: true}).click();
+  await expect(dialog).toContainText("没有发现会阻止适配包选择");
+  await dialog.getByRole("combobox", {name: "游戏适配包", exact: true}).selectOption("minecraft-java");
+  await dialog.getByRole("button", {name: "应用适配包", exact: true}).click();
+  await expect(dialog).toBeHidden();
+
+  const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
+  expect(calls.filter((call: any) => call.command === "resolve_game_conflict").map((call: any) => call.args.conflictId)).toEqual(["txn-pbz-mods", "approval-pbz"]);
+  expect(calls.filter((call: any) => call.command === "set_game_adapter").map((call: any) => call.args)).toEqual([
+    {id: "game-fixture", adapterSlug: "minecraft-java"},
+  ]);
+});
+
 test("library retains the game cover placeholder when the adapter image fails", async ({page}) => {
   await installMockTauri(page);
   await page.route("**/favicon.png", (route) => route.abort());
@@ -395,7 +430,8 @@ test("directory picker scans only the chosen library without registering games",
   await expect(adapted).toHaveAttribute("data-variant", "success");
   await expect(adapted.locator("svg")).toBeVisible();
   await expect(page.getByText("Fixture Game", {exact: true})).toBeVisible();
-  await expect(page.getByText("61% 匹配", {exact: true})).toBeVisible();
+  await expect(page.getByText("未匹配", {exact: true})).toBeVisible();
+  await expect(page.getByText("60% 匹配", {exact: true})).toHaveCount(0);
   await page.getByRole("button", {name: "选择游戏目录", exact: true}).click();
   await expect(directory).toHaveValue("/sandbox/new-game");
   await expect(adapted).toBeVisible();

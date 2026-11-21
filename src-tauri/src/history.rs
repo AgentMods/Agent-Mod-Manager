@@ -1,6 +1,7 @@
 //! Durable chat history. Message insertion order is independent of clock changes.
 
 use crate::{
+    agent::{attachments::user_content, Attachment},
     db::Db,
     error::{AppError, AppResult},
     settings::{conversation_permission_key, validate_permission_mode},
@@ -47,13 +48,26 @@ fn first_message_title(content: &str) -> String {
     if clean.is_empty() {
         return DEFAULT_TITLE.into();
     }
-    let mut chars = clean.chars();
+    truncate_title(&clean)
+}
+
+fn truncate_title(title: &str) -> String {
+    let mut chars = title.chars();
     let mut title: String = chars.by_ref().take(TITLE_LIMIT).collect();
     if chars.next().is_some() {
         title.pop();
         title.push('…');
     }
     title
+}
+
+fn message_title(content: &str, attachments: &[Attachment]) -> String {
+    if content.trim().is_empty() {
+        if let Some(first) = attachments.first() {
+            return truncate_title(first.name());
+        }
+    }
+    first_message_title(content)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -94,6 +108,8 @@ pub struct Message {
     pub id: String,
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
     pub reasoning: Option<String>,
     pub tool_calls: Option<Value>,
     pub tool_call_id: Option<String>,
@@ -102,7 +118,12 @@ pub struct Message {
 impl Message {
     /// Reasoning is kept locally; it is not portable across OpenAI providers.
     pub fn to_openai(&self) -> Value {
-        let mut value = json!({ "role": self.role, "content": self.content });
+        let mut value = json!({ "role": self.role });
+        value["content"] = if self.role == "user" {
+            user_content(&self.content, &self.attachments)
+        } else {
+            json!(self.content)
+        };
         if let Some(calls) = &self.tool_calls {
             value["tool_calls"] = calls.clone();
         }
@@ -282,7 +303,8 @@ impl History {
         source: &str,
         message_id: &str,
         edited_content: Option<String>,
-    ) -> AppResult<(String, String)> {
+        edited_attachments: Option<Vec<Attachment>>,
+    ) -> AppResult<(String, String, Vec<Attachment>)> {
         let mut conn = self.db.conn();
         let tx = conn.transaction()?;
         let conversation = read_conversation(&tx, source)?;
@@ -311,15 +333,23 @@ impl History {
                 .ok_or_else(|| AppError::NotFound("原始提问".into()))?,
             _ => return Err(AppError::Invalid("只能编辑用户消息".into())),
         };
+        let attachments: Vec<Attachment> = match edited_attachments {
+            Some(attachments) => attachments,
+            None => tx.query_row(
+                "SELECT attachments_json FROM messages WHERE rowid=?1",
+                [cutoff],
+                |row| Ok(serde_column(row, 0)?.unwrap_or_default()),
+            )?,
+        };
         let branch = new_id("conv");
         let timestamp = now();
         tx.execute(
             "INSERT INTO conversations(id,title,game_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)",
-            params![branch, first_message_title(&content), conversation.game_id, timestamp],
+            params![branch, message_title(&content, &attachments), conversation.game_id, timestamp],
         )?;
         let copied = tx.execute(
-            "INSERT INTO messages(id,conversation_id,role,content,reasoning,tool_calls_json,tool_call_id,name,token_count,created_at)
-             SELECT ?1 || ':' || id,?1,role,content,reasoning,tool_calls_json,tool_call_id,name,token_count,created_at
+            "INSERT INTO messages(id,conversation_id,role,content,reasoning,tool_calls_json,tool_call_id,name,token_count,created_at,attachments_json)
+             SELECT ?1 || ':' || id,?1,role,content,reasoning,tool_calls_json,tool_call_id,name,token_count,created_at,attachments_json
              FROM messages WHERE conversation_id=?2 AND rowid<?3 ORDER BY rowid",
             params![branch, source, cutoff],
         )?;
@@ -356,7 +386,7 @@ impl History {
             params![branch, source, cutoff],
         )?;
         tx.commit()?;
-        Ok((branch, content))
+        Ok((branch, content, attachments))
     }
 
     pub fn archive_conversation(&self, id: &str, archived: bool) -> AppResult<()> {
@@ -468,33 +498,65 @@ impl History {
         tool_calls: Option<Value>,
         tool_call_id: Option<&str>,
     ) -> AppResult<Message> {
+        self.append(
+            conversation_id,
+            role,
+            content,
+            tool_calls,
+            tool_call_id,
+            Vec::new(),
+        )
+    }
+
+    pub(crate) fn append_user_message(
+        &self,
+        conversation_id: &str,
+        content: &str,
+        attachments: Vec<Attachment>,
+    ) -> AppResult<Message> {
+        self.append(conversation_id, "user", content, None, None, attachments)
+    }
+
+    fn append(
+        &self,
+        conversation_id: &str,
+        role: &str,
+        content: &str,
+        tool_calls: Option<Value>,
+        tool_call_id: Option<&str>,
+        attachments: Vec<Attachment>,
+    ) -> AppResult<Message> {
         validate_message(role, tool_calls.as_ref(), tool_call_id)?;
         let message = Message {
             id: new_id("msg"),
             role: role.into(),
             content: content.into(),
+            attachments,
             reasoning: None,
             tool_calls,
             tool_call_id: tool_call_id.map(str::to_owned),
         };
+        let attachments_json = (!message.attachments.is_empty())
+            .then(|| serde_json::to_string(&message.attachments))
+            .transpose()?;
         let timestamp = now();
         let mut conn = self.db.conn();
         let tx = conn.transaction()?;
         ensure_conversation(&tx, conversation_id)?;
         tx.execute(
-            "INSERT INTO messages(id,conversation_id,role,content,tool_calls_json,tool_call_id,created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO messages(id,conversation_id,role,content,tool_calls_json,tool_call_id,created_at,attachments_json)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![message.id, conversation_id, role, content,
-                message.tool_calls.as_ref().map(serde_json::to_string).transpose()?, tool_call_id, timestamp],
+                message.tool_calls.as_ref().map(serde_json::to_string).transpose()?, tool_call_id, timestamp, attachments_json],
         )?;
         tx.execute(
             "UPDATE conversations SET message_count=message_count+1,updated_at=?2 WHERE id=?1",
             params![conversation_id, timestamp],
         )?;
-        if role == "user" && !content.trim().is_empty() {
+        if role == "user" && (!content.trim().is_empty() || !message.attachments.is_empty()) {
             tx.execute(
                 "UPDATE conversations SET title=?2,auto_title_pending=0 WHERE id=?1 AND auto_title_pending=1",
-                params![conversation_id, first_message_title(content)],
+                params![conversation_id, message_title(content, &message.attachments)],
             )?;
         }
         tx.commit()?;
@@ -718,7 +780,7 @@ fn read_permission_mode(conn: &Connection, id: &str) -> AppResult<Option<String>
 
 fn read_messages(conn: &Connection, id: &str) -> AppResult<Vec<Message>> {
     // created_at has millisecond precision; UUIDs are random. Neither is sequence.
-    let mut stmt = conn.prepare("SELECT id,role,content,reasoning,tool_calls_json,tool_call_id FROM messages WHERE conversation_id=?1 ORDER BY rowid")?;
+    let mut stmt = conn.prepare("SELECT id,role,content,reasoning,tool_calls_json,tool_call_id,attachments_json FROM messages WHERE conversation_id=?1 ORDER BY rowid")?;
     let result = stmt
         .query_map([id], |row| {
             Ok(Message {
@@ -728,6 +790,7 @@ fn read_messages(conn: &Connection, id: &str) -> AppResult<Vec<Message>> {
                 reasoning: row.get(3)?,
                 tool_calls: json_column(row, 4)?,
                 tool_call_id: row.get(5)?,
+                attachments: serde_column(row, 6)?.unwrap_or_default(),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -752,6 +815,13 @@ fn tool_call_from_row(row: &Row<'_>) -> rusqlite::Result<ToolCallRecord> {
 }
 
 fn json_column(row: &Row<'_>, index: usize) -> rusqlite::Result<Option<Value>> {
+    serde_column(row, index)
+}
+
+fn serde_column<T: serde::de::DeserializeOwned>(
+    row: &Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<T>> {
     let encoded: Option<String> = row.get(index)?;
     encoded
         .map(|encoded| {
@@ -1199,14 +1269,21 @@ mod tests {
             )
             .unwrap();
 
-        let (retry, prompt) = history
-            .fork_before_message(&source.id, &answer.id, None)
+        let (retry, prompt, attachments) = history
+            .fork_before_message(&source.id, &answer.id, None, None)
             .unwrap();
         assert_eq!(prompt, "Original question");
-        let (edit, prompt) = history
-            .fork_before_message(&source.id, &question.id, Some("Edited question".into()))
+        assert!(attachments.is_empty());
+        let (edit, prompt, attachments) = history
+            .fork_before_message(
+                &source.id,
+                &question.id,
+                Some("Edited question".into()),
+                None,
+            )
             .unwrap();
         assert_eq!(prompt, "Edited question");
+        assert!(attachments.is_empty());
         for branch_id in [retry, edit] {
             let branch = history.get_conversation(&branch_id).unwrap();
             assert_eq!(branch.conversation.game_id, source.game_id);

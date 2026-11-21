@@ -26,11 +26,14 @@ static IMPORT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 pub struct ImportPreview {
     pub filename: String,
     /// The original explicit selection, not an authorization root.
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub source_path: PathBuf,
     /// Destination of the reviewed COPY; it does not exist at preview time.
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub artifact_path: PathBuf,
     pub sha256: String,
     pub size: u64,
+    #[serde(serialize_with = "crate::transaction::serialize_user_plan")]
     pub plan: FilePlan,
     pub warnings: Vec<String>,
 }

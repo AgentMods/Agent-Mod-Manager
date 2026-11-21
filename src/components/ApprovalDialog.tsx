@@ -1,3 +1,4 @@
+import { displayApprovalPreview, isFilePlanApproval } from "@/lib/agent-path-presentation";
 import { useMemo, useState } from "react";
 import { CheckIcon, ShieldCheckIcon, XIcon } from "lucide-react";
 import { api } from "../lib/api";
@@ -23,7 +24,7 @@ function Approval({event}: {event: AgentEvent}) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const preview = event.payload.preview;
-  const plan = findPlan(preview);
+  const plan = isFilePlanApproval(event.payload.title) ? findPlan(preview) : null;
   async function respond(approved: boolean) {
     if (busy) return;
     setBusy(true); setError(null);
@@ -33,7 +34,7 @@ function Approval({event}: {event: AgentEvent}) {
     } catch (failure) { setError(failure); }
     finally { setBusy(false); }
   }
-  const jsonPreview = <pre className="max-h-72 overflow-auto rounded-md border bg-muted p-3 font-mono text-xs break-all whitespace-pre-wrap">{JSON.stringify(preview, null, 2)}</pre>;
+  const jsonPreview = <pre className="max-h-72 overflow-auto rounded-md border bg-muted p-3 font-mono text-xs break-all whitespace-pre-wrap">{JSON.stringify(displayApprovalPreview(event.payload.title, preview), null, 2)}</pre>;
   return <Modal title="操作审批" onClose={() => {void respond(false);}} actions={<>
     <Button variant="outline" disabled={busy} onClick={() => {void respond(false);}}><XIcon data-icon="inline-start"/>拒绝</Button>
     <Button disabled={busy} onClick={() => {void respond(true);}}><CheckIcon data-icon="inline-start"/>批准并执行</Button>

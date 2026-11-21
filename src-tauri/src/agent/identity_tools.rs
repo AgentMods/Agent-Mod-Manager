@@ -167,7 +167,8 @@ impl AgentTool for IdentityTool {
                 "SEARCH_GAME_IDENTITY",
                 &context.cancel,
             )
-            .await?,
+            .await?
+            .into_user_paths(),
         )?)
     }
 }

@@ -1,3 +1,4 @@
+import { displayPath, pathBasename } from "@/lib/paths";
 import { useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { open } from '@tauri-apps/plugin-dialog';
@@ -69,7 +70,7 @@ function DiagnosticSources({ files }: { files: DiagnosticFile[] }) {
     <ItemGroup className="mt-3 gap-2">
       {files.map(({ file, kind, status, encoding, truncated, notes }, i) => <Item role="listitem" size="sm" variant="muted" key={i}>
         <ItemContent className="min-w-0 wrap-anywhere">
-          <PathText>{clipSourceText(file.split(/[\\/]/).at(-1) || '未命名文件', 120)}</PathText>
+          <PathText>{clipSourceText(pathBasename(file) || '未命名文件', 120)}</PathText>
           <p>{kind === 'log' ? '日志' : '加载顺序'} · {readStatusLabels[status] ?? '读取状态未知'}
             {encoding && ` · ${clipSourceText(encoding, 32)}`}{truncated && ' · 已截断'}</p>
           {notes.map((note, index) => <p key={index}>{clipSourceText(note, 256)}</p>)}
@@ -92,8 +93,8 @@ function ReplacementEffects({ plan }: { plan: FilePlan }) {
         return <TableRow key={index}>
           <TableCell className="align-top whitespace-normal">{effect}</TableCell>
           <TableCell className="whitespace-normal">
-            <PathText className="block">{operation.dst}</PathText>
-            {operation.op === 'move' && operation.src && <><small className="text-muted-foreground">原位置</small><PathText className="block">{operation.src}</PathText></>}
+            <PathText className="block">{displayPath(operation.dst)}</PathText>
+            {operation.op === 'move' && operation.src && <><small className="text-muted-foreground">原位置</small><PathText className="block">{displayPath(operation.src)}</PathText></>}
           </TableCell>
         </TableRow>;
       })}</TableBody>
@@ -219,7 +220,7 @@ function GameDetails({ gameId }: { gameId: string }) {
   async function previewFomod() {
     if (!writable || busy || !artifactPath.trim()) return;
     await run(async () => {
-      const preview = await api<FomodPreview>('preview_fomod', { artifactPath: artifactPath.trim() });
+      const preview = await api<FomodPreview>('preview_fomod', { artifactPath });
       if (artifactHash && preview.artifactSha256 !== artifactHash) {
         throw new Error('归档内容自导入或上次扫描后已变化，请重新导入或验证归档路径。');
       }
@@ -388,7 +389,7 @@ function GameDetails({ gameId }: { gameId: string }) {
                 <DiagnosticSources files={diagnosis.logs?.files ?? []} />
                 {diagnosis.evidence.length > 0 && <ItemGroup className="gap-2">
                   {diagnosis.evidence.map((e, i) => <Item role="listitem" variant="muted" size="sm" key={i}>
-                    <ItemContent className="min-w-0 wrap-anywhere"><PathText>{e.file}{e.line ? `:${e.line}` : ''}</PathText><p>{e.text}</p></ItemContent>
+                    <ItemContent className="min-w-0 wrap-anywhere"><PathText>{displayPath(e.file)}{e.line ? `:${e.line}` : ''}</PathText><p>{e.text}</p></ItemContent>
                   </Item>)}
                 </ItemGroup>}
               </CardContent>
@@ -401,7 +402,7 @@ function GameDetails({ gameId }: { gameId: string }) {
             <ErrorState error={roots.error} />
             {Object.keys(roots.data ?? {}).length > 0 && <ItemGroup className="gap-2">
               {Object.entries(roots.data ?? {}).map(([id, value]) => <Item role="listitem" size="sm" variant="outline" key={id}>
-                <ItemContent className="min-w-0"><ItemTitle className="max-w-full wrap-anywhere">{id}</ItemTitle><PathText>{value}</PathText></ItemContent>
+                <ItemContent className="min-w-0"><ItemTitle className="max-w-full wrap-anywhere">{id}</ItemTitle><PathText>{displayPath(value)}</PathText></ItemContent>
               </Item>)}
             </ItemGroup>}
             <FieldGroup className="flex-row flex-wrap items-end gap-2">
@@ -441,7 +442,7 @@ function GameDetails({ gameId }: { gameId: string }) {
     {installOpen && <Modal title="归档安装预览" onClose={() => { if (!busy) setInstallOpen(false); }} actions={<>
       <Button variant="outline" disabled={busy} onClick={() => setInstallOpen(false)}>取消</Button>
       <Button disabled={!writable || busy || !artifactPath.trim() || !filename.trim() || !modName.trim() || !modType.trim() || !adapter.data || (fomodPreview !== null && (fomodMappings.length === 0 || !validFomodSelection(fomodPreview, fomodSelections)))} onClick={() => run(async () => {
-        const result = await api<{ plan: FilePlan; warnings: string[] }>('plan_install', { request: { gameId, artifactPath: artifactPath.trim(), filename: filename.trim(), name: modName.trim(), modType: modType.trim(), version: null, expectedSha256: artifactHash, folderName: null, mappings: fomodMappings, source: 'local', sourceModId: null } });
+        const result = await api<{ plan: FilePlan; warnings: string[] }>('plan_install', { request: { gameId, artifactPath, filename, name: modName.trim(), modType: modType.trim(), version: null, expectedSha256: artifactHash, folderName: null, mappings: fomodMappings, source: 'local', sourceModId: null } });
         setInstallOpen(false);
         if (result.warnings.length) notify(result.warnings.join('；'));
         reviewPlan(result.plan, refresh);

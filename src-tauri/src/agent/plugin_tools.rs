@@ -92,7 +92,11 @@ impl AgentTool for PluginTool {
             let (preview, plan) = match name {
                 "write_plugin_draft" => {
                     let draft = plugin_workflow::plan_write_draft(&engine, text(&args, "slug")?, text(&args, "adapter_json")?, text(&args, "skill_markdown")?)?;
-                    (json!({"draft":draft.draft,"plan":draft.plan,"adapterJson":args["adapter_json"],"skillMarkdown":args["skill_markdown"],"trust":"untrusted_instructions"}), Some(draft.plan))
+                    let mut preview = serde_json::to_value(&draft)?;
+                    preview["adapterJson"] = args["adapter_json"].clone();
+                    preview["skillMarkdown"] = args["skill_markdown"].clone();
+                    preview["trust"] = json!("untrusted_instructions");
+                    (preview, Some(draft.plan))
                 }
                 "install_plugin" => {
                     let id = text(&args, "draft_id")?;
@@ -124,7 +128,7 @@ impl AgentTool for PluginTool {
                 engine.apply_file_ops(&plan.id)?;
                 let reconciliation = plugin_workflow::reconcile_deployments(&engine)?;
                 crate::skills::reconcile_deployments(&engine)?;
-                return Ok(json!({"status":"committed","plan":plan,"preview":prepared.preview,"reconciliation":reconciliation}));
+                return Ok(json!({"status":"committed","plan":plan.into_user_paths(),"preview":prepared.preview,"reconciliation":reconciliation}));
             }
             match name {
                 "list_plugin_packages" => {
@@ -206,7 +210,9 @@ mod tests {
         assert!(plugin_workflow::list_drafts(&context.engine)
             .unwrap()
             .is_empty());
-        tool.execute(&context, args, prepared).await.unwrap();
+        let displayed = prepared.preview["plan"].clone();
+        let result = tool.execute(&context, args, prepared).await.unwrap();
+        assert_eq!(result["plan"], displayed);
         let tool = registry.get("install_plugin").unwrap();
         let args = json!({"draft_id":draft_id});
         let prepared = tool.prepare(&context, &args).await.unwrap();
@@ -217,7 +223,9 @@ mod tests {
         assert!(plugins::list_plugins(&context.engine.db)
             .unwrap()
             .is_empty());
-        tool.execute(&context, args, prepared).await.unwrap();
+        let displayed = prepared.preview["deployment"]["plan"].clone();
+        let result = tool.execute(&context, args, prepared).await.unwrap();
+        assert_eq!(result["plan"], displayed);
         assert_eq!(
             plugins::list_plugins(&context.engine.db).unwrap()[0].slug,
             "test-game"

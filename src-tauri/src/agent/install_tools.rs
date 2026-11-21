@@ -6,7 +6,7 @@ use crate::{
     error::{AppError, AppResult},
     install, install_dependencies, install_file_evidence,
     sources::MAX_MODRINTH_DEPENDENCIES,
-    transaction::FileOp,
+    transaction::{serialize_user_plan, FileOp},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -198,20 +198,43 @@ impl AgentTool for InstallTool {
         };
         let args = args.clone();
         tokio::task::spawn_blocking(move || {
-            let (preview,plan) = match name.as_str() {
-            "install_mod" => {
-                    let preview = install::plan_install(&engine,&serde_json::from_value(args["request"].clone())?)?;
-                    (json!(preview),Some(preview.plan))
+            let (preview, plan) = match name.as_str() {
+                "install_mod" => {
+                    let preview = install::plan_install(
+                        &engine,
+                        &serde_json::from_value(args["request"].clone())?,
+                    )?;
+                    (json!(preview), Some(preview.plan))
                 }
                 "uninstall_mod" => {
-                    let plan = install::plan_uninstall(&engine,text(&args,"install_id")?)?;
-                    (json!(plan),Some(plan))
+                    let plan = install::plan_uninstall(&engine, text(&args, "install_id")?)?;
+                    let preview = serialize_user_plan(&plan, serde_json::value::Serializer)?;
+                    (preview, Some(plan))
                 }
-                "rollback_transaction" => (json!({"action":"rollback","originalPlan":engine.get_plan(text(&args,"transaction_id")?)?}),None),
-                _ => (args,None),
+                "rollback_transaction" => {
+                    let original = engine.get_plan(text(&args, "transaction_id")?)?;
+                    (
+                        json!({"action":"rollback","originalPlan":original.into_user_paths()}),
+                        None,
+                    )
+                }
+                _ => (args, None),
             };
-            Ok(PreparedTool{preview,plan,effect:if matches!(name.as_str(), "plan_install" | "list_installs" | "inspect_install") {Effect::Read} else {Effect::ManagerWrite}})
-        }).await.map_err(|e|AppError::Other(e.to_string()))?
+            Ok(PreparedTool {
+                preview,
+                plan,
+                effect: if matches!(
+                    name.as_str(),
+                    "plan_install" | "list_installs" | "inspect_install"
+                ) {
+                    Effect::Read
+                } else {
+                    Effect::ManagerWrite
+                },
+            })
+        })
+        .await
+        .map_err(|e| AppError::Other(e.to_string()))?
     }
     async fn execute(
         &self,
@@ -245,17 +268,21 @@ impl AgentTool for InstallTool {
                         "fileCount": file_count,
                     }));
                 }
-                return Ok(json!({"plan":plan,"status":"committed","preview":prepared.preview}));
+                return Ok(json!({"plan":plan.into_user_paths(),"status":"committed","preview":prepared.preview}));
             }
             match name.as_str() {
                 "plan_install" => Ok(json!(install::plan_install(
                     &engine,
                     &serde_json::from_value(args["request"].clone())?
                 )?)),
-                "list_installs" => Ok(json!(install::list_installs(
-                    &engine,
-                    text(&args, "game_id")?
-                )?)),
+                "list_installs" => {
+                    let installs = install::list_installs(&engine, text(&args, "game_id")?)?;
+                    let result: Vec<_> = installs
+                        .into_iter()
+                        .map(install::InstalledMod::into_user_paths)
+                        .collect();
+                    Ok(json!(result))
+                }
                 "inspect_install" => {
                     let InspectInstallArgs {
                         game_id,

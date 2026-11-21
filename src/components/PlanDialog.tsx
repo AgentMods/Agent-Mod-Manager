@@ -1,3 +1,4 @@
+import { displayPath } from "@/lib/paths";
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { CheckIcon } from "lucide-react";
@@ -24,8 +25,8 @@ export function PlanPreview({plan}: {plan: FilePlan}) {
           {plan.entries.map((entry, index) => <TableRow key={`${index}-${entry.operation.dst}`}>
             <TableCell className="align-top"><Badge tone={entry.before ? "warning" : "success"}>{entry.operation.op}</Badge></TableCell>
             <TableCell className="align-top whitespace-normal">
-              {entry.operation.src && <PathText className="block">{entry.operation.src}</PathText>}
-              <PathText className="block text-foreground">{entry.operation.dst}</PathText>
+              {entry.operation.src && <PathText className="block">{displayPath(entry.operation.src)}</PathText>}
+              <PathText className="block text-foreground">{displayPath(entry.operation.dst)}</PathText>
             </TableCell>
             <TableCell className="align-top whitespace-normal text-muted-foreground">{entry.before ? `${bytes(entry.before.size)} / 自动备份` : "新增"}</TableCell>
           </TableRow>)}

@@ -4,7 +4,8 @@ use crate::{
     settings::{parse_model_base_url, ReasoningEffort},
 };
 use futures_util::StreamExt;
-use serde_json::{json, Value};
+use serde::Serialize;
+use serde_json::Value;
 use std::error::Error;
 use tokio_util::sync::CancellationToken;
 
@@ -18,6 +19,25 @@ pub struct ModelConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub api_key: Option<String>,
 }
+#[derive(Serialize)]
+struct CompletionRequest<'a> {
+    model: &'a str,
+    // Borrow the messages so building the request does not copy the data URLs.
+    messages: &'a [Value],
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [Value]>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
 pub struct ModelClient {
     http: reqwest::Client,
 }
@@ -114,16 +134,16 @@ impl ModelClient {
         on_delta: &mut impl FnMut(&Delta, &Completion) -> AppResult<()>,
     ) -> Result<Completion, StreamFailure> {
         let endpoint = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
-        let mut body = json!({"model":config.model,"messages":messages,"stream":streaming});
-        if streaming {
-            body["stream_options"] = json!({"include_usage":true});
-        }
-        if let Some(effort) = config.reasoning_effort {
-            body["reasoning_effort"] = json!(effort);
-        }
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
-        }
+        let body = CompletionRequest {
+            model: &config.model,
+            messages,
+            stream: streaming,
+            stream_options: streaming.then_some(StreamOptions {
+                include_usage: true,
+            }),
+            reasoning_effort: config.reasoning_effort,
+            tools: (!tools.is_empty()).then_some(tools),
+        };
         let accept = if streaming {
             "text/event-stream"
         } else {

@@ -1,12 +1,14 @@
 import { useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowLeftIcon, ArrowRightIcon, BotIcon, CheckIcon, CircleAlertIcon, Gamepad2Icon, MoonIcon, RadarIcon, ScanSearchIcon, SunIcon, TriangleAlertIcon } from "lucide-react";
-import { api, errorText } from "@/lib/api";
+import { api, errorText, useBackendQuery } from "@/lib/api";
 import { useUI } from "@/lib/store";
-import type { BootstrapState, GameCandidate, ScanReport } from "@/lib/types";
+import type { BootstrapState, Game, GameCandidate, ScanReport } from "@/lib/types";
 import { AgentConfiguration } from "@/components/AgentConfiguration";
 import { GameMatchBadge } from "@/components/GameMatchBadge";
 import { PathText } from "@/components/ui";
+import { displayPath, gameDirectoryKey } from "@/lib/paths";
+import { reconcileCandidates } from "@/lib/game-discovery";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -39,6 +41,7 @@ export default function OnboardingPage({automatic = false, recoveryError = null}
   const client = useQueryClient();
   const [step, setStep] = useState(0);
   const [report, setReport] = useState<ScanReport | null>(null);
+  const games = useBackendQuery<Game[]>(["games"], "list_games", undefined, report !== null);
   const [selected, setSelected] = useState<string[]>([]);
   const [candidateErrors, setCandidateErrors] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<"scan" | "register" | "settings" | "finish" | null>(null);
@@ -56,7 +59,8 @@ export default function OnboardingPage({automatic = false, recoveryError = null}
     setBusy("scan");
     setError(null);
     try {
-      setReport(await api<ScanReport>("scan_games", {options: {}}));
+      const result = await api<ScanReport>("scan_games", {options: {}});
+      setReport({...result, candidates: reconcileCandidates(result.candidates)});
       setSelected([]);
       setCandidateErrors({});
     } catch (failure) {
@@ -67,23 +71,23 @@ export default function OnboardingPage({automatic = false, recoveryError = null}
   }
 
   async function register(candidate: GameCandidate) {
-    const path = candidate.rootPath;
-    if (busy || recoveryError || !selected.includes(path) || candidate.registeredGameId) return;
+    const key = gameDirectoryKey(candidate.rootPath);
+    if (busy || recoveryError || !selected.includes(key) || candidate.registeredGameId) return;
     setBusy("register");
-    setCandidateErrors((previous) => ({...previous, [path]: ""}));
+    setCandidateErrors((previous) => ({...previous, [key]: ""}));
     try {
       if (automatic && !resumeRecorded.current) {
         await api("start_onboarding");
         resumeRecorded.current = true;
       }
-      const game = await api<{id: string}>("register_game", {directory: path, adapterSlug: candidate.suggestedAdapterSlug});
+      const game = await api<{id: string}>("register_game", {directory: candidate.rootPath, adapterSlug: candidate.suggestedAdapterSlug, fromDiscovery: true});
       setReport((previous) => previous && ({...previous, candidates: previous.candidates.map((item) =>
-        item.rootPath === path ? {...item, registeredGameId: game.id} : item,
+        gameDirectoryKey(item.rootPath) === key ? {...item, registeredGameId: game.id} : item,
       )}));
-      setSelected((previous) => previous.filter((item) => item !== path));
+      setSelected((previous) => previous.filter((item) => item !== key));
       void client.invalidateQueries({queryKey: ["games"]});
     } catch (failure) {
-      setCandidateErrors((previous) => ({...previous, [path]: errorText(failure)}));
+      setCandidateErrors((previous) => ({...previous, [key]: errorText(failure)}));
     } finally {
       setBusy(null);
     }
@@ -161,14 +165,16 @@ export default function OnboardingPage({automatic = false, recoveryError = null}
             {report?.truncated && <OnboardingAlert warning>已达到扫描上限。可在游戏库中手动检查其他目录。</OnboardingAlert>}
             {!!report?.warnings.length && <details className="rounded-md border px-3 py-2 text-sm">
               <summary className="cursor-pointer font-medium">扫描警告（{report.warnings.length}）</summary>
-              <ul className="mt-2 flex list-disc flex-col gap-1 pl-5 break-all text-muted-foreground">{report.warnings.map(({path, message}, index) => <li key={index}>{path}：{message}</li>)}</ul>
+              <ul className="mt-2 flex list-disc flex-col gap-1 pl-5 break-all text-muted-foreground">{report.warnings.map(({path, message}, index) => <li key={index}>{displayPath(path)}：{message}</li>)}</ul>
             </details>}
             {report && (report.candidates.length ? <ItemGroup className="gap-2" aria-label="扫描候选游戏">
-              {report.candidates.map((candidate) => <CandidateRow key={candidate.rootPath} candidate={candidate}
-                selected={selected.includes(candidate.rootPath)} disabled={!!busy || !!recoveryError}
-                error={candidateErrors[candidate.rootPath]} onSelect={(checked) => setSelected((previous) =>
-                  checked ? [...previous, candidate.rootPath] : previous.filter((path) => path !== candidate.rootPath),
-                )} onRegister={() => void register(candidate)}/>)}
+              {reconcileCandidates(report.candidates, games.data).map((candidate) => {
+                const key = gameDirectoryKey(candidate.rootPath);
+                return <CandidateRow key={key} candidate={candidate} selected={selected.includes(key)} disabled={!!busy || !!recoveryError || games.isLoading}
+                  error={candidateErrors[key]} onSelect={(checked) => setSelected((previous) =>
+                    checked ? [...previous, key] : previous.filter((path) => path !== key),
+                  )} onRegister={() => void register(candidate)}/>;
+              })}
             </ItemGroup> : <Empty className="border"><EmptyHeader><EmptyTitle>未发现候选目录</EmptyTitle><EmptyDescription>未发现候选目录。可在游戏库中手动添加游戏。</EmptyDescription></EmptyHeader></Empty>)}
           </>}
           {step === 2 && <Tabs defaultValue="library" className="gap-4">
@@ -207,7 +213,7 @@ function CandidateRow({candidate, selected, disabled, error, onSelect, onRegiste
           <Checkbox aria-label={`选择 ${candidate.name}`} checked={registered || selected} disabled={disabled || registered} onCheckedChange={(checked) => onSelect(checked === true)}/>
           <ItemTitle>{candidate.name}</ItemTitle>
         </Label>
-        <PathText>{candidate.rootPath}</PathText>
+        <PathText>{displayPath(candidate.rootPath)}</PathText>
         <ItemDescription className="line-clamp-none">{platformLabels[candidate.platform] ?? candidate.platform} · 建议适配包：{candidate.suggestedAdapterSlug ?? "无"}</ItemDescription>
         {!!candidate.warnings.length && <ul className="flex list-disc flex-col gap-1 pl-5 text-xs text-warning">
           {candidate.warnings.map((warning, index) => <li key={index}>{warning}</li>)}

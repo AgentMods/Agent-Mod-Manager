@@ -100,6 +100,7 @@ async fn generic_web_download_is_reviewed_before_network_io_in_every_permission_
             .start_turn(TurnRequest {
                 conversation_id: conversation.clone(),
                 content: "Download this public archive for review".into(),
+                attachments: None,
                 model: None,
                 permission_mode: Some(mode),
                 reasoning_effort: None,
@@ -158,6 +159,7 @@ async fn generic_web_download_is_reviewed_before_network_io_in_every_permission_
         socket.write_all(response.as_bytes()).await.unwrap();
         socket.write_all(&archive).await.unwrap();
 
+        let result = next_expected(&mut rx, "tool-result").await;
         let done = next_expected(&mut rx, "done").await;
         assert_eq!(done.payload["status"], "done", "mode: {mode:?}");
         let model_requests = tokio::time::timeout(Duration::from_secs(10), model_job)
@@ -204,6 +206,10 @@ async fn generic_web_download_is_reviewed_before_network_io_in_every_permission_
         assert_eq!(
             record.artifact.path, artifact_path,
             "artifact path must not alias another path"
+        );
+        assert_eq!(
+            result.payload["result"],
+            json!(record.artifact.clone().into_user_paths())
         );
         assert!(!record.artifact.integrity_verified);
         assert!(record.artifact.requires_review);
@@ -267,6 +273,7 @@ async fn web_download_rejects_unreviewed_destination_without_network_io() {
         .start_turn(TurnRequest {
             conversation_id: conversation.clone(),
             content: "Try to choose an output path".into(),
+            attachments: None,
             model: None,
             permission_mode: Some(PermissionMode::FullTrust),
             reasoning_effort: None,

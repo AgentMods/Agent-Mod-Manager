@@ -30,6 +30,14 @@ pub struct Snapshot {
     pub files: BTreeMap<PathBuf, Fingerprint>,
 }
 
+impl Snapshot {
+    pub(crate) fn into_user_paths(mut self) -> Self {
+        self.path = crate::paths::user_path(&self.path).into_owned();
+        self.root_path = crate::paths::user_path(&self.root_path).into_owned();
+        self
+    }
+}
+
 fn registered_path(conn: &Connection, game_id: &str) -> AppResult<PathBuf> {
     let root: String =
         conn.query_row("SELECT root_path FROM games WHERE id=?1", [game_id], |r| {
@@ -63,7 +71,10 @@ fn confirm_registration(conn: &Connection, game_id: &str, root: &Path) -> AppRes
 }
 
 fn changed(path: &Path) -> AppError {
-    AppError::Conflict(format!("生成快照计划时路径已变化: {}", path.display()))
+    AppError::Conflict(format!(
+        "生成快照计划时路径已变化: {}",
+        crate::paths::display_path(path)
+    ))
 }
 
 fn directory_state(engine: &FileEngine, path: &Path) -> AppResult<(FileIdentity, SystemTime)> {
@@ -139,7 +150,7 @@ impl Inventory {
                 } else {
                     return Err(AppError::Denied(format!(
                         "快照不支持链接或特殊文件: {}",
-                        path.display()
+                        crate::paths::display_path(&path)
                     )));
                 }
             }
@@ -167,7 +178,7 @@ impl Inventory {
 fn relative_to(root: &Path, path: &Path) -> AppResult<PathBuf> {
     path.strip_prefix(root)
         .map(Path::to_path_buf)
-        .map_err(|_| AppError::PathEscape(path.display().to_string()))
+        .map_err(|_| AppError::PathEscape(crate::paths::display_path(path)))
 }
 
 fn validate_relative(relative: &Path) -> AppResult<()> {
@@ -185,7 +196,7 @@ fn validate_relative(relative: &Path) -> AppResult<()> {
 
 fn check_backup_path(engine: &FileEngine, path: &Path) -> AppResult<()> {
     if !path.starts_with(engine.paths.backups()) {
-        return Err(AppError::PathEscape(path.display().to_string()));
+        return Err(AppError::PathEscape(crate::paths::display_path(path)));
     }
     engine.stable_path(path, true)?;
     Ok(())
@@ -210,7 +221,7 @@ fn verify_snapshot_file(engine: &FileEngine, path: &Path, expected: &Fingerprint
     if !matches {
         return Err(AppError::Conflict(format!(
             "快照文件校验失败: {}",
-            path.display()
+            crate::paths::display_path(path)
         )));
     }
     Ok(())

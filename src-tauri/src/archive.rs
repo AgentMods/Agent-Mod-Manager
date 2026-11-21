@@ -81,7 +81,7 @@ fn detect_format_from(path: &Path, file: &mut File) -> AppResult<&'static str> {
     }
     Err(AppError::Unsupported(format!(
         "无法识别归档格式: {}",
-        path.display()
+        crate::paths::display_path(path)
     )))
 }
 

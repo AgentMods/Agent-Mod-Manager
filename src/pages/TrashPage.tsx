@@ -1,3 +1,4 @@
+import { displayPath } from "@/lib/paths";
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { FileIcon, FolderIcon, RefreshCwIcon, RotateCcwIcon, SearchIcon, Trash2Icon, TriangleAlertIcon } from "lucide-react";
@@ -38,7 +39,7 @@ export default function TrashPage() {
   const gameOptions = [...new Set(items.flatMap((item) => item.game_id ? [item.game_id] : []))];
   const term = search.trim().toLocaleLowerCase();
   const rows = items.filter((item) => (!gameId || item.game_id === gameId) &&
-    [item.label, item.original_path, item.reason, item.game_id && gameNames.get(item.game_id)]
+    [item.label, item.original_path, displayPath(item.original_path), item.reason, item.game_id && gameNames.get(item.game_id)]
       .some((value) => value?.toLocaleLowerCase().includes(term)));
   const selectedItems = items.filter((item) => selected.has(item.id));
   const selectedBytes = selectedItems.reduce((sum, item) => sum + item.size, 0);
@@ -167,13 +168,13 @@ export default function TrashPage() {
             <TableHead scope="col">名称 / 原始位置</TableHead><TableHead scope="col">所属游戏</TableHead><TableHead scope="col">移入时间</TableHead><TableHead scope="col">大小</TableHead><TableHead scope="col">状态</TableHead>
           </TableRow></TableHeader>
           <TableBody>{rows.map((item) => <TableRow key={item.id} data-state={selected.has(item.id) ? "selected" : undefined}>
-            <TableCell><Checkbox aria-label={`选择 ${item.label || item.original_path}`} checked={selected.has(item.id)} disabled={disabled} onCheckedChange={() => toggleItem(item.id)}/></TableCell>
+            <TableCell><Checkbox aria-label={`选择 ${item.label || displayPath(item.original_path)}`} checked={selected.has(item.id)} disabled={disabled} onCheckedChange={() => toggleItem(item.id)}/></TableCell>
             <TableCell className="break-all whitespace-normal">
               <div className="flex min-w-0 items-center gap-2 font-medium">
                 {item.is_dir ? <FolderIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true"/> : <FileIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true"/>}
-                <span>{item.label || item.original_path}</span>
+                <span>{item.label || displayPath(item.original_path)}</span>
               </div>
-              <PathText className="block" title={item.original_path}>{item.original_path}</PathText>
+              <PathText className="block" title={displayPath(item.original_path)}>{displayPath(item.original_path)}</PathText>
               {item.reason && <span className="block text-xs text-muted-foreground">{item.reason}</span>}
             </TableCell>
             <TableCell className="break-all whitespace-normal">{item.game_id ? gameNames.get(item.game_id) ?? item.game_id : "未关联游戏"}</TableCell>
@@ -199,7 +200,7 @@ export default function TrashPage() {
         </AlertDescription>
       </Alert>
       <ul className="flex max-h-44 list-disc flex-col gap-2 overflow-y-auto pl-5 text-sm break-all">
-        {purgeItems.map((item) => <li key={item.id}>{item.label || item.original_path}<PathText className="block">{item.original_path}</PathText></li>)}
+        {purgeItems.map((item) => <li key={item.id}>{item.label || displayPath(item.original_path)}<PathText className="block">{displayPath(item.original_path)}</PathText></li>)}
       </ul>
       <Label className="items-start font-normal">
         <Checkbox checked={purgeAcknowledged} disabled={!!busy} onCheckedChange={(checked) => setPurgeAcknowledged(checked === true)}/>

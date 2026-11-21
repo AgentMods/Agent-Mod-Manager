@@ -17,6 +17,9 @@ use tokio::{
     sync::mpsc,
 };
 
+#[path = "attachment_tests.rs"]
+mod agent_attachment;
+
 #[path = "live_modrinth_tests.rs"]
 mod live_modrinth;
 
@@ -175,7 +178,14 @@ fn desktop_turn_dispatch_returns_while_the_database_is_locked() {
     let (reply, replies) = mpsc::channel();
     let request = json!({"conversationId":conv,"content":"continue"});
     for (cmd, body) in [
-        ("start_turn", json!({"request":request})),
+        (
+            "start_turn",
+            json!({"request": {
+                "conversationId":conv,
+                "content":"",
+                "attachments":[{"kind":"document","name":"notes.md","markdown":"# Notes"}]
+            }}),
+        ),
         (
             "restart_turn",
             json!({"request":request,"messageId":"previous","edit":false}),
@@ -244,6 +254,7 @@ async fn edit_and_retry_send_forked_context_to_the_model() {
     let request = |content: &str| TurnRequest {
         conversation_id: source.clone(),
         content: content.into(),
+        attachments: None,
         model: None,
         permission_mode: None,
         reasoning_effort: None,
@@ -297,6 +308,7 @@ async fn real_sse_tool_loop_waits_for_approval_and_replays_history() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "移入回收站".into(),
+            attachments: None,
             model: None,
             permission_mode: None,
             reasoning_effort: None,
@@ -407,6 +419,7 @@ async fn automatic_fomod_sse_install_applies_the_reviewed_plan_and_returns_a_rec
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "安装归档中可自动选择的 FOMOD 文件".into(),
+            attachments: None,
             model: None,
             permission_mode: Some(super::policy::PermissionMode::AutoApprove),
             reasoning_effort: None,
@@ -422,7 +435,8 @@ async fn automatic_fomod_sse_install_applies_the_reviewed_plan_and_returns_a_rec
     assert_eq!(preview["requiresReview"], true);
     let plan = &preview["plan"];
     let id = plan["id"].as_str().unwrap();
-    assert_eq!(*plan, json!(agent.engine.get_plan(id).unwrap()));
+    let stored_plan = agent.engine.get_plan(id).unwrap();
+    assert_eq!(*plan, json!(stored_plan.clone().into_user_paths()));
     let entries = plan["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2);
     for (entry, dst, archive_path, bytes) in [
@@ -440,9 +454,12 @@ async fn automatic_fomod_sse_install_applies_the_reviewed_plan_and_returns_a_rec
         ),
     ] {
         assert_eq!(entry["operation"]["op"], "copy");
-        assert_eq!(entry["operation"]["dst"], json!(dst));
+        assert_eq!(
+            entry["operation"]["dst"],
+            json!(crate::paths::user_path(dst))
+        );
         let src = Path::new(entry["operation"]["src"].as_str().unwrap());
-        assert!(src.starts_with(agent.engine.paths.staging()));
+        assert!(src.starts_with(crate::paths::user_path(&agent.engine.paths.staging())));
         assert!(src.ends_with(archive_path));
         assert_eq!(std::fs::read(src).unwrap(), bytes);
         assert_eq!(entry["source"]["sha256"], util::sha256_file(src).unwrap());
@@ -488,8 +505,8 @@ async fn automatic_fomod_sse_install_applies_the_reviewed_plan_and_returns_a_rec
     assert_eq!(status, "committed");
     let journal: Vec<Value> = serde_json::from_str(&journal).unwrap();
     assert_eq!(journal.len(), entries.len());
-    for (journal_entry, planned_entry) in journal.iter().zip(entries) {
-        assert_eq!(journal_entry["entry"], *planned_entry);
+    for (journal_entry, stored_entry) in journal.iter().zip(&stored_plan.entries) {
+        assert_eq!(journal_entry["entry"], json!(stored_entry));
     }
 
     let requests = job.await.unwrap();
@@ -534,6 +551,7 @@ async fn reject_approval_does_not_touch_game_files() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "trash".into(),
+            attachments: None,
             model: None,
             permission_mode: None,
             reasoning_effort: None,
@@ -578,6 +596,7 @@ async fn rejected_plugin_publication_never_grants_upload_consent_in_either_revie
             .start_turn(TurnRequest {
                 conversation_id: conv.clone(),
                 content: "发布适配包".into(),
+                attachments: None,
                 model: None,
                 permission_mode: Some(mode),
                 reasoning_effort: None,
@@ -635,6 +654,7 @@ async fn rejected_online_identification_never_searches_or_registers_in_either_re
             .start_turn(TurnRequest {
                 conversation_id: conv.clone(),
                 content: "识别这个游戏，先审核搜索词".into(),
+                attachments: None,
                 model: None,
                 permission_mode: Some(mode),
                 reasoning_effort: None,
@@ -697,6 +717,7 @@ async fn questionnaire_waits_for_valid_answers_and_resumes_with_ordered_skips() 
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "确认适配".into(),
+            attachments: None,
             model: None,
             permission_mode: Some(crate::agent::policy::PermissionMode::FullTrust),
             reasoning_effort: None,
@@ -761,6 +782,7 @@ async fn cancellation_unblocks_approval_and_next_turn_repairs_tool_protocol() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "ask".into(),
+            attachments: None,
             model: None,
             permission_mode: None,
             reasoning_effort: None,
@@ -771,6 +793,7 @@ async fn cancellation_unblocks_approval_and_next_turn_repairs_tool_protocol() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "duplicate".into(),
+            attachments: None,
             model: None,
             permission_mode: None,
             reasoning_effort: None,
@@ -784,6 +807,7 @@ async fn cancellation_unblocks_approval_and_next_turn_repairs_tool_protocol() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "continue".into(),
+            attachments: None,
             model: None,
             permission_mode: None,
             reasoning_effort: None,
@@ -829,6 +853,7 @@ async fn agent_turn_uses_only_reasoning_effort_enabled_for_the_active_model() {
     let request = |reasoning_effort| TurnRequest {
         conversation_id: conv.clone(),
         content: "hi".into(),
+        attachments: None,
         model: None,
         permission_mode: None,
         reasoning_effort,
@@ -883,6 +908,7 @@ async fn per_turn_model_override_uses_configured_budget_and_preserves_saved_defa
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "hi".into(),
+            attachments: None,
             model: Some("second-model".into()),
             permission_mode: None,
             reasoning_effort: Some(ReasoningEffort::Ultra),
@@ -950,6 +976,7 @@ fn per_turn_model_and_reasoning_are_validated_before_writing_messages() {
     let invalid_model = agent.start_turn(TurnRequest {
         conversation_id: conv.clone(),
         content: "invalid model".into(),
+        attachments: None,
         model: Some("not-configured".into()),
         permission_mode: None,
         reasoning_effort: None,
@@ -962,6 +989,7 @@ fn per_turn_model_and_reasoning_are_validated_before_writing_messages() {
     let invalid_reasoning = agent.start_turn(TurnRequest {
         conversation_id: conv.clone(),
         content: "invalid reasoning".into(),
+        attachments: None,
         model: Some("second-model".into()),
         permission_mode: None,
         reasoning_effort: Some(ReasoningEffort::Low),
@@ -1139,6 +1167,7 @@ async fn model_stream_dropped_after_output_retries_only_the_current_request() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "trash".into(),
+            attachments: None,
             model: None,
             permission_mode: Some(super::policy::PermissionMode::FullTrust),
             reasoning_effort: None,
@@ -1303,6 +1332,7 @@ async fn model_stream_exhausted_retries_keep_the_last_visible_reply() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "hi".into(),
+            attachments: None,
             model: None,
             permission_mode: None,
             reasoning_effort: None,
@@ -1345,6 +1375,7 @@ async fn unconfigured_model_reports_why_the_turn_failed_without_a_delta() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "hi".into(),
+            attachments: None,
             model: None,
             permission_mode: None,
             reasoning_effort: None,
@@ -1379,6 +1410,7 @@ async fn model_sse_error_replays_on_the_partial_reply_without_entering_history()
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "hi".into(),
+            attachments: None,
             model: None,
             permission_mode: None,
             reasoning_effort: None,
@@ -1446,6 +1478,7 @@ async fn truncated_tool_stream_never_executes() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "trash".into(),
+            attachments: None,
             model: None,
             permission_mode: Some(super::policy::PermissionMode::FullTrust),
             reasoning_effort: None,
@@ -1491,6 +1524,7 @@ async fn context_compression_preserves_full_history_and_summarizes_only_older_tu
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "继续安装".into(),
+            attachments: None,
             model: None,
             permission_mode: None,
             reasoning_effort: None,
@@ -1524,6 +1558,7 @@ async fn cancel_stalled_model_request_finishes_without_waiting_for_network_timeo
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "request".into(),
+            attachments: None,
             model: None,
             permission_mode: None,
             reasoning_effort: None,
@@ -1566,6 +1601,7 @@ async fn auto_approve_applies_only_registered_game_plan_without_prompt() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "安装".into(),
+            attachments: None,
             model: None,
             permission_mode: Some(super::policy::PermissionMode::AutoApprove),
             reasoning_effort: None,
@@ -1608,6 +1644,7 @@ async fn auto_approve_requires_confirmation_for_move_out_of_manager_storage() {
         .start_turn(TurnRequest {
             conversation_id: conv.clone(),
             content: "Move".into(),
+            attachments: None,
             model: None,
             permission_mode: Some(super::policy::PermissionMode::AutoApprove),
             reasoning_effort: None,

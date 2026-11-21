@@ -76,6 +76,7 @@ pub struct FomodAutoSelection {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FomodPreview {
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub artifact_path: PathBuf,
     pub artifact_sha256: String,
     pub config_path: String,

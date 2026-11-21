@@ -18,8 +18,12 @@ export interface Conversation {
     pending: { approval_id: string; status: "waiting-answer" | "waiting-approval" } | null;
   };
 }
+export type AgentAttachment =
+  | { kind: "image"; name: string; dataUrl: string }
+  | { kind: "document"; name: string; markdown: string };
 export interface Message {
   id: string; role: string; content: string; reasoning: string | null;
+  attachments?: AgentAttachment[];
   tool_calls: unknown; tool_call_id: string | null; token_count?: number; created_at?: string;
 }
 export interface AgentEvent {
@@ -31,6 +35,19 @@ export interface FilePlan {
   entries: Array<{operation: {op: string; src?: string; dst: string}; impact: string;
     before: {kind: string; size: number; sha256: string} | null;
     source: {kind: string; size: number; sha256: string} | null}>;
+}
+export type GamePlanConflictKind = "file_plan" | "approval" | "recovery";
+export interface GamePlanConflict {
+  id: string;
+  kind: GamePlanConflictKind;
+  status: string;
+  title: string;
+  summary: string;
+  paths: string[];
+  detail: string | null;
+  canResolve: boolean;
+  resolutionHint: string | null;
+  planId?: string | null;
 }
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
 export interface AgentModelSettings {

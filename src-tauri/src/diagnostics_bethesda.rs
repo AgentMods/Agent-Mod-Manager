@@ -49,6 +49,7 @@ pub enum PluginHeaderStatus {
 #[serde(rename_all = "camelCase")]
 pub struct BethesdaPluginEvidence {
     pub name: String,
+    #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub path: String,
     pub enabled: bool,
     pub list_line: usize,
