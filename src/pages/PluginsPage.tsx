@@ -7,23 +7,26 @@ import { useUI } from '@/lib/store';
 import type { FilePlan, Plugin } from '@/lib/types';
 import { Badge, date, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, PathText } from '@/components/ui';
 import { GameCover } from '@/components/GameCover';
+import { ManagerPluginCatalog } from '@/components/ManagerPluginCatalog';
 import { PluginPublications } from '@/components/PluginPublications';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { AlertDialog, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Field, FieldLabel } from '@/components/ui/field';
+import { Field, FieldDescription, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group';
 import { Label } from '@/components/ui/label';
 import { Spinner } from '@/components/ui/spinner';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
+import { stagger } from "@/lib/motion";
 
 type Draft = { id: string; slug: string; path: string; writeTransactionId: string; createdAt: string };
-type Validation = { draft: Draft; transactionStatus: string; valid: boolean; package: { adapter: { name: string; version: string; platforms: string[]; modTypes: { id: string; name: string }[] }; skill: { description: string } } | null; hashes: { adapterSha256: string; skillSha256: string } | null; issues: { code: string; message: string }[]; warnings: string[] };
+type Validation = { draft: Draft; transactionStatus: string; valid: boolean; package: { adapter: { name: string; version: string; platforms: string[]; mcpServers?: { id: string; name: string }[]; modTypes: { id: string; name: string }[] }; skill: { description: string } } | null; hashes: { adapterSha256: string; skillSha256: string } | null; issues: { code: string; message: string }[]; warnings: string[] };
+const pluginSourceLabel = (source: string) => source === 'external' ? '本地导入' : '已安装';
 
 export default function PluginsPage() {
   const client = useQueryClient();
@@ -40,7 +43,7 @@ export default function PluginsPage() {
   const [skillError, setSkillError] = useState<unknown>(null);
   const skill = useBackendQuery<{ skill: { enabled: boolean; valid: boolean }; markdown: string }>(['skills', 'package', skillSlug], 'get_skill', { name: skillSlug }, !!skillSlug);
   const [draftOpen, setDraftOpen] = useState(false);
-  const [publishDraft, setPublishDraft] = useState<Draft | null>(null);
+  const [publishDraft, setPublishDraft] = useState<{ id?: string; slug: string } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Draft | null>(null);
   const deleteButton = useRef<HTMLButtonElement>(null);
   const draftsTab = useRef<HTMLButtonElement>(null);
@@ -63,6 +66,7 @@ export default function PluginsPage() {
       await Promise.all([
         client.invalidateQueries({ queryKey: ['plugins'] }),
         client.invalidateQueries({ queryKey: ['skills'] }),
+        client.invalidateQueries({ queryKey: ['mcp'] }),
       ]);
     } catch (e) { setError(e); } finally { setBusy(false); }
   }
@@ -118,11 +122,13 @@ export default function PluginsPage() {
       <Button variant="outline" disabled={!writable || busy} onClick={() => { setDraftOpen(true); setError(null); }}><PlusIcon data-icon="inline-start" />新建草稿</Button>
     </>} />
     <Tabs value={tab} onValueChange={setTab} className="gap-4">
-      <div className="max-w-full "><TabsList>
+      <div className="max-w-full"><TabsList aria-label="适配包分类" variant="line">
         <TabsTrigger value="installed">已安装</TabsTrigger>
+        <TabsTrigger value="catalog">云端插件</TabsTrigger>
         <TabsTrigger value="drafts" ref={draftsTab}>草稿 {plural(drafts.data?.length ?? 0)}</TabsTrigger>
         <TabsTrigger value="publications">发布记录</TabsTrigger>
       </TabsList></div>
+      <TabsContent value="catalog"><ManagerPluginCatalog writable={writable} /></TabsContent>
     </Tabs>
     <ErrorState error={plugins.error} /><ErrorState error={drafts.error} /><ErrorState error={error} />
     {tab === 'installed' && <>
@@ -132,7 +138,7 @@ export default function PluginsPage() {
           <div className="rounded-lg border">
             <Table>
               <TableHeader><TableRow><TableHead>适配包</TableHead><TableHead>版本</TableHead><TableHead>来源</TableHead><TableHead>验证</TableHead><TableHead>状态</TableHead></TableRow></TableHeader>
-              <TableBody>{filtered.map(plugin => <TableRow key={plugin.slug} data-state={selectedSlug === plugin.slug ? 'selected' : undefined} className="cursor-pointer" onClick={() => setSelectedSlug(plugin.slug)}>
+              <TableBody>{filtered.map((plugin, index) => <TableRow key={plugin.slug} data-state={selectedSlug === plugin.slug ? 'selected' : undefined} className="cursor-pointer motion-safe:animate-soft-fade" style={stagger(index, 30)} onClick={() => setSelectedSlug(plugin.slug)}>
                 <TableCell>
                   <button type="button" className="flex items-center gap-3 rounded-md text-left outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" onClick={() => setSelectedSlug(plugin.slug)}>
                     <PackageIcon className="size-5 shrink-0 text-muted-foreground" />
@@ -140,7 +146,7 @@ export default function PluginsPage() {
                   </button>
                 </TableCell>
                 <TableCell>{plugin.version}</TableCell>
-                <TableCell>{plugin.source === 'builtin' ? '内置' : plugin.source === 'external' ? '本地导入' : plugin.source}</TableCell>
+                <TableCell>{pluginSourceLabel(plugin.source)}</TableCell>
                 <TableCell><Badge tone={plugin.validated ? 'success' : 'warning'}>{plugin.validated ? '已验证' : '未验证'}</Badge></TableCell>
                 <TableCell><Badge tone={plugin.enabled && plugin.validated ? 'success' : 'neutral'}>{plugin.enabled ? '已启用' : '已停用'}</Badge></TableCell>
               </TableRow>)}</TableBody>
@@ -158,7 +164,7 @@ export default function PluginsPage() {
                   <dt className="text-muted-foreground">标识</dt><dd className="break-all">{selected.slug}</dd>
                   <dt className="text-muted-foreground">游戏</dt><dd>{selected.gameName}</dd>
                   <dt className="text-muted-foreground">版本</dt><dd>{selected.version}</dd>
-                  <dt className="text-muted-foreground">来源</dt><dd>{selected.source === "builtin" ? "内置" : selected.source === "external" ? "本地导入" : selected.source}</dd>
+                  <dt className="text-muted-foreground">来源</dt><dd>{pluginSourceLabel(selected.source)}</dd>
                   <dt className="text-muted-foreground">安装目录</dt><dd><PathText>{displayPath(selected.installPath)}</PathText></dd>
                 </dl>
                 <Label className="font-normal">
@@ -170,6 +176,12 @@ export default function PluginsPage() {
                   <CardDescription>{selected.description}</CardDescription>
                   <Button variant="outline" size="sm" className="self-start" disabled={!selected.validated} onClick={() => { setSkillError(null); setSkillSlug(selected.slug); }}><FileCode2Icon data-icon="inline-start" />查看游戏 Skill</Button>
                 </div>
+                {!!selected.mcpServerNames?.length && <div className="flex flex-col gap-2 border-t pt-4">
+                  <h3 className="text-sm font-semibold">工具</h3>
+                  <ul className="text-sm">{selected.mcpServerNames.map((name, index) => <li key={index} className="wrap-anywhere">{name}</li>)}</ul>
+                  <CardDescription>{selected.enabled ? '可在「设置 → 工具」中配置凭据和启动连接。' : '启用适配包后，可在「设置 → 工具」中启动连接。'}</CardDescription>
+                </div>}
+                <Button variant="outline" disabled={!writable || busy || !selected.validated || selected.source !== 'external'} onClick={() => setPublishDraft({ slug: selected.slug })}><UploadIcon data-icon="inline-start" />发布管理器插件</Button>
                 <Button disabled={!writable || busy || !selected.validated} onClick={() => startAdapterChat({ name: selected.name, slug: selected.slug })}><SparklesIcon data-icon="inline-start" />用 Agent 修改</Button>
               </> : <p className="text-sm text-muted-foreground">未选择适配包</p>}
             </CardContent>
@@ -228,7 +240,7 @@ export default function PluginsPage() {
     </>}>
       <ErrorState error={error} />
       <Field><FieldLabel htmlFor="draft-slug">Slug</FieldLabel><Input id="draft-slug" value={slug} onChange={e => setSlug(e.target.value)} maxLength={100} /></Field>
-      <Field><FieldLabel htmlFor="draft-adapter">adapter.json</FieldLabel><Textarea id="draft-adapter" className="font-mono text-xs" rows={12} spellCheck={false} value={adapterJson} onChange={e => setAdapterJson(e.target.value)} /></Field>
+      <Field><FieldLabel htmlFor="draft-adapter">adapter.json</FieldLabel><FieldDescription id="draft-mcp-hint">插件提供的工具可写在 <code>mcpServers</code> 数组中。</FieldDescription><Textarea aria-describedby="draft-mcp-hint" id="draft-adapter" className="font-mono text-xs" rows={12} spellCheck={false} value={adapterJson} onChange={e => setAdapterJson(e.target.value)} /></Field>
       <Field><FieldLabel htmlFor="draft-skill">SKILL.md</FieldLabel><Textarea id="draft-skill" className="font-mono text-xs" rows={10} spellCheck={false} value={skillMarkdown} onChange={e => setSkillMarkdown(e.target.value)} /></Field>
     </Modal>}
     {validation && <Modal title={`验证：${validation.draft.slug}`} onClose={() => { if (!busy) setValidation(null); }} actions={<>
@@ -243,6 +255,7 @@ export default function PluginsPage() {
           <dt className="text-muted-foreground">名称</dt><dd>{validation.package.adapter.name}</dd>
           <dt className="text-muted-foreground">版本</dt><dd>{validation.package.adapter.version}</dd>
           <dt className="text-muted-foreground">平台</dt><dd>{validation.package.adapter.platforms.join('、')}</dd>
+          {!!validation.package.adapter.mcpServers?.length && <><dt className="text-muted-foreground">工具</dt><dd className="wrap-anywhere">{validation.package.adapter.mcpServers.map(server => server.name).join('、')}</dd></>}
           <dt className="text-muted-foreground">Mod 类型</dt><dd>{validation.package.adapter.modTypes.map(type => `${type.name} (${type.id})`).join('、')}</dd>
         </>}
         {validation.hashes && <>

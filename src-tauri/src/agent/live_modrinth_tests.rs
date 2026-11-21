@@ -7,7 +7,7 @@ use crate::{
     app::AppServices,
     artifacts,
     download::DownloadArtifact,
-    games, install,
+    games, install, plugins,
     sources::{SearchResult, SourceState},
     transaction::FilePlan,
     util,
@@ -176,6 +176,7 @@ fn approve(agent: &AgentRuntime, conv: &str, event: &AgentEvent, expected_tool: 
 async fn opt_in_live_modrinth_agent_install_and_rollback() {
     let temp = tempfile::tempdir().unwrap();
     let app = AppServices::initialize(temp.path().join("data")).unwrap();
+    plugins::test_fixtures::install(&app.engine.db, &app.engine.paths).unwrap();
     let root = temp.path().join("minecraft");
     fs::create_dir_all(root.join("mods")).unwrap();
     fs::write(root.join("options.txt"), b"fullscreen:false\n").unwrap();

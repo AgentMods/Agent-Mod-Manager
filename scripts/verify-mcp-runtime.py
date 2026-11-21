@@ -1,4 +1,4 @@
-"""Exercise a packaged MCP runtime offline, without npm or uv on the system PATH."""
+"""Exercise the packaged MCP launchers and Bing helper offline."""
 import argparse
 import json
 import os
@@ -11,6 +11,7 @@ import tempfile
 import zipfile
 
 LOCK = Path(__file__).with_name('mcp-runtime.lock.json')
+PACKAGE = LOCK.parent.parent / 'package.json'
 
 
 def python_fixture(directory):
@@ -39,7 +40,7 @@ def verify(archive_path, work):
             if not dest.is_relative_to(runtime) or stat.S_ISLNK(entry.external_attr >> 16):
                 raise ValueError(f'Unsafe runtime entry {entry.filename!r}')
             archive.extract(entry, runtime)
-            if not entry.is_dir() and (entry.filename.startswith('bin/') or (entry.external_attr >> 16) & 0o111):
+            if not entry.is_dir() and (entry.external_attr >> 16) & 0o111:
                 dest.chmod(0o700)
 
     bin_dir = runtime / 'bin'
@@ -75,6 +76,27 @@ def verify(archive_path, work):
     lock = json.loads(LOCK.read_text(encoding='utf-8'))
     run([node, '--version'], 'v' + lock['node']['version'])
     run([node, npx, '--version'], lock['node']['npmVersion'])
+    helper = bin_dir / 'bing-search.cjs'
+    if helper.read_bytes() != LOCK.with_name('bing-search.cjs').read_bytes():
+        raise RuntimeError('Packaged Bing helper does not match scripts/bing-search.cjs')
+    node_flags = [node, '--no-global-search-paths']
+    subprocess.run([*node_flags, '--check', helper], cwd=work, env=env, check=True, timeout=15)
+    playwright_version = json.loads(PACKAGE.read_text(encoding='utf-8'))['devDependencies']['playwright-core']
+    # Use Node's resolution from the actual helper location and require the packaged
+    # API. Do not launch a browser or perform an HTTP request in installer smoke tests.
+    run([*node_flags, '--eval', '''
+const assert = require('node:assert/strict');
+const { realpathSync } = require('node:fs');
+const { createRequire } = require('node:module');
+const { dirname, join } = require('node:path');
+const helper = process.argv[1];
+const load = createRequire(helper);
+const local = realpathSync(join(dirname(helper), 'node_modules', 'playwright-core', 'index.js'));
+assert.equal(realpathSync(load.resolve('playwright-core')), local);
+assert.equal(load('playwright-core/package.json').version, process.argv[2]);
+assert.equal(typeof load('playwright-core').chromium.launch, 'function');
+console.log('bing-helper-playwright-ok');
+''', '--', helper, playwright_version], 'bing-helper-playwright-ok')
     # uvx's version may also display its upstream build commit and date.
     version = subprocess.check_output([uvx, '--version'], cwd=work, env=env, text=True, timeout=15).strip()
     if version.split()[:2] != ['uvx', lock['uv']['version']]:

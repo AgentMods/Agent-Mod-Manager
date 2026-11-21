@@ -45,7 +45,7 @@ async fn agent_attachment_send_edit_and_retry_reach_model_and_history() {
     let history = History::new(engine.db.clone());
     let (url, job) = server(vec![final_reply(); 6]).await;
     let (agent, conv, mut rx) = runtime(engine, &url);
-    // This test exercises branching independently of compression and its extra call.
+    // Keep enough room that model requests reflect the full stored context.
     agent.settings.set("context_budget", json!(131072)).unwrap();
     let prior = [
         image("earlier.gif", GIF),
@@ -62,13 +62,29 @@ async fn agent_attachment_send_edit_and_retry_reach_model_and_history() {
     let detail = history.get_conversation(&conv).unwrap();
     let user = &detail.messages[2];
     let answer = &detail.messages[3];
+    let original_user_id = user.id.clone();
+    let prefix_ids = [detail.messages[0].id.clone(), detail.messages[1].id.clone()];
     assert_eq!(user.content, "");
-    let payload = json!(detail);
-    assert_eq!(payload["messages"][0]["attachments"], json!(prior));
-    assert!(payload["messages"][1].get("attachments").is_none());
-    assert_eq!(payload["messages"][2]["attachments"], json!(target));
+    assert_eq!(detail.conversation.id, conv);
+    assert_eq!(detail.conversation.title, "Test");
+    assert_eq!(json!(detail.messages[0])["attachments"], json!(prior));
+    assert_eq!(json!(detail.messages[2])["attachments"], json!(target));
 
     let replacement = [document("replacement.md", "# New Document")];
+    let assert_target_state = |content: &str, attachments: Value| {
+        let current = history.get_conversation(&conv).unwrap();
+        assert_eq!(current.conversation.id, conv);
+        assert_eq!(current.conversation.title, "Test");
+        assert_eq!(current.messages[2].id, original_user_id);
+        assert_eq!(current.messages[2].content, content);
+        assert_eq!(json!(current.messages[2].attachments), attachments);
+    };
+    let later_user = history
+        .append_message(&conv, "user", "Discard this later question", None, None)
+        .unwrap();
+    let later_assistant = history
+        .append_message(&conv, "assistant", "Discard this later answer", None, None)
+        .unwrap();
     let retry = agent
         .restart_turn(
             request(&conv, "ignored on retry", &replacement),
@@ -77,6 +93,10 @@ async fn agent_attachment_send_edit_and_retry_reach_model_and_history() {
         )
         .unwrap();
     assert_turn_done(&mut rx).await;
+    assert_target_state("", json!(target));
+    let edited_suffix = history
+        .append_message(&conv, "user", "Discard this edited suffix", None, None)
+        .unwrap();
     let edit_omit = agent
         .restart_turn(
             serde_json::from_value(json!({"conversationId":conv,"content":"Keep the image"}))
@@ -86,15 +106,21 @@ async fn agent_attachment_send_edit_and_retry_reach_model_and_history() {
         )
         .unwrap();
     assert_turn_done(&mut rx).await;
+    assert_target_state("Keep the image", json!(target));
     let edit_replace = agent
         .restart_turn(request(&conv, "", &replacement), &user.id, true)
         .unwrap();
     assert_turn_done(&mut rx).await;
+    assert_target_state("", json!(replacement));
     let edit_remove = agent
         .restart_turn(request(&conv, "Remove the image", &[]), &user.id, true)
         .unwrap();
     assert_turn_done(&mut rx).await;
+    assert_target_state("Remove the image", json!([]));
 
+    for conversation_id in [&retry, &edit_omit, &edit_replace, &edit_remove] {
+        assert_eq!(conversation_id, &conv);
+    }
     let sent = job.await.unwrap();
     let parts = &sent[0]["messages"][1]["content"];
     assert_eq!(parts[0], json!({"type":"text","text":"Read these"}));
@@ -136,22 +162,31 @@ async fn agent_attachment_send_edit_and_retry_reach_model_and_history() {
         .ends_with("# New Document"));
     assert_eq!(sent[5]["messages"][3]["content"], "Remove the image");
 
-    for (branch, expected, title) in [
-        (&retry, &target[..], "target.png"),
-        (&edit_omit, &target[..], "Keep the image"),
-        (&edit_replace, &replacement[..], "replacement.md"),
-        (&edit_remove, &[][..], "Remove the image"),
-    ] {
-        let detail = json!(history.get_conversation(branch).unwrap());
-        assert_eq!(detail["conversation"]["title"], title);
-        assert_eq!(detail["messages"][0]["attachments"], json!(prior));
-        if expected.is_empty() {
-            assert!(detail["messages"][2].get("attachments").is_none());
-        } else {
-            assert_eq!(detail["messages"][2]["attachments"], json!(expected));
-        }
+    for body in &sent[2..] {
+        let encoded = body.to_string();
+        assert!(!encoded.contains("Discard this later question"));
+        assert!(!encoded.contains("Discard this later answer"));
+        assert!(!encoded.contains("Discard this edited suffix"));
     }
-    assert_eq!(json!(history.get_conversation(&conv).unwrap()), payload);
+
+    let final_detail = history.get_conversation(&conv).unwrap();
+    assert_eq!(final_detail.conversation.id, conv);
+    assert_eq!(final_detail.conversation.title, "Test");
+    assert_eq!(final_detail.messages.len(), 4);
+    assert_eq!(final_detail.messages[0].id, prefix_ids[0]);
+    assert_eq!(final_detail.messages[1].id, prefix_ids[1]);
+    assert_eq!(json!(final_detail.messages[0])["attachments"], json!(prior));
+    assert_eq!(final_detail.messages[2].id, original_user_id);
+    assert_eq!(final_detail.messages[2].content, "Remove the image");
+    assert!(final_detail.messages[2].attachments.is_empty());
+    assert_eq!(final_detail.messages[3].role, "assistant");
+    assert_eq!(final_detail.messages[3].content, "完成");
+    assert!(!final_detail.messages.iter().any(|message| {
+        message.id == answer.id
+            || message.id == later_user.id
+            || message.id == later_assistant.id
+            || message.id == edited_suffix.id
+    }));
 }
 
 #[tokio::test]

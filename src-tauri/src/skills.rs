@@ -91,7 +91,6 @@ pub fn migrate(db: &Db) -> AppResult<()> {
 #[serde(rename_all = "snake_case")]
 pub enum SkillKind {
     System,
-    Builtin,
     Plugin,
     Standalone,
     Unknown,
@@ -378,8 +377,8 @@ fn registry_row(engine: &FileEngine, name: &str) -> AppResult<Option<SkillInfo>>
 /// ownership grant. In particular, game-package Skills are never standalone.
 fn standalone_owner(engine: &FileEngine, name: &str) -> AppResult<Option<SkillInfo>> {
     plugins::validate_slug(name)?;
-    if is_system_skill(name) || plugins::BUILTIN_PACKAGES.iter().any(|(n, _, _)| *n == name) {
-        return Err(AppError::Conflict("不能接管内置 Skill 名称".into()));
+    if is_system_skill(name) {
+        return Err(AppError::Conflict("不能接管系统 Skill 名称".into()));
     }
     let plugin: bool = engine.db.conn().query_row(
         "SELECT EXISTS(SELECT 1 FROM plugins WHERE slug=?1)",
@@ -671,7 +670,7 @@ fn reconcile_locked(engine: &FileEngine) -> AppResult<ReconcileReport> {
                 report.removed.push(name);
             }
             Err(error) => {
-                // Never change a colliding builtin/plugin/unknown-source row.
+                // Never change a colliding plugin or unknown-source row.
                 if standalone_owner(engine, &name).is_ok() && disable(engine, &name)? {
                     report.disabled.push(name.clone());
                 }
@@ -870,17 +869,14 @@ fn inspect(engine: &FileEngine, mut info: SkillInfo) -> (SkillInfo, Option<Strin
                     "插件 Skill 的位置/来源/校验状态不匹配".into(),
                 ));
             }
-            info.kind = if source == "builtin" {
-                SkillKind::Builtin
-            } else if source == SOURCE {
-                SkillKind::Plugin
-            } else {
+            if source != SOURCE {
                 return Err(AppError::Denied("未知插件 Skill 来源".into()));
-            };
+            }
+            info.kind = SkillKind::Plugin;
             if !validated {
                 return Err(AppError::Denied("关联插件未通过完整性校验".into()));
             }
-            plugin_workflow::validate_package_directory(engine, &expected, source == "builtin")?;
+            plugin_workflow::validate_package_directory(engine, &expected)?;
             let markdown = read_text(engine, &info.location, SKILL_LIMIT)?;
             let adapter = read_text(engine, &expected.join("adapter.json"), ADAPTER_LIMIT)?;
             let package = plugins::parse_package(&info.name, &adapter, &markdown)?;
@@ -888,13 +884,6 @@ fn inspect(engine: &FileEngine, mut info: SkillInfo) -> (SkillInfo, Option<Strin
                 return Err(AppError::Conflict(
                     "插件 Skill 对应适配包与登记内容不一致".into(),
                 ));
-            }
-            if source == "builtin"
-                && !plugins::BUILTIN_PACKAGES
-                    .iter()
-                    .any(|(n, _, text)| *n == info.name && *text == markdown)
-            {
-                return Err(AppError::Conflict("内置 Skill 内容与嵌入版本不同".into()));
             }
             info.description = package.skill.description;
             Ok(markdown)

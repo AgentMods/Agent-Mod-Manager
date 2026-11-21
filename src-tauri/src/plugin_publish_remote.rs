@@ -11,20 +11,22 @@ use crate::{
     transaction::FileEngine,
 };
 use rmcp::{
-    model::CallToolRequestParams,
+    model::{CallToolRequestParams, CallToolResponse},
     service::RunningService,
     transport::{
+        common::client_side_sse::NeverRetry,
         streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
     },
     RoleClient, ServiceExt,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use zeroize::Zeroizing;
 
-const ENDPOINT: &str = "https://www.glossmod.com/api/v1/mcp";
+const ENDPOINT: &str = publication::DESTINATION;
 const SECRET_REF: &str = "mcp.glossmod_http.api_key";
 const MAX_RESPONSE: usize = 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -80,20 +82,30 @@ async fn put_bytes(
     Ok(())
 }
 
-struct Transport {
+/// Shared fixed-origin MCP session. Callers own the tool allowlist and decoded
+/// contract; this layer handles the existing settings credential, deadlines,
+/// transport limits, sanitized errors and exactly one tool request.
+pub(crate) struct PublicationMcp {
     service: RunningService<RoleClient, ()>,
-    http: reqwest::Client,
-    key: String,
+    key: Zeroizing<String>,
+    max_response: usize,
 }
 
-impl Drop for Transport {
+impl Drop for PublicationMcp {
     fn drop(&mut self) {
         self.service.cancellation_token().cancel();
     }
 }
 
-impl Transport {
-    async fn connect(settings: &Settings, cancel: &CancellationToken) -> AppResult<Self> {
+impl PublicationMcp {
+    pub(crate) async fn connect(
+        settings: &Settings,
+        max_response: usize,
+        cancel: &CancellationToken,
+    ) -> AppResult<Self> {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
         let key = settings
             .read_secret(SECRET_REF)
             .map_err(|_| AppError::Other("无法读取 Mod 客栈凭据".into()))?
@@ -101,12 +113,37 @@ impl Transport {
                 !key.is_empty() && key.len() <= 8192 && !key.chars().any(char::is_control)
             })
             .ok_or_else(|| AppError::Denied("请先在设置中配置 Mod 客栈 API Key".into()))?;
-        let config = StreamableHttpClientTransportConfig::with_uri(ENDPOINT)
-            .auth_header(key.clone())
+        Self::connect_with(ENDPOINT, key, max_response, cancel).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn connect_to(
+        endpoint: &str,
+        key: String,
+        max_response: usize,
+        cancel: &CancellationToken,
+    ) -> AppResult<Self> {
+        Self::connect_with(endpoint, key, max_response, cancel).await
+    }
+
+    async fn connect_with(
+        endpoint: &str,
+        key: String,
+        max_response: usize,
+        cancel: &CancellationToken,
+    ) -> AppResult<Self> {
+        use reqwest_mcp::header::{HeaderValue, AUTHORIZATION};
+        let key = Zeroizing::new(key);
+        let mut auth = HeaderValue::from_str(&Zeroizing::new(format!("Bearer {}", key.as_str())))
+            .map_err(|_| AppError::Denied("Mod 客栈 API Key 格式无效".into()))?;
+        auth.set_sensitive(true);
+        let mut config = StreamableHttpClientTransportConfig::with_uri(endpoint)
+            .custom_headers([(AUTHORIZATION, auth)].into())
             .max_concurrent_requests(1)
-            .max_sse_event_size(MAX_RESPONSE)
+            .max_sse_event_size(max_response)
             .reinit_on_expired_session(false)
             .control_request_timeout(Duration::from_secs(2));
+        config.retry_config = Arc::<NeverRetry>::default();
         let client = reqwest_mcp::Client::builder()
             .redirect(reqwest_mcp::redirect::Policy::none())
             .retry(reqwest_mcp::retry::never())
@@ -120,8 +157,60 @@ impl Transport {
             _ = cancel.cancelled() => return Err(AppError::Cancelled),
             result = tokio::time::timeout(TIMEOUT, ().serve(io)) => result.map_err(|_| failed())?.map_err(|_| failed())?,
         };
+        Ok(Self {
+            service,
+            key,
+            max_response,
+        })
+    }
+
+    pub(crate) fn echoes_key(&self, value: &Value) -> bool {
+        echoes(value, &self.key)
+    }
+
+    pub(crate) async fn call_tool(
+        &self,
+        name: &str,
+        args: Value,
+        max_request: usize,
+        cancel: &CancellationToken,
+    ) -> AppResult<Value> {
+        if serde_json::to_vec(&args)?.len() > max_request {
+            return Err(failed());
+        }
+        let arguments = match args {
+            Value::Object(map) => map,
+            _ => return Err(failed()),
+        };
+        let request = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments);
+        let reply = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(AppError::Cancelled),
+            response = tokio::time::timeout(TIMEOUT, self.service.peer().call_tool_once(request)) => response.map_err(|_| failed())?.map_err(|_| failed())?,
+        };
+        let CallToolResponse::Complete(response) = reply else {
+            return Err(failed());
+        };
+        let raw = serde_json::to_value(response).map_err(|_| failed())?;
+        if self.echoes_key(&raw)
+            || serde_json::to_vec(&raw).map_err(|_| failed())?.len() > self.max_response
+        {
+            return Err(failed());
+        }
+        Ok(raw)
+    }
+}
+
+struct Transport {
+    mcp: PublicationMcp,
+    http: reqwest::Client,
+}
+
+impl Transport {
+    async fn connect(settings: &Settings, cancel: &CancellationToken) -> AppResult<Self> {
+        let mcp = PublicationMcp::connect(settings, MAX_RESPONSE, cancel).await?;
         let http = upload_client()?;
-        Ok(Self { service, http, key })
+        Ok(Self { mcp, http })
     }
 
     async fn call<T: DeserializeOwned>(
@@ -141,22 +230,19 @@ impl Transport {
         ) {
             return Err(AppError::Denied("发布流程不能调用其它远程工具".into()));
         }
-        let arguments = args.as_object().cloned().ok_or_else(failed)?;
-        if serde_json::to_vec(&args)?.len() > 256 * 1024 {
-            return Err(failed());
-        }
-        let request = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments);
-        let response = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(AppError::Cancelled),
-            response = tokio::time::timeout(TIMEOUT, self.service.peer().call_tool(request)) => response.map_err(|_| failed())?.map_err(|_| failed())?,
-        };
-        let raw = serde_json::to_value(response).map_err(|_| failed())?;
-        parse_result(raw, &self.key)
+        let raw = self.mcp.call_tool(name, args, 256 * 1024, cancel).await?;
+        parse_result(raw, &self.mcp.key)
     }
 
     async fn put(&self, path: &str, payload: &[u8], cancel: &CancellationToken) -> AppResult<()> {
-        put_bytes(&self.http, &self.key, upload_url(path)?, payload, cancel).await
+        put_bytes(
+            &self.http,
+            &self.mcp.key,
+            upload_url(path)?,
+            payload,
+            cancel,
+        )
+        .await
     }
 }
 
@@ -187,18 +273,22 @@ fn upload_url(path: &str) -> AppResult<Url> {
     Ok(url)
 }
 
+fn echoes(value: &Value, key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    match value {
+        Value::String(text) => text.contains(key),
+        Value::Array(items) => items.iter().any(|item| echoes(item, key)),
+        Value::Object(items) => items
+            .iter()
+            .any(|(name, value)| name.contains(key) || echoes(value, key)),
+        _ => false,
+    }
+}
+
 fn parse_result<T: DeserializeOwned>(raw: Value, key: &str) -> AppResult<T> {
     let encoded = serde_json::to_string(&raw).map_err(|_| failed())?;
-    fn echoes(value: &Value, key: &str) -> bool {
-        match value {
-            Value::String(text) => text.contains(key),
-            Value::Array(items) => items.iter().any(|item| echoes(item, key)),
-            Value::Object(items) => items
-                .iter()
-                .any(|(name, value)| name.contains(key) || echoes(value, key)),
-            _ => false,
-        }
-    }
     if encoded.len() > MAX_RESPONSE
         || (!key.is_empty() && echoes(&raw, key))
         || raw["isError"] == true

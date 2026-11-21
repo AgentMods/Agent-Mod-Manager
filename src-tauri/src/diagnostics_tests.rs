@@ -17,7 +17,7 @@ impl Fixture {
         let base = temp.path().canonicalize().unwrap();
         let paths = AppPaths::new(base.join("manager")).unwrap();
         let engine = FileEngine::new(Db::open(&paths.db_file()).unwrap(), paths);
-        plugins::seed_builtins(&engine.db, &engine.paths).unwrap();
+        plugins::test_fixtures::install(&engine.db, &engine.paths).unwrap();
         let root = base.join("game");
         fs::create_dir(&root).unwrap();
         for marker in plugins::adapter_for(&engine.db, slug).unwrap().markers {

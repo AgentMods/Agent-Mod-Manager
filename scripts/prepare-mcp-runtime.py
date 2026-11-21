@@ -1,4 +1,5 @@
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -20,6 +21,8 @@ LOCK = ROOT / 'scripts/mcp-runtime.lock.json'
 OUTPUT = ROOT / 'src-tauri/resources/mcp-runtime/runtime.zip'
 CACHE = ROOT / 'src-tauri/target/mcp-runtime-downloads'
 MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
+BING_HELPER = 'bin/bing-search.cjs'
+PLAYWRIGHT_DIR = 'bin/node_modules/playwright-core'
 
 # Node's names differ from both Rust's target triples and Astral's asset names.
 NODE_TARGETS = {
@@ -44,16 +47,16 @@ def host_target():
     return f'{arch}-{system}'
 
 
-def sha256_file(path):
+def hash_file(path, algorithm='sha256'):
     with path.open('rb') as stream:
-        return hashlib.file_digest(stream, 'sha256').hexdigest()
+        return hashlib.file_digest(stream, algorithm).hexdigest()
 
 
-def download(url, sha256):
-    if not re.fullmatch(r'[0-9a-f]{64}', sha256):
-        raise ValueError(f'Invalid locked SHA-256 for {url}')
-    destination = CACHE / f'{sha256}-{url.rsplit("/", 1)[-1]}'
-    if destination.is_file() and sha256_file(destination) == sha256:
+def download(url, digest, algorithm='sha256'):
+    if len(digest) != 2 * hashlib.new(algorithm).digest_size or not re.fullmatch(r'[0-9a-f]+', digest):
+        raise ValueError(f'Invalid locked {algorithm} for {url}')
+    destination = CACHE / f'{digest}-{url.rsplit("/", 1)[-1]}'
+    if destination.is_file() and hash_file(destination, algorithm) == digest:
         return destination
     for attempt in range(3):
         try:
@@ -67,9 +70,9 @@ def download(url, sha256):
                         if size > MAX_DOWNLOAD_BYTES:
                             raise ValueError(f'Download exceeds size limit: {url}')
                         stream.write(chunk)
-                actual = sha256_file(path)
-                if actual != sha256:
-                    raise ValueError(f'SHA-256 mismatch for {url}: expected {sha256}, got {actual}')
+                actual = hash_file(path, algorithm)
+                if actual != digest:
+                    raise ValueError(f'{algorithm} mismatch for {url}: expected {digest}, got {actual}')
                 path.replace(destination)
             return destination
         except (OSError, ValueError) as error:
@@ -77,6 +80,33 @@ def download(url, sha256):
                 raise RuntimeError(f'Could not obtain verified asset {url}: {error}') from error
             time.sleep(2 ** attempt)
     raise AssertionError('unreachable')
+
+
+def locked_playwright():
+    # Use Yarn's exact registry tarball and integrity, not the mutable node_modules tree
+    # or a second version pin. Cross-target builds do not need Yarn's install tree.
+    package = json.loads((ROOT / 'package.json').read_text(encoding='utf-8'))
+    version = package['devDependencies'].get('playwright-core', '')
+    if not re.fullmatch(r'\d+\.\d+\.\d+', version):
+        raise ValueError('Pin playwright-core to an exact version in package.json')
+    selector = f'playwright-core@{version}'
+    yarn_lock = (ROOT / 'yarn.lock').read_text(encoding='utf-8')
+    stanzas = []
+    for stanza in re.split(r'\n(?=\S)', yarn_lock):
+        header, _, body = stanza.partition('\n')
+        if header.endswith(':') and selector in [key.strip().strip('"') for key in header[:-1].split(',')]:
+            stanzas.append(body)
+    url = f'https://registry.npmjs.org/playwright-core/-/playwright-core-{version}.tgz'
+    if len(stanzas) != 1:
+        raise ValueError(f'Expected exactly one {selector} entry in yarn.lock')
+    block = stanzas[0]
+    locked_version = re.search(r'^  version "([^"]+)"$', block, re.MULTILINE)
+    resolved = re.search(r'^  resolved "([^"]+)"$', block, re.MULTILINE)
+    integrity = re.search(r'^  integrity sha512-([A-Za-z0-9+/=]+)$', block, re.MULTILINE)
+    if (not locked_version or locked_version[1] != version or not resolved
+            or not re.fullmatch(re.escape(url) + r'#[0-9a-f]{40}', resolved[1]) or not integrity):
+        raise ValueError(f'Invalid version, registry URL or integrity for {selector} in yarn.lock')
+    return version, url, base64.b64decode(integrity[1], validate=True).hex()
 
 
 class RuntimeZip:
@@ -100,6 +130,9 @@ class RuntimeZip:
 
     def copy_distribution(self, asset, select):
         # Read only the selected regular files and never extract upstream archives to disk.
+        def executable(dest):
+            return dest.startswith('bin/') and dest.count('/') == 1
+
         if asset.suffix == '.zip':
             with zipfile.ZipFile(asset) as source:
                 for member in source.infolist():
@@ -109,7 +142,7 @@ class RuntimeZip:
                     if stat.S_IFMT(member.external_attr >> 16) not in (0, stat.S_IFREG):
                         raise ValueError(f'Unexpected non-file in {asset.name}: {member.filename}')
                     with source.open(member) as stream:
-                        self.add(dest, stream, member.file_size, dest.startswith('bin/'))
+                        self.add(dest, stream, member.file_size, executable(dest))
         else:
             with tarfile.open(asset, 'r|*') as source:
                 for member in source:
@@ -119,7 +152,7 @@ class RuntimeZip:
                     if not member.isfile():
                         raise ValueError(f'Unexpected non-file in {asset.name}: {member.name}')
                     with source.extractfile(member) as stream:
-                        self.add(dest, stream, member.size, dest.startswith('bin/'))
+                        self.add(dest, stream, member.size, executable(dest))
 
 
 def prepare(target):
@@ -134,11 +167,17 @@ def prepare(target):
     uv_root = f'uv-{target}'
     uv_asset = f'{uv_root}.zip' if windows else f'{uv_root}.tar.gz'
     exe = '.exe' if windows else ''
+    playwright_version, playwright_url, playwright_hash = locked_playwright()
+    helper = ROOT / 'scripts/bing-search.cjs'
+    if not helper.is_file():
+        raise ValueError(f'Missing Bing search helper: {helper.relative_to(ROOT)}')
 
     CACHE.mkdir(parents=True, exist_ok=True)
-    print(f'Preparing MCP runtime for {target}: Node {node["version"]}, npm {node["npmVersion"]}, uv {uv["version"]}', flush=True)
+    print(f'Preparing MCP runtime for {target}: Node {node["version"]}, npm {node["npmVersion"]}, '
+          f'uv {uv["version"]}, playwright-core {playwright_version}', flush=True)
     node_archive = download(f'https://nodejs.org/dist/v{node["version"]}/{node_asset}', node['sha256'][node_target])
     uv_archive = download(f'https://github.com/astral-sh/uv/releases/download/{uv["version"]}/{uv_asset}', uv['sha256'][target])
+    playwright_archive = download(playwright_url, playwright_hash, 'sha512')
     npm_prefix = f'{node_root}/{"" if windows else "lib/"}node_modules/npm/'
     node_binary = f'{node_root}/{"node.exe" if windows else "bin/node"}'
     uv_names = {f'uv{exe}', f'uvx{exe}'}
@@ -158,6 +197,11 @@ def prepare(target):
             return 'bin/' + name[len(prefix):]
         return None
 
+    def select_playwright(name):
+        if name.startswith('package/') and name != 'package/':
+            return f'{PLAYWRIGHT_DIR}/{name[len("package/"):]}'
+        return None
+
     # Stage outside Tauri's watched resource directory. A failed run cannot publish a partial ZIP.
     with tempfile.TemporaryDirectory(prefix='assemble-', dir=CACHE) as work:
         path = Path(work) / 'runtime.zip'
@@ -165,6 +209,9 @@ def prepare(target):
             runtime = RuntimeZip(archive)
             runtime.copy_distribution(node_archive, select_node)
             runtime.copy_distribution(uv_archive, select_uv)
+            with helper.open('rb') as stream:
+                runtime.add(BING_HELPER, stream, os.fstat(stream.fileno()).st_size)
+            runtime.copy_distribution(playwright_archive, select_playwright)
             for name, sha256 in uv['licenses'].items():
                 license_path = download(f'https://raw.githubusercontent.com/astral-sh/uv/{uv["commit"]}/{name}', sha256)
                 with license_path.open('rb') as stream:
@@ -173,6 +220,8 @@ def prepare(target):
                 f'bin/node{exe}', f'bin/uv{exe}', f'bin/uvx{exe}',
                 'npm/bin/npm-cli.js', 'npm/bin/npx-cli.js', 'npm/package.json', 'npm/LICENSE',
                 'licenses/node/LICENSE', 'licenses/uv/LICENSE-APACHE', 'licenses/uv/LICENSE-MIT',
+                BING_HELPER, f'{PLAYWRIGHT_DIR}/index.js', f'{PLAYWRIGHT_DIR}/LICENSE',
+                f'{PLAYWRIGHT_DIR}/package.json',
             }
             if missing := required - runtime.names:
                 raise ValueError(f'Missing entries in assembled MCP runtime: {", ".join(sorted(missing))}')
@@ -180,15 +229,21 @@ def prepare(target):
             npm_package = json.loads(archive.read('npm/package.json'))
             if npm_package['name'] != 'npm' or npm_package['version'] != node['npmVersion']:
                 raise ValueError('Node distribution does not contain the locked npm version')
-        digest = sha256_file(path)
+            playwright_package = json.loads(archive.read(f'{PLAYWRIGHT_DIR}/package.json'))
+            if (playwright_package['name'] != 'playwright-core'
+                    or playwright_package['version'] != playwright_version):
+                raise ValueError('Playwright distribution does not match the Yarn lock')
+            if any(playwright_package.get(key) for key in ('dependencies', 'optionalDependencies', 'peerDependencies')):
+                raise ValueError('Bundled playwright-core must not need external runtime packages')
+        digest = hash_file(path)
         # Preserve the timestamp for repeat builds of identical bytes (Cargo watches this directory).
-        if not OUTPUT.is_file() or sha256_file(OUTPUT) != digest:
+        if not OUTPUT.is_file() or hash_file(OUTPUT) != digest:
             path.replace(OUTPUT)
     print(f'{OUTPUT.relative_to(ROOT)}: SHA-256 {digest}')
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Prepare the pinned Node/npm/uv MCP runtime ZIP.')
+    parser = argparse.ArgumentParser(description='Prepare the pinned Node/npm/uv and Bing search runtime ZIP.')
     parser.add_argument('--target', help='Rust target triple; defaults to TAURI_ENV_TARGET_TRIPLE or native host')
     args = parser.parse_args()
     try:

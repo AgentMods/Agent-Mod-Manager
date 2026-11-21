@@ -27,7 +27,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
-struct MockSecrets(Mutex<HashMap<String, String>>);
+pub(crate) struct MockSecrets(Mutex<HashMap<String, String>>);
 impl SecretStore for MockSecrets {
     fn read(&self, key: &str) -> AppResult<Option<String>> {
         Ok(self.0.lock().unwrap().get(key).cloned())
@@ -66,13 +66,43 @@ fn playwright_v2_args() -> Vec<String> {
     .collect()
 }
 
-fn assert_playwright_windows_args(args: &[String]) {
-    let mut expected = playwright_v2_args();
-    expected.push("--browser=msedge".into());
-    assert_eq!(args, expected);
+fn playwright_v11_args() -> Vec<String> {
+    let mut args = vec![
+        "--yes",
+        "@playwright/mcp@latest",
+        "--headless",
+        "--isolated",
+        "--no-webmcp",
+    ];
+    if cfg!(windows) {
+        args.push("--browser=msedge");
+    }
+    args.into_iter().map(str::to_owned).collect()
+}
+
+fn expected_playwright_args() -> Vec<String> {
+    let base = dirs::download_dir()
+        .or_else(dirs::data_local_dir)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    let output_dir = base.join("Agent Mod Manager").join("Playwright");
+    assert!(output_dir.is_absolute());
+    let mut args = playwright_v11_args();
+    args.extend([
+        "--file-paths=absolute".into(),
+        "--output-dir".into(),
+        output_dir.to_str().unwrap().into(),
+    ]);
+    args
 }
 
 fn markitdown_args() -> Vec<String> {
+    ["--prerelease", "allow", "markitdown-mcp@latest"]
+        .map(String::from)
+        .into()
+}
+
+fn markitdown_pinned_args() -> Vec<String> {
     [
         "--with",
         "azure-ai-contentunderstanding==1.2.0b3",
@@ -102,10 +132,15 @@ fn sqlite_crud_presets_markitdown_inherits_uvx_default_and_secret_references() {
     servers.seed_presets().unwrap();
     servers.seed_presets().unwrap();
     let presets = servers.list().unwrap();
-    assert_eq!(presets.len(), 4);
+    assert_eq!(presets.len(), 8);
     assert!(presets
         .iter()
         .all(|server| !server.enabled && server.builtin));
+    assert!(presets.iter().all(
+        |server| server.description.as_deref().is_some_and(|text| text
+            .chars()
+            .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)))
+    ));
     let markitdown = servers.get("markitdown").unwrap();
     assert_eq!(markitdown.command.as_deref(), Some("uvx"));
     assert_eq!(markitdown.args, markitdown_args());
@@ -120,15 +155,25 @@ fn sqlite_crud_presets_markitdown_inherits_uvx_default_and_secret_references() {
         http.credential_url.as_deref(),
         Some("https://www.glossmod.com/creator/ai")
     );
-    let stdio = servers.get("glossmod_3dm").unwrap();
-    assert_eq!(stdio.name, "3DM MCP");
+    let three_dm = servers.get("glossmod_3dm").unwrap();
+    assert_eq!(three_dm.name, "3DM MCP");
+    assert_eq!(three_dm.transport, McpTransport::StreamableHttp);
+    assert_eq!(three_dm.url.as_deref(), Some("https://mod.3dmgame.com/mcp"));
     assert_eq!(
-        stdio.credential_url.as_deref(),
+        three_dm.credential_url.as_deref(),
         Some("https://mod.3dmgame.com/Workshop/Api")
     );
-    assert_eq!(stdio.command.as_deref(), Some("uvx"));
-    assert_eq!(stdio.args, vec!["glossmod-mcp"]);
-    let key = &stdio.env_secret_refs["GLOSSMOD_API_KEY"];
+    assert!(
+        three_dm.command.is_none()
+            && three_dm.args.is_empty()
+            && three_dm.env_secret_refs.is_empty()
+    );
+    let key = three_dm.bearer_secret_ref.as_deref().unwrap();
+    assert_eq!(key, "mcp.glossmod_3dm.api_key");
+    assert!(client::http_authorization(&settings, &three_dm)
+        .unwrap()
+        .0
+        .is_empty());
     servers
         .write_secret(&settings, key, "mock-secret-value")
         .unwrap();
@@ -136,11 +181,14 @@ fn sqlite_crud_presets_markitdown_inherits_uvx_default_and_secret_references() {
         settings.read_secret(key).unwrap().as_deref(),
         Some("mock-secret-value")
     );
+    let (headers, _) = client::http_authorization(&settings, &three_dm).unwrap();
+    assert_eq!(headers["Authorization"], "mock-secret-value");
+    assert!(headers["Authorization"].is_sensitive());
     let encoded: String = servers
         .db
         .conn()
         .query_row(
-            "SELECT env_json FROM mcp_servers WHERE id='glossmod_3dm'",
+            "SELECT secret_ref FROM mcp_servers WHERE id='glossmod_3dm'",
             [],
             |r| r.get(0),
         )
@@ -162,6 +210,169 @@ fn sqlite_crud_presets_markitdown_inherits_uvx_default_and_secret_references() {
         .is_err());
 }
 
+#[test]
+fn mod_source_presets_bind_their_published_stdio_commands_and_credentials() {
+    let (_dir, servers, settings, _) = fixture();
+    servers.seed_presets().unwrap();
+    for (id, args) in [
+        ("modio", vec!["modio-mcp@latest"]),
+        ("curseforge", vec!["curseforge-mcp@latest"]),
+        ("gamebanana", vec!["gamebanana-mcp@latest"]),
+        (
+            "nexusmods",
+            vec![
+                "--upgrade",
+                "--from",
+                "glossmod-nexusmods-mcp",
+                "nexusmods-mcp",
+            ],
+        ),
+    ] {
+        let config = servers.get(id).unwrap();
+        assert_eq!(config.transport, McpTransport::Stdio);
+        assert_eq!(config.command.as_deref(), Some("uvx"));
+        assert_eq!(config.args, args);
+        config.validate().unwrap();
+    }
+    let modio = servers.get("modio").unwrap();
+    assert_eq!(
+        modio.env_secret_refs["MODIO_API_BASE_URL"],
+        "mcp.modio.api_base_url"
+    );
+    assert_eq!(modio.env_secret_refs["MODIO_API_KEY"], "mcp.modio.api_key");
+    assert!(ServerConfig {
+        id: "other".into(),
+        ..modio
+    }
+    .validate()
+    .is_err());
+    assert!(servers
+        .get("gamebanana")
+        .unwrap()
+        .env_secret_refs
+        .is_empty());
+    let curseforge = servers.get("curseforge").unwrap();
+    let key = &curseforge.env_secret_refs["CURSEFORGE_API_KEY"];
+    assert!(client::stdio_secret(&settings, &curseforge, "CURSEFORGE_API_KEY", key).is_err());
+    let nexus = servers.get("nexusmods").unwrap();
+    let key = &nexus.env_secret_refs["NEXUSMODS_API_KEY"];
+    assert_eq!(
+        client::stdio_secret(&settings, &nexus, "NEXUSMODS_API_KEY", key).unwrap(),
+        None
+    );
+    servers.write_secret(&settings, key, "sample-key").unwrap();
+    assert_eq!(
+        client::stdio_secret(&settings, &nexus, "NEXUSMODS_API_KEY", key)
+            .unwrap()
+            .as_deref(),
+        Some("sample-key")
+    );
+}
+
+#[test]
+fn v10_upgrade_unpins_stock_packages_and_preserves_user_launch_settings() {
+    let (_dir, servers, _, context) = fixture();
+    servers.seed_presets().unwrap();
+    let mut old_browser = playwright_v2_args();
+    if cfg!(windows) {
+        old_browser.push("--browser=msedge".into());
+    }
+    let mut expected_stock = Vec::new();
+    for (id, old_args) in [
+        ("playwright", old_browser),
+        ("markitdown", markitdown_pinned_args()),
+        ("modio", vec!["modio-mcp==1.0.0".into()]),
+        ("curseforge", vec!["curseforge-mcp==1.0.0".into()]),
+        (
+            "nexusmods",
+            vec![
+                "--from".into(),
+                "glossmod-nexusmods-mcp==1.0.0".into(),
+                "nexusmods-mcp".into(),
+            ],
+        ),
+    ] {
+        let mut stock = servers.get(id).unwrap();
+        stock.enabled = true;
+        if id == "curseforge" {
+            stock.env_secret_refs.insert(
+                "CURSEFORGE_API_KEY".into(),
+                "mcp.personal.curseforge".into(),
+            );
+        }
+        expected_stock.push(stock.clone());
+        stock.args = old_args;
+        servers.update(&stock).unwrap();
+        servers.remember_start(&stock).unwrap();
+    }
+    let mut pinned = servers.get("gamebanana").unwrap();
+    pinned.enabled = true;
+    pinned.args = vec!["gamebanana-mcp==0.9.0".into()];
+    servers.update(&pinned).unwrap();
+    servers.remember_start(&pinned).unwrap();
+    servers
+        .db
+        .conn()
+        .pragma_update(None, "user_version", 10)
+        .unwrap();
+    let path = context.engine.paths.db_file();
+    let upgraded = McpServers::new(Db::open(&path).unwrap());
+    upgraded.seed_presets().unwrap();
+    for expected in expected_stock {
+        assert_eq!(upgraded.get(&expected.id).unwrap(), expected);
+        assert!(upgraded.startup_digest(&expected.id).unwrap().is_none());
+    }
+    assert_eq!(upgraded.get("gamebanana").unwrap(), pinned);
+    assert!(ConnectionConsent::from_remembered(&upgraded, &pinned).is_ok());
+}
+
+#[test]
+fn v9_migrates_only_the_stock_3dm_transport_and_revokes_its_launch_consent_once() {
+    for (builtin, args, migrates) in [
+        (true, "glossmod-mcp", true),
+        (true, "glossmod-mcp==0.9", false),
+        (false, "glossmod-mcp", false),
+    ] {
+        let (_dir, servers, _, ctx) = fixture();
+        servers.seed_presets().unwrap();
+        let mut expected_http = servers.get("glossmod_3dm").unwrap();
+        expected_http.enabled = true;
+        let mut old = ServerConfig::stdio("glossmod_3dm", "3DM MCP", "uvx", vec![args.into()]);
+        old.credential_url = expected_http.credential_url.clone();
+        old.env_secret_refs
+            .insert("GLOSSMOD_API_KEY".into(), "mcp.glossmod_3dm.api_key".into());
+        old.enabled = true;
+        old.builtin = builtin;
+        if builtin {
+            servers.update(&old).unwrap();
+        } else {
+            servers.remove(&old.id).unwrap();
+            servers.create(&old).unwrap();
+        }
+        servers.remember_start(&old).unwrap();
+        servers
+            .db
+            .conn()
+            .execute_batch("PRAGMA user_version=8")
+            .unwrap();
+        let path = ctx.engine.paths.db_file();
+        let upgraded = McpServers::new(Db::open(&path).unwrap());
+        upgraded.seed_presets().unwrap();
+        let expected = if migrates { expected_http } else { old.clone() };
+        assert!(upgraded
+            .get(&old.id)
+            .unwrap()
+            .same_connection_config(&expected));
+        assert_eq!(
+            upgraded.startup_requests().unwrap().contains(&old.id),
+            !migrates
+        );
+        upgraded.remember_start(&expected).unwrap();
+        let reopened = McpServers::new(Db::open(&path).unwrap());
+        assert!(ConnectionConsent::from_remembered(&reopened, &expected).is_ok());
+    }
+}
+
 const LEGACY_3DM_JSON: &str = concat!(
     r#"{"id":"glossmod_3dm","name":"3DM MCP (glossmod-mcp)","transport":"stdio","command":"uvx","args":["glossmod-mcp"],"url":null,"#,
     r#""env_secret_refs":{"GLOSSMOD_API_KEY":"mcp.glossmod_3dm.api_key"},"bearer_secret_ref":null,"enabled":true,"builtin":true}"#,
@@ -172,22 +383,25 @@ const LEGACY_HTTP_JSON: &str = concat!(
 );
 
 #[test]
-fn credential_url_is_serde_compatible_and_excluded_from_the_legacy_launch_digest() {
+fn display_metadata_is_serde_compatible_and_excluded_from_the_legacy_launch_digest() {
     for legacy_json in [LEGACY_3DM_JSON, LEGACY_HTTP_JSON] {
         let mut config: ServerConfig = serde_json::from_str(legacy_json).unwrap();
         let legacy_digest: [u8; 32] = Sha256::digest(legacy_json.as_bytes()).into();
         assert!(config.credential_url.is_none());
+        assert!(config.description.is_none());
         assert_eq!(serde_json::to_vec(&config).unwrap(), legacy_json.as_bytes());
         assert_eq!(config.confirmation_digest().unwrap(), legacy_digest);
 
         let mut json = serde_json::to_value(&config).unwrap();
         json["credential_url"] = Value::Null;
+        json["description"] = Value::Null;
         assert_eq!(
             serde_json::from_value::<ServerConfig>(json).unwrap(),
             config
         );
 
         config.credential_url = Some("https://example.test/account/keys".into());
+        config.description = Some("用于查找模组".into());
         assert_eq!(config.confirmation_digest().unwrap(), legacy_digest);
         assert_eq!(
             serde_json::from_value::<ServerConfig>(serde_json::to_value(&config).unwrap()).unwrap(),
@@ -196,6 +410,65 @@ fn credential_url_is_serde_compatible_and_excluded_from_the_legacy_launch_digest
         config.enabled = false;
         assert_ne!(config.confirmation_digest().unwrap(), legacy_digest);
     }
+}
+
+#[test]
+fn v9_description_migration_preserves_legacy_consents_and_manual_rows() {
+    let (_dir, servers, _, context) = fixture();
+    servers.seed_presets().unwrap();
+    let mut builtin = servers.get("glossmod_http").unwrap();
+    let default_description = builtin.description.take().unwrap();
+    builtin.enabled = true;
+    builtin.url = Some("https://example.test/custom-mcp".into());
+    servers.update(&builtin).unwrap();
+    // A custom row using a preset ID is not eligible for the backfill.
+    let mut manual = ServerConfig::http("gamebanana", "Local catalog", "https://example.test/mcp");
+    manual.enabled = true;
+    servers.remove(&manual.id).unwrap();
+    servers.create(&manual).unwrap();
+    servers.remember_start(&builtin).unwrap();
+    servers.remember_start(&manual).unwrap();
+    let legacy = [&builtin, &manual].map(|c| servers.startup_digest(&c.id).unwrap().unwrap());
+    servers
+        .db
+        .conn()
+        .execute_batch("ALTER TABLE mcp_servers DROP COLUMN description; PRAGMA user_version=9;")
+        .unwrap();
+    drop(servers);
+
+    let path = context.engine.paths.db_file();
+    let upgraded = McpServers::new(Db::open(&path).unwrap());
+    assert_eq!(
+        upgraded.startup_requests().unwrap(),
+        ["gamebanana", "glossmod_http"]
+    );
+    builtin.description = Some(default_description);
+    for (expected, digest) in [(&builtin, &legacy[0]), (&manual, &legacy[1])] {
+        let actual = upgraded.get(&expected.id).unwrap();
+        assert_eq!(&actual, expected);
+        assert_eq!(
+            upgraded.startup_digest(&actual.id).unwrap().as_ref(),
+            Some(digest)
+        );
+        assert!(ConnectionConsent::from_remembered(&upgraded, &actual).is_ok());
+    }
+    assert_eq!(
+        upgraded
+            .list()
+            .unwrap()
+            .iter()
+            .filter(|c| c.description.is_some())
+            .count(),
+        7
+    );
+
+    builtin.description = None;
+    assert!(!upgraded.update(&builtin).unwrap());
+    drop(upgraded);
+    let reopened = McpServers::new(Db::open(&path).unwrap());
+    reopened.seed_presets().unwrap();
+    assert_eq!(reopened.get(&builtin.id).unwrap(), builtin);
+    assert!(ConnectionConsent::from_remembered(&reopened, &builtin).is_ok());
 }
 
 #[test]
@@ -281,14 +554,288 @@ fn credential_url_round_trips_through_create_list_update_and_clear() {
     assert_eq!(reopened.get("custom").unwrap(), config);
 }
 
+fn register_test_plugin(servers: &McpServers, slug: &str, enabled: bool, validated: bool) {
+    servers
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO plugins(slug,name,game_name,version,source,enabled,validated,install_path,adapter_json,created_at,updated_at)
+             VALUES(?1,?1,?1,'1.0.0','external',?2,?3,?1,'{}','test','test')",
+            rusqlite::params![slug, enabled, validated],
+        )
+        .unwrap();
+}
+
+fn plugin_server(slug: &str, suffix: &str) -> ServerConfig {
+    let mut config = ServerConfig::http(
+        &format!("plugin_{slug}_{suffix}"),
+        "Plugin MCP",
+        "https://example.com/mcp",
+    );
+    config.plugin_slug = Some(slug.into());
+    config
+}
+
+fn sync_test_plugin(servers: &McpServers, slug: &str, configs: &[ServerConfig]) -> bool {
+    let mut conn = servers.db.conn();
+    let tx = conn.transaction().unwrap();
+    let changed = config::sync_plugin_servers(&tx, slug, configs).unwrap();
+    tx.commit().unwrap();
+    changed
+}
+
 #[test]
-fn credential_url_v6_migration_backfills_builtins_once_and_preserves_remembered_grants() {
+fn plugin_mcp_v7_migration_preserves_legacy_rows_and_digests() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-v7.sqlite");
+    let servers = McpServers::new(Db::open(&path).unwrap());
+    servers.seed_presets().unwrap();
+    let mut legacy: ServerConfig = serde_json::from_str(LEGACY_HTTP_JSON).unwrap();
+    legacy.credential_url = Some("https://www.glossmod.com/creator/ai".into());
+    servers.update(&legacy).unwrap();
+    servers.remember_start(&legacy).unwrap();
+    let mut manual = ServerConfig::http("manual", "Manual", "https://example.test/mcp");
+    manual.enabled = true;
+    servers.create(&manual).unwrap();
+    servers.remember_start(&manual).unwrap();
+    let manual_digest = manual.confirmation_digest().unwrap();
+    let legacy_digest = Sha256::digest(LEGACY_HTTP_JSON.as_bytes()).to_vec();
+    servers
+        .db
+        .conn()
+        .execute_batch(
+            "DROP INDEX mcp_servers_plugin_slug;
+             ALTER TABLE mcp_servers DROP COLUMN plugin_slug;
+             PRAGMA user_version=7;",
+        )
+        .unwrap();
+    drop(servers);
+
+    let migrated = McpServers::new(Db::open(&path).unwrap());
+    let version: i64 = migrated
+        .db
+        .conn()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, crate::db::SCHEMA_VERSION);
+    assert_eq!(
+        migrated.startup_requests().unwrap(),
+        ["glossmod_http", "manual"]
+    );
+    for (expected, digest) in [(legacy, legacy_digest), (manual, manual_digest.to_vec())] {
+        let stored = migrated.get(&expected.id).unwrap();
+        assert!(stored.same_connection_config(&expected));
+        assert!(serde_json::to_value(&stored)
+            .unwrap()
+            .get("plugin_slug")
+            .is_none());
+        assert_eq!(migrated.startup_digest(&stored.id).unwrap(), Some(digest));
+        assert!(ConnectionConsent::from_remembered(&migrated, &stored).is_ok());
+    }
+}
+
+#[test]
+fn plugin_mcp_sync_preserves_unchanged_grants_and_never_enables_added_or_changed_services() {
+    let (_dir, servers, _, _) = fixture();
+    register_test_plugin(&servers, "first", true, true);
+    register_test_plugin(&servers, "second", true, true);
+    let mut stable = plugin_server("first", "stable");
+    stable.enabled = true; // Even if set by trusted code, sync is not an enable operation.
+    let mut changed = plugin_server("first", "changed");
+    let removed = plugin_server("first", "removed");
+    let added = plugin_server("first", "added");
+    let other = plugin_server("second", "other");
+    let initial_configs = [stable.clone(), changed.clone(), removed.clone()];
+    assert!(sync_test_plugin(&servers, "first", &initial_configs));
+    sync_test_plugin(&servers, "second", std::slice::from_ref(&other));
+    let stored = servers.get(&stable.id).unwrap();
+    assert!(!stored.enabled);
+    assert_eq!(stored.plugin_slug.as_deref(), Some("first"));
+    assert_eq!(
+        serde_json::to_value(&stored).unwrap()["plugin_slug"],
+        "first"
+    );
+    assert_ne!(
+        stored.confirmation_digest().unwrap(),
+        ServerConfig {
+            plugin_slug: None,
+            ..stored
+        }
+        .confirmation_digest()
+        .unwrap()
+    );
+    for id in [&stable.id, &changed.id, &removed.id, &other.id] {
+        servers.set_enabled(id, true).unwrap();
+        servers.remember_start(&servers.get(id).unwrap()).unwrap();
+    }
+    let stable_digest = servers.startup_digest(&stable.id).unwrap();
+    assert!(stable_digest.is_some());
+    assert!(!sync_test_plugin(&servers, "first", &initial_configs));
+
+    changed.url = Some("https://example.com/updated".into());
+    assert!(sync_test_plugin(
+        &servers,
+        "first",
+        &[added.clone(), changed.clone(), stable.clone()],
+    ));
+    assert_eq!(servers.get(&stable.id).unwrap(), stable);
+    assert_eq!(servers.startup_digest(&stable.id).unwrap(), stable_digest);
+    for expected in [added, changed] {
+        assert_eq!(servers.get(&expected.id).unwrap(), expected);
+        assert_eq!(servers.startup_digest(&expected.id).unwrap(), None);
+    }
+    assert!(matches!(
+        servers.get(&removed.id),
+        Err(AppError::NotFound(_))
+    ));
+    assert_eq!(
+        servers.startup_requests().unwrap(),
+        [stable.id, other.id.clone()]
+    );
+    assert!(sync_test_plugin(&servers, "first", &[]));
+    assert!(!sync_test_plugin(&servers, "first", &[]));
+    assert_eq!(servers.startup_requests().unwrap(), [other.id]);
+    assert_eq!(servers.list().unwrap().len(), 1);
+}
+
+#[test]
+fn plugin_mcp_sync_collision_leaves_manual_and_owned_rows_intact() {
+    let (_dir, servers, _, _) = fixture();
+    register_test_plugin(&servers, "first", true, true);
+    register_test_plugin(&servers, "second", true, true);
+    let old = plugin_server("first", "old");
+    sync_test_plugin(&servers, "first", std::slice::from_ref(&old));
+    let foreign = plugin_server("second", "foreign");
+    sync_test_plugin(&servers, "second", std::slice::from_ref(&foreign));
+    let mut manual = plugin_server("first", "manual");
+    manual.plugin_slug = None;
+    manual.enabled = true;
+    servers.create(&manual).unwrap();
+    servers.remember_start(&manual).unwrap();
+    let before = servers.list().unwrap();
+    let new = plugin_server("first", "new");
+    let reowned = |config: &ServerConfig| ServerConfig {
+        plugin_slug: Some("first".into()),
+        ..config.clone()
+    };
+    for collision in [
+        reowned(&manual),
+        reowned(&foreign),
+        new.clone(),
+        ServerConfig {
+            id: crate::mcp_connections::LOCAL_SERVER_ID.into(),
+            ..new.clone()
+        },
+        ServerConfig {
+            id: "modio".into(),
+            ..new.clone()
+        },
+        ServerConfig {
+            id: "markitdown".into(),
+            ..new.clone()
+        },
+    ] {
+        let mut conn = servers.db.conn();
+        let tx = conn.transaction().unwrap();
+        assert!(matches!(
+            config::sync_plugin_servers(&tx, "first", &[new.clone(), collision]),
+            Err(AppError::Conflict(_))
+        ));
+        tx.commit().unwrap(); // Preflight must not mutate any rows, even if committed.
+        drop(conn);
+        assert_eq!(servers.list().unwrap(), before);
+        assert_eq!(servers.startup_requests().unwrap(), [manual.id.clone()]);
+    }
+}
+
+#[test]
+fn plugin_mcp_crud_and_startup_respect_ownership_and_revoke() {
+    let (_dir, servers, _, _) = fixture();
+    register_test_plugin(&servers, "first", true, true);
+    register_test_plugin(&servers, "second", true, true);
+    let owned = plugin_server("first", "owned");
+    let foreign = plugin_server("second", "foreign");
+    let manual = ServerConfig::http("manual", "Manual", "https://example.com/mcp");
+    servers.create(&manual).unwrap();
+    assert!(matches!(servers.create(&owned), Err(AppError::Denied(_))));
+    assert!(matches!(
+        servers.update(&ServerConfig {
+            id: manual.id.clone(),
+            ..owned.clone()
+        }),
+        Err(AppError::Denied(_))
+    ));
+    sync_test_plugin(&servers, "first", std::slice::from_ref(&owned));
+    sync_test_plugin(&servers, "second", std::slice::from_ref(&foreign));
+    let mut stripped = owned.clone();
+    stripped.plugin_slug = None;
+    assert!(matches!(
+        servers.update(&stripped),
+        Err(AppError::Denied(_))
+    ));
+    assert!(matches!(
+        servers.remove(&owned.id),
+        Err(AppError::Denied(_))
+    ));
+    for id in [&owned.id, &foreign.id, &manual.id] {
+        servers.set_enabled(id, true).unwrap();
+        servers.remember_start(&servers.get(id).unwrap()).unwrap();
+    }
+    let enabled_owned = servers.get(&owned.id).unwrap();
+    for (enabled, validated) in [(true, false), (false, true)] {
+        servers
+            .db
+            .conn()
+            .execute(
+                "UPDATE plugins SET enabled=?1, validated=?2 WHERE slug='first'",
+                rusqlite::params![enabled, validated],
+            )
+            .unwrap();
+        assert_eq!(servers.get(&owned.id).unwrap(), owned);
+        assert!(!servers
+            .list()
+            .unwrap()
+            .iter()
+            .any(|config| config.id == owned.id));
+        assert!(!servers.startup_requests().unwrap().contains(&owned.id));
+        assert!(matches!(
+            servers.set_enabled(&owned.id, true),
+            Err(AppError::Denied(_))
+        ));
+        assert!(ConnectionConsent::from_remembered(&servers, &enabled_owned).is_err());
+        assert!(servers.remember_start(&enabled_owned).is_err());
+    }
+    {
+        let mut conn = servers.db.conn();
+        let tx = conn.transaction().unwrap();
+        assert!(config::revoke_plugin_servers(&tx, "first").unwrap());
+        assert!(!config::revoke_plugin_servers(&tx, "first").unwrap());
+        tx.commit().unwrap();
+    }
+    servers
+        .db
+        .conn()
+        .execute("UPDATE plugins SET enabled=1 WHERE slug='first'", [])
+        .unwrap();
+    assert!(servers.list().unwrap().contains(&owned));
+    assert_eq!(servers.get(&owned.id).unwrap(), owned);
+    assert_eq!(servers.startup_digest(&owned.id).unwrap(), None);
+    assert!(ConnectionConsent::from_remembered(&servers, &enabled_owned).is_err());
+    servers.set_enabled(&owned.id, true).unwrap();
+    assert_eq!(servers.get(&owned.id).unwrap(), enabled_owned);
+    assert_eq!(servers.startup_requests().unwrap(), [manual.id, foreign.id]);
+}
+
+#[test]
+fn v6_upgrade_backfills_credential_pages_and_preserves_grants_for_unchanged_transports() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("legacy-v6.sqlite");
     let servers = McpServers::new(Db::open(&path).unwrap());
     servers.seed_presets().unwrap();
     let custom = ServerConfig::http("custom", "Custom", "https://example.com/mcp");
     servers.create(&custom).unwrap();
+    let mut expected_3dm = servers.get("glossmod_3dm").unwrap();
+    expected_3dm.enabled = true;
     let fixtures = [
         (LEGACY_HTTP_JSON, "https://www.glossmod.com/creator/ai"),
         (LEGACY_3DM_JSON, "https://mod.3dmgame.com/Workshop/Api"),
@@ -314,35 +861,30 @@ fn credential_url_v6_migration_backfills_builtins_once_and_preserves_remembered_
     drop(servers);
 
     let migrated = McpServers::new(Db::open(&path).unwrap());
+    assert_eq!(migrated.startup_requests().unwrap(), ["glossmod_http"]);
+    assert_eq!(migrated.get("glossmod_3dm").unwrap(), expected_3dm);
+    assert!(ConnectionConsent::from_remembered(&migrated, &expected_3dm).is_err());
+    let mut http: ServerConfig = serde_json::from_str(LEGACY_HTTP_JSON).unwrap();
+    http.credential_url = Some("https://www.glossmod.com/creator/ai".into());
+    let stored_http = migrated.get(&http.id).unwrap();
+    assert!(stored_http.same_connection_config(&http));
+    http.description = stored_http.description;
     assert_eq!(
-        migrated.startup_requests().unwrap(),
-        ["glossmod_3dm", "glossmod_http"]
+        migrated.startup_digest(&http.id).unwrap(),
+        Some(Sha256::digest(LEGACY_HTTP_JSON.as_bytes()).to_vec())
     );
-    for (json, default_url) in fixtures {
-        let mut expected: ServerConfig = serde_json::from_str(json).unwrap();
-        expected.credential_url = Some(default_url.into());
-        let stored = migrated.get(&expected.id).unwrap();
-        let v6_digest = Sha256::digest(json.as_bytes()).to_vec();
-        assert_eq!(stored, expected);
-        assert_eq!(
-            migrated.startup_digest(&stored.id).unwrap(),
-            Some(v6_digest)
-        );
-        assert!(ConnectionConsent::from_remembered(&migrated, &stored).is_ok());
-    }
+    assert!(ConnectionConsent::from_remembered(&migrated, &http).is_ok());
     assert_eq!(migrated.get("custom").unwrap(), custom);
-    let mut http = migrated.get("glossmod_http").unwrap();
     http.credential_url = None;
     migrated.update(&http).unwrap();
-    let mut stdio = migrated.get("glossmod_3dm").unwrap();
-    stdio.credential_url = Some("https://example.com/user-edited-portal".into());
-    migrated.update(&stdio).unwrap();
+    expected_3dm.credential_url = Some("https://example.com/user-edited-portal".into());
+    migrated.update(&expected_3dm).unwrap();
     drop(migrated);
 
     let reopened = McpServers::new(Db::open(&path).unwrap());
     reopened.seed_presets().unwrap();
     assert_eq!(reopened.get("glossmod_http").unwrap(), http);
-    assert_eq!(reopened.get("glossmod_3dm").unwrap(), stdio);
+    assert_eq!(reopened.get("glossmod_3dm").unwrap(), expected_3dm);
 }
 
 #[test]
@@ -379,11 +921,7 @@ fn microsoft_mcp_presets_are_credential_free_and_preserve_existing_config() {
         playwright.command.as_deref(),
         Some(if cfg!(windows) { "npx.cmd" } else { "npx" })
     );
-    if cfg!(windows) {
-        assert_playwright_windows_args(&playwright.args);
-    } else {
-        assert_eq!(playwright.args, playwright_v2_args());
-    }
+    assert_eq!(playwright.args, expected_playwright_args());
     assert!(playwright.env_secret_refs.is_empty() && playwright.bearer_secret_ref.is_none());
     assert!(!playwright.enabled && playwright.builtin);
     assert!(ConnectionConsent::after_user_confirmation(&playwright, false).is_err());
@@ -462,13 +1000,13 @@ fn markitdown_v2_through_v5_stock_upgrade_clears_consent_once_and_v5_user_edit_p
 }
 
 #[test]
-fn markitdown_direct_v1_upgrade_keeps_package_only_config_and_revokes_bare_uvx_consent() {
+fn markitdown_direct_v1_upgrade_switches_to_latest_and_revokes_bare_uvx_consent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v1.sqlite");
     let servers = McpServers::new(Db::open(&path).unwrap());
     servers.seed_presets().unwrap();
     let mut legacy = servers.get("markitdown").unwrap();
-    legacy.args = markitdown_args();
+    legacy.args = markitdown_pinned_args();
     legacy.enabled = true;
     servers.update(&legacy).unwrap();
     servers.remember_start(&legacy).unwrap();
@@ -529,7 +1067,136 @@ fn markitdown_v5_custom_launches_preserve_values_and_existing_consent() {
 }
 
 #[test]
-fn playwright_v2_to_v3_migration_is_windows_only_invalidates_consent_and_runs_once() {
+fn playwright_output_dir_prefers_downloads_and_never_creates_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    let downloads = dir.path().join("Redirected Downloads");
+    let local_data = dir.path().join("Local Data");
+    let temp = dir.path().join("Temp");
+    for (bases, expected) in [
+        (
+            vec![downloads.clone(), local_data.clone(), temp.clone()],
+            &downloads,
+        ),
+        (
+            vec!["relative".into(), local_data.clone(), temp.clone()],
+            &local_data,
+        ),
+        (vec![temp.clone()], &temp),
+    ] {
+        let output = config::playwright_output_dir(bases).unwrap();
+        assert_eq!(
+            std::path::Path::new(&output),
+            expected.join("Agent Mod Manager").join("Playwright")
+        );
+    }
+    assert!(config::playwright_output_dir(["relative".into()]).is_none());
+    assert_eq!(dir.path().read_dir().unwrap().count(), 0);
+}
+
+#[test]
+fn playwright_v11_migration_does_not_use_v12_download_flags() {
+    let (_dir, servers, _, _) = fixture();
+    servers.seed_presets().unwrap();
+    let mut legacy = servers.get("playwright").unwrap();
+    legacy.args = playwright_v11_args();
+    legacy.args[1] = "@playwright/mcp@0.0.85".into();
+    servers.update(&legacy).unwrap();
+    config::migrate_unpinned_presets(&servers.db.conn()).unwrap();
+    assert_eq!(
+        servers.get("playwright").unwrap().args,
+        playwright_v11_args()
+    );
+}
+
+#[test]
+fn playwright_v12_upgrade_changes_stock_args_and_revokes_old_consent_once() {
+    let (_dir, servers, _, context) = fixture();
+    servers.seed_presets().unwrap();
+    let mut legacy = servers.get("playwright").unwrap();
+    legacy.args = playwright_v11_args();
+    legacy.enabled = true;
+    legacy.description = Some("My browser description".into());
+    servers.update(&legacy).unwrap();
+    servers.remember_start(&legacy).unwrap();
+    let mut other = servers.get("gamebanana").unwrap();
+    other.enabled = true;
+    servers.update(&other).unwrap();
+    servers.remember_start(&other).unwrap();
+    servers
+        .db
+        .conn()
+        .pragma_update(None, "user_version", 11)
+        .unwrap();
+    let path = context.engine.paths.db_file();
+
+    let upgraded = McpServers::new(Db::open(&path).unwrap());
+    let mut expected = legacy.clone();
+    expected.args = expected_playwright_args();
+    assert_eq!(upgraded.get("playwright").unwrap(), expected);
+    assert!(upgraded.startup_digest("playwright").unwrap().is_none());
+    assert!(ConnectionConsent::from_remembered(&upgraded, &expected).is_err());
+    assert_eq!(upgraded.get(&other.id).unwrap(), other);
+    assert!(ConnectionConsent::from_remembered(&upgraded, &other).is_ok());
+
+    // A deliberate restore of the original flags must not retrigger migration.
+    upgraded.update(&legacy).unwrap();
+    upgraded.remember_start(&legacy).unwrap();
+    let reopened = McpServers::new(Db::open(&path).unwrap());
+    reopened.seed_presets().unwrap();
+    assert_eq!(reopened.get("playwright").unwrap(), legacy);
+    assert!(ConnectionConsent::from_remembered(&reopened, &legacy).is_ok());
+}
+
+#[test]
+fn playwright_v12_upgrade_preserves_custom_launch_settings_and_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    for customization in ["name", "command", "args", "env", "non_builtin"] {
+        let path = dir.path().join(format!("v11-{customization}.sqlite"));
+        let servers = McpServers::new(Db::open(&path).unwrap());
+        servers.seed_presets().unwrap();
+        let mut customized = servers.get("playwright").unwrap();
+        customized.args = playwright_v11_args();
+        match customization {
+            "name" => customized.name = "My Playwright".into(),
+            "command" => customized.command = Some("custom-npx.cmd".into()),
+            "args" => customized.args.extend([
+                "--file-paths=relative".into(),
+                "--output-dir".into(),
+                dir.path().join("My Playwright").to_str().unwrap().into(),
+            ]),
+            "env" => {
+                customized
+                    .env_secret_refs
+                    .insert("BROWSER_API_KEY".into(), "mcp.personal.browser".into());
+            }
+            "non_builtin" => {
+                servers
+                    .db
+                    .conn()
+                    .execute("UPDATE mcp_servers SET builtin=0 WHERE id='playwright'", [])
+                    .unwrap();
+                customized.builtin = false;
+            }
+            _ => unreachable!(),
+        }
+        customized.enabled = true;
+        servers.update(&customized).unwrap();
+        servers.remember_start(&customized).unwrap();
+        servers
+            .db
+            .conn()
+            .pragma_update(None, "user_version", 11)
+            .unwrap();
+
+        let upgraded = McpServers::new(Db::open(&path).unwrap());
+        assert_eq!(upgraded.get("playwright").unwrap(), customized);
+        assert_eq!(upgraded.startup_requests().unwrap(), ["playwright"]);
+        assert!(ConnectionConsent::from_remembered(&upgraded, &customized).is_ok());
+    }
+}
+
+#[test]
+fn playwright_v2_upgrade_selects_platform_defaults_and_respects_subsequent_edits() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("playwright-v2.sqlite");
     let servers = McpServers::new(Db::open(&path).unwrap());
@@ -548,29 +1215,23 @@ fn playwright_v2_to_v3_migration_is_windows_only_invalidates_consent_and_runs_on
 
     let servers = McpServers::new(Db::open(&path).unwrap());
     let reopened = servers.get("playwright").unwrap();
-    if cfg!(windows) {
-        assert_playwright_windows_args(&reopened.args);
-        assert!(reopened.enabled && reopened.builtin);
-        assert!(servers.startup_requests().unwrap().is_empty());
-        assert!(ConnectionConsent::from_remembered(&servers, &reopened).is_err());
+    assert_eq!(reopened.args, expected_playwright_args());
+    assert!(reopened.enabled && reopened.builtin);
+    assert!(servers.startup_requests().unwrap().is_empty());
+    assert!(ConnectionConsent::from_remembered(&servers, &reopened).is_err());
 
-        // After the one-time migration, an explicit return to the old arguments is respected.
-        let mut opted_out = reopened;
-        opted_out.args = playwright_v2_args();
-        servers.update(&opted_out).unwrap();
-        servers.remember_start(&opted_out).unwrap();
-        drop(servers);
+    // After the one-time migration, an explicit return to the old arguments is respected.
+    let mut opted_out = reopened;
+    opted_out.args = playwright_v2_args();
+    servers.update(&opted_out).unwrap();
+    servers.remember_start(&opted_out).unwrap();
+    drop(servers);
 
-        let servers = McpServers::new(Db::open(&path).unwrap());
-        servers.seed_presets().unwrap();
-        assert_eq!(servers.get("playwright").unwrap(), opted_out);
-        assert_eq!(servers.startup_requests().unwrap(), ["playwright"]);
-        assert!(ConnectionConsent::from_remembered(&servers, &opted_out).is_ok());
-    } else {
-        assert_eq!(reopened, legacy);
-        assert!(servers.startup_requests().unwrap().is_empty()); // v4 changes the bare launcher.
-        assert!(ConnectionConsent::from_remembered(&servers, &reopened).is_err());
-    }
+    let servers = McpServers::new(Db::open(&path).unwrap());
+    servers.seed_presets().unwrap();
+    assert_eq!(servers.get("playwright").unwrap(), opted_out);
+    assert_eq!(servers.startup_requests().unwrap(), ["playwright"]);
+    assert!(ConnectionConsent::from_remembered(&servers, &opted_out).is_ok());
 }
 
 #[test]
@@ -638,7 +1299,7 @@ fn unsafe_plaintext_configuration_and_namespace_collisions_are_rejected() {
     assert!(a.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
 }
 
-async fn mock_http(mode: &'static str) -> (String, CancellationToken, Arc<AtomicBool>) {
+pub(crate) async fn mock_http(mode: &'static str) -> (String, CancellationToken, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     let stop = CancellationToken::new();
@@ -1163,6 +1824,35 @@ async fn live_markitdown_preset_initializes_and_lists_conversion_tool() {
         .any(|tool| tool.remote_name == "convert_to_markdown"));
 }
 
+/// Opt-in native HTTP smoke using a disposable DB and no credentials.
+/// Only initializes the connection and discovers tools; never invokes them.
+#[tokio::test]
+#[ignore = "requires network access to the public 3DM MCP endpoint"]
+async fn live_3dm_public_http_initializes_and_registers_tools() {
+    use crate::mcp_connections::McpConnections;
+
+    let (_dir, servers, settings, _) = fixture();
+    servers.seed_presets().unwrap();
+    servers.set_enabled("glossmod_3dm", true).unwrap();
+    let config = servers.get("glossmod_3dm").unwrap();
+
+    let registry = ToolRegistry::default();
+    let connections = McpConnections::default();
+    let info = connections
+        .connect(settings, &registry, config, false)
+        .await
+        .expect("failed to initialize and discover tools from the public 3DM MCP endpoint");
+    println!("3DM public MCP discovered {} tools", info.tools.len());
+    assert!(!info.tools.is_empty(), "public 3DM MCP returned no tools");
+    for name in &info.tools {
+        assert!(registry.get(name).is_ok(), "tool not registered: {name}");
+    }
+    connections
+        .disconnect(&registry, &servers, &info.server_id)
+        .await
+        .unwrap();
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn confirmed_stdio_mock_receives_keychain_secret_without_ambient_credentials() {
@@ -1509,3 +2199,9 @@ rl.on('line', line => {
         "https://registry.npmmirror.com"
     );
 }
+
+#[path = "connection_tests.rs"]
+mod connection_tests;
+
+#[path = "glossmod_download_tests.rs"]
+mod glossmod_download_tests;

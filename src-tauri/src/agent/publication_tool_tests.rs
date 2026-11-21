@@ -1,6 +1,8 @@
 use super::*;
 use crate::{
-    agent::policy::PermissionMode, plugin_workflow, plugins, settings::SecretStore,
+    agent::{policy::PermissionMode, tests::install_adapter_package},
+    plugins,
+    settings::SecretStore,
     transaction::tests::setup,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,14 +29,10 @@ fn fixture() -> (
     std::path::PathBuf,
 ) {
     let (temp, engine, _) = setup();
-    let mut adapter: Value = serde_json::from_str(plugins::BUILTIN_PACKAGES[0].1).unwrap();
-    adapter["slug"] = json!("publication-fixture");
-    let draft = plugin_workflow::plan_write_draft(&engine, "publication-fixture", &adapter.to_string(), "---\nname: publication-fixture\ndescription: Public fixture\n---\nReview before applying.\n").unwrap();
-    engine.approve_plan(&draft.plan.id).unwrap();
-    engine.apply_file_ops(&draft.plan.id).unwrap();
+    let draft = install_adapter_package(&engine, plugins::test_fixtures::PACKAGES[0]);
     let secrets = Arc::new(NoRemoteSecrets::default());
     let settings = Settings::with_secret_store(engine.db.clone(), secrets.clone());
-    let args = json!({"draft_id":draft.draft.id,"metadata":{"title":"Public fixture","summary":"Summary","description":"Description","tags":["adapter"],"gameIds":[]}});
+    let args = json!({"draft_id":draft.id,"tags":["adapter"]});
     (
         temp,
         ToolContext {
@@ -46,7 +44,7 @@ fn fixture() -> (
         PublishPlugin { settings },
         args,
         secrets,
-        draft.draft.path,
+        draft.path,
     )
 }
 
@@ -58,21 +56,37 @@ async fn preparation_exposes_exact_files_but_never_approves_or_reads_credentials
     let prepared = tool.prepare(&context, &args).await.unwrap();
     assert_eq!(prepared.effect, Effect::Publish);
     assert!(prepared.plan.is_none());
-    let record: plugin_publish::PublicationRecord =
+    let record: manager_publication::PublicationRecord =
         serde_json::from_value(prepared.preview).unwrap();
-    assert_eq!(record.preview.package.files.len(), 2);
+    assert_eq!(record.preview.files.len(), 2);
     assert!(record
         .preview
-        .package
         .files
         .iter()
-        .any(|file| file.name == "SKILL.md" && file.text.contains("Review before applying.")));
+        .any(|file| file.name == "SKILL.md" && file.text == plugins::test_fixtures::PACKAGES[0].2));
     assert_eq!(
-        record.preview.package.destination,
-        plugin_publish::DESTINATION
+        record.preview.destination,
+        crate::plugin_publish::DESTINATION
     );
     assert!(record.approved_digest.is_none());
-    assert!(record.file_id.is_none());
+    assert!(record.remote.is_none());
+    assert_eq!(secrets.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn installed_package_and_explicit_release_are_bound_to_the_approval() {
+    let (_temp, context, tool, draft, secrets, _) = fixture();
+    let slug = plugins::test_fixtures::PACKAGES[0].0;
+    let args = json!({"slug":slug,"plugin_id":42,"tags":["适配"]});
+    let prepared = tool.prepare(&context, &args).await.unwrap();
+    assert_eq!(
+        prepared.preview["preview"]["target"],
+        json!({"kind":"release","pluginId":42})
+    );
+    assert_eq!(prepared.preview["preview"]["slug"], slug);
+    let mut ambiguous = args;
+    ambiguous["draft_id"] = draft["draft_id"].clone();
+    assert!(tool.prepare(&context, &ambiguous).await.is_err());
     assert_eq!(secrets.0.load(Ordering::SeqCst), 0);
 }
 
@@ -90,7 +104,7 @@ async fn cancellation_before_execute_never_grants_publication_consent() {
         tool.prepare(&context, &args).await,
         Err(AppError::Cancelled)
     ));
-    assert!(plugin_publish::get_publication(&context.engine, &id)
+    assert!(manager_publication::get_publication(&context.engine, &id)
         .unwrap()
         .approved_digest
         .is_none());
@@ -108,7 +122,7 @@ async fn changed_source_between_preview_and_approval_is_rejected_before_network(
     )
     .unwrap();
     assert!(tool.execute(&context, args, prepared).await.is_err());
-    assert!(plugin_publish::get_publication(&context.engine, &id)
+    assert!(manager_publication::get_publication(&context.engine, &id)
         .unwrap()
         .approved_digest
         .is_none());
@@ -119,8 +133,8 @@ async fn changed_source_between_preview_and_approval_is_rejected_before_network(
 async fn invalid_arguments_and_prepared_effect_cannot_bypass_publish_review() {
     let (_temp, context, tool, args, secrets, _) = fixture();
     for invalid in [
-        json!({"draft_id":args["draft_id"],"metadata":args["metadata"],"upload_url":"https://elsewhere.invalid"}),
-        json!({"draft_id":12,"metadata":args["metadata"]}),
+        json!({"draft_id":args["draft_id"],"tags":args["tags"],"upload_url":"https://elsewhere.invalid"}),
+        json!({"draft_id":12,"tags":args["tags"]}),
     ] {
         assert!(tool.prepare(&context, &invalid).await.is_err());
     }

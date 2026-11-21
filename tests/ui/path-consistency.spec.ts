@@ -11,8 +11,8 @@ function argsFor(page: Page, command: string) {
     .filter((call: any) => call.command === command).map((call: any) => call.args), command);
 }
 
-async function openLibrary(page: Page, gameRootPath?: string) {
-  await installMockTauri(page, { gameRootPath });
+async function openLibrary(page: Page, gameRootPath?: string, withExternalAdapter = false) {
+  await installMockTauri(page, { gameRootPath, withExternalAdapter });
   await page.goto("/");
   await page.getByRole("button", { name: "游戏库", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Minecraft Java Edition", exact: true })).toBeVisible();
@@ -45,7 +45,7 @@ async function installDiscoveryResponses(page: Page) {
         target.__AMM_TEST__.calls.push({ command, args });
         if (command === "scan_games") return { candidates: scanCandidates, warnings: [{ path: verbatimUnc, message: "检查路径" }], directoriesChecked: 9, entriesChecked: 9, truncated: false };
         if (command === "identify_game" && args.directory === unix) return scanCandidates[3];
-        if (command === "register_game") return { id: "game-fixture" };
+        if (command === "register_game") return { id: "game-fixture", name: "从扫描添加" };
         if (command === "plugin:dialog|open") return verbatimUnc;
         throw new Error("目录未按原样传递");
       }
@@ -58,8 +58,23 @@ test("扫描候选合并旧路径别名，UNC 与 Unix 大小写不合并，发�
   await openLibrary(page, verbatimUnc);
   await installDiscoveryResponses(page);
   const library = page.getByTestId("library-page");
-  await page.getByRole("button", { name: "选择游戏目录", exact: true }).click();
-  const row = (name: string) => library.locator('[data-slot="item"]').filter({ has: page.getByText(name, { exact: true }) });
+  await page.getByRole("button", { name: "扫描游戏", exact: true }).click();
+  const discovery = page.getByRole("dialog", { name: "扫描游戏", exact: true });
+  const row = (name: string) => discovery.locator('[data-slot="item"]').filter({ has: page.getByText(name, { exact: true }) });
+  await expect(discovery).toBeVisible();
+  await expect(discovery.getByRole("status").filter({ hasText: "已检查" })).toContainText("已检查 9 个目录、9 个条目");
+  await expect(row("已登记")).toBeVisible();
+  expect(await argsFor(page, "scan_games")).toEqual([{ options: { userRoots: [], includeCommonRoots: true } }]);
+  await page.keyboard.press("Escape");
+  await expect(discovery).toBeHidden();
+  await expect(library).toBeVisible();
+  await page.getByRole("button", { name: "扫描游戏", exact: true }).click();
+  await expect(discovery).toBeVisible();
+  await expect.poll(async () => (await argsFor(page, "scan_games")).length).toBe(2);
+  expect(await argsFor(page, "scan_games")).toEqual([
+    { options: { userRoots: [], includeCommonRoots: true } },
+    { options: { userRoots: [], includeCommonRoots: true } },
+  ]);
   await expect(row("已登记").getByRole("button", { name: "管理中" })).toBeDisabled();
   await expect(row("已登记").getByText(ordinaryUnc, { exact: true })).toBeVisible();
   await expect(row("已登记的另一拼法")).toHaveCount(0);
@@ -68,18 +83,26 @@ test("扫描候选合并旧路径别名，UNC 与 Unix 大小写不合并，发�
     await expect(row(name).getByRole("button", { name: "添加", exact: true })).toBeEnabled();
   }
   await expect(row("服务端已登记").getByRole("button", { name: "管理中" })).toBeDisabled();
-  await expect(library.getByRole("status").getByText(`扫描目录：${ordinaryUnc}`, { exact: true })).toBeVisible();
-  await expect(library.getByRole("status").getByText(`${ordinaryUnc}：检查路径`, { exact: true })).toBeVisible();
-  expect(await argsFor(page, "scan_games")).toEqual([{ options: { userRoots: [verbatimUnc], includeCommonRoots: false } }]);
+  await discovery.getByRole("button", { name: "选择游戏目录", exact: true }).click();
+  await expect(discovery.getByLabel("游戏目录", { exact: true })).toHaveValue(verbatimUnc);
+  await expect(discovery.getByRole("status").filter({ hasText: "扫描目录：" })).toContainText(`扫描目录：${ordinaryUnc}`);
+  await expect(discovery.getByRole("status").filter({ hasText: "检查路径" })).toContainText(`${ordinaryUnc}：检查路径`);
+  expect((await argsFor(page, "scan_games")).at(-1)).toEqual({ options: { userRoots: [verbatimUnc], includeCommonRoots: false } });
 
-  await page.getByLabel("游戏目录", { exact: true }).fill(unix);
-  await page.getByRole("button", { name: "检查单个游戏", exact: true }).click();
+  await discovery.getByLabel("游戏目录", { exact: true }).fill(unix);
+  await discovery.getByRole("button", { name: "检查单个游戏", exact: true }).click();
   await expect(row("Unix 大写")).toBeVisible();
   expect(await argsFor(page, "identify_game")).toEqual([{ directory: unix }]);
-  await page.getByRole("button", { name: "扫描此目录", exact: true }).click();
+  await discovery.getByRole("button", { name: "扫描此目录", exact: true }).click();
   await row("从扫描添加").getByRole("button", { name: "添加", exact: true }).click();
+  await expect(page.getByText("已将「从扫描添加」添加到游戏库", { exact: true })).toBeVisible();
+  await expect(discovery).toBeVisible();
+  await expect(row("从扫描添加").getByRole("button", { name: "管理中", exact: true })).toBeDisabled();
   expect((await argsFor(page, "scan_games")).at(-1)).toEqual({ options: { userRoots: [unix], includeCommonRoots: false } });
   expect(await argsFor(page, "register_game")).toEqual([{ directory: verbatimDrive, adapterSlug: null, fromDiscovery: true }]);
+  await page.keyboard.press("Escape");
+  await expect(discovery).toBeHidden();
+  await expect(library).toBeVisible();
 });
 
 test("新手引导合并别名并保持原始注册路径", async ({ page }) => {
@@ -203,16 +226,19 @@ test("Agent 审批和工具详情只转换原生结构化路径，不改文本�
     } });
   }, { verbatimDrive, dst, detail });
 
-  const approval = page.getByRole("dialog", { name: "操作审批", exact: true });
+  const approval = page.getByRole("group", { name: "操作审批", exact: true });
+  await expect(page.getByRole("dialog", { name: "操作审批", exact: true })).toHaveCount(0);
   await expect(approval.getByText(projectedDst, { exact: true })).toBeVisible();
   await expect(approval.getByText(verbatimDrive, { exact: true })).toBeVisible(); // summary is text
   await approval.getByText("完整请求", { exact: true }).click();
   const preview = JSON.parse(await approval.locator("pre").innerText());
   expect(preview.entries[0].operation).toEqual({ op: "move", src: String.raw`C:\Games\Fixture`, dst: projectedDst });
   expect(preview.summary).toBe(verbatimDrive);
-  await approval.getByRole("button", { name: "拒绝", exact: true }).click();
-  await expect(approval).toBeHidden();
+  const reject = approval.getByRole("button", { name: "拒绝", exact: true });
+  await reject.click();
+  await expect(reject).toHaveCount(0);
   expect((await argsFor(page, "respond_approval"))[0]).toMatchObject({ approvalId: "approval-fixture", response: { approved: false } });
+  await expect(page.getByRole("button", { name: "trash_paths 已拒绝", exact: true })).toBeVisible();
   const encoded = (text: string) => JSON.stringify(text);
   const nativeTrace = page.getByRole("button", { name: "read_dir 执行失败", exact: true });
   await expect(nativeTrace).toHaveAttribute("aria-expanded", "true");
@@ -225,7 +251,7 @@ test("Agent 审批和工具详情只转换原生结构化路径，不改文本�
 });
 
 test("归档预览和安装提交保留归档路径与原文件名", async ({ page }) => {
-  await openLibrary(page);
+  await openLibrary(page, undefined, true);
   const filename = " Map\\Pack.zip ";
   const artifactPath = `/sandbox/data/staging/${filename}`;
   await page.evaluate(() => {

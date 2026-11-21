@@ -1,6 +1,11 @@
 //! Declarative game packages. Loading never expands environment variables, runs
 //! a script, installs a mod, or grants filesystem access. All paths in an
 //! adapter are relative to an explicitly registered root.
+mod mcp;
+#[cfg(test)]
+pub(crate) mod test_fixtures;
+pub use mcp::PluginMcpServer;
+
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::storage::AppPaths;
@@ -138,6 +143,8 @@ pub struct GameAdapter {
     pub steam_app_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<PluginMcpServer>,
     pub install_roots: Vec<InstallRoot>,
     pub mod_types: Vec<ModType>,
     pub archive_rules: Vec<ArchiveRule>,
@@ -291,6 +298,7 @@ impl GameAdapter {
     pub fn validate(&self) -> AppResult<()> {
         validate_slug(&self.slug)?;
         validate_version(&self.version)?;
+        self.mcp_configs()?;
         if self.schema_version != 1 || self.name.trim().is_empty() || self.name.len() > 256 {
             return Err(invalid("适配包名称为空或 schemaVersion 不受支持"));
         }
@@ -611,99 +619,43 @@ pub fn load_package(directory: &Path) -> AppResult<GamePackage> {
     )
 }
 
-macro_rules! builtin {
-    ($slug:literal) => {
-        (
-            $slug,
-            include_str!(concat!("../../plugins/games/", $slug, "/adapter.json")),
-            include_str!(concat!("../../plugins/games/", $slug, "/SKILL.md")),
-        )
-    };
-}
-
-pub const BUILTIN_PACKAGES: [(&str, &str, &str); 6] = [
-    builtin!("minecraft-java"),
-    builtin!("skyrim-se"),
-    builtin!("fallout4"),
-    builtin!("stardew-valley"),
-    builtin!("cyberpunk-2077"),
-    builtin!("baldurs-gate-3"),
-];
-
-pub fn builtin_packages() -> AppResult<Vec<GamePackage>> {
-    BUILTIN_PACKAGES
-        .iter()
-        .map(|(slug, json, skill)| parse_package(slug, json, skill))
-        .collect()
-}
-
-/// Idempotent registration of embedded packages in the existing schema. Enabled
-/// flags and created_at survive reseeding. External name collisions fail closed.
-/// The package files are materialized only inside AppPaths, never game/user roots.
-/// A filesystem failure can leave unregistered static files; retrying is safe.
-pub fn seed_builtins(db: &Db, paths: &AppPaths) -> AppResult<()> {
-    let packages = builtin_packages()?;
+/// Park directories registered by earlier desktop releases, including local edits.
+/// If the process stops before the database commit, a missing source is safe to retry.
+pub(crate) fn retire_builtin_adapters(db: &Db, paths: &AppPaths) -> AppResult<()> {
+    let _files = crate::transaction::write_lock();
     let mut conn = db.conn();
-    let tx = conn.transaction()?;
-    // Check every collision before writing any files or changing any rows.
-    for package in &packages {
-        let slug = &package.adapter.slug;
-        for (table, key) in [("plugins", "slug"), ("skills", "name")] {
-            let source: Option<String> = tx
-                .query_row(
-                    &format!("SELECT source FROM {table} WHERE {key}=?1"),
-                    [slug],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if source.as_deref().is_some_and(|s| s != "builtin") {
-                return Err(AppError::Conflict(format!("保留外部 {table} 记录: {slug}")));
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let legacy: Vec<(String, PathBuf)> = {
+        let mut stmt =
+            tx.prepare("SELECT slug,install_path FROM plugins WHERE source='builtin'")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?)))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for (slug, registered) in legacy {
+        validate_slug(&slug)?;
+        let package = paths.plugins().join("games").join(&slug);
+        if registered == package {
+            if let Some(id) = crate::safe_fs::identity(&package)? {
+                let backup = paths.backups().join("retired-adapters");
+                crate::safe_fs::create_dir_all(&backup)?;
+                let destination = backup.join(format!("{slug}-{}", uuid::Uuid::new_v4()));
+                crate::safe_fs::rename_checked(&package, &destination, &id)?;
             }
         }
-    }
-    let now = chrono::Utc::now().to_rfc3339();
-    for (package, (_, json, markdown)) in packages.iter().zip(BUILTIN_PACKAGES.iter()) {
-        let dir = paths.plugins().join("games").join(&package.adapter.slug);
-        write_static(paths, &dir.join("adapter.json"), json.as_bytes())?;
-        write_static(paths, &dir.join("SKILL.md"), markdown.as_bytes())?;
-        let location = dir.join("SKILL.md").to_string_lossy().to_string();
+        tx.execute("UPDATE games SET adapter_slug=NULL,adapter_version=NULL,updated_at=?2 WHERE adapter_slug=?1", params![slug, crate::util::now()])?;
         tx.execute(
-            "INSERT INTO plugins (slug,name,game_name,version,description,source,enabled,validated,install_path,adapter_json,created_at,updated_at)
-             VALUES (?1,?2,?2,?3,?4,'builtin',1,1,?5,?6,?7,?7)
-             ON CONFLICT(slug) DO UPDATE SET name=excluded.name,game_name=excluded.game_name,version=excluded.version,description=excluded.description,validated=1,install_path=excluded.install_path,adapter_json=excluded.adapter_json,updated_at=excluded.updated_at",
-            params![package.adapter.slug, package.adapter.name, package.adapter.version, package.skill.description, dir.to_string_lossy(), json, now],
+            "DELETE FROM skills WHERE name=?1 AND source='builtin'",
+            [&slug],
         )?;
         tx.execute(
-            "INSERT INTO skills (name,description,location,source,enabled,created_at) VALUES (?1,?2,?3,'builtin',1,?4)
-             ON CONFLICT(name) DO UPDATE SET description=excluded.description,location=excluded.location",
-            params![package.skill.name, package.skill.description, location, now],
+            "DELETE FROM plugins WHERE slug=?1 AND source='builtin'",
+            [&slug],
         )?;
     }
     tx.commit()?;
     Ok(())
-}
-
-fn write_static(paths: &AppPaths, target: &Path, bytes: &[u8]) -> AppResult<()> {
-    // Keep the plugin directory itself inside app storage, even if an existing
-    // ancestor is a symlink. Check the leaf too before opening it for writing.
-    let parent = target
-        .parent()
-        .ok_or_else(|| invalid("适配包路径没有父目录"))?;
-    let guarded = paths.guard(parent, &[])?;
-    fs::create_dir_all(&guarded)?;
-    paths.guard(target, &[])?;
-    if let Ok(meta) = fs::symlink_metadata(target) {
-        if !meta.file_type().is_file() {
-            return Err(AppError::Denied(format!(
-                "拒绝覆盖非普通包文件: {}",
-                crate::paths::display_path(target)
-            )));
-        }
-        if fs::read(target)? == bytes {
-            return Ok(());
-        }
-    }
-    crate::util::atomic_write(target, bytes)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -720,6 +672,8 @@ pub struct PluginInfo {
     #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub install_path: String,
     pub cover_url: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mcp_server_names: Vec<String>,
 }
 
 pub fn list_plugins(db: &Db) -> AppResult<Vec<PluginInfo>> {
@@ -729,15 +683,23 @@ pub fn list_plugins(db: &Db) -> AppResult<Vec<PluginInfo>> {
         let slug: String = r.get(0)?;
         let version: String = r.get(3)?;
         let validated: bool = r.get(7)?;
-        let cover_url = if validated {
+        let adapter = if validated {
             r.get::<_, Option<String>>(9)?
                 .and_then(|json| serde_json::from_str::<GameAdapter>(&json).ok())
                 .filter(|adapter| adapter.slug == slug && adapter.version == version)
-                .and_then(|adapter| adapter.cover_url)
-                .filter(|url| valid_cover_url(url))
         } else {
             None
         };
+        let (cover_url, mcp_server_names) = adapter.map_or_else(Default::default, |adapter| {
+            (
+                adapter.cover_url.filter(|url| valid_cover_url(url)),
+                adapter
+                    .mcp_servers
+                    .into_iter()
+                    .map(|server| server.name)
+                    .collect(),
+            )
+        });
         Ok(PluginInfo {
             slug,
             name: r.get(1)?,
@@ -749,6 +711,7 @@ pub fn list_plugins(db: &Db) -> AppResult<Vec<PluginInfo>> {
             validated,
             install_path: r.get(8)?,
             cover_url,
+            mcp_server_names,
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -801,9 +764,8 @@ mod tests {
     }
 
     #[test]
-    fn all_six_embedded_packages_validate_and_roundtrip() {
-        let packages = builtin_packages().unwrap();
-        assert_eq!(packages.len(), 6);
+    fn external_package_fixtures_validate_and_roundtrip() {
+        let packages = test_fixtures::packages().unwrap();
         let mut names = BTreeSet::new();
         for p in packages {
             assert!(names.insert(p.adapter.slug.clone()));
@@ -814,7 +776,7 @@ mod tests {
 
     #[test]
     fn covers_are_optional_and_only_public_https_addresses_are_accepted() {
-        for mut package in builtin_packages().unwrap() {
+        for mut package in test_fixtures::packages().unwrap() {
             assert!(package
                 .adapter
                 .cover_url
@@ -934,7 +896,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_code_fields_identity_and_root_references() {
-        let (slug, json, skill) = BUILTIN_PACKAGES[0];
+        let (slug, json, skill) = test_fixtures::PACKAGES[0];
         let mut value: serde_json::Value = serde_json::from_str(json).unwrap();
         value["command"] = "run me".into();
         assert!(parse_package(slug, &value.to_string(), skill).is_err());
@@ -946,7 +908,7 @@ mod tests {
 
     #[test]
     fn validates_paths_in_every_declarative_location() {
-        let (slug, json, skill) = BUILTIN_PACKAGES[1];
+        let (slug, json, skill) = test_fixtures::PACKAGES[1];
         for pointer in [
             "/markers/0/path",
             "/installRoots/0/relativePath",
@@ -972,7 +934,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_input_and_invalid_package_files() {
-        let (slug, json, skill) = BUILTIN_PACKAGES[0];
+        let (slug, json, skill) = test_fixtures::PACKAGES[0];
         assert!(parse_package(slug, &" ".repeat(MAX_ADAPTER_BYTES + 1), skill).is_err());
         assert!(parse_package(slug, json, &" ".repeat(MAX_SKILL_BYTES + 1)).is_err());
         let temp = tempfile::tempdir().unwrap();
@@ -985,64 +947,9 @@ mod tests {
     }
 
     #[test]
-    fn seeds_idempotently_preserving_disabled_flags() {
-        let (_temp, paths, db) = fixture();
-        seed_builtins(&db, &paths).unwrap();
-        db.conn()
-            .execute(
-                "UPDATE plugins SET enabled=0 WHERE slug='minecraft-java'",
-                [],
-            )
-            .unwrap();
-        db.conn()
-            .execute(
-                "UPDATE skills SET enabled=0 WHERE name='minecraft-java'",
-                [],
-            )
-            .unwrap();
-        seed_builtins(&db, &paths).unwrap();
-        assert_eq!(list_plugins(&db).unwrap().len(), 6);
-        assert!(adapter_for(&db, "minecraft-java").is_err());
-        assert_eq!(
-            db.conn()
-                .query_row("SELECT COUNT(*) FROM skills", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            6
-        );
-        assert!(!db
-            .conn()
-            .query_row(
-                "SELECT enabled FROM skills WHERE name='minecraft-java'",
-                [],
-                |r| r.get::<_, bool>(0)
-            )
-            .unwrap());
-        load_package(&paths.plugins().join("games/baldurs-gate-3")).unwrap();
-    }
-
-    #[test]
-    fn seed_preserves_external_collision_and_rolls_back() {
-        let (_temp, paths, db) = fixture();
-        db.conn().execute("INSERT INTO skills (name,description,location,source,created_at) VALUES ('fallout4','custom','external','user','original')", []).unwrap();
-        assert!(seed_builtins(&db, &paths).is_err());
-        assert!(list_plugins(&db).unwrap().is_empty());
-        assert!(!paths.plugins().join("games").exists());
-        assert_eq!(
-            db.conn()
-                .query_row(
-                    "SELECT description FROM skills WHERE name='fallout4'",
-                    [],
-                    |r| r.get::<_, String>(0)
-                )
-                .unwrap(),
-            "custom"
-        );
-    }
-
-    #[test]
     fn database_tampering_is_revalidated() {
         let (_temp, paths, db) = fixture();
-        seed_builtins(&db, &paths).unwrap();
+        test_fixtures::install(&db, &paths).unwrap();
         db.conn().execute("UPDATE plugins SET adapter_json=replace(adapter_json,'archive/pc/mod','../escape') WHERE slug='cyberpunk-2077'", []).unwrap();
         assert!(adapter_for(&db, "cyberpunk-2077").is_err());
     }
@@ -1056,7 +963,7 @@ mod tests {
         fs::create_dir_all(&user).unwrap();
         let game = game.canonicalize().unwrap();
         let user = user.canonicalize().unwrap();
-        let adapter = builtin_packages().unwrap().pop().unwrap().adapter;
+        let adapter = test_fixtures::packages().unwrap().pop().unwrap().adapter;
         let mut registered = BTreeMap::new();
         assert!(adapter
             .resolve_root(
@@ -1093,20 +1000,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn rejects_symlinked_packages_and_escaped_destinations() {
+    fn rejects_symlinked_package_files() {
         use std::os::unix::fs::symlink;
-        let (temp, paths, db) = fixture();
+        let temp = tempfile::tempdir().unwrap();
         let outside = temp.path().join("outside");
         fs::create_dir_all(&outside).unwrap();
-        symlink(&outside, paths.plugins().join("games")).unwrap();
-        assert!(seed_builtins(&db, &paths).is_err());
-        assert!(fs::read_dir(&outside).unwrap().next().is_none());
-        assert!(list_plugins(&db).unwrap().is_empty());
         let package = temp.path().join("minecraft-java");
         fs::create_dir_all(&package).unwrap();
-        fs::write(outside.join("adapter.json"), BUILTIN_PACKAGES[0].1).unwrap();
+        fs::write(outside.join("adapter.json"), test_fixtures::PACKAGES[0].1).unwrap();
         symlink(outside.join("adapter.json"), package.join("adapter.json")).unwrap();
-        fs::write(package.join("SKILL.md"), BUILTIN_PACKAGES[0].2).unwrap();
+        fs::write(package.join("SKILL.md"), test_fixtures::PACKAGES[0].2).unwrap();
         assert!(load_package(&package).is_err());
     }
 
@@ -1120,7 +1023,7 @@ mod tests {
         fs::create_dir_all(&game).unwrap();
         fs::create_dir_all(&outside).unwrap();
         symlink(&outside, game.join("mods")).unwrap();
-        let adapter = builtin_packages().unwrap().remove(0).adapter;
+        let adapter = test_fixtures::packages().unwrap().remove(0).adapter;
         assert!(adapter
             .resolve_root(
                 "mods",

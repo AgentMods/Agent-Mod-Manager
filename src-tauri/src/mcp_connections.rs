@@ -7,8 +7,10 @@ use crate::{
     settings::Settings,
 };
 use serde::Serialize;
-use std::{collections::BTreeMap, sync::Arc};
-use tokio::sync::Mutex;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex, MutexGuard},
+};
 use tokio_util::sync::CancellationToken;
 
 /// Fixed ID of the automatically managed entry for this app's own local MCP server.
@@ -16,9 +18,7 @@ pub const LOCAL_SERVER_ID: &str = "amm_local";
 
 pub(crate) fn require_external(id: &str) -> AppResult<()> {
     if id == LOCAL_SERVER_ID {
-        return Err(AppError::Denied(
-            "请使用本地 MCP 服务的启动和停止控件".into(),
-        ));
+        return Err(AppError::Denied("请使用本地工具的启动和停止控件".into()));
     }
     Ok(())
 }
@@ -30,6 +30,8 @@ pub struct McpConnections {
 }
 enum Slot {
     Starting {
+        config: Box<ServerConfig>,
+        requires_saved_consent: bool,
         cancel: CancellationToken,
         finished: CancellationToken,
     },
@@ -38,12 +40,40 @@ enum Slot {
         names: Vec<String>,
     },
 }
+impl Slot {
+    fn config(&self) -> &ServerConfig {
+        match self {
+            Self::Starting { config, .. } => config,
+            Self::Running { client, .. } => client.server_config(),
+        }
+    }
+
+    fn revoke(self, registry: &ToolRegistry) -> Option<Box<McpClient>> {
+        match self {
+            Self::Starting { cancel, .. } => cancel.cancel(),
+            Self::Running { client, names } => {
+                registry.unregister(&names);
+                client.disconnect();
+                return Some(client);
+            }
+        }
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
 enum Start {
     Confirmed(bool),
     Remembered,
     Attachment,
     ManagedLocal,
 }
+impl Start {
+    fn requires_saved_consent(self) -> bool {
+        matches!(self, Self::Remembered | Self::Attachment)
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionInfo {
@@ -58,10 +88,13 @@ impl McpConnections {
         }
     }
 
+    // No awaits while held: committed plugin changes also revoke slots synchronously.
+    fn lock_slots(&self) -> MutexGuard<'_, BTreeMap<String, Slot>> {
+        self.slots.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
     pub async fn list(&self) -> Vec<ConnectionInfo> {
-        self.slots
-            .lock()
-            .await
+        self.lock_slots()
             .iter()
             .filter_map(|(server, slot)| match slot {
                 Slot::Starting { .. } => None,
@@ -144,26 +177,28 @@ impl McpConnections {
         let servers = McpServers::new(settings.db.clone());
         let config = servers.get(MARKITDOWN_ID).map_err(|err| match err {
             AppError::NotFound(_) => AppError::NotFound(
-                "缺少内置 MarkItDown MCP，请重启应用恢复预设后，在「设置 → MCP 服务」中启动它。"
-                    .into(),
+                "缺少内置 MarkItDown MCP，请重启应用恢复预设后，在「设置 → 工具」中启动它。".into(),
             ),
             other => other,
         })?;
         if !config.builtin || config.transport != McpTransport::Stdio {
-            return Err(AppError::Invalid("聊天附件需要内置的 stdio MarkItDown MCP。请在「设置 → MCP 服务」中恢复该预设并启动。".into()));
+            return Err(AppError::Invalid(
+                "聊天附件需要内置的 stdio MarkItDown MCP。请在「设置 → 工具」中恢复该预设并启动。"
+                    .into(),
+            ));
         }
         let (info, client) = self
             .start(settings.clone(), registry, config, Start::Attachment)
             .await
             .map_err(|err| match err {
-                AppError::Denied(_) => AppError::Denied("此 MarkItDown MCP 配置需要启动授权。请确认 stdio 进程使用当前用户的系统权限，或前往「设置 → MCP 服务」启动它。".into()),
-                other => AppError::Other(format!("无法使用 MarkItDown MCP。请在「设置 → MCP 服务」中检查连接后重试。{other}")),
+                AppError::Denied(_) => AppError::Denied("此 MarkItDown MCP 配置需要启动授权。请确认 stdio 进程使用当前用户的系统权限，或前往「设置 → 工具」启动它。".into()),
+                other => AppError::Other(format!("无法使用 MarkItDown MCP。请在「设置 → 工具」中检查连接后重试。{other}")),
             })?;
         if !info
             .tools
             .contains(&namespaced_tool_name(MARKITDOWN_ID, MARKDOWN_TOOL))
         {
-            return Err(AppError::Unsupported("MarkItDown MCP 未提供 convert_to_markdown。请在「设置 → MCP 服务」中检查内置预设并重新启动。".into()));
+            return Err(AppError::Unsupported("MarkItDown MCP 未提供 convert_to_markdown。请在「设置 → 工具」中检查内置预设并重新启动。".into()));
         }
         Ok(client)
     }
@@ -179,69 +214,78 @@ impl McpConnections {
         let cancel = CancellationToken::new();
         let finished = CancellationToken::new();
         let _notify_waiters = finished.clone().drop_guard();
-        let consent = {
-            let mut slots = self.slots.lock().await;
-            if let Some(slot) = slots.get(&expected.id) {
-                if !matches!(start, Start::Attachment) {
+        let reservation = {
+            // Match-and-enable and slot reservations must not cross a plugin commit.
+            // Lock order: file write lock -> slots -> database (never across network IO).
+            let _plugin_write = expected
+                .plugin_slug
+                .as_ref()
+                .map(|_| crate::transaction::write_lock());
+            let mut slots = self.lock_slots();
+            match slots.get(&expected.id) {
+                Some(_) if !matches!(start, Start::Attachment) => {
                     return Err(AppError::Conflict("MCP 正在启动或已连接".into()));
                 }
-                // Concurrent uploads and desktop restore share one handshake. A waiter never
-                // retries a failed or revoked launch and cannot hold up an explicit stop.
-                if let Slot::Starting { finished, cancel } = slot {
-                    let (finished, cancel) = (finished.clone(), cancel.clone());
-                    drop(slots);
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => return Err(AppError::Cancelled),
-                        _ = finished.cancelled() => (),
+                Some(Slot::Starting {
+                    finished, cancel, ..
+                }) => Err((finished.clone(), cancel.clone())),
+                Some(slot) => return Self::attached(Some(slot), &expected),
+                None => {
+                    let mut current = servers.get(&expected.id)?;
+                    let enable_owned = matches!(start, Start::Confirmed(_))
+                        && current.plugin_slug.is_some()
+                        && !current.enabled
+                        && expected.enabled;
+                    if enable_owned {
+                        current.enabled = true;
                     }
-                    slots = self.slots.lock().await;
-                }
-                if let Some(Slot::Running { client, names }) = slots.get(&expected.id) {
-                    if client.server_config() == &expected {
-                        return Ok((
-                            ConnectionInfo {
-                                server_id: expected.id,
-                                tools: names.clone(),
-                            },
-                            client.as_ref().clone(),
+                    if !current.same_connection_config(&expected) {
+                        return Err(AppError::Conflict(
+                            "配置已变化，请重新确认完整连接配置".into(),
                         ));
                     }
+                    let consent = match start {
+                        Start::Confirmed(accepted) => {
+                            ConnectionConsent::after_user_confirmation(&expected, accepted)?
+                        }
+                        Start::Remembered | Start::Attachment => {
+                            ConnectionConsent::from_remembered(&servers, &expected)?
+                        }
+                        Start::ManagedLocal => {
+                            ConnectionConsent::after_user_confirmation(&expected, false)?
+                        }
+                    };
+                    // Only the enable flag may differ, and a declined stdio warning cannot enable it.
+                    if enable_owned {
+                        servers.set_enabled(&expected.id, true)?;
+                    }
+                    slots.insert(
+                        expected.id.clone(),
+                        Slot::Starting {
+                            config: Box::new(expected.clone()),
+                            requires_saved_consent: start.requires_saved_consent(),
+                            cancel: cancel.clone(),
+                            finished,
+                        },
+                    );
+                    Ok(consent)
                 }
-                return Err(AppError::Conflict(
-                    "连接已停止、启动失败或配置已更改。请在「设置 → MCP 服务」中检查 MarkItDown 状态后重试。".into(),
-                ));
             }
-            if slots.len() >= 8 {
-                return Err(AppError::Invalid("最多同时连接8个MCP服务器".into()));
-            }
-            if servers.get(&expected.id)? != expected {
-                return Err(AppError::Conflict(
-                    "配置已变化，请重新确认完整连接配置".into(),
-                ));
-            }
-            let consent = match start {
-                Start::Confirmed(accepted) => {
-                    ConnectionConsent::after_user_confirmation(&expected, accepted)?
-                }
-                Start::Remembered | Start::Attachment => {
-                    ConnectionConsent::from_remembered(&servers, &expected)?
-                }
-                Start::ManagedLocal => {
-                    ConnectionConsent::after_user_confirmation(&expected, false)?
-                }
-            };
-            slots.insert(
-                expected.id.clone(),
-                Slot::Starting {
-                    cancel: cancel.clone(),
-                    finished,
-                },
-            );
-            consent
         };
-        let remember = matches!(start, Start::Confirmed(_));
-        self.finish_start(settings, registry, expected, remember, cancel, consent)
+        let consent = match reservation {
+            Ok(consent) => consent,
+            Err((finished, cancel)) => {
+                // Concurrent uploads and desktop restore share one handshake. A waiter never
+                // retries a failed or revoked launch and cannot hold up an explicit stop.
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(AppError::Cancelled),
+                    _ = finished.cancelled() => (),
+                }
+                return Self::attached(self.lock_slots().get(&expected.id), &expected);
+            }
+        };
+        self.finish_start(settings, registry, expected, start, cancel, consent)
             .await
             .map_err(|err| match err {
                 // Authorization succeeded. Filesystem/transport denials must never reopen the consent dialog.
@@ -252,13 +296,34 @@ impl McpConnections {
             })
     }
 
+    fn attached(
+        slot: Option<&Slot>,
+        expected: &ServerConfig,
+    ) -> AppResult<(ConnectionInfo, McpClient)> {
+        if let Some(Slot::Running { client, names }) = slot {
+            if client.server_config().same_connection_config(expected) {
+                return Ok((
+                    ConnectionInfo {
+                        server_id: expected.id.clone(),
+                        tools: names.clone(),
+                    },
+                    client.as_ref().clone(),
+                ));
+            }
+        }
+        Err(AppError::Conflict(
+            "连接已停止、启动失败或配置已更改。请在「设置 → 工具」中检查 MarkItDown 状态后重试。"
+                .into(),
+        ))
+    }
+
     // Never hold the lifecycle lock through a remote handshake or a stdio download.
     async fn finish_start(
         &self,
         settings: Settings,
         registry: &ToolRegistry,
         expected: ServerConfig,
-        remember: bool,
+        start: Start,
         cancel: CancellationToken,
         consent: ConnectionConsent,
     ) -> AppResult<(ConnectionInfo, McpClient)> {
@@ -283,44 +348,95 @@ impl McpConnections {
             Ok((client, tools))
         }
         .await;
-        let mut slots = self.slots.lock().await;
-        if cancel.is_cancelled() {
-            // Stop/edit removed our reservation. A newer start may already own the ID.
-            drop(slots);
-            if let Ok((client, _)) = prepared {
-                client.disconnect_and_wait().await?;
+        let mut client_to_close = None;
+        let finished = (|| {
+            let _plugin_write = expected
+                .plugin_slug
+                .as_ref()
+                .map(|_| crate::transaction::write_lock());
+            let mut slots = self.lock_slots();
+            if cancel.is_cancelled() {
+                // Stop/edit removed our reservation. A newer start may already own the ID.
+                client_to_close = prepared.ok().map(|(client, _)| client);
+                return Err(AppError::Cancelled);
             }
-            return Err(AppError::Cancelled);
-        }
-        slots.remove(&expected.id);
-        let (client, tools) = prepared?;
-        let names: Vec<_> = tools.iter().map(|t| t.definition().name).collect();
-        let result = registry.register_batch(tools).and_then(|()| {
-            if remember {
-                if let Err(err) = servers.remember_start(&expected) {
-                    registry.unregister(&names);
-                    return Err(err);
+            slots.remove(&expected.id);
+            let (client, tools) = prepared?;
+            let names: Vec<_> = tools.iter().map(|t| t.definition().name).collect();
+            let result = (|| {
+                client.ensure_current()?;
+                if start.requires_saved_consent() {
+                    ConnectionConsent::from_remembered(&servers, &expected)?;
                 }
+                registry.register_batch(tools)?;
+                if matches!(start, Start::Confirmed(_)) {
+                    if let Err(err) = servers.remember_start(&expected) {
+                        registry.unregister(&names);
+                        return Err(err);
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(err) = result {
+                client_to_close = Some(client);
+                return Err(err);
             }
-            Ok(())
-        });
-        if let Err(err) = result {
-            drop(slots);
+            let info = ConnectionInfo {
+                server_id: expected.id.clone(),
+                tools: names.clone(),
+            };
+            slots.insert(
+                expected.id,
+                Slot::Running {
+                    client: Box::new(client.clone()),
+                    names,
+                },
+            );
+            Ok((info, client))
+        })();
+        if let Some(client) = client_to_close {
             client.disconnect_and_wait().await?;
-            return Err(err);
         }
-        let info = ConnectionInfo {
-            server_id: expected.id.clone(),
-            tools: names.clone(),
-        };
-        slots.insert(
-            expected.id,
-            Slot::Running {
-                client: Box::new(client.clone()),
-                names,
-            },
-        );
-        Ok((info, client))
+        finished
+    }
+
+    /// Revoke stale slots for this plugin after a committed change. Other plugins,
+    /// manual services, and matching launch configurations/consents are untouched.
+    pub(crate) fn invalidate_plugin(
+        &self,
+        registry: &ToolRegistry,
+        servers: &McpServers,
+        slug: &str,
+    ) {
+        let mut slots = self.lock_slots();
+        let stale: Vec<_> = slots
+            .iter()
+            .filter_map(|(id, slot)| {
+                let expected = slot.config();
+                if expected.plugin_slug.as_deref() != Some(slug) {
+                    return None;
+                }
+                let requires_saved_consent = match slot {
+                    Slot::Starting {
+                        requires_saved_consent,
+                        ..
+                    } => *requires_saved_consent,
+                    Slot::Running { .. } => true,
+                };
+                let keep = servers.get(id).is_ok_and(|current| {
+                    current.enabled && current.same_connection_config(expected)
+                }) && (!requires_saved_consent
+                    || ConnectionConsent::from_remembered(servers, expected).is_ok());
+                (!keep).then(|| id.clone())
+            })
+            .collect();
+        for id in stale {
+            if let Some(slot) = slots.remove(&id) {
+                // No blocking wait in the plugin commit path: disconnect requests a
+                // kill immediately, and the child has kill_on_drop as a fallback.
+                drop(slot.revoke(registry));
+            }
+        }
     }
 
     /// Commit stop/edit/remove and revoke the slot together so a queued restore cannot undo it.
@@ -330,18 +446,37 @@ impl McpConnections {
         id: &str,
         change: impl FnOnce() -> AppResult<()>,
     ) -> AppResult<()> {
-        let mut slots = self.slots.lock().await;
-        // Never leave live tools running just because persistence is unavailable.
-        let changed = change();
-        match slots.remove(id) {
-            Some(Slot::Starting { cancel, .. }) => cancel.cancel(),
-            Some(Slot::Running { client, names }) => {
-                registry.unregister(&names);
-                client.disconnect();
-                drop(slots);
-                return changed.and(client.disconnect_and_wait().await);
+        self.revoke_if_needed(registry, id, || change().map(|()| true))
+            .await
+    }
+
+    /// A successful metadata-only edit does not revoke an existing slot.
+    pub(crate) async fn revoke_if_needed(
+        &self,
+        registry: &ToolRegistry,
+        id: &str,
+        change: impl FnOnce() -> AppResult<bool>,
+    ) -> AppResult<()> {
+        let (changed, client) = {
+            let mut slots = self.lock_slots();
+            let changed = match change() {
+                Ok(false) => return Ok(()),
+                result => result.map(|_| ()),
+            };
+            // A denied manual update/removal of a plugin-owned record is not a stop.
+            if matches!(changed, Err(AppError::Denied(_)))
+                && slots
+                    .get(id)
+                    .is_some_and(|slot| slot.config().plugin_slug.is_some())
+            {
+                return changed;
             }
-            None => (),
+            // Never leave live tools running just because persistence is unavailable.
+            let client = slots.remove(id).and_then(|slot| slot.revoke(registry));
+            (changed, client)
+        };
+        if let Some(client) = client {
+            return changed.and(client.disconnect_and_wait().await);
         }
         changed
     }

@@ -1,11 +1,8 @@
-import { useState, type ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { FileTextIcon, ImageIcon, LoaderCircleIcon, RotateCcwIcon, XIcon } from "lucide-react";
-import { ErrorState, Modal } from "./ui";
-import { Button } from "./ui/button";
-import { Spinner } from "./ui/spinner";
-import { McpLaunchDetails } from "./McpLaunchDetails";
-import { useBackendQuery } from "@/lib/api";
+import { Modal } from "./ui";
+import { api } from "@/lib/api";
 import { startMcpConnection, type McpConfig } from "@/lib/mcp-connection";
 import { Attachment, AttachmentAction, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentMedia, AttachmentTitle, AttachmentTrigger } from "./ui/attachment";
 import type { AgentAttachment } from "@/lib/types";
@@ -39,29 +36,30 @@ export function MessageAttachment({ value }: { value: AgentAttachment }) {
   return <AttachmentCard name={value.name} image={value.kind === "image"} value={value} />;
 }
 
-export function AttachmentConverterSetup({ onClose, onStarted }: { onClose: () => void; onStarted: () => void }) {
-  const configs = useBackendQuery<McpConfig[]>(["mcp", "configs"], "mcp_list");
-  const config = configs.data?.find((entry) => entry.id === "markitdown" && entry.builtin && entry.transport === "stdio");
+export function useAttachmentConverterStart() {
+  const pending = useRef(false);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<unknown>();
   const client = useQueryClient();
-  async function start() {
-    if (!config || starting) return;
+  async function start(onStarted: () => void) {
+    if (pending.current) return;
+    pending.current = true;
     setStarting(true); setError(null);
     try {
-      await startMcpConnection(config, true);
-      void client.invalidateQueries({ queryKey: ["mcp"] });
+      // Only the explicit launch action reads and authorizes the current built-in stdio preset.
+      const configs = await api<McpConfig[]>("mcp_list");
+      const config = configs.find((entry) => entry.id === "markitdown" && entry.builtin && entry.transport === "stdio");
+      if (!config) throw new Error("请在「设置 → 工具」中恢复内置 MarkItDown 预设。");
+      await startMcpConnection(config);
       onStarted();
     } catch (failure) { setError(failure); }
-    finally { setStarting(false); }
+    finally {
+      pending.current = false;
+      setStarting(false);
+      void client.invalidateQueries({ queryKey: ["mcp"] });
+    }
   }
-  return <Modal title="启动 MarkItDown MCP" onClose={() => { if (!starting) onClose(); }} className="sm:max-w-md" actions={<>
-    <Button type="button" variant="outline" disabled={starting} onClick={onClose}>取消</Button>
-    <Button type="button" disabled={!config || starting} onClick={() => void start()}>{starting && <Spinner />}启动并转换</Button>
-  </>}>
-    {config ? <McpLaunchDetails config={config} /> : configs.isLoading ? <Spinner /> : null}
-    <ErrorState error={error || configs.error || (configs.data && !config ? "请在设置的 MCP 服务中恢复内置 MarkItDown 预设。" : null)} />
-  </Modal>;
+  return { start, starting, error };
 }
 
 export function ComposerAttachment({ draft, disabled, onRemove, onRetry }: {

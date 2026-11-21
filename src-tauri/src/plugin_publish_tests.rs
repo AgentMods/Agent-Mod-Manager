@@ -59,7 +59,7 @@ impl Fixture {
 }
 fn content() -> (String, String) {
     let mut value: serde_json::Value =
-        serde_json::from_str(plugins::BUILTIN_PACKAGES[0].1).unwrap();
+        serde_json::from_str(plugins::test_fixtures::PACKAGES[0].1).unwrap();
     value["slug"] = json!(SLUG);
     value["name"] = json!("Publish Test");
     value["version"] = json!("1.2.3");
@@ -551,22 +551,34 @@ fn installed_external_requires_matching_committed_plan_not_just_validated_flag()
 }
 
 #[test]
-fn installed_builtins_require_exact_embedded_raw_bytes() {
+fn former_adapter_slug_publishes_only_the_reviewed_external_package() {
     let f = Fixture::new();
-    plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
-    let slug = plugins::BUILTIN_PACKAGES[0].0;
-    let (_, _) = prepare_installed_package(&f.engine, slug, metadata()).unwrap();
-    let path = f
-        .engine
-        .paths
-        .plugins()
-        .join("games")
-        .join(slug)
-        .join("SKILL.md");
-    let mut raw = fs::read_to_string(&path).unwrap();
-    raw.push('\n');
-    fs::write(path, raw).unwrap();
+    let (slug, adapter, skill) = plugins::test_fixtures::PACKAGES[0];
+    let reviewed_skill = format!("{skill}\nExternal package revision.\n");
+    let draft =
+        plugin_workflow::plan_write_draft(&f.engine, slug, adapter, &reviewed_skill).unwrap();
+    f.engine.approve_plan(&draft.plan.id).unwrap();
+    f.engine.apply_file_ops(&draft.plan.id).unwrap();
+    let deployment = plugin_workflow::plan_install_plugin(&f.engine, &draft.draft.id).unwrap();
+    f.engine.approve_plan(&deployment.plan.id).unwrap();
+    f.engine.apply_file_ops(&deployment.plan.id).unwrap();
+    plugin_workflow::reconcile_deployments(&f.engine).unwrap();
+
+    let (preview, _) = prepare_installed_package(&f.engine, slug, metadata()).unwrap();
+    assert_eq!(
+        preview.source,
+        PublicationSource::Installed {
+            slug: slug.into(),
+            source: "external".into(),
+            deployment_transaction_id: Some(deployment.plan.id),
+        }
+    );
+    assert_eq!(preview.package.files[1].text, reviewed_skill);
+    let publication = create_publication(&f.engine, &preview).unwrap();
+    approve_publication(&f.engine, &publication.id, &preview.digest).unwrap();
+    fs::write(deployment.install_path.join("SKILL.md"), skill).unwrap();
     assert!(prepare_installed_package(&f.engine, slug, metadata()).is_err());
+    assert!(verified_upload_artifact(&f.engine, &publication.id, &preview.digest).is_err());
 }
 
 #[test]

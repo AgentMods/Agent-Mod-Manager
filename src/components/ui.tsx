@@ -11,7 +11,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 
 /** Page frame shared by every top-level view: width cap, padding and vertical rhythm. */
 export function Page({ className, ...props }: ComponentProps<"div">) {
-  return <div className={cn("mx-auto flex min-h-full w-full max-w-[1760px] flex-col gap-6 p-4 sm:p-6 lg:p-8", className)} {...props}/>;
+  return <div className={cn("mx-auto flex min-h-full w-full max-w-[1760px] flex-col gap-6 p-4 motion-safe:animate-page-in sm:p-6 lg:p-8", className)} {...props}/>;
 }
 
 export function PageHeader({ title, subtitle, actions }: { title: string; subtitle?: string; actions?: ReactNode }) {
@@ -41,9 +41,9 @@ export function IconButton({ title, children, variant = "ghost", size = "icon-sm
 }
 
 export function EmptyState({ title, children, action, icon }: { title: string; children?: ReactNode; action?: ReactNode; icon?: ReactNode }) {
-  return <Empty className="border">
+  return <Empty className="border motion-safe:animate-rise-in">
     <EmptyHeader>
-      <EmptyMedia variant="icon">{icon ?? <InboxIcon/>}</EmptyMedia>
+      <EmptyMedia variant="icon" className="motion-safe:animate-float">{icon ?? <InboxIcon/>}</EmptyMedia>
       <EmptyTitle>{title}</EmptyTitle>
       {children && <EmptyDescription>{children}</EmptyDescription>}
     </EmptyHeader>
@@ -52,7 +52,7 @@ export function EmptyState({ title, children, action, icon }: { title: string; c
 }
 
 export function ErrorState({ error, className }: { error: unknown; className?: string }) {
-  return error ? <Alert variant="destructive" className={className}><AlertTriangleIcon/><AlertDescription className="break-words">{errorText(error)}</AlertDescription></Alert> : null;
+  return error ? <Alert variant="destructive" className={cn("motion-safe:animate-rise-in", className)}><AlertTriangleIcon/><AlertDescription className="break-words">{errorText(error)}</AlertDescription></Alert> : null;
 }
 
 const toneVariants = { success: "success", warning: "warning", error: "danger", danger: "danger", neutral: "secondary" } as const;

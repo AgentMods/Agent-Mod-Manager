@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Gamepad2Icon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { backendAvailable, useBackendQuery } from "./lib/api";
@@ -6,7 +6,7 @@ import { syncAgentEvents } from "./lib/agent-store";
 import { useUI } from "./lib/store";
 import { t } from "./lib/i18n";
 import type { BootstrapState, PageName } from "./lib/types";
-import { ApprovalDialog } from "./components/ApprovalDialog";
+import { BackgroundApprovalLink } from "./components/AgentConfirmation";
 import { PlanDialog } from "./components/PlanDialog";
 import { ErrorState, IconButton } from "./components/ui";
 import { Breadcrumb, BreadcrumbItem, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
@@ -15,6 +15,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
+import { stagger } from "@/lib/motion";
 
 const LibraryPage = lazy(() => import("./pages/LibraryPage"));
 const GameDetailPage = lazy(() => import("./pages/GameDetailPage"));
@@ -61,7 +62,7 @@ function storeRail(open: boolean) {
 }
 
 function Loading({ children }: { children: string }) {
-  return <div role="status" className="flex min-h-40 items-center justify-center gap-2 p-8 text-sm text-muted-foreground"><Spinner />{children}</div>;
+  return <div role="status" className="flex min-h-40 items-center justify-center gap-2 p-8 text-sm text-muted-foreground motion-safe:animate-soft-fade"><Spinner />{children}</div>;
 }
 
 export default function App() {
@@ -73,7 +74,18 @@ export default function App() {
   const visibleConversation = useUI((state) => state.view === "agent" ? state.conversationId : null);
   const client = useQueryClient();
   const bootstrap = useBackendQuery<BootstrapState>(["bootstrap"], "get_bootstrap_state");
-  useEffect(() => { document.documentElement.dataset.theme = theme; document.documentElement.style.colorScheme = theme; }, [theme]);
+  const shownTheme = useRef<string | null>(null);
+  useEffect(() => {
+    const root = document.documentElement;
+    const switching = shownTheme.current !== null && shownTheme.current !== theme;
+    shownTheme.current = theme;
+    root.dataset.theme = theme; root.style.colorScheme = theme;
+    if (!switching) return;
+    // motion.css fades colours while this class is present; the first paint never animates.
+    root.classList.add("theme-switching");
+    const timer = setTimeout(() => root.classList.remove("theme-switching"), 400);
+    return () => { clearTimeout(timer); root.classList.remove("theme-switching"); };
+  }, [theme]);
   useEffect(() => syncAgentEvents(visibleConversation, (id, events) => {
     void client.invalidateQueries({ queryKey: ["conversation", id] });
     void client.invalidateQueries({ queryKey: ["conversations"] });
@@ -92,8 +104,13 @@ export default function App() {
       }
     }
     if (events.some((event) => event.kind === "tool-result" && event.payload.status === "done" &&
-      ["write_plugin_draft", "install_plugin"].includes(String(event.payload.name)))) {
+      ["write_plugin_draft", "import_cloud_plugin", "install_plugin"].includes(String(event.payload.name)))) {
       for (const key of ["plugin-drafts", "plugins", "game-adapter", "skills"]) {
+        void client.invalidateQueries({ queryKey: [key] });
+      }
+    }
+    if (events.some(event => event.kind === "tool-result" && event.payload.name === "publish_plugin" && event.payload.status === "done")) {
+      for (const key of ["manager-publications", "manager-plugin-games"]) {
         void client.invalidateQueries({ queryKey: [key] });
       }
     }
@@ -131,9 +148,9 @@ export default function App() {
           <SidebarGroupContent>
             <nav aria-label="主导航">
               <SidebarMenu>
-                {navigation.map(({ id, label, icon: Icon }) => {
+                {navigation.map(({ id, label, icon: Icon }, index) => {
                   const active = view === id || (id === "library" && view === "detail");
-                  return <SidebarMenuItem key={id}>
+                  return <SidebarMenuItem key={id} className="motion-safe:animate-slide-in-left" style={stagger(index, 50)}>
                     <SidebarMenuButton tooltip={label} isActive={active} aria-current={view === id ? "page" : undefined} onClick={() => navigate(id as PageName)}>
                       <Icon /><span>{label}</span>
                     </SidebarMenuButton>
@@ -147,7 +164,7 @@ export default function App() {
       <SidebarFooter className="p-3">
         <div className="flex items-center justify-between gap-2 group-data-[collapsible=icon]:flex-col">
           <IconButton title={settingsItem.label} variant={view === "settings" ? "secondary" : "ghost"} aria-current={view === "settings" ? "page" : undefined} onClick={() => navigate("settings")}><settingsItem.icon /></IconButton>
-          <IconButton title={theme === "light" ? "切换暗色主题" : "切换亮色主题"} onClick={toggleTheme}>{theme === "light" ? <MoonIcon /> : <SunIcon />}</IconButton>
+          <IconButton title={theme === "light" ? "切换暗色主题" : "切换亮色主题"} onClick={toggleTheme}>{theme === "light" ? <MoonIcon className="motion-safe:animate-icon-swap" /> : <SunIcon className="motion-safe:animate-icon-swap" />}</IconButton>
         </div>
       </SidebarFooter>
       <SidebarRail />
@@ -165,6 +182,7 @@ export default function App() {
             </BreadcrumbList>
           </Breadcrumb>
         </div>
+        <BackgroundApprovalLink visibleConversation={visibleConversation} />
       </header>
       {!backendAvailable && <Alert role="status" className="rounded-none border-x-0 border-t-0 bg-muted/50"><AlertDescription>未连接桌面服务，游戏目录与文件操作不可用。</AlertDescription></Alert>}
       {bootstrap.data?.recoveryError && <ErrorState className="rounded-none border-x-0 border-t-0" error={`文件事务恢复需要处理：${bootstrap.data.recoveryError}`} />}
@@ -173,6 +191,6 @@ export default function App() {
         <Suspense fallback={<Loading>正在加载...</Loading>}><Page /></Suspense>
       </main>
     </SidebarInset>
-    <PlanDialog /><ApprovalDialog />
+    <PlanDialog />
   </SidebarProvider>;
 }

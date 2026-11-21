@@ -19,8 +19,8 @@ use std::{
 
 pub const DESTINATION: &str = "https://www.glossmod.com/api/v1/mcp";
 pub const MAX_ARCHIVE_BYTES: usize = 1024 * 1024;
-const ADAPTER_LIMIT: usize = 256 * 1024;
-const SKILL_LIMIT: usize = 128 * 1024;
+pub(crate) const ADAPTER_LIMIT: usize = 256 * 1024;
+pub(crate) const SKILL_LIMIT: usize = 128 * 1024;
 const PREVIEW_LIMIT: usize = 3 * 1024 * 1024;
 
 fn invalid(message: &str) -> AppError {
@@ -139,6 +139,7 @@ pub enum PublicationSource {
     Installed {
         slug: String,
         source: String,
+        // Older publication records can lack a deployment ID.
         deployment_transaction_id: Option<String>,
     },
 }
@@ -348,6 +349,18 @@ pub fn prepare_package(
     metadata: PublicationMetadata,
 ) -> AppResult<(PublicationPreview, PackageBytes)> {
     metadata.validate()?;
+    with_draft_source(engine, draft_id, |source, slug, files| {
+        build_preview(source, slug, files, metadata)
+    })
+}
+
+/// Hold the verified draft under the file write lock through a local action.
+/// The callback must not acquire that lock or run remote requests.
+pub(crate) fn with_draft_source<T>(
+    engine: &FileEngine,
+    draft_id: &str,
+    action: impl FnOnce(PublicationSource, &str, [PublicationFile; 2]) -> AppResult<T>,
+) -> AppResult<T> {
     // Workflow locking precedes the file lock; do not invert its lock order.
     let validation = plugin_workflow::validate_draft(engine, draft_id)?;
     if !validation.valid || validation.transaction_status != "committed" {
@@ -367,7 +380,7 @@ pub fn prepare_package(
     if files[0].sha256 != hashes.adapter_sha256 || files[1].sha256 != hashes.skill_sha256 {
         return Err(conflict("Draft changed after validation"));
     }
-    build_preview(source, &validation.draft.slug, files, metadata)
+    action(source, &validation.draft.slug, files)
 }
 
 // FileEngine deletion and restoration share this lock. Recheck after fresh
@@ -430,7 +443,7 @@ fn installed_provenance(
     slug: &str,
     target: &Path,
     files: &[PublicationFile; 2],
-) -> AppResult<Option<String>> {
+) -> AppResult<String> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct Content {
@@ -504,21 +517,32 @@ fn installed_provenance(
             source,
             files,
         )?;
-        return Ok(Some(id));
+        return Ok(id);
     }
     Err(AppError::Denied(
         "Installed external package has no matching committed deployment".into(),
     ))
 }
 
-/// Installed packages are proven from embedded bytes or committed deployment
-/// records, never merely from the registry's `validated` flag.
+/// Verify the installed files against their reviewed, committed deployment.
 pub fn prepare_installed_package(
     engine: &FileEngine,
     slug: &str,
     metadata: PublicationMetadata,
 ) -> AppResult<(PublicationPreview, PackageBytes)> {
     metadata.validate()?;
+    with_installed_source(engine, slug, |source, slug, files| {
+        build_preview(source, slug, files, metadata)
+    })
+}
+
+/// Hold the verified installed package under the file write lock through a
+/// local action. The callback must not acquire that lock or run remote requests.
+pub(crate) fn with_installed_source<T>(
+    engine: &FileEngine,
+    slug: &str,
+    action: impl FnOnce(PublicationSource, &str, [PublicationFile; 2]) -> AppResult<T>,
+) -> AppResult<T> {
     plugins::validate_slug(slug)?;
     let _files = crate::transaction::write_lock();
     let target = engine.paths.plugins().join("games").join(slug);
@@ -527,10 +551,7 @@ pub fn prepare_installed_package(
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?;
     let (source, validated, path, adapter, version) =
         row.ok_or_else(|| AppError::NotFound("Installed package".into()))?;
-    if !validated
-        || Path::new(&path) != target
-        || !matches!(source.as_str(), "builtin" | "external")
-    {
+    if !validated || Path::new(&path) != target || source != "external" {
         return Err(AppError::Denied(
             "Installed package is unverified or has unknown ownership".into(),
         ));
@@ -538,35 +559,21 @@ pub fn prepare_installed_package(
     let files = read_files(engine, &target)?;
     let parsed = plugins::parse_package(slug, &files[0].text, &files[1].text)?;
     if parsed.adapter.version != version
-        || serde_json::from_str::<serde_json::Value>(&adapter)?
-            != serde_json::to_value(&parsed.adapter)?
+        || !plugins::matches_registered_adapter(&adapter, &parsed.adapter)?
     {
         return Err(conflict(
             "Installed adapter differs from its registry entry",
         ));
     }
-    let deployment_transaction_id = if source == "builtin" {
-        if !plugins::BUILTIN_PACKAGES
-            .iter()
-            .any(|(s, a, k)| *s == slug && *a == files[0].text && *k == files[1].text)
-        {
-            return Err(AppError::Denied(
-                "Installed built-in bytes differ from embedded provenance".into(),
-            ));
-        }
-        None
-    } else {
-        installed_provenance(engine, slug, &target, &files)?
-    };
-    build_preview(
+    let deployment_transaction_id = installed_provenance(engine, slug, &target, &files)?;
+    action(
         PublicationSource::Installed {
             slug: slug.into(),
             source,
-            deployment_transaction_id,
+            deployment_transaction_id: Some(deployment_transaction_id),
         },
         slug,
         files,
-        metadata,
     )
 }
 

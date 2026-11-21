@@ -19,6 +19,7 @@ import {
 import { Field, FieldLabel } from "./ui/field";
 import { Input } from "./ui/input";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+import { stagger } from "@/lib/motion";
 
 interface Props {
   conversations: Conversation[];
@@ -46,7 +47,7 @@ const statusIndicators = {
 function ConversationStatus({ id, status }: { id: string; status: AgentConversationStatus }) {
   const { text, Icon, color } = statusIndicators[status];
   return <span id={id} role="img" aria-label={text} className={cn("relative ms-auto inline-flex size-4 shrink-0 items-center justify-center", color)}>
-    {status === "running" && <span aria-hidden="true" className="absolute size-3 rounded-full border-[1.5px] border-current opacity-25" />}
+    {status === "running" && <span aria-hidden="true" className="absolute size-3 rounded-full border-[1.5px] border-current opacity-25 motion-safe:animate-soft-ping" />}
     <Icon aria-hidden="true" className={cn("size-3.5", status === "running" && "motion-safe:animate-spin")} />
   </span>;
 }
@@ -98,7 +99,7 @@ export const AgentConversationList = memo(function AgentConversationList({ conve
         case "delete": await api("delete_conversation", { id }); break;
       }
       if ((action === "archive" || action === "delete") && useUI.getState().conversationId === id) onSelect(null);
-      if (action === "delete") client.removeQueries({ queryKey: ["conversation", id], exact: true });
+      if (action === "delete") client.removeQueries({ queryKey: ["conversation", id] });
       else void client.invalidateQueries({ queryKey: ["conversation", id] });
       await client.invalidateQueries({ queryKey: ["conversations"] });
       setDialog(null);
@@ -120,13 +121,13 @@ export const AgentConversationList = memo(function AgentConversationList({ conve
         <span>{label}</span><span className="tabular-nums">{rows.length}</span>
       </div>
       <ul aria-label={label} className="flex gap-1 overflow-x-auto md:flex-col md:overflow-visible">
-        {rows.map((conversation) => {
+        {rows.map((conversation, index) => {
           const current = conversation.id === selectedId;
           const state = statuses[conversation.id];
           const statusId = `${titleId}-status-${conversation.id}`;
           const PinActionIcon = conversation.pinned ? PinOffIcon : PinIcon;
           return <li key={conversation.id}
-            className={cn("flex max-w-full min-w-0 shrink-0 items-center rounded-md pr-1 md:w-full", current && "bg-secondary")}>
+            className={cn("flex max-w-full min-w-0 shrink-0 items-center rounded-md pr-1 transition-colors duration-200 motion-safe:animate-slide-in-left md:w-full", current && "bg-secondary")} style={stagger(index, 30)}>
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button type="button" variant="ghost" size="sm" disabled={disabled || pending} aria-current={current || undefined}

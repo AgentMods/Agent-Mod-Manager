@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { access, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import { basename, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -26,9 +27,16 @@ async function waitForDatabase(path, child, output, getLaunchError) {
     }
     try {
       await stat(path);
-      return;
+      const db = new DatabaseSync(path, { readOnly: true });
+      try {
+        // Connection presets are registered after adapter and Skill reconciliation.
+        const hasTable = db.prepare("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='mcp_servers'").get();
+        if (hasTable && db.prepare('SELECT 1 FROM mcp_servers WHERE builtin=1 LIMIT 1').get()) return;
+      } finally {
+        db.close();
+      }
     } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
+      if (error.code !== 'ENOENT' && error.errcode !== 5 && error.errcode !== 6) throw error;
     }
     await delay(250);
   }
@@ -77,7 +85,6 @@ async function run() {
   const database = join(profile, 'Library', 'Application Support', 'com.glossmod.amm', 'manager.db');
   try {
     await waitForDatabase(database, child, output, () => launchError);
-    const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(database, { readOnly: true });
     let quickCheck;
     let pluginCount;
@@ -88,7 +95,7 @@ async function run() {
       db.close();
     }
     assert.equal(quickCheck, 'ok');
-    assert.equal(pluginCount, 6);
+    assert.equal(pluginCount, 0);
     const result = await stop(child, exit);
     await writeFile(join(evidenceDir, 'launch.json'), JSON.stringify({
       application: basename(application),
@@ -98,7 +105,7 @@ async function run() {
       exit: result,
     }, null, 2) + '\n');
     await writeFile(join(evidenceDir, 'launch.log'), output.join(''));
-    console.log(`PASS: macOS packaged app initialized SQLite and seeded ${pluginCount} plugins`);
+    console.log(`PASS: macOS packaged app initialized SQLite with an empty plugin registry (${pluginCount} plugins)`);
   } finally {
     if (child.exitCode === null && child.signalCode === null) await stop(child, exit);
     await writeFile(join(evidenceDir, 'launch.log'), output.join('')).catch(() => {});

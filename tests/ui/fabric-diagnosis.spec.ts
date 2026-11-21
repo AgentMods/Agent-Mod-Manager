@@ -24,7 +24,7 @@ function startup(status: FabricStartup['status'], overrides: Partial<FabricStart
 }
 
 async function setup(page: Page) {
-  await installMockTauri(page);
+  await installMockTauri(page, {withExternalAdapter: true});
   await page.goto('/');
   await page.getByRole('button', {name: '游戏库', exact: true}).click();
   const heading = page.getByRole('heading', { name: 'Minecraft Java Edition', exact: true });

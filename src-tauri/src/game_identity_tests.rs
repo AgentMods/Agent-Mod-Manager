@@ -1,31 +1,5 @@
 use super::*;
-use crate::{db::Db, settings::SecretStore, storage::AppPaths};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-
-struct NoSecrets;
-impl SecretStore for NoSecrets {
-    fn read(&self, _: &str) -> AppResult<Option<String>> {
-        Ok(None)
-    }
-    fn write(&self, _: &str, _: &str) -> AppResult<()> {
-        Ok(())
-    }
-}
-
-struct CountingSecrets {
-    reads: AtomicUsize,
-    key: String,
-}
-impl SecretStore for CountingSecrets {
-    fn read(&self, _: &str) -> AppResult<Option<String>> {
-        self.reads.fetch_add(1, Ordering::SeqCst);
-        Ok(Some(self.key.clone()))
-    }
-    fn write(&self, _: &str, _: &str) -> AppResult<()> {
-        Ok(())
-    }
-}
+use crate::{db::Db, storage::AppPaths};
 
 fn fixture() -> (tempfile::TempDir, FileEngine, PathBuf) {
     let temp = tempfile::tempdir().unwrap();
@@ -41,7 +15,7 @@ fn fixture() -> (tempfile::TempDir, FileEngine, PathBuf) {
 
 fn result(status: WebSearchStatus) -> WebSearchResult {
     WebSearchResult {
-        provider: "brave",
+        provider: web_search::PROVIDER,
         status,
         message: "Untrusted search excerpts",
         truncated: false,
@@ -63,7 +37,6 @@ async fn evidence(engine: &FileEngine, root: &Path) -> GameIdentitySearch {
         "Public Game video game",
         "SEARCH_GAME_IDENTITY",
         &CancellationToken::new(),
-        || Ok(false),
         |_| async { Ok(result(WebSearchStatus::Available)) },
     )
     .await
@@ -84,6 +57,33 @@ fn replace_evidence(engine: &FileEngine, previous: &str, e: &GameIdentitySearch)
         "UPDATE game_identity_searches SET id=?1,root_path=?2,fingerprint=?3,query=?4,evidence_json=?5,created_at=?6 WHERE id=?7",
         params![e.id,e.root_path,e.fingerprint,e.query,serde_json::to_string(e).unwrap(),e.created_at,previous],
     ).unwrap();
+}
+
+#[test]
+fn preview_only_suggests_an_adapter_after_its_package_is_installed() {
+    let (_temp, engine, root) = fixture();
+    fs::write(root.join("SkyrimSE.exe"), b"fixture").unwrap();
+    fs::create_dir(root.join("Data")).unwrap();
+    fs::write(root.join("Data/Skyrim.esm"), b"fixture").unwrap();
+
+    let without_package = preview(&engine, &root).unwrap();
+    assert!(without_package.local_candidate.matches.is_empty());
+    assert!(without_package
+        .local_candidate
+        .suggested_adapter_slug
+        .is_none());
+
+    crate::plugins::test_fixtures::install(&engine.db, &engine.paths).unwrap();
+    let with_package = preview(&engine, &root).unwrap();
+    assert_eq!(with_package.fingerprint, without_package.fingerprint);
+    assert_eq!(
+        with_package
+            .local_candidate
+            .suggested_adapter_slug
+            .as_deref(),
+        Some("skyrim-se")
+    );
+    assert!(games::list_games(&engine.db).unwrap().is_empty());
 }
 
 #[test]
@@ -183,7 +183,6 @@ async fn provider_receives_only_reviewed_query_and_cache_roundtrips() {
         "Reviewed Public Game",
         "SEARCH_GAME_IDENTITY",
         &CancellationToken::new(),
-        || Ok(true),
         |q| async move {
             assert_eq!(q.query, "Reviewed Public Game");
             assert_eq!(q.count, 5);
@@ -196,15 +195,26 @@ async fn provider_receives_only_reviewed_query_and_cache_roundtrips() {
     .await
     .unwrap();
     assert_eq!(first.candidates.len(), 5);
-    let second = search_with(
+    assert_eq!(serde_json::to_value(&first).unwrap()["provider"], "bing");
+    assert!(search(
         &engine,
+        &McpRuntime::default(),
+        &root,
+        &fp,
+        "Reviewed Public Game",
+        "yes",
+        &CancellationToken::new(),
+    )
+    .await
+    .is_err());
+    let second = search(
+        &engine,
+        &McpRuntime::default(),
         &root,
         &fp,
         "Reviewed Public Game",
         "SEARCH_GAME_IDENTITY",
         &CancellationToken::new(),
-        || Ok(true),
-        |_| async { panic!("Cache should prevent provider call") },
     )
     .await
     .unwrap();
@@ -222,23 +232,36 @@ async fn provider_receives_only_reviewed_query_and_cache_roundtrips() {
 async fn consent_stale_preview_and_cancellation_stop_before_provider() {
     let (_temp, engine, root) = fixture();
     let fp = snapshot(&engine, &root).unwrap().fingerprint;
-    for (fingerprint, confirmation, cancel) in [
-        (fp.as_str(), "yes", CancellationToken::new()),
-        ("wrong", "SEARCH_GAME_IDENTITY", CancellationToken::new()),
-        (fp.as_str(), "SEARCH_GAME_IDENTITY", {
-            let c = CancellationToken::new();
-            c.cancel();
-            c
-        }),
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    for (fingerprint, query, confirmation, cancel) in [
+        (fp.as_str(), "Public Game", "yes", CancellationToken::new()),
+        (
+            "wrong",
+            "Public Game",
+            "SEARCH_GAME_IDENTITY",
+            CancellationToken::new(),
+        ),
+        (
+            fp.as_str(),
+            "/private/file.exe",
+            "SEARCH_GAME_IDENTITY",
+            CancellationToken::new(),
+        ),
+        (
+            fp.as_str(),
+            "Public Game",
+            "SEARCH_GAME_IDENTITY",
+            cancelled,
+        ),
     ] {
         assert!(search_with(
             &engine,
             &root,
             fingerprint,
-            "Public Game",
+            query,
             confirmation,
             &cancel,
-            || Ok(false),
             |_| async { panic!("Provider must not run") }
         )
         .await
@@ -251,7 +274,6 @@ async fn consent_stale_preview_and_cancellation_stop_before_provider() {
         "Public Game",
         "SEARCH_GAME_IDENTITY",
         &CancellationToken::new(),
-        || Ok(false),
         |_| async {
             fs::write(root.join("changed"), []).unwrap();
             Ok(result(WebSearchStatus::Available))
@@ -275,7 +297,6 @@ async fn cancelled_provider_does_not_store_evidence() {
             "Public Game",
             "SEARCH_GAME_IDENTITY",
             &cancel,
-            || Ok(false),
             |_| async {
                 cancel.cancel();
                 Ok(result(WebSearchStatus::Available))
@@ -294,22 +315,65 @@ async fn cancelled_provider_does_not_store_evidence() {
     assert_eq!(count, 0);
 }
 
-#[tokio::test]
-async fn no_key_returns_real_configuration_state_even_with_cached_results() {
+// Write the old JSON layout independently of the current serializer: its byte order
+// is part of the ID digest, and old records did not have a provider field.
+fn store_legacy_brave_evidence(engine: &FileEngine, root: &Path) -> GameIdentitySearch {
+    let scan = snapshot(engine, root).unwrap();
+    let root = scan.root.to_str().unwrap();
+    let query = "Public Game video game";
+    let created_at = Utc::now().to_rfc3339();
+    let encoded = |id: &str| {
+        format!(
+            concat!(
+                r#"{{"id":"{id}","rootPath":{root},"fingerprint":"{fingerprint}","query":"{query}","status":"available","message":"Brave search excerpts","candidates":[{{"name":"Public Game","title":"Brave result","url":"https://store.steampowered.com/app/123/","snippet":"An unverified excerpt"}}],"createdAt":"{created_at}"}}"#,
+            ),
+            id = id,
+            root = serde_json::to_string(root).unwrap(),
+            fingerprint = scan.fingerprint,
+            query = query,
+            created_at = created_at,
+        )
+    };
+    let prefix = format!("identity_{}", uuid::Uuid::new_v4().simple());
+    let digest = hex::encode(Sha256::digest(encoded(&prefix)));
+    let id = format!("{prefix}_{digest}");
+    let conn = engine.db.conn();
+    conn.execute(
+        "INSERT INTO game_identity_searches(id,root_path,fingerprint,query,evidence_json,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+        params![id, root, scan.fingerprint, query, encoded(&id), created_at],
+    )
+    .unwrap();
+    load_evidence(&conn, &id).unwrap()
+}
+
+#[test]
+fn historical_evidence_confirmed_under_original_id_retains_brave_source() {
     let (_temp, engine, root) = fixture();
-    let first = evidence(&engine, &root).await;
-    let settings = Settings::with_secret_store(engine.db.clone(), Arc::new(NoSecrets));
+    let legacy = store_legacy_brave_evidence(&engine, &root);
+    assert!(legacy.provider.is_none());
+    let game = confirm(&engine, &legacy.id, 0, "Name", "CONFIRM_GAME_IDENTITY").unwrap();
+    assert_eq!(game.metadata["onlineIdentity"]["source"], "brave");
+    assert_eq!(game.metadata["onlineIdentity"]["searchId"], legacy.id);
+    assert_eq!(game.metadata["onlineIdentity"]["title"], "Brave result");
+}
+
+#[tokio::test]
+async fn bing_lookup_does_not_reuse_brave_cache_and_reports_missing_runtime() {
+    let (_temp, engine, root) = fixture();
+    let legacy = store_legacy_brave_evidence(&engine, &root);
     let searched = search(
         &engine,
-        &settings,
+        &McpRuntime::default(),
         &root,
-        &first.fingerprint,
-        &first.query,
+        &legacy.fingerprint,
+        &legacy.query,
         "SEARCH_GAME_IDENTITY",
         &CancellationToken::new(),
     )
     .await
     .unwrap();
+    assert_ne!(searched.id, legacy.id);
+    assert_eq!(searched.evidence_provider(), "bing");
     assert_eq!(searched.status, GameIdentityStatus::NeedsConfiguration);
     assert!(searched.candidates.is_empty());
     assert!(confirm(&engine, &searched.id, 0, "Name", "CONFIRM_GAME_IDENTITY").is_err());
@@ -346,6 +410,7 @@ async fn confirm_is_atomic_preserves_metadata_counts_and_never_guesses_steam_or_
     );
     assert_eq!(confirmed.cover_path.as_deref(), Some("cover"));
     assert_eq!(confirmed.metadata["custom"], 42);
+    assert_eq!(confirmed.metadata["onlineIdentity"]["source"], "bing");
     assert_eq!(
         confirmed.metadata["onlineIdentity"]["query"],
         searched.query
@@ -424,7 +489,6 @@ async fn empty_available_and_unavailable_results_are_not_confirmable() {
             "Public Game",
             "SEARCH_GAME_IDENTITY",
             &CancellationToken::new(),
-            || Ok(false),
             |_| async {
                 let mut r = result(status);
                 r.results.clear();
@@ -527,82 +591,15 @@ fn standard_mac_steam_and_minecraft_roots_have_exact_bounded_exceptions() {
 }
 
 #[tokio::test]
-async fn authorization_and_fingerprint_validation_precede_any_secret_access() {
+async fn removing_bing_provenance_cannot_convert_evidence_to_brave() {
     let (_temp, engine, root) = fixture();
-    let fp = snapshot(&engine, &root).unwrap().fingerprint;
-    let secrets = Arc::new(CountingSecrets {
-        reads: AtomicUsize::new(0),
-        key: "Public Game".into(),
-    });
-    let settings = Settings::with_secret_store(engine.db.clone(), secrets.clone());
-    settings
-        .write_secret(web_search::SECRET_REF, "ignored")
-        .unwrap();
-    let canceled = CancellationToken::new();
-    canceled.cancel();
-    for (fingerprint, confirmation, cancel) in [
-        (fp.as_str(), "yes", CancellationToken::new()),
-        (fp.as_str(), "SEARCH_GAME_IDENTITY", canceled),
-        ("stale", "SEARCH_GAME_IDENTITY", CancellationToken::new()),
-    ] {
-        assert!(search(
-            &engine,
-            &settings,
-            &root,
-            fingerprint,
-            "Public Game",
-            confirmation,
-            &cancel
-        )
-        .await
-        .is_err());
-        assert_eq!(secrets.reads.load(Ordering::SeqCst), 0);
-    }
-    fs::write(root.join("changed"), []).unwrap();
-    assert!(search(
-        &engine,
-        &settings,
-        &root,
-        &fp,
-        "Public Game",
-        "SEARCH_GAME_IDENTITY",
-        &CancellationToken::new()
-    )
-    .await
-    .is_err());
-    assert_eq!(secrets.reads.load(Ordering::SeqCst), 0);
-}
-
-#[tokio::test]
-async fn raw_and_encoded_credentials_are_rejected_before_cache_or_network() {
-    let (_temp, engine, root) = fixture();
-    let e = evidence(&engine, &root).await;
-    let secrets = Arc::new(CountingSecrets {
-        reads: AtomicUsize::new(0),
-        key: e.query.clone(),
-    });
-    let settings = Settings::with_secret_store(engine.db.clone(), secrets);
-    settings
-        .write_secret(web_search::SECRET_REF, "ignored")
-        .unwrap();
-    for query in [
-        e.query.clone(),
-        format!("find {} official", e.query),
-        "Public%20Game%20video%20game".into(),
-    ] {
-        assert!(matches!(
-            search(
-                &engine,
-                &settings,
-                &root,
-                &e.fingerprint,
-                &query,
-                "SEARCH_GAME_IDENTITY",
-                &CancellationToken::new()
-            )
-            .await,
-            Err(AppError::Denied(_))
-        ));
-    }
-    assert!(load_evidence(&engine.db.conn(), &e.id).is_ok());
+    let mut searched = evidence(&engine, &root).await;
+    let id = searched.id.clone();
+    searched.provider = None;
+    replace_evidence(&engine, &id, &searched);
+    assert!(matches!(
+        confirm(&engine, &id, 0, "Name", "CONFIRM_GAME_IDENTITY"),
+        Err(AppError::Invalid(message)) if message == "Search evidence was modified"
+    ));
+    assert!(games::list_games(&engine.db).unwrap().is_empty());
 }

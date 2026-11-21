@@ -52,13 +52,13 @@ impl AgentTool for SourceTool {
     fn definition(&self) -> ToolDefinition {
         let (description, properties, required, effect) = match self.name.as_str() {
             "search_mods" => (
-                "在已配置来源搜索 Mod；未配置 Key 的来源会降级并返回状态。game_ids 使用来源原生游戏 ID，不是 Steam App ID；3dm 的 ID 是正整数，且不支持结构化游戏版本/加载器筛选",
+                "在管理器内置目录搜索 Mod；这里只列原生提供方。本轮已连接的 Mod 平台 MCP（包括 Mod 客栈）可独立查找和下载文件。未配置 Key 的来源会降级并返回状态。game_ids 使用来源原生游戏 ID，不是 Steam App ID；3dm 的 ID 是正整数，且不支持结构化游戏版本/加载器筛选",
                 json!({"query":{"type":"string"},"game_ids":{"type":"object"},"game_version":{"type":"string"},"loader":{"type":"string"},"source_ids":{"type":"array","items":{"type":"string"}},"limit":{"type":"integer"},"offset":{"type":"integer"}}),
                 vec!["query"],
                 Effect::Read,
             ),
             "list_mod_versions" => (
-                "只读列出来源项目的发布版本；当前支持 Modrinth 和 Thunderstore。已知但不支持列出版本的来源返回 unsupported 状态，未知来源 ID 返回错误。game_id 是来源原生游戏 ID，不是本地登记 ID 或 Steam App ID。game_version 和 loader 仅按来源声明筛选，不代表已验证兼容；Thunderstore 不提供这两项声明时会返回 limited。选定具体版本后，用本次查询的 source_id、project_id 和选中版本的精确 version_id 调用 resolve_mod，并传入已知的游戏版本和加载器；不要猜测版本 ID，也不要根据列表直接下载或安装。",
+                "只读列出来源项目的发布版本；当前支持 Modrinth 和 Thunderstore。已知但不支持列出版本的来源返回 unsupported 状态，未知来源 ID 返回错误。game_id 是来源原生游戏 ID，不是本地登记 ID 或 Steam App ID。game_version 和 loader 仅按来源声明筛选，不代表已验证兼容；Thunderstore 不提供这两项声明时会返回 limited。原生目录解析使用本次查询的 source_id、project_id 和精确 version_id。常规下载按 system-mod-download 选择来源 MCP。",
                 json!({
                     "source_id":{"type":"string"},
                     "project_id":{"type":"string"},
@@ -90,7 +90,7 @@ impl AgentTool for SourceTool {
                 Effect::Read,
             ),
             _ => (
-                "用本会话 resolve_mod 返回的 download.resolution_id 下载到管理器 downloads；校验大小和 hash，不自动安装。ID 只能用一次；失效或重试时重新解析同一精确版本。不要提交 URL 或复制解析元数据。",
+                "原生目录专用，仅用于明确要求按原生解析凭证下载的场景。常规 Mod 下载走来源 MCP，来源无法下载时走 Playwright MCP。用本会话 resolve_mod 返回的 download.resolution_id 下载到管理器 downloads；校验大小和 hash，不自动安装。ID 只能用一次；失效或重试时重新解析同一精确版本。不要提交 URL 或复制解析元数据。",
                 json!({"resolution_id":{"type":"string","format":"uuid"}}),
                 vec!["resolution_id"],
                 Effect::ManagerWrite,

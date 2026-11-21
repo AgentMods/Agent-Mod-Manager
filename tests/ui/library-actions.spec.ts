@@ -123,7 +123,7 @@ test.describe("游戏卡片操作", () => {
 
   test("没有 Mod 的游戏可以移除，卡片随之消失", async ({page}) => {
     // The onboarding fixture registers "Fixture Game" with zero installed Mods.
-    await installMockTauri(page, {onboarding: true});
+    await installMockTauri(page, {onboarding: true, withExternalAdapter: true});
     await page.goto("/");
     await page.getByRole("button", {name: "扫描已安装游戏"}).click();
     const fixture = page.getByRole("listitem").filter({hasText: "Fixture Game"});
@@ -203,7 +203,7 @@ test.describe("游戏卡片操作", () => {
   });
 
   test("取消移除会保留适配包，确认移除后可重新绑定", async ({page}) => {
-    await installMockTauri(page);
+    await installMockTauri(page, {withExternalAdapter: true});
     await page.goto("/");
     await page.getByRole("button", {name: "游戏库", exact: true}).click();
     const game = card(page, "Minecraft Java Edition");
@@ -236,7 +236,7 @@ test.describe("游戏卡片操作", () => {
   });
 
   test("当前适配包停用后仍可移除", async ({page}) => {
-    await installMockTauri(page, {adapterDisabled: true});
+    await installMockTauri(page, {adapterDisabled: true, withExternalAdapter: true});
     await page.goto("/");
     await page.getByRole("button", {name: "游戏库", exact: true}).click();
     const dialog = await openAdapterDialog(page);
@@ -247,7 +247,7 @@ test.describe("游戏卡片操作", () => {
   });
 
   test("待处理任务阻止移除适配包，解除冲突后仍需确认", async ({page}) => {
-    await installMockTauri(page, {gamePlanConflicts: [{id: "plan-pending", kind: "file_plan", status: "planned", title: "更新 Minecraft 文件", paths: [], canResolve: true}]});
+    await installMockTauri(page, {withExternalAdapter: true, gamePlanConflicts: [{id: "plan-pending", kind: "file_plan", status: "planned", title: "更新 Minecraft 文件", paths: [], canResolve: true}]});
     await page.goto("/");
     await page.getByRole("button", {name: "游戏库", exact: true}).click();
     const dialog = await openAdapterDialog(page);

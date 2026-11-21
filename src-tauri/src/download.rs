@@ -104,8 +104,31 @@ struct Transfer<'a> {
     size: Option<u64>,
     hashes: &'a FileHashes,
     warnings: &'a [String],
-    web_archive: Option<ArchiveKind>,
+    kind: TransferKind,
     max_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+enum TransferKind {
+    Catalog,
+    Web(ArchiveKind),
+    Mcp(ArchiveKind),
+}
+
+impl TransferKind {
+    fn archive(self) -> Option<ArchiveKind> {
+        match self {
+            Self::Catalog => None,
+            Self::Web(archive) | Self::Mcp(archive) => Some(archive),
+        }
+    }
+
+    fn validate_endpoint(self, url: &str) -> AppResult<url::Url> {
+        match self {
+            Self::Catalog => validate_download_url(url),
+            Self::Web(_) | Self::Mcp(_) => web_download::validated_endpoint(url),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -257,7 +280,7 @@ impl DownloadManager {
                 size: request.size,
                 hashes: &request.hashes,
                 warnings: &request.warnings,
-                web_archive: None,
+                kind: TransferKind::Catalog,
                 max_bytes: self.options.max_bytes,
             },
             cancel,
@@ -272,15 +295,47 @@ impl DownloadManager {
         cancel: CancellationToken,
         progress: Option<ProgressCallback>,
     ) -> AppResult<DownloadArtifact> {
-        self.transfer(&Transfer {
-            url: request.url(),
-            filename: request.filename(),
-            size: None,
-            hashes: &FileHashes::default(),
-            warnings: &["网页直链下载，未绑定任何目录来源、项目或版本；仅检查归档头，内容和来源仍需审查".into()],
-            web_archive: Some(request.archive()),
-            max_bytes: self.options.max_bytes.min(MAX_WEB_BYTES),
-        }, cancel, progress).await
+        self.transfer(
+            &Transfer {
+                url: request.url(),
+                filename: request.filename(),
+                size: None,
+                hashes: &FileHashes::default(),
+                warnings: &["网页直链下载，未绑定任何目录来源、项目或版本；仅检查归档头，内容和来源仍需审查".into()],
+                kind: TransferKind::Web(request.archive()),
+                max_bytes: self.options.max_bytes.min(MAX_WEB_BYTES),
+            },
+            cancel,
+            progress,
+        )
+        .await
+    }
+
+    /// The caller must authorize and validate the MCP receipt before handing
+    /// the transport its short-lived URL. This is not an Agent or IPC input.
+    pub(crate) async fn download_mcp_archive(
+        &self,
+        url: &str,
+        filename: &str,
+        expected_size: Option<u64>,
+        cancel: CancellationToken,
+        progress: Option<ProgressCallback>,
+    ) -> AppResult<DownloadArtifact> {
+        let (url, archive) = web_download::parse_mcp_archive(url, filename)?;
+        self.transfer(
+            &Transfer {
+                url: url.as_str(),
+                filename,
+                size: expected_size,
+                hashes: &FileHashes::default(),
+                warnings: &["MCP 回执下载，仅检查归档头和回执提供的大小；归档内容仍需审查".into()],
+                kind: TransferKind::Mcp(archive),
+                max_bytes: self.options.max_bytes.min(MAX_WEB_BYTES),
+            },
+            cancel,
+            progress,
+        )
+        .await
     }
 
     async fn transfer(
@@ -289,22 +344,26 @@ impl DownloadManager {
         cancel: CancellationToken,
         progress: Option<ProgressCallback>,
     ) -> AppResult<DownloadArtifact> {
-        validate_download_url(request.url)?;
+        request.kind.validate_endpoint(request.url)?;
         safe_filename(request.filename)?;
         request.hashes.validate()?;
         if request.size.is_some_and(|size| size > request.max_bytes) {
             return Err(invalid("文件超过下载大小限制"));
         }
-        let representation =
-            serde_json::to_vec(&(request.url, request.filename, request.size, request.hashes))?;
-        let mut key = Sha256::new();
-        // Legacy catalog partials retain their existing keys. Uncataloged data
-        // gets a separate resume namespace even when the URL and format match.
-        if request.web_archive.is_some() {
-            key.update(b"web-download\0");
-        }
-        key.update(representation);
-        let fingerprint = hex::encode(key.finalize());
+        let fingerprint = if matches!(request.kind, TransferKind::Mcp(_)) {
+            // Do not derive durable paths, progress IDs, or sidecar keys
+            // from a short-lived credential.
+            uuid::Uuid::new_v4().simple().to_string()
+        } else {
+            let representation =
+                serde_json::to_vec(&(request.url, request.filename, request.size, request.hashes))?;
+            let mut key = Sha256::new();
+            if matches!(request.kind, TransferKind::Web(_)) {
+                key.update(b"web-download\0");
+            }
+            key.update(representation);
+            hex::encode(key.finalize())
+        };
         let _lock = tokio::select! { biased; _ = cancel.cancelled() => return Err(AppError::Cancelled), guard = self.lock.lock() => guard };
         let directory = self.root.join(&fingerprint);
         match std::fs::create_dir(&directory) {
@@ -473,12 +532,7 @@ impl DownloadManager {
         partial: Option<&Partial>,
         cancel: &CancellationToken,
     ) -> AppResult<reqwest::Response> {
-        let validate = if request_spec.web_archive.is_some() {
-            web_download::validated_endpoint
-        } else {
-            validate_download_url
-        };
-        let mut url = validate(request_spec.url)?;
+        let mut url = request_spec.kind.validate_endpoint(request_spec.url)?;
         for _ in 0..=5 {
             let client = tokio::select! { biased; _ = cancel.cancelled() => return Err(AppError::Cancelled),
             c = pinned_download_client(&url, self.options.request_timeout) => c? };
@@ -501,7 +555,7 @@ impl DownloadManager {
                 let next = url
                     .join(location)
                     .map_err(|_| invalid("下载重定向 URL 无效"))?;
-                url = validate(next.as_str())?;
+                url = request_spec.kind.validate_endpoint(next.as_str())?;
                 continue;
             }
             return Ok(response);
@@ -517,9 +571,15 @@ impl DownloadManager {
         cancel: &CancellationToken,
         emit: &(impl Fn(DownloadPhase, u64, Option<u64>) + Send + Sync),
     ) -> AppResult<DownloadArtifact> {
-        let mut partial = self
-            .resume(directory, fingerprint, request.max_bytes)
-            .await?;
+        // A signed MCP URL can be echoed in an arbitrary response header.
+        // Keep its ETag out of sidecars; catalog and public-link downloads retain resume support.
+        let resumable = !matches!(request.kind, TransferKind::Mcp(_));
+        let mut partial = if resumable {
+            self.resume(directory, fingerprint, request.max_bytes)
+                .await?
+        } else {
+            None
+        };
         let mut response = self.response(request, partial.as_ref(), cancel).await?;
         if let Some(p) = &partial {
             let valid = response.status() == StatusCode::PARTIAL_CONTENT
@@ -573,7 +633,11 @@ impl DownloadManager {
                 return Err(invalid("响应大小与来源文件大小不符"));
             }
         }
-        let etag = strong_etag(response.headers().get(header::ETAG));
+        let etag = if resumable {
+            strong_etag(response.headers().get(header::ETAG))
+        } else {
+            None
+        };
         let mut partial = match partial {
             Some(p) => p,
             None => {
@@ -597,7 +661,12 @@ impl DownloadManager {
                 Ok(c) => c,
                 Err(_) => {
                     partial.file.sync_data().await?;
-                    return Err(AppError::Other("下载流中断，可安全续传的片段已保留".into()));
+                    let message = if resumable {
+                        "下载流中断，可安全续传的片段已保留"
+                    } else {
+                        "下载流中断，未完成的片段已保留"
+                    };
+                    return Err(AppError::Other(message.into()));
                 }
             };
             downloaded = downloaded
@@ -628,7 +697,8 @@ impl DownloadManager {
         same_file(&partial.path, &partial.file.metadata().await?)?;
         let hashes = hash_open_file(&mut partial.file, downloaded, request.hashes, cancel).await?;
         if request
-            .web_archive
+            .kind
+            .archive()
             .is_some_and(|archive| !archive.matches(&hashes.prefix[..hashes.prefix_len]))
         {
             self.reject(
@@ -1075,6 +1145,235 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    fn mock_signed_url(server: &Server) -> String {
+        let origin = server.url.strip_suffix("/mod.zip").unwrap();
+        format!("{origin}/opaque-mcp-path?signature=secret-mcp-url")
+    }
+
+    #[tokio::test]
+    async fn mcp_archive_uses_receipt_name_and_does_not_persist_signed_transport_data() {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("fixture.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, b"fixture").unwrap();
+        let data = zip.finish().unwrap().into_inner();
+
+        let mut redirect = Reply::new(302, b"", 0, None);
+        redirect.headers.extend([
+            ("Location", "/opaque-cdn?signature=secret-cdn-url".into()),
+            ("Set-Cookie", "session=private-cookie".into()),
+        ]);
+        let mut reply = Reply::new(
+            200,
+            &data,
+            data.len(),
+            Some("\"secret-mcp-url:secret-cdn-url\""),
+        );
+        reply.headers.push((
+            "Content-Disposition",
+            "attachment; filename=ignored.ps1".into(),
+        ));
+        let server = mock(vec![redirect, reply]).await;
+        let (_dir, _, manager) = setup(1);
+        let url = mock_signed_url(&server);
+        let events = Arc::new(StdMutex::new(Vec::new()));
+        let captured = events.clone();
+        let artifact = manager
+            .download_mcp_archive(
+                &url,
+                "Release v1.zip",
+                Some(data.len() as u64),
+                CancellationToken::new(),
+                Some(Arc::new(move |event| captured.lock().unwrap().push(event))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(artifact.filename, "Release v1.zip");
+        assert_eq!(artifact.size, data.len() as u64);
+        assert_eq!(std::fs::read(&artifact.path).unwrap(), data);
+        assert_eq!(artifact.sha256, hex::encode(Sha256::digest(&data)));
+        assert_eq!(artifact.sha512, hex::encode(Sha512::digest(&data)));
+        assert!(
+            !artifact.integrity_verified
+                && artifact.requires_review
+                && !artifact.auto_install_allowed
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(events.last().unwrap().phase, DownloadPhase::Completed);
+        let sidecar = artifact
+            .path
+            .parent()
+            .unwrap()
+            .join(format!("{}.json", artifact.id));
+        let meta = std::fs::read_to_string(sidecar).unwrap();
+        assert_eq!(serde_json::from_str::<PartialMeta>(&meta).unwrap().etag, "");
+        for text in [
+            serde_json::to_string(&artifact).unwrap(),
+            serde_json::to_string(&*events).unwrap(),
+            meta,
+        ] {
+            for secret in [
+                url.as_str(),
+                "secret-mcp-url",
+                "secret-cdn-url",
+                "private-cookie",
+            ] {
+                assert!(!text.contains(secret));
+            }
+        }
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("get /opaque-mcp-path?signature=secret-mcp-url "));
+        assert!(requests[1].starts_with("get /opaque-cdn?signature=secret-cdn-url "));
+        for request in requests.iter() {
+            assert!(!request.contains("\r\nauthorization:"));
+            assert!(!request.contains("\r\ncookie:"));
+            assert!(!request.contains("\r\nreferer:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_archive_quarantines_html_disguised_as_an_archive() {
+        let html = b"<html>not an archive</html>";
+        let mut reply = Reply::new(200, html, html.len(), None);
+        reply
+            .headers
+            .push(("Content-Type", "application/zip".into()));
+        let server = mock(vec![reply]).await;
+        let (_dir, paths, manager) = setup(1);
+        let url = mock_signed_url(&server);
+        let message = manager
+            .download_mcp_archive(&url, "test.zip", None, CancellationToken::new(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("文件头与归档类型不匹配"));
+        assert!(!message.contains(&url));
+        assert!(!message.contains("secret-mcp-url"));
+        let files: Vec<_> = walkdir::WalkDir::new(paths.downloads())
+            .min_depth(2)
+            .into_iter()
+            .map(|entry| entry.unwrap().into_path())
+            .collect();
+        assert!(files.iter().any(
+            |path| path.extension().unwrap() == "part" && std::fs::read(path).unwrap() == html
+        ));
+        assert!(files
+            .iter()
+            .any(|path| path.extension().unwrap() == "rejected"));
+        assert!(!files.iter().any(|path| path.extension().unwrap() == "zip"));
+    }
+
+    #[tokio::test]
+    async fn mcp_archive_enforces_one_gib_limit_before_request_and_from_headers() {
+        let over_cap = MAX_WEB_BYTES + 1;
+        let server = mock(vec![Reply::new(200, b"", over_cap as usize, None)]).await;
+        let (_dir, paths, _) = setup(1);
+        let manager = DownloadManager::new(&paths).unwrap();
+        let url = mock_signed_url(&server);
+        let message = manager
+            .download_mcp_archive(
+                &url,
+                "test.zip",
+                Some(over_cap),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("文件超过下载大小限制"));
+        assert!(server.requests.lock().unwrap().is_empty());
+        assert!(std::fs::read_dir(paths.downloads())
+            .unwrap()
+            .next()
+            .is_none());
+
+        let message = manager
+            .download_mcp_archive(&url, "test.zip", None, CancellationToken::new(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("响应超过下载大小限制"));
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            walkdir::WalkDir::new(paths.downloads())
+                .min_depth(2)
+                .into_iter()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_archive_validates_receipt_size_in_headers_and_while_streaming() {
+        let mut chunked = Reply::new(200, b"6\r\nPK\x03\x04xx\r\n0\r\n\r\n", 0, None);
+        chunked.headers = vec![("Transfer-Encoding", "chunked".into())];
+        let server = mock(vec![Reply::new(200, b"PK\x03\x04xx", 6, None), chunked]).await;
+        let (_dir, _paths, manager) = setup(1);
+        let url = mock_signed_url(&server);
+        for message in ["响应大小与来源文件大小不符", "下载超过预期大小"] {
+            let error = manager
+                .download_mcp_archive(&url, "test.zip", Some(5), CancellationToken::new(), None)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, AppError::Invalid(reason) if reason.contains(message)));
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_archive_rejects_private_redirect_without_exposing_either_url() {
+        let private = "https://169.254.169.254/opaque?signature=secret-cdn-url";
+        let mut redirect = Reply::new(302, b"", 0, None);
+        redirect.headers.push(("Location", private.into()));
+        let server = mock(vec![redirect]).await;
+        let (_dir, _, manager) = setup(1);
+        let url = mock_signed_url(&server);
+        let error = manager
+            .download_mcp_archive(&url, "test.zip", None, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AppError::Denied(_)));
+        let message = error.to_string();
+        for secret in [url.as_str(), private, "secret-mcp-url", "secret-cdn-url"] {
+            assert!(!message.contains(secret));
+        }
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn public_web_errors_contain_neither_the_approved_link_nor_a_signed_redirect() {
+        // An invalid wire status exercises reqwest's error path, whose raw
+        // error can contain the signed request URL.
+        for (code, expected) in [(403, "HTTP 403"), (9999, "下载网络请求失败")] {
+            let mut redirect = Reply::new(302, b"", 0, None);
+            let cdn_path = "/opaque-cdn?signature=secret-cdn-url";
+            redirect.headers.push(("Location", cdn_path.into()));
+            let server = mock(vec![
+                redirect,
+                Reply::new(code, b"secret-response", 15, None),
+            ])
+            .await;
+            let (_dir, _, manager) = setup(1);
+            let request = WebDownload::parse(&server.url).unwrap();
+            let error = manager
+                .download_web(&request, CancellationToken::new(), None)
+                .await
+                .unwrap_err();
+            let message = serde_json::to_string(&error).unwrap();
+            assert!(message.contains(expected));
+            for secret in [
+                server.url.as_str(),
+                cdn_path,
+                "secret-cdn-url",
+                "secret-response",
+            ] {
+                assert!(!message.contains(secret));
+            }
+            assert_eq!(server.requests.lock().unwrap().len(), 2);
+        }
     }
 
     #[test]

@@ -78,7 +78,7 @@ export interface ScanReport {
 }
 export interface Plugin {
   slug: string; name: string; gameName: string; version: string; description: string;
-  source: string; enabled: boolean; validated: boolean; installPath: string; coverUrl: string | null;
+  source: string; enabled: boolean; validated: boolean; installPath: string; coverUrl: string | null; mcpServerNames?: string[];
 }
 export interface TrashItem {
   id: string; original_path: string; trash_path: string; transaction_id: string | null;

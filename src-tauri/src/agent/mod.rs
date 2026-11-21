@@ -1,5 +1,6 @@
 pub mod approval;
 pub(crate) mod attachments;
+pub mod catalog_tools;
 pub use attachments::Attachment;
 pub mod client;
 pub mod diagnostic_tools;

@@ -3,7 +3,9 @@ import { ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, PlusIcon, Sh
 import { DropdownMenu as Menu, Popover, Slider } from "radix-ui";
 import { Button } from "@/components/ui/button";
 import { AttachmentGroup } from "@/components/ui/attachment";
-import { AttachmentConverterSetup, ComposerAttachment } from "./AgentAttachments";
+import { Spinner } from "@/components/ui/spinner";
+import { ComposerAttachment, useAttachmentConverterStart } from "./AgentAttachments";
+import { ErrorState } from "./ui";
 import { MAX_ATTACHMENTS, MAX_MESSAGE_ATTACHMENT_BYTES, type DraftAttachment } from "@/lib/agent-attachments";
 import { toast } from "sonner";
 import {
@@ -53,16 +55,21 @@ export function AgentComposer({
 }: AgentComposerProps) {
   const [picker, setPicker] = useState<"model" | "reasoning" | null>(null);
   const filePicker = useRef<HTMLInputElement>(null);
-  const [setupOpen, setSetupOpen] = useState(false);
+  const converter = useAttachmentConverterStart();
   const needsSetup = attachments.some((item) => item.state === "error" && item.needsConsent);
   const controlsDisabled = disabled || busy;
   const ready = attachments.filter((item) => item.state === "ready");
   const tooLarge = ready.reduce((total, item) => total + item.bytes, 0) > MAX_MESSAGE_ATTACHMENT_BYTES;
   const canSend = !controlsDisabled && !tooLarge && ready.length === attachments.length && (Boolean(input.trim()) || ready.length > 0);
 
-  function retryFailed(id?: string) {
-    updateAttachments((current) => current.map((item) => item.state === "error" && (id ? item.id === id : item.needsConsent)
+  function retryFailed(shouldRetry: (item: Extract<DraftAttachment, { state: "error" }>) => boolean) {
+    updateAttachments((current) => current.map((item) => item.state === "error" && shouldRetry(item)
       ? { id: item.id, state: "processing", file: item.file } : item));
+  }
+
+  function startConverter() {
+    const draftIds = new Set(attachments.map((item) => item.id));
+    void converter.start(() => retryFailed((item) => item.needsConsent === true && draftIds.has(item.id)));
   }
 
   function addFiles(files: File[]) {
@@ -86,7 +93,7 @@ export function AgentComposer({
     if (canSend) onSend(ready.map((item) => item.attachment));
   }}>
     {onCancelEdit && <div className="mb-1 flex items-center justify-between gap-2 px-2 text-xs text-muted-foreground">
-      <span>正在编辑消息 · 发送后开启新分支</span>
+      <span>正在编辑消息</span>
       <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={onCancelEdit}>取消编辑</Button>
     </div>}
     <input ref={filePicker} type="file" aria-label="选择附件" hidden multiple disabled={controlsDisabled} onChange={(event) => {
@@ -99,13 +106,15 @@ export function AgentComposer({
         <AttachmentGroup aria-label="待发送附件" aria-live="polite" className="max-h-[25dvh] flex-wrap gap-1.5 overflow-y-auto">
           {attachments.map((draft) => <ComposerAttachment key={draft.id} draft={draft} disabled={controlsDisabled}
             onRemove={() => updateAttachments((current) => current.filter((item) => item.id !== draft.id))}
-            onRetry={() => retryFailed(draft.id)} />)}
+            onRetry={() => retryFailed((item) => item.id === draft.id)} />)}
         </AttachmentGroup>
-        {needsSetup && <Button type="button" size="xs" variant="outline" className="self-start" disabled={controlsDisabled} onClick={() => setSetupOpen(true)}>启动 MarkItDown MCP</Button>}
-        {needsSetup && setupOpen && <AttachmentConverterSetup onClose={() => setSetupOpen(false)} onStarted={() => {
-          setSetupOpen(false);
-          retryFailed();
-        }} />}
+        {needsSetup && <>
+          <Button type="button" size="xs" variant="outline" className="self-start" disabled={controlsDisabled || converter.starting}
+            aria-busy={converter.starting} onClick={startConverter}>
+            {converter.starting && <Spinner data-icon="inline-start" />}启动 MarkItDown MCP
+          </Button>
+          <ErrorState error={converter.error} />
+        </>}
         {tooLarge && <span role="alert" className="text-xs text-destructive">附件合计超过 20 MiB，请移除部分附件后分次发送。</span>}
       </InputGroupAddon>}
       <InputGroupTextarea
@@ -171,7 +180,7 @@ export function AgentComposer({
               <DropdownMenuContent {...popupPosition} aria-label="本轮模型"
                 className="max-h-[min(23rem,var(--radix-dropdown-menu-content-available-height))] w-[min(19rem,calc(100vw-24px))] rounded-2xl p-1.5 shadow-lg">
                 <DropdownMenuRadioGroup value={model} onValueChange={onModelChange}>
-                  {models.map(({id, display_name}) => (
+                  {models.map(({ id, display_name }) => (
                     <Menu.RadioItem key={id} value={id} title={id}
                       className="flex min-h-8 cursor-default items-center gap-3 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none data-highlighted:bg-muted data-[state=checked]:font-medium">
                       <span className="min-w-0 flex-1 wrap-anywhere">{display_name?.trim() || id}</span>
@@ -186,10 +195,10 @@ export function AgentComposer({
               onOpenChange={(open) => setPicker((current) => open ? "reasoning" : current === "reasoning" ? null : current)}
               onOpenModel={() => setPicker("model")} onChange={onReasoningChange} />}
           </div>
-          {onCancel ? <Button type="button" aria-label="停止生成" title="停止生成" variant="secondary" size="icon"
-            className="rounded-full bg-foreground text-background hover:bg-foreground/85" onClick={onCancel}>
+          {onCancel ? <Button key="stop" type="button" aria-label="停止生成" title="停止生成" variant="secondary" size="icon"
+            className="rounded-full bg-foreground text-background hover:bg-foreground/85 motion-safe:animate-pop-in" onClick={onCancel}>
             <SquareIcon aria-hidden="true" className="size-3 fill-current" />
-          </Button> : <Button type="submit" aria-label="发送消息" title="发送消息" size="icon" className="rounded-full" disabled={!canSend}>
+          </Button> : <Button key="send" type="submit" aria-label="发送消息" title="发送消息" size="icon" className="rounded-full motion-safe:animate-pop-in" disabled={!canSend}>
             <ArrowUpIcon aria-hidden="true" />
           </Button>}
         </div>

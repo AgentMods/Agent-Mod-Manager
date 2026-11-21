@@ -68,7 +68,7 @@ impl AgentTool for WebDownloadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: NAME.into(),
-            description: "仅在目录来源不能下载、且用户要求下载时，提交用户明确给出或证据中直接出现的公开 HTTPS ZIP/JAR/7z/tar.gz 直链，经用户审批后下载至管理器 downloads。不要猜测 URL，不要提交网页、私有链接、登录链接或带参数/签名的地址。结果不是目录版本、不会自动安装；安装需要另外核对文件和创建安装计划。".into(),
+            description: "仅用于用户明确点名通过管理器的直链下载工具传输公开 HTTPS ZIP/JAR/7z/tar.gz 归档。常规 Mod 下载请先用来源 MCP，无法取得文件时用 Playwright MCP 的浏览器下载。不要猜测 URL，不要提交网页、私有链接、登录链接或带参数/签名的地址。结果不是目录版本、不会自动安装；安装需要另外核对文件和创建安装计划。".into(),
             parameters: json!({"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":MAX_WEB_URL_BYTES}},"required":["url"],"additionalProperties":false}),
             effect: Effect::UncatalogedDownload,
         }

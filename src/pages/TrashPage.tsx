@@ -16,6 +16,7 @@ import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { stagger } from "@/lib/motion";
 
 export default function TrashPage() {
   const trash = useBackendQuery<TrashItem[]>(["trash"], "list_trash", {includeRestored: false});
@@ -167,7 +168,7 @@ export default function TrashPage() {
             })}/></TableHead>
             <TableHead scope="col">名称 / 原始位置</TableHead><TableHead scope="col">所属游戏</TableHead><TableHead scope="col">移入时间</TableHead><TableHead scope="col">大小</TableHead><TableHead scope="col">状态</TableHead>
           </TableRow></TableHeader>
-          <TableBody>{rows.map((item) => <TableRow key={item.id} data-state={selected.has(item.id) ? "selected" : undefined}>
+          <TableBody>{rows.map((item, index) => <TableRow key={item.id} data-state={selected.has(item.id) ? "selected" : undefined} className="motion-safe:animate-soft-fade" style={stagger(index, 30)}>
             <TableCell><Checkbox aria-label={`选择 ${item.label || displayPath(item.original_path)}`} checked={selected.has(item.id)} disabled={disabled} onCheckedChange={() => toggleItem(item.id)}/></TableCell>
             <TableCell className="break-all whitespace-normal">
               <div className="flex min-w-0 items-center gap-2 font-medium">

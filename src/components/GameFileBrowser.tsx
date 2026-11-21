@@ -74,7 +74,7 @@ function FileTreeNode({ node, selected, onSelect, onToggle, searching }: {
         <span className={sizeClass}>—</span><span className={dateClass}>{node.modified && date(node.modified)}</span>
       </Button>
     </CollapsibleTrigger>
-    <CollapsibleContent>
+    <CollapsibleContent className="motion-safe:overflow-hidden motion-safe:data-[state=closed]:animate-collapsible-up motion-safe:data-[state=open]:animate-collapsible-down">
       <div className="ml-3 flex min-w-0 flex-col border-l pl-1 sm:ml-4">
         {node.loading && <p role="status" className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground"><Spinner />正在读取目录…</p>}
         <ErrorState error={node.error} />

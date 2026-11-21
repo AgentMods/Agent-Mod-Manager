@@ -3,7 +3,7 @@ import { installMockTauri } from './mock-tauri';
 
 async function setup(page: Page) {
   await page.emulateMedia({ colorScheme: 'light' });
-  await installMockTauri(page);
+  await installMockTauri(page, {withExternalAdapter: true});
   await page.goto('/');
   await page.getByRole('button', {name: '游戏库', exact: true}).click();
   await expect(page.getByRole('heading', { name: 'Minecraft Java Edition', exact: true })).toBeVisible();

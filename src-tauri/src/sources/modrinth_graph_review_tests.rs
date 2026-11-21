@@ -21,7 +21,7 @@ const LOADER: &str = "fabric";
 
 fn fixture() -> (tempfile::TempDir, FileEngine, Game) {
     let (temp, engine, root) = crate::transaction::tests::setup();
-    plugins::seed_builtins(&engine.db, &engine.paths).unwrap();
+    plugins::test_fixtures::install(&engine.db, &engine.paths).unwrap();
     std::fs::write(root.join("options.txt"), "offline fixture").unwrap();
     let game = games::register_game(&engine.db, &root, Some("minecraft-java")).unwrap();
     assert_eq!(game.adapter_slug.as_deref(), Some("minecraft-java"));

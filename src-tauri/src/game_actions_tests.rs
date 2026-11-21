@@ -5,6 +5,7 @@ use super::{
 use crate::{
     db::Db,
     paths::user_path,
+    plugins::test_fixtures,
     transaction::{FileOp, FilePlan},
 };
 use serde_json::json;
@@ -513,10 +514,7 @@ fn pending_rollback_approval_is_scoped_by_its_original_plan() {
 }
 
 fn minecraft_adapter() -> GameAdapter {
-    serde_json::from_str(include_str!(
-        "../../plugins/games/minecraft-java/adapter.json"
-    ))
-    .unwrap()
+    serde_json::from_str(test_fixtures::PACKAGES[0].1).unwrap()
 }
 
 #[test]
@@ -536,6 +534,35 @@ fn root_location_is_registered_and_mods_requires_adapter() {
         resolve_location(&f.engine, "g", "root"),
         Err(AppError::NotFound(_))
     ));
+}
+
+#[test]
+fn missing_package_leaves_the_game_accessible_without_adapter_paths() {
+    let f = Fixture::new();
+    f.engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE games SET adapter_slug='minecraft-java',adapter_version='1.0.0' WHERE id='g'",
+            [],
+        )
+        .unwrap();
+    make_dir(&f.root.join("mods"));
+    let world = make_dir(&f.outside.join("world"));
+
+    assert_eq!(resolve_location(&f.engine, "g", "root").unwrap(), f.root);
+    assert!(matches!(
+        resolve_location(&f.engine, "g", "mods"),
+        Err(AppError::NotFound(_))
+    ));
+    assert!(matches!(
+        game_roots::register_user_root(&f.engine, "g", "world-datapacks", &world),
+        Err(AppError::NotFound(_))
+    ));
+    assert!(game_roots::registered_user_roots(&f.engine.db, "g")
+        .unwrap()
+        .is_empty());
+    assert_eq!(f.game().adapter_slug.as_deref(), Some("minecraft-java"));
 }
 
 #[test]
@@ -571,8 +598,8 @@ fn mods_reports_unregistered_user_root_and_uses_explicit_registration() {
         .archive_rules
         .retain(|rule| rule.mod_type == "datapack");
     f.engine.db.conn().execute(
-        "INSERT INTO plugins(slug,name,game_name,version,install_path,adapter_json,created_at,updated_at)
-         VALUES (?1,'Minecraft','Minecraft',?2,'unused',?3,'now','now')",
+        "INSERT INTO plugins(slug,name,game_name,version,source,install_path,adapter_json,created_at,updated_at)
+         VALUES (?1,'Minecraft','Minecraft',?2,'local','unused',?3,'now','now')",
         params![adapter.slug, adapter.version, serde_json::to_string(&adapter).unwrap()],
     ).unwrap();
     f.engine
@@ -606,7 +633,7 @@ fn mods_reports_unregistered_user_root_and_uses_explicit_registration() {
 #[test]
 fn selecting_a_package_checks_markers_and_keeps_the_game_registration() {
     let f = Fixture::new();
-    crate::plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
+    test_fixtures::install(&f.engine.db, &f.engine.paths).unwrap();
     assert!(set_game_adapter(&f.engine, "g", "minecraft-java").is_err());
     assert_eq!(f.game().adapter_slug, None);
     let adapter = minecraft_adapter();
@@ -1070,7 +1097,7 @@ fn remove_game_adapter_ipc_accepts_only_id_and_returns_game() {
 }
 
 fn make_minecraft_selectable(f: &Fixture) {
-    crate::plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
+    test_fixtures::install(&f.engine.db, &f.engine.paths).unwrap();
     let adapter = minecraft_adapter();
     let marker = adapter
         .markers

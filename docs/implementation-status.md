@@ -3,6 +3,56 @@
 Updated: 2026-11-21. The full project goal remains active. This is an
 implementation and verification snapshot, not a release-completion claim.
 
+**Installation rule research (2026-11-21, Windows).** When creating or changing
+installation rules, the desktop Agent uses connected Mod-source MCP tools to select
+release files with distinct installation layouts. The game Skill records the
+sample, file ID or version, observed paths, dependencies and installation steps.
+The authoring guide reserves automatic mappings for verified layouts. Configuration
+edits and unresolved layouts are documented for manual review. The existing `extract_preview` tool
+accepts optional `offset` and `limit` for sample inspection. Each page validates
+the full archive and reports the total entry count and next offset.
+
+A live anonymous Nexus Mods MCP check for Black Myth: Wukong retrieved author
+instructions for a CSharpLoader plugin and a preset appended to Engine.ini.
+See the release pages for [Easier Dodge, file 5120](https://www.nexusmods.com/blackmythwukong/mods/1571?tab=files&file_id=5120)
+and [Pure Clarity, file 5111](https://www.nexusmods.com/blackmythwukong/mods/1564?tab=files&file_id=5111). The check covered the authors' instructions and release
+metadata. Archive contents are covered by local fixtures. The public 3DM MCP
+advertised its tools but returned a service error for the game and Mod queries.
+
+A loopback Agent and MCP fixture covers discovery, sample previews, draft creation
+and validation with a 32K GPT-family context budget. The conservative unknown-model
+token estimate can exceed the same budget during a multi-sample turn.
+
+**Bing web search (2026-11-21, Windows).** The packaged Playwright helper
+returned web results for `Minecraft official website` through the Rust search
+entry point. The agent and opt-in game identification share this helper.
+Existing game identification evidence retains its recorded source. Eleven
+offline browser tests covered parsing, redirects, blocked prefetches, error
+pages and cancellation. The 18 focused desktop UI cases for identification and Skill settings passed across
+three viewport sizes. Six broader workflow cases still expected a history
+navigation button that was absent from the current UI.
+
+**Game library scan dialog (2026-11-21).** Opening the dialog scans common
+locations. Directory selection, single-game inspection and scan results share
+that dialog. Adding a game marks its row as managed and refreshes the library.
+Players can continue adding candidates or close the dialog and open a game card.
+
+**Windows Rust test directories (2026-11-21).** The local and CI test launcher
+places each run under `src-tauri/target/test-tmp/` and removes its directory
+when Cargo exits. The library suite passed 738 tests with 8 ignored. A
+filtered SQLite test and a Cargo argument error also exercised cleanup.
+
+**External game adapters (2026-11-21, Windows).** New profiles start with an
+empty adapter registry. Startup retires packages registered by older releases
+as built-in, moves their managed directories into `backups/retired-adapters/`,
+and clears their game bindings. The upgrade regression checks that installed Mod
+records and external bindings survive, local edits are backed up, and a retired
+slug can be installed through the external package workflow and read after a
+restart. Game discovery tests cover registering a game with an empty adapter
+registry. The Windows Rust library suite passed 738 tests with 8 ignored.
+Playwright covered external installation from the empty package center at 390,
+1280 and 1440 px. Strict Clippy and the frontend production build passed.
+
 **Agent adapter binding (2026-11-21, Windows).** A game card's authoring chat
 can create, validate, install and bind an external package in one turn. The
 `set_game_adapter` tool uses the conversation's registered game, or an explicit
@@ -43,10 +93,9 @@ card's unregistered Mod directory, and portable import filename validation.
 **Agent window responsiveness (2026-11-20, Windows).** Turn start, retry,
 event replay, cancellation and approval IPC no longer wait for database or
 runtime locks on the window thread. Startup repairs interrupted tool calls from
-protocol metadata only; the background task builds the prompt once. Retrying a
-long conversation copies prior completed events without rescanning them for
-each delta. On a synthetic in-memory SQLite fixture with 8,001 events the copy
-query took about 9 s before and 6 ms after; this is not model response time.
+protocol metadata only; the background task builds the prompt once. The former retry implementation copied prior completed events. On a
+synthetic in-memory SQLite fixture with 8,001 events, optimizing that copy
+reduced its duration from about 9 s to 6 ms.
 Live text batches within 32 ms, terminal/approval events flush immediately,
 and unchanged Markdown and completed reasoning traces stay stable.
 
@@ -146,21 +195,18 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   holds a staging directory handle for entry writes. The install preview
   requires exact staged source paths and hashes; failed staging is retained
   for inspection or later trashing.
-- Six embedded declarative adapters and Skills: Minecraft Java, Skyrim SE,
-  Fallout 4, Stardew Valley, Cyberpunk 2077, Baldur's Gate 3. Validation covers
-  schema identity, versions, relative paths, references and Skill frontmatter.
-  Built-in package and Skill reads tolerate the regular backup files retained by
-  reseeding and still verify the current declarations.
+- Game adapters are installed externally through the draft and reviewed deployment
+  workflow. Schema validation covers identity, versions, relative paths,
+  references and Skill frontmatter.
 - The adapter manifest provides optional `coverUrl` for the library and package
-  details. The six built-in manifests point to official game artwork. Missing or
-  unavailable covers fall back to the game placeholder. Existing manifests can
-  omit the field. `loadOrder.kind` accepts `none` for games without a dedicated
+  details. Missing or unavailable covers fall back to the game placeholder.
+  Existing manifests can omit the field. `loadOrder.kind` accepts `none` for games without a dedicated
   load-order format.
 - Players can start a prefilled Agent chat from the game library and package
   center or request a new or updated adapter in chat. The Agent can find
   registered packages, read verified package contents, and use the existing
   draft, validation and installation transactions. Local updates keep the slug.
-  Built-in packages can be copied under a new slug. The desktop library applies
+  The desktop library applies
   a selected installed package to a registered game after checking its markers.
   Players can also detach the current package in the same selector, even if it
   is disabled. Detaching keeps the game, its installed Mods and the package
@@ -176,9 +222,9 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   and Mod downloads, plus manually installed Skills in their own section.
   Game Skills are available from their package details. The Agent can read the
   active system Skills and the selected game's package Skill.
-- Desktop Settings uses MCP and Skills as the entry points for Mod provider
-  workflows. Brave credentials for built-in web search and game identification
-  are configured in the web search Skill details.
+- Desktop Settings uses the 工具 and Skills tabs as the entry points for Mod provider
+  workflows. The built-in web search and game identification use Playwright to
+  search Bing without a search API key.
 - Game discovery: bounded shallow scans, marker confidence with ambiguous
   candidates, structured Steam ACF and libraryfolders parsing, secondary Steam
   libraries, Epic/Legendary metadata, explicit canonical root registration,
@@ -193,7 +239,13 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   A unique full adapter match is labeled “已适配” with a green check.
 - First-run onboarding: desktop-only bootstrap detection with persisted
   `onboarding_completed`, explicit scan-candidate registration, Agent settings
-  setup with encrypted API-key storage, and a three-stage feature tour. The
+  setup with encrypted API-key storage, and a feature tour. Saving or skipping
+  the model configuration opens an optional MCP tools panel within the Agent
+  stage. It shares connection status, credential entry and start/stop actions
+  with Settings. Both pages can start every stopped external connection. Settings
+  can also stop all running connections and cancel remembered automatic starts.
+  Each connection reports its own failure and can be retried. Users can continue
+  to the tour with all tools stopped. The
   onboarding UI uses local React shadcn/ui-compatible Button/Card/Badge/
   Progress/Tabs/Alert/Dialog components, supports light/dark themes and a
   narrow 390px layout, and can be reopened from Settings. Browser preview keeps
@@ -233,8 +285,15 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   by `tests/ui/sidebar-memory.spec.ts`.
 - Agent messages expose copy, edit, and retry in the message footer. Edit
   restores the original text in the composer. Sending an edit or retrying a
-  reply opens a new conversation with the context preceding that turn. The
-  original conversation remains available in the conversation list.
+  reply regenerates from the selected question in the same conversation,
+  replacing the previous reply and later turns. Earlier messages, the chat
+  title, game binding and pin are preserved. Retry reuses the original
+  attachments. The rewind and replacement turn start commit together, and
+  live and replayed events carry the cutoff for removing superseded output.
+- Agent tool approvals appear inline in the owning chat using the shadcn/ui
+  Confirmation pattern. The card shows the prepared request or file plan before
+  the user approves or rejects it. After a decision the tool trace shows the
+  outcome. A header shortcut opens a chat with a pending background approval.
 - Agent `ask_user` requests open a questionnaire in the bottom message composer.
   Each step supports single-choice options or free text, back/next, and skip.
   Long questions scroll above the step controls. Live questions retain the
@@ -302,8 +361,8 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   preview/confirmation and rejects stale or incomplete rollback inputs. Trash
   entries from the replaced version require rollback rather than direct
   restore. See [reviewed version replacement](install-lifecycle.md#reviewed-version-replacement).
-- App startup: logging, database initialization, recovery, embedded package seed,
-  single-instance plugin. Rust IPC wrappers exist for current file/trash/snapshot
+- App startup handles logging, database initialization, transaction recovery,
+  legacy adapter retirement and single-instance enforcement. Rust IPC wrappers exist for current file/trash/snapshot
   and plugin operations; file-changing commands produce plans before apply.
 - Rust Agent runtime: OpenAI-compatible chat completions SSE, incremental UTF-8
   and tool-call assembly, complete-stream gate before tool execution, bounded
@@ -358,7 +417,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   not launch/connect MCP or share Mod 客栈 credentials. See
   [source restrictions and evidence](mod-sources.md).
   Shared provider HTTP caching and rate limiting are implemented;
-  Brave search opts out of caching raw third-party response bodies.
+  Bing search uses a fresh browser session and keeps raw pages out of that cache.
 - Agent Chat provides the in-app Mod search and download workflow. The Mod
   Discovery page and its standalone download history and install dialog were
   removed. Mod source settings remain available.
@@ -456,15 +515,15 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   `fabric.mod.json` ID/version declarations with historical top-level log rows
   and distinguishes install record matches from unrecorded and ambiguous files.
   It never extracts or executes a JAR. See [diagnostic limits](diagnostics.md).
-- Brave Web Search is registered as a read-only Agent tool. It uses the fixed
-  HTTPS endpoint and the `sources.brave` secret, limits queries to
-  1..512 characters/75 words and counts to 1..10, rejects local/private paths
-  and credential-bearing URLs, bounds result fields, and marks excerpts
-  untrusted. It validates result URLs as public HTTP(S) and never fetches them.
-  Missing credentials report `needs_configuration`; malformed or failed
-  responses do not become fabricated successful results.
+- The read-only `web_search` Agent tool uses the bundled Node and Playwright
+  runtime to open Bing and extract ranked titles, destination URLs and snippets.
+  Queries accept 1..512 characters, up to 75 words and 1..10 hits. Local paths
+  and URLs with embedded credentials are rejected. Returned links must be public
+  HTTP(S) URLs. The tool marks excerpts untrusted and bounds serialized results
+  to 32 KiB. Missing browser setup reports `needs_configuration`; search failures
+  report `unavailable`.
 - Unknown-game identification has bounded local name previews, exact-query
-  opt-in Brave searches, untrusted candidate selection and independent desktop
+  opt-in Bing searches, untrusted candidate selection and independent desktop
   registration consent. Search evidence is bound to the canonical root,
   metadata fingerprint, query and record digest, expires after 24 hours and
   is invalidated by a newer search or successful confirmation. Confirmation
@@ -477,11 +536,21 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   encrypted-Store secret references, explicit exact-config connection confirmation,
   namespaced tools, bounded results/cancellation, stale-config revocation and
   atomic registry registration. All external tool annotations remain untrusted.
-  Playwright MCP and MarkItDown MCP join the Mod 客栈 and 3DM presets as
-  opt-in configurations. Desktop bundles carry Node.js/npm/npx and uv/uvx. A confirmed
+  The eight opt-in presets are Mod 客栈, Playwright, MarkItDown, mod.io,
+  CurseForge, GameBanana, 3DM and Nexus Mods. `system-mod-download` uses the
+  connected source MCPs for project and file discovery and download, including
+  Mod 客栈. The official Mod 客栈 attachment tool requests a signed link and transfers a selected
+  file into managed downloads under a single approval. When a source cannot
+  deliver the file, the Agent uses the connected Playwright MCP to download it
+  from the official page. Schema v12 gives the stock Playwright browser a
+  user-writable output directory and absolute download receipts.
+  Schema v9 moves the stock 3DM stdio preset to `https://mod.3dmgame.com/mcp`
+  and expires its old launch consent while retaining the credential reference. Desktop bundles carry Node.js/npm/npx and uv/uvx. A confirmed
   bare launcher uses the packaged runtime with a child-only npm or PyPI mirror
   (npmmirror or Tsinghua). Explicit executable paths retain their own configuration.
-  The Windows Playwright preset selects installed Edge. MarkItDown inherits the bundled
+  Schema v11 updates the six stock npm/PyPI launch commands to fetch current
+  releases from the configured package index. Users can still pin a version in
+  their own launch arguments. The Windows Playwright preset selects installed Edge. MarkItDown inherits the bundled
   uvx index. Schema v6 removes the redundant index flag and URL from the unedited
   historical preset and expires its old startup consent. Custom configurations are preserved.
   Schema v4 clears prior auto-start consent for bare aliases.
@@ -500,19 +569,33 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   discovery and navigation; these are not native settings UI tests.
   Stdio is an explicitly acknowledged unsandboxed OS-user process, not contained
   by FileEngine; stronger cross-platform sandboxing remains required.
-- External MCP connections use a compact list with a per-service credentials
-  dialog for Bearer and stdio environment secrets. Its footer has 返回 and 保存.
+- Game adapters can declare optional stdio and Streamable HTTP services in
+  `adapter.json` under `mcpServers`. The plugin detail and draft validation show
+  the declared services. The MCP settings list identifies their owner and handles
+  credentials and explicit startup. Deployment and rollback synchronize the
+  service definitions with the verified package inside the registry transaction.
+  Disabling the owner or replacing a launch configuration revokes launch consent.
+  See [the package example](../README.md#mcp-services-in-game-plugins).
+- The 3DM public HTTP endpoint accepts anonymous tool discovery and takes the raw API key in `Authorization` for authenticated requests. The desktop client selects that format by endpoint, including for saved and custom connections. HTTP 401 and 403 startup errors identify the credential or permission problem without exposing response bodies. The opt-in native smoke registered 16 tools on 2026-11-21.
+- External MCP connections show an optional single-line description beside the
+  service name. Hover or keyboard focus reveals the full text. Built-in services
+  include Chinese descriptions, custom connections can be edited in Settings,
+  and adapters can supply a `description` per service in `mcpServers`.
+  The per-service credentials dialog handles Bearer and stdio environment secrets.
+  Its footer has 返回 and 保存.
   保存 submits the nonblank fields together. Each connection can store an
   optional `credential_url`. The 获取 Key link opens that page in the system
-  browser. The Mod客栈 and 3DM presets include their key-management pages.
+  browser. The credential-backed Mod service presets include their key-management pages.
   Each row shows 未启动,
   启动中, 运行中 (tool count) or 启动失败 with the reason, and has one start/stop
-  button. Starting saves `enabled` itself, so the editor has no enable switch.
+  button. Clicking Start launches the selected external service directly and saves `enabled`.
+  The desktop has no fixed limit on the number of connected MCP servers.
   On desktop launch, previously started connections restore in the background.
   Only a successful manual handshake and tool registration save consent to that
-  exact configuration (stdio requires acknowledgement of OS-user privileges).
-  Merely enabled or legacy configurations have no consent. Stop, edit or remove
-  revokes it; a transient restore failure permits retry on the next launch or
+  exact configuration selected with Start.
+  Merely enabled or legacy configurations have no consent. Stopping, changing
+  connection parameters or removing the service
+  revokes it. A transient restore failure permits retry on the next launch or
   cancellation from Settings even when disconnected. The local server remembers
   its opt-in separately and recreates its loopback endpoint and token.
   Playwright covers both transports, masked inputs, keyboard dismissal and
@@ -526,19 +609,38 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   resolve/download, install/list/uninstall/rollback and diagnosis/logs. The complete
   registry also includes the bounded web search and reviewed plugin-publication
   operations described above.
-- Plugin publication has an exact package/file/metadata preview, digest-bound
-  approval, a second explicit `PUBLISH_PLUGIN` confirmation, durable history and
-  guarded remote upload/scan/publish phases. Unknown remote outcomes are not
-  automatically retried. The desktop can verify upload completion, a completed
-  safety scan, or a matching published work on the caller's own Mod 客栈 shelf
-  without resending. Inconclusive states stay unchanged; authenticated live
-  network publication has not been exercised.
+- The plugin center, library and Agent can discover anonymous Mod客栈 catalog releases. A selected release's exact two source files pass the local validator and reviewed draft/install workflow. Library binding retains the registered game's marker checks.
+- New manager plugin publications use the dedicated MCP first-release and subsequent-release tools. Each preview binds the exact files, tags and target to the user's consent. Ambiguous writes use read-only reconciliation. Earlier ordinary-work publications retain separate history and reconciliation. See [the publication contract](plugin-publication.md).
 - The frontend has eight lazy-loaded views (including game detail), light/dark
   themes, Skill management, plugin draft/validate/install/enable controls, and
   publication preview/history. These implemented surfaces are not evidence of
   cross-platform or release acceptance.
 
 ## Verification
+
+The Windows desktop client discovered the official Mod 客栈 attachment tool as a
+public guest. A loopback MCP and file server exercised an approved ZIP transfer
+with one signing request, no forwarded API key and a matching hash. A separate
+Playwright MCP test clicked a page link in Edge, observed one archive request,
+and verified the reported absolute path and SHA-256. Both transfers used fixtures.
+
+In-place message retry and editing were verified on Windows on 2026-11-21.
+The Rust library suite passed 746 tests with 10 ignored. All 63 focused
+Playwright cases passed across three viewport sizes, including repeated edits,
+late stream events, draft attachments and switching conversations during a retry.
+The production frontend build and all-target Clippy check passed.
+
+On 2026-11-21 all six unpinned package presets initialized on Windows and listed
+tools using the bundled launchers and configured mirrors. MarkItDown exposed
+`convert_to_markdown`. The settings and attachment UI suites passed 81 cases
+across three viewport sizes, including direct start, retry and repeated clicks.
+
+On 2026-11-21 the Windows native MCP client connected to the seeded 3DM HTTP
+endpoint without credentials and registered 16 tools. Isolated stdio handshakes
+listed 12 mod.io tools, 13 CurseForge tools, 9 GameBanana tools and 9 Nexus Mods
+tools. These probes did not download or install a Mod. SQLite tests cover fresh
+seeding, upgrades from the stock stdio preset and preservation of edited launch
+configurations. The 3DM settings credential test passed at all three viewports.
 
 Storage settings passed the Playwright regression with mocked desktop IPC at
 both desktop widths and the narrow viewport, covering Windows display paths,
@@ -663,9 +765,9 @@ profile. Playwright drives the installed WebView2 over loopback CDP, and a
 PID-scoped helper selects the metadata-only JAR through the native Windows file
 chooser. The script verifies streamed diagnosis, staged import, install and
 trash approvals, cancellation, archived history across a process restart and
-byte-exact restoration. It checks SQLite read-only for four committed
-transactions, three completed turns, one cancelled turn and one archived
-conversation. JavaScript and PowerShell syntax checks and both embedded C# helper
+byte-exact restoration. Its read-only SQLite checks cover the external adapter
+deployment, game file transactions, three completed turns, one cancelled turn
+and one archived conversation. JavaScript and PowerShell syntax checks and both embedded C# helper
 compilations passed locally. NSIS/MSI, the native chooser and interactive Windows
 11 acceptance still require execution on Windows.
 
@@ -710,7 +812,7 @@ whole-volume durability.
 Run from `src-tauri`:
 
 ```sh
-cargo test --lib
+node ../scripts/test-rust.mjs --lib
 cargo check --no-default-features
 cargo clippy --lib --no-default-features -- -D warnings
 ```
@@ -850,7 +952,7 @@ with Tauri's ad hoc identity (`-`), without Apple Developer ID or notarization.
 The earlier resulting `.app` is 37.00 MiB and the DMG is 13.90 MiB. A current
 unsigned arm64 `.app` rebuild completed on 2026-11-19 at 38.58 MiB. CI now has
 a macOS launch smoke that uses an isolated home, checks SQLite `quick_check`,
-and verifies six embedded plugins. `hdiutil verify`
+and checks that a fresh installation has an empty adapter registry. `hdiutil verify`
 reported `VALID`; strict `codesign` verification passed both in the mounted
 read-only image and on a temporary copy. The copied executable matched the
 release app's SHA-256. A direct launch from that copy under an isolated `HOME`
@@ -868,7 +970,7 @@ distribution acceptance, and it does not repeat the earlier game workflow.
 
 - Key-authenticated 3DM REST and real archive acceptance remain pending. Its
   public MCP schema and read-only Mod metadata were inspected, but no download,
-  login or authenticated REST request was performed. Live Brave/model/provider
+  login or authenticated REST request was performed. Live model/provider
   acceptance remains pending outside the verified anonymous Modrinth and
   Thunderstore flows.
 - Verify third-party activation and stronger archive provenance. The Fabric
@@ -952,3 +1054,9 @@ All requirements in the original approved plan remain in scope.
 - Agent 对话页已按传统桌面 Agent 产品重排：持久工作区/最近对话侧栏、宽画布式消息区、顶部会话信息和底部悬浮式 Prompt Input；亮色/暗色主题共用语义 token，窄屏保留横向会话列表。
 - 使用 shadcn/ui AI Elements 的 Trace 组合承载 Reasoning 与 Tool trace，并新增本地可组合 `trace.tsx`、`code-block.tsx`，不切换项目现有 `new-york` 风格，也不重复实现全局审批弹窗。
 - Agent 状态、流式回复、权限策略、思考等级、token usage、错误回放、原生链接打开与现有 Tauri API 保持不变。2026-11-19 验证：`yarn typecheck`、`yarn build`，以及 Agent/引导/工作流相关 93 个 Playwright 用例在 desktop-1280、desktop-1440、narrow-390 通过。
+
+### 界面动画（2026-11-21）
+- 新增 `src/motion.css`（关键帧与 `animate-*` 令牌）和 `src/lib/motion.ts`（`stagger`、`useDidChange`）。页面进入、游戏卡片与表格行依次浮入、发现候选行、空状态与错误提示、封面图加载渐显、侧边栏导航依次滑入与当前项指示条、主题切换颜色渐变与图标旋转、复选框与单选框勾选弹出、Badge 颜色过渡、文件夹展开与收起、引导页步骤切换。
+- Agent 对话：消息浮入、空状态图标浮动与光环、处理中三点跳动、会话列表行滑入、运行中会话的脉冲环、工具与思考完成时的勾选弹出（只在状态变化时播放，历史记录不重播）、发送与停止按钮切换弹出。
+- 所有效果都通过 `motion-safe:` 或 `prefers-reduced-motion: no-preference` 保护，系统开启减少动画时全部关闭；侧边栏指示条属于状态，减少动画下仍显示。`tests/ui/motion.spec.ts` 覆盖默认播放、减少动画关闭、指示条、导航依次进入、主题渐变清理和 `stagger` 取值。
+- 2026-11-21 验证：`yarn typecheck`、`vite build` 与 `motion.spec.ts`（3 个视口 21 个用例）通过。整套 `yarn test:ui` 在并行负载下有偶发超时，相关文件单独重复运行通过；`workflows.spec.ts` 中依赖已隐藏的「历史对话」导航项的 2 个用例在改动前就失败。`yarn build` 当前被他人未提交的 `SettingsPage.tsx` 中未使用的 `SecretField` 阻断（TS6133），与动画无关。

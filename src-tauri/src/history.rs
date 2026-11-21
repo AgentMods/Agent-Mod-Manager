@@ -296,97 +296,98 @@ impl History {
         })
     }
 
-    /// Snapshot the context before the selected user turn. A retry targets an
-    /// assistant message and uses the nearest preceding user message as input.
-    pub(crate) fn fork_before_message(
-        &self,
-        source: &str,
-        message_id: &str,
-        edited_content: Option<String>,
-        edited_attachments: Option<Vec<Attachment>>,
-    ) -> AppResult<(String, String, Vec<Attachment>)> {
-        let mut conn = self.db.conn();
-        let tx = conn.transaction()?;
-        let conversation = read_conversation(&tx, source)?;
-        if conversation.archived {
-            return Err(AppError::Denied("请先恢复归档会话".into()));
-        }
-        let (target_row, role, original): (i64, String, String) = tx
+    /// Replace a turn's input in place. The caller commits this rewind and the
+    /// replacement turn-start together so a rejected start preserves the chat.
+    pub(crate) fn restart_user_message(
+        tx: &rusqlite::Transaction<'_>,
+        conversation: &str,
+        selected_id: &str,
+        edit: Option<(&str, Option<Vec<Attachment>>)>,
+    ) -> AppResult<(String, i64)> {
+        let (selected_row, role): (i64, String) = tx
             .query_row(
-                "SELECT rowid,role,content FROM messages WHERE conversation_id=?1 AND id=?2",
-                params![source, message_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                "SELECT rowid,role FROM messages WHERE conversation_id=?1 AND id=?2",
+                params![conversation, selected_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or_else(|| AppError::NotFound("消息".into()))?;
-        let (cutoff, content) = match (role.as_str(), edited_content) {
-            ("user", Some(content)) => (target_row, content),
-            ("user", None) => (target_row, original),
-            ("assistant", None) => tx
-                .query_row(
-                    "SELECT rowid,content FROM messages
-                     WHERE conversation_id=?1 AND role='user' AND rowid<?2 ORDER BY rowid DESC LIMIT 1",
-                    params![source, target_row],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?
-                .ok_or_else(|| AppError::NotFound("原始提问".into()))?,
-            _ => return Err(AppError::Invalid("只能编辑用户消息".into())),
-        };
-        let attachments: Vec<Attachment> = match edited_attachments {
-            Some(attachments) => attachments,
-            None => tx.query_row(
-                "SELECT attachments_json FROM messages WHERE rowid=?1",
-                [cutoff],
-                |row| Ok(serde_column(row, 0)?.unwrap_or_default()),
-            )?,
-        };
-        let branch = new_id("conv");
-        let timestamp = now();
-        tx.execute(
-            "INSERT INTO conversations(id,title,game_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)",
-            params![branch, message_title(&content, &attachments), conversation.game_id, timestamp],
-        )?;
-        let copied = tx.execute(
-            "INSERT INTO messages(id,conversation_id,role,content,reasoning,tool_calls_json,tool_call_id,name,token_count,created_at,attachments_json)
-             SELECT ?1 || ':' || id,?1,role,content,reasoning,tool_calls_json,tool_call_id,name,token_count,created_at,attachments_json
-             FROM messages WHERE conversation_id=?2 AND rowid<?3 ORDER BY rowid",
-            params![branch, source, cutoff],
-        )?;
-        tx.execute(
-            "UPDATE conversations SET message_count=?2 WHERE id=?1",
-            params![branch, copied],
-        )?;
-        tx.execute(
-            "INSERT INTO settings(key,value) SELECT ?1,value FROM settings WHERE key=?2",
-            params![
-                conversation_permission_key(&branch),
-                conversation_permission_key(source)
-            ],
-        )?;
-        // Compute membership once per conversation. A correlated lookup for
-        // the terminal event would rescan thousands of deltas per copied row
-        // while holding the app's single database connection.
-        tx.execute(
-            "WITH prior_turns AS (
-                 SELECT e.turn_id FROM agent_events e JOIN messages m ON m.id=e.message_id
-                 WHERE e.conversation_id=?2 AND m.conversation_id=?2 AND m.rowid<?3
-             ), finished AS (
-                 SELECT turn_id FROM agent_events WHERE conversation_id=?2 AND kind='done'
-             ), answers AS (
-                 SELECT turn_id, json_extract(payload_json,'$.approvalId') FROM agent_events
-                 WHERE conversation_id=?2 AND kind='approval-resolved'
+        if role != "user" && (edit.is_some() || role != "assistant") {
+            return Err(AppError::Invalid("只能编辑用户消息或重试回复".into()));
+        }
+        let (cutoff, user_id, content, attachments): (i64, String, String, Vec<Attachment>) = tx
+            .query_row(
+                "SELECT rowid,id,content,attachments_json FROM messages
+             WHERE conversation_id=?1 AND role='user' AND rowid<=?2 ORDER BY rowid DESC LIMIT 1",
+                params![conversation, selected_row],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        serde_column(row, 3)?.unwrap_or_default(),
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| AppError::NotFound("原始提问".into()))?;
+
+        if let Some((text, replacement)) = edit {
+            let attachments = replacement.unwrap_or(attachments);
+            crate::agent::attachments::validate_user_input(text, &attachments)?;
+            let encoded = (!attachments.is_empty())
+                .then(|| serde_json::to_string(&attachments))
+                .transpose()?;
+            tx.execute(
+                "UPDATE messages SET content=?1,attachments_json=?2,token_count=0 WHERE id=?3",
+                params![text, encoded, user_id],
+            )?;
+        } else {
+            crate::agent::attachments::validate_user_input(&content, &attachments)?;
+        }
+
+        // Legacy turn-start events had no message ID. Find the whole selected
+        // turn via any of its messages, including intermediate tool replies.
+        // A legacy turn cancelled before its first delta may have no such link.
+        let history_through_seq: i64 = tx.query_row(
+            "WITH next_question AS (
+                 SELECT MIN(rowid) AS boundary FROM messages
+                 WHERE conversation_id=?1 AND role='user' AND rowid>?2
+             ), selected_turns AS (
+                 SELECT e.turn_id FROM agent_events e JOIN messages m ON m.id=e.message_id, next_question
+                 WHERE e.conversation_id=?1 AND m.conversation_id=?1 AND m.rowid>=?2
+                   AND (boundary IS NULL OR m.rowid<boundary)
+             ), first_removed AS (
+                 SELECT MIN(seq) AS start FROM agent_events WHERE conversation_id=?1 AND turn_id IN selected_turns
              )
-             INSERT INTO agent_events(turn_id,conversation_id,message_id,kind,payload_json,created_at)
-             SELECT ?1 || ':' || e.turn_id,?1,?1 || ':' || e.message_id,e.kind,e.payload_json,e.created_at
-             FROM agent_events e WHERE e.conversation_id=?2
-               AND e.turn_id IN prior_turns AND e.turn_id IN finished
-               AND (e.kind<>'approval-request' OR (e.turn_id, json_extract(e.payload_json,'$.approvalId')) IN answers)
-             ORDER BY e.seq",
-            params![branch, source, cutoff],
+             SELECT CASE WHEN start IS NOT NULL THEN (
+                 SELECT COALESCE(MAX(seq),0) FROM agent_events WHERE conversation_id=?1 AND seq<start
+             ) ELSE (
+                 SELECT COALESCE(MAX(seq),0) FROM agent_events WHERE conversation_id=?1 AND turn_id IN (
+                     SELECT e.turn_id FROM agent_events e JOIN messages m ON m.id=e.message_id
+                     WHERE e.conversation_id=?1 AND m.conversation_id=?1 AND m.rowid<?2
+                 )
+             ) END FROM first_removed",
+            params![conversation, cutoff], |row| row.get(0),
         )?;
-        tx.commit()?;
-        Ok((branch, content, attachments))
+        tx.execute(
+            "DELETE FROM agent_events WHERE conversation_id=?1 AND seq>?2",
+            params![conversation, history_through_seq],
+        )?;
+        // Tool executions and their approvals remain available for audit even
+        // when their assistant message is no longer part of this transcript.
+        tx.execute(
+            "UPDATE tool_calls SET message_id=NULL WHERE conversation_id=?1 AND message_id IN (
+            SELECT id FROM messages WHERE conversation_id=?1 AND rowid>?2)",
+            params![conversation, cutoff],
+        )?;
+        let removed = tx.execute(
+            "DELETE FROM messages WHERE conversation_id=?1 AND rowid>?2",
+            params![conversation, cutoff],
+        )?;
+        tx.execute("UPDATE conversations SET task_summary=NULL,message_count=message_count-?2,updated_at=?3 WHERE id=?1",
+            params![conversation, removed, now()])?;
+        Ok((user_id, history_through_seq))
     }
 
     pub fn archive_conversation(&self, id: &str, archived: bool) -> AppResult<()> {
@@ -498,27 +499,45 @@ impl History {
         tool_calls: Option<Value>,
         tool_call_id: Option<&str>,
     ) -> AppResult<Message> {
-        self.append(
+        let mut conn = self.db.conn();
+        let tx = conn.transaction()?;
+        let message = Self::insert_message(
+            &tx,
             conversation_id,
             role,
             content,
             tool_calls,
             tool_call_id,
             Vec::new(),
-        )
+        )?;
+        tx.commit()?;
+        Ok(message)
     }
 
+    #[cfg(test)]
     pub(crate) fn append_user_message(
         &self,
         conversation_id: &str,
         content: &str,
         attachments: Vec<Attachment>,
     ) -> AppResult<Message> {
-        self.append(conversation_id, "user", content, None, None, attachments)
+        let mut conn = self.db.conn();
+        let tx = conn.transaction()?;
+        let message = Self::insert_message(
+            &tx,
+            conversation_id,
+            "user",
+            content,
+            None,
+            None,
+            attachments,
+        )?;
+        tx.commit()?;
+        Ok(message)
     }
 
-    fn append(
-        &self,
+    pub(crate) fn insert_message(
+        tx: &rusqlite::Transaction<'_>,
         conversation_id: &str,
         role: &str,
         content: &str,
@@ -540,9 +559,7 @@ impl History {
             .then(|| serde_json::to_string(&message.attachments))
             .transpose()?;
         let timestamp = now();
-        let mut conn = self.db.conn();
-        let tx = conn.transaction()?;
-        ensure_conversation(&tx, conversation_id)?;
+        ensure_conversation(tx, conversation_id)?;
         tx.execute(
             "INSERT INTO messages(id,conversation_id,role,content,tool_calls_json,tool_call_id,created_at,attachments_json)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -559,7 +576,6 @@ impl History {
                 params![conversation_id, message_title(content, &message.attachments)],
             )?;
         }
-        tx.commit()?;
         Ok(message)
     }
 
@@ -1181,11 +1197,12 @@ mod tests {
     }
 
     #[test]
-    fn message_branches_keep_only_the_context_before_the_question() {
+    fn restarting_a_legacy_turn_keeps_earlier_events_and_execution_records() {
         let (_dir, history) = fixture();
         let source = history
-            .create_conversation("Source", Some("game_1"))
+            .create_conversation("My chat", Some("game_1"))
             .unwrap();
+        history.set_conversation_pinned(&source.id, true).unwrap();
         history
             .set_permission_mode(&source.id, Some("auto_approve"))
             .unwrap();
@@ -1194,121 +1211,65 @@ mod tests {
                 .append_message(&source.id, role, text, None, None)
                 .unwrap()
         };
-        append("user", "Earlier question");
+        let first = append("user", "Earlier question");
         let earlier = append("assistant", "Earlier answer");
         let question = append("user", "Original question");
         let answer = append("assistant", "Original answer");
         append("user", "Later question");
+        history.set_summary(&source.id, "Old context").unwrap();
+        history
+            .set_tool_call(
+                &source.id,
+                Some(&answer.id),
+                &call(),
+                ToolCallUpdate {
+                    status: "done".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let events = crate::agent::events::Events {
             db: history.db.clone(),
             sink: std::sync::Arc::new(|_| {}),
         };
-        events
-            .emit(
-                "earlier",
-                &source.id,
-                Some(&earlier.id),
-                "delta",
-                json!({"content": "Earlier answer"}),
-            )
-            .unwrap();
-        events
-            .emit(
-                "earlier",
-                &source.id,
-                Some(&earlier.id),
-                "approval-request",
-                json!({"approvalId":"unresolved"}),
-            )
-            .unwrap();
-        for kind in ["approval-request", "approval-resolved"] {
-            events
-                .emit(
-                    "earlier",
-                    &source.id,
-                    Some(&earlier.id),
-                    kind,
-                    json!({"approvalId":"answered"}),
-                )
-                .unwrap();
+        for (turn, message) in [("earlier", &earlier.id), ("target", &answer.id)] {
+            for (kind, id) in [
+                ("turn-start", None),
+                ("delta", Some(message.as_str())),
+                ("done", None),
+            ] {
+                events.emit(turn, &source.id, id, kind, json!({})).unwrap();
+            }
         }
-        events
-            .emit(
-                "unfinished",
-                &source.id,
-                Some(&earlier.id),
-                "delta",
-                json!({"content": "incomplete"}),
-            )
-            .unwrap();
-        events
-            .emit(
-                "earlier",
-                &source.id,
-                None,
-                "done",
-                json!({"status": "done"}),
-            )
-            .unwrap();
-        events
-            .emit(
-                "target",
-                &source.id,
-                Some(&answer.id),
-                "delta",
-                json!({"content": "Original answer"}),
-            )
-            .unwrap();
-        events
-            .emit(
-                "target",
-                &source.id,
-                None,
-                "done",
-                json!({"status": "done"}),
-            )
-            .unwrap();
-
-        let (retry, prompt, attachments) = history
-            .fork_before_message(&source.id, &answer.id, None, None)
-            .unwrap();
-        assert_eq!(prompt, "Original question");
-        assert!(attachments.is_empty());
-        let (edit, prompt, attachments) = history
-            .fork_before_message(
-                &source.id,
-                &question.id,
-                Some("Edited question".into()),
-                None,
-            )
-            .unwrap();
-        assert_eq!(prompt, "Edited question");
-        assert!(attachments.is_empty());
-        for branch_id in [retry, edit] {
-            let branch = history.get_conversation(&branch_id).unwrap();
-            assert_eq!(branch.conversation.game_id, source.game_id);
-            assert_eq!(
-                branch.conversation.permission_mode.as_deref(),
-                Some("auto_approve")
-            );
-            assert_eq!(branch.conversation.message_count, 2);
-            assert_eq!(branch.messages[0].content, "Earlier question");
-            assert_eq!(branch.messages[1].content, "Earlier answer");
-            let replay = events.replay(&branch_id, 0, 10).unwrap();
-            assert_eq!(
-                replay.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
-                ["delta", "approval-request", "approval-resolved", "done"]
-            );
-            assert_eq!(replay[1].payload["approvalId"], "answered");
-            assert_eq!(
-                replay[0].message_id.as_deref(),
-                Some(branch.messages[1].id.as_str())
-            );
+        let before = events.replay(&source.id, 0, 20).unwrap();
+        {
+            let mut conn = history.db.conn();
+            let tx = conn.transaction().unwrap();
+            let (user_id, through) =
+                History::restart_user_message(&tx, &source.id, &answer.id, None).unwrap();
+            assert_eq!(user_id, question.id);
+            assert_eq!(through, before[2].seq);
+            tx.commit().unwrap();
         }
+        let detail = history.get_conversation(&source.id).unwrap();
+        assert_eq!(detail.messages, [first, earlier, question]);
+        assert_eq!(detail.conversation.message_count, 3);
+        assert_eq!(detail.conversation.task_summary, None);
+        assert!(detail.conversation.pinned);
+        assert_eq!(detail.conversation.game_id, source.game_id);
+        assert_eq!(detail.conversation.title, source.title);
         assert_eq!(
-            history.get_conversation(&source.id).unwrap().messages.len(),
-            5
+            detail.conversation.permission_mode.as_deref(),
+            Some("auto_approve")
         );
+        assert_eq!(
+            json!(events.replay(&source.id, 0, 20).unwrap()),
+            json!(before[..3])
+        );
+        let calls = history.list_tool_calls(&source.id).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].status, "done");
+        assert_eq!(calls[0].message_id, None);
     }
 
     #[test]

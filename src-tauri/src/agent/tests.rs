@@ -38,6 +38,23 @@ impl SecretStore for NoSecrets {
         Ok(())
     }
 }
+pub(super) fn install_adapter_package(
+    engine: &crate::transaction::FileEngine,
+    (slug, adapter, skill): (&str, &str, &str),
+) -> crate::plugin_workflow::DraftInfo {
+    use crate::plugin_workflow;
+
+    let draft = plugin_workflow::plan_write_draft(engine, slug, adapter, skill).unwrap();
+    engine.approve_plan(&draft.plan.id).unwrap();
+    engine.apply_file_ops(&draft.plan.id).unwrap();
+    let install = plugin_workflow::plan_install_plugin(engine, &draft.draft.id).unwrap();
+    engine.approve_plan(&install.plan.id).unwrap();
+    engine.apply_file_ops(&install.plan.id).unwrap();
+    let report = plugin_workflow::reconcile_deployments(engine).unwrap();
+    assert!(report.registered.iter().any(|name| name == slug));
+    draft.draft
+}
+
 fn event(content: Value) -> String {
     format!("data: {}\n\n", content)
 }
@@ -239,7 +256,7 @@ fn desktop_turn_dispatch_returns_while_the_database_is_locked() {
 }
 
 #[tokio::test]
-async fn edit_and_retry_send_forked_context_to_the_model() {
+async fn edit_and_retry_replace_context_in_the_same_conversation() {
     let (_dir, engine, _game) = setup();
     let history = History::new(engine.db.clone());
     let (url, job) = server(vec![final_reply(), final_reply()]).await;
@@ -249,11 +266,12 @@ async fn edit_and_retry_send_forked_context_to_the_model() {
             .append_message(&source, role, content, None, None)
             .unwrap()
     };
-    add("user", "Earlier question");
-    add("assistant", "Earlier answer");
+    let earlier_user = add("user", "Earlier question");
+    let earlier_assistant = add("assistant", "Earlier answer");
     let user = add("user", "Original question");
     let assistant = add("assistant", "Original response");
     add("user", "Later question");
+    add("assistant", "Later answer");
     let request = |content: &str| TurnRequest {
         conversation_id: source.clone(),
         content: content.into(),
@@ -262,21 +280,46 @@ async fn edit_and_retry_send_forked_context_to_the_model() {
         permission_mode: None,
         reasoning_effort: None,
     };
-    let retry = agent
-        .restart_turn(request(""), &assistant.id, false)
-        .unwrap();
-    let done = next(&mut rx, "done").await;
-    assert_eq!(done.conversation_id, retry);
-    assert_eq!(done.payload["status"], "done");
-    let edit = agent
-        .restart_turn(request("Edited question"), &user.id, true)
-        .unwrap();
-    let done = next(&mut rx, "done").await;
-    assert_eq!(done.conversation_id, edit);
-    assert_eq!(done.payload["status"], "done");
-
-    let requests = job.await.unwrap();
-    for (body, prompt) in requests
+    for (selected, edit, text) in [
+        (&assistant.id, false, ""),
+        (&user.id, true, "Edited question"),
+    ] {
+        let id = agent.restart_turn(request(text), selected, edit).unwrap();
+        assert_eq!(id, source);
+        let start = next(&mut rx, "turn-start").await;
+        assert_eq!(start.message_id.as_deref(), Some(user.id.as_str()));
+        assert_eq!(start.payload["historyThroughSeq"], 0);
+        let done = next(&mut rx, "done").await;
+        assert_eq!(done.conversation_id, source);
+        assert_eq!(done.payload["status"], "done");
+        let detail = history.get_conversation(&source).unwrap();
+        assert_eq!(detail.conversation.title, "Test");
+        assert_eq!(detail.messages.len(), 4);
+        assert_eq!(
+            detail.messages[..2],
+            [earlier_user.clone(), earlier_assistant.clone()]
+        );
+        assert_eq!(detail.messages[2].id, user.id);
+        assert_eq!(
+            detail.messages[2].content,
+            if edit { text } else { "Original question" }
+        );
+        assert_eq!(detail.messages[3].content, "完成");
+        assert_ne!(detail.messages[3].id, assistant.id);
+        assert!(agent
+            .events
+            .replay(&source, 0, 100)
+            .unwrap()
+            .iter()
+            .all(|e| e.turn_id == start.turn_id));
+        if !edit {
+            add("user", "Later follow-up");
+        }
+    }
+    assert_eq!(history.list_conversations(false).unwrap().len(), 1);
+    for (body, prompt) in job
+        .await
+        .unwrap()
         .iter()
         .zip(["Original question", "Edited question"])
     {
@@ -290,7 +333,66 @@ async fn edit_and_retry_send_forked_context_to_the_model() {
             ]
         );
     }
-    assert_eq!(history.get_conversation(&source).unwrap().messages.len(), 5);
+}
+
+#[tokio::test]
+async fn rejected_restart_preserves_chat_and_replay() {
+    let (_dir, engine, _game) = setup();
+    let history = History::new(engine.db.clone());
+    let (url, job) = server(vec![final_reply()]).await;
+    let (agent, conv, mut rx) = runtime(engine, &url);
+    let request = TurnRequest {
+        conversation_id: conv.clone(),
+        content: "Saved question".into(),
+        attachments: None,
+        model: None,
+        permission_mode: None,
+        reasoning_effort: None,
+    };
+    agent.start_turn(request.clone()).unwrap();
+    assert_eq!(next(&mut rx, "done").await.payload["status"], "done");
+    job.await.unwrap();
+    let detail = history.get_conversation(&conv).unwrap();
+    let user = &detail.messages[0].id;
+    let answer = &detail.messages[1].id;
+    let replay = json!(agent.events.replay(&conv, 0, 100).unwrap());
+    let assert_preserved = || {
+        assert_eq!(history.get_conversation(&conv).unwrap(), detail);
+        assert_eq!(json!(agent.events.replay(&conv, 0, 100).unwrap()), replay);
+    };
+    let blank = TurnRequest {
+        content: String::new(),
+        ..request.clone()
+    };
+    assert!(agent.restart_turn(blank, user, true).is_err());
+    assert_preserved();
+    let bad_model = TurnRequest {
+        model: Some("unconfigured-model".into()),
+        ..request.clone()
+    };
+    assert!(agent.restart_turn(bad_model, answer, false).is_err());
+    assert_preserved();
+
+    // Fail after the transcript rewind and turn insert to exercise SQL rollback.
+    history
+        .db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_start BEFORE INSERT ON agent_events
+        WHEN NEW.kind='turn-start' BEGIN SELECT RAISE(ABORT,'start failed'); END;",
+        )
+        .unwrap();
+    let edit = TurnRequest {
+        content: "Replacement".into(),
+        ..request
+    };
+    assert!(agent.restart_turn(edit, user, true).is_err());
+    assert_preserved();
+    let conversations = history.list_conversations(false).unwrap();
+    assert_eq!(
+        json!(conversations[0])["agent_status"]["turn_status"],
+        "done"
+    );
 }
 
 #[tokio::test]
@@ -372,7 +474,7 @@ async fn automatic_fomod_sse_install_applies_the_reviewed_plan_and_returns_a_rec
     use std::{io::Write, path::Path};
 
     let (_dir, engine, root) = setup();
-    plugins::seed_builtins(&engine.db, &engine.paths).unwrap();
+    plugins::test_fixtures::install(&engine.db, &engine.paths).unwrap();
     let data = root.join("Data");
     std::fs::create_dir(&data).unwrap();
     std::fs::write(root.join("SkyrimSE.exe"), b"game").unwrap();
@@ -578,15 +680,11 @@ async fn reject_approval_does_not_touch_game_files() {
 
 #[tokio::test]
 async fn rejected_plugin_publication_never_grants_upload_consent_in_either_review_mode() {
-    use crate::{agent::policy::PermissionMode, plugin_publish, plugin_workflow, plugins};
+    use crate::{agent::policy::PermissionMode, manager_publication, plugins};
     for mode in [PermissionMode::RequestApproval, PermissionMode::AutoApprove] {
         let (_dir, engine, _) = setup();
-        let mut adapter: Value = serde_json::from_str(plugins::BUILTIN_PACKAGES[0].1).unwrap();
-        adapter["slug"] = json!("rejected-publication");
-        let draft = plugin_workflow::plan_write_draft(&engine, "rejected-publication", &adapter.to_string(), "---\nname: rejected-publication\ndescription: Reviewed fixture\n---\nPublic instructions.\n").unwrap();
-        engine.approve_plan(&draft.plan.id).unwrap();
-        engine.apply_file_ops(&draft.plan.id).unwrap();
-        let args = json!({"draft_id":draft.draft.id,"metadata":{"title":"Public fixture","summary":"Summary","description":"Description"}});
+        let draft = install_adapter_package(&engine, plugins::test_fixtures::PACKAGES[0]);
+        let args = json!({"draft_id":draft.id,"tags":["fixture"]});
         let response = format!(
             "{}data: [DONE]\n\n",
             event(
@@ -608,14 +706,14 @@ async fn rejected_plugin_publication_never_grants_upload_consent_in_either_revie
         let approval = next(&mut rx, "approval-request").await;
         assert_eq!(approval.payload["title"], "publish_plugin");
         assert_eq!(
-            approval.payload["preview"]["preview"]["package"]["files"]
+            approval.payload["preview"]["preview"]["files"]
                 .as_array()
                 .unwrap()
                 .len(),
             2
         );
         let id = approval.payload["preview"]["id"].as_str().unwrap();
-        assert!(plugin_publish::get_publication(&agent.engine, id)
+        assert!(manager_publication::get_publication(&agent.engine, id)
             .unwrap()
             .approved_digest
             .is_none());
@@ -630,10 +728,13 @@ async fn rejected_plugin_publication_never_grants_upload_consent_in_either_revie
             )
             .unwrap();
         next(&mut rx, "done").await;
-        let record = plugin_publish::get_publication(&agent.engine, id).unwrap();
+        let record = manager_publication::get_publication(&agent.engine, id).unwrap();
         assert!(record.approved_digest.is_none());
-        assert!(record.file_id.is_none());
-        assert_eq!(record.phase, plugin_publish::PublicationPhase::Prepared);
+        assert!(record.remote.is_none());
+        assert_eq!(
+            record.state,
+            manager_publication::PublicationState::Intended
+        );
         assert_eq!(job.await.unwrap().len(), 2);
     }
 }

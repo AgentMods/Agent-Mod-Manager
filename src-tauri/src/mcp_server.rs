@@ -343,9 +343,7 @@ impl LocalMcpServer {
             connections
                 .connect_local(runtime.settings.clone(), &runtime.registry, &endpoint)
                 .await
-                .map_err(|err| {
-                    AppError::Other(format!("无法将本地 MCP 服务连接到 Agent（{err}）"))
-                })?;
+                .map_err(|err| AppError::Other(format!("无法将本地工具连接到 Agent（{err}）")))?;
             if remember {
                 self.remember_startup_request()?;
             }

@@ -278,12 +278,14 @@ struct ApplyEvidence {
 
 #[cfg(test)]
 type RenameHook = Box<dyn Fn(&JournalRename) + Send + Sync>;
+type PluginMcpChangeHandler = Box<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct FileEngine {
     pub db: Db,
     pub paths: Arc<AppPaths>,
     local_agent_files: bool,
+    plugin_mcp_change_handler: Arc<OnceLock<PluginMcpChangeHandler>>,
     #[cfg(test)]
     fail_before: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -298,12 +300,31 @@ impl FileEngine {
             db,
             paths: Arc::new(paths),
             local_agent_files: false,
+            plugin_mcp_change_handler: Arc::new(OnceLock::new()),
             #[cfg(test)]
             fail_before: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             #[cfg(test)]
             cross_device: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             before_rename: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn set_plugin_mcp_change_handler(
+        &self,
+        handler: impl Fn(&str) + Send + Sync + 'static,
+    ) {
+        assert!(self
+            .plugin_mcp_change_handler
+            .set(Box::new(handler))
+            .is_ok());
+    }
+
+    /// Notify the desktop runtime after committing and dropping the DB guard,
+    /// before releasing the file write lock that serializes plugin mutations.
+    pub(crate) fn notify_plugin_mcp_changed(&self, slug: &str) {
+        if let Some(handler) = self.plugin_mcp_change_handler.get() {
+            handler(slug);
         }
     }
 

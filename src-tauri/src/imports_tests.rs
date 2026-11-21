@@ -68,7 +68,7 @@ fn preview_is_inert_camel_case_and_native_apply_enables_separate_install() {
         .unwrap();
     jar.write_all(b"{}").unwrap();
     jar.finish().unwrap();
-    plugins::seed_builtins(&engine.db, &engine.paths).unwrap();
+    plugins::test_fixtures::install(&engine.db, &engine.paths).unwrap();
     let game_root = source.parent().unwrap().join("game");
     fs::create_dir(&game_root).unwrap();
     fs::write(game_root.join("options.txt"), "game").unwrap();

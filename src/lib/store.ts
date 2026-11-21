@@ -27,6 +27,8 @@ function initialTheme(): "light" | "dark" {
   return matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
+const adapterResearchPrompt = "请先使用已有的 Mod 平台 MCP，查找并获取该游戏不同安装类型的代表性 Mod。结合发布页的安装说明、依赖声明和压缩包目录结构，分析并核实各类型的安装规则。请自行核实游戏识别标记，只在信息无法核实或需要我决定偏好时向我提问。";
+
 export const useUI = create<UIState>((set) => ({
   view: "agent", gameId: null, conversationId: null, adapterChat: null, theme: initialTheme(), planReview: null,
   navigate: (view) => set({view}),
@@ -41,8 +43,8 @@ export const useUI = create<UIState>((set) => ({
       prompt: target?.slug
         ? `我想修改「${target.name}」适配包（${target.slug}）。请先读取现有适配包，再和我确认要修改的内容。`
         : target
-          ? `请为管理中的游戏「${target.name}」创建适配包，包含游戏封面和游戏 Skill。请先和我确认识别标记与 Mod 安装规则，校验通过后安装并绑定到这款游戏。`
-          : "我想创建一个游戏适配包，包含游戏封面和游戏 Skill。请先和我确认游戏名称及适配需求。",
+          ? `请为管理中的游戏「${target.name}」创建适配包，包含游戏封面和游戏 Skill。${adapterResearchPrompt}校验通过后安装并绑定到这款游戏。`
+          : `我想创建一个游戏适配包，包含游戏封面和游戏 Skill。若目标游戏不明确，请先向我确认。${adapterResearchPrompt}`,
     },
   }),
   setConversation: (conversationId, keepAdapterChat = false) => set((state) => ({

@@ -25,7 +25,8 @@ impl Fixture {
         let paths = AppPaths::new(temp.path().join("manager")).unwrap();
         let engine = FileEngine::new(Db::open(&paths.db_file()).unwrap(), paths);
         publication::migrate(&engine.db.conn()).unwrap();
-        let mut adapter: Value = serde_json::from_str(plugins::BUILTIN_PACKAGES[0].1).unwrap();
+        let mut adapter: Value =
+            serde_json::from_str(plugins::test_fixtures::PACKAGES[0].1).unwrap();
         adapter["slug"] = json!("remote-publish-test");
         adapter["name"] = json!("Remote Publication Test");
         adapter["version"] = json!("1.2.3");

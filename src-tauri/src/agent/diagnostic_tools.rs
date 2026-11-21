@@ -93,7 +93,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::new(temp.path().join("data")).unwrap();
         let engine = FileEngine::new(Db::open(&paths.db_file()).unwrap(), paths);
-        plugins::seed_builtins(&engine.db, &engine.paths).unwrap();
+        plugins::test_fixtures::install(&engine.db, &engine.paths).unwrap();
         let root = temp.path().join("game");
         std::fs::create_dir_all(root.join("logs")).unwrap();
         std::fs::write(root.join("options.txt"), "fixture").unwrap();

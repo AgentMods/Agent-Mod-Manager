@@ -6,7 +6,7 @@ fn fixture(slug: &str) -> (tempfile::TempDir, FileEngine, games::Game) {
     let temp = tempfile::tempdir().unwrap();
     let data = AppPaths::new(temp.path().join("data")).unwrap();
     let engine = FileEngine::new(Db::open(&data.db_file()).unwrap(), data);
-    plugins::seed_builtins(&engine.db, &engine.paths).unwrap();
+    plugins::test_fixtures::install(&engine.db, &engine.paths).unwrap();
     let root = temp.path().join("game");
     std::fs::create_dir(&root).unwrap();
     match slug {

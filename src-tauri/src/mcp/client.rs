@@ -7,9 +7,10 @@ use crate::{
 };
 use rmcp::{
     model::{CallToolRequestParams, PaginatedRequestParams},
-    service::RunningService,
+    service::{ClientInitializeError, RunningService},
     transport::{
-        async_rw::AsyncRwTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+        async_rw::AsyncRwTransport,
+        streamable_http_client::{StreamableHttpClientTransportConfig, StreamableHttpError},
         StreamableHttpClientTransport,
     },
     RoleClient, ServiceExt,
@@ -134,13 +135,14 @@ pub struct McpTool {
 
 struct Session {
     service: RunningService<RoleClient, ()>,
+    lifetime: CancellationToken,
     child: Mutex<Option<Child>>,
     secrets: ConnectionSecrets,
 }
 
 impl Session {
     fn stop(&self) {
-        self.service.cancellation_token().cancel();
+        self.lifetime.cancel();
         if let Some(child) = self
             .child
             .lock()
@@ -182,7 +184,7 @@ impl McpClient {
         if !config.enabled {
             return Err(AppError::Denied("MCP server is disabled".into()));
         }
-        if consent.config != config {
+        if !consent.config.same_connection_config(&config) {
             return Err(AppError::Conflict(
                 "MCP configuration changed; confirm again".into(),
             ));
@@ -190,6 +192,7 @@ impl McpClient {
         if cancel.is_cancelled() {
             return Err(AppError::Cancelled);
         }
+        let lifetime = CancellationToken::new();
         let mut resolved_secrets = Vec::new();
         let (service, child, secrets) = match config.transport {
             McpTransport::StreamableHttp => {
@@ -201,25 +204,23 @@ impl McpClient {
                         .reinit_on_expired_session(false)
                         .control_request_timeout(Duration::from_secs(2));
                 transport_config.channel_buffer_capacity = 4;
-                if let Some(key) = &config.bearer_secret_ref {
-                    let token = required_secret(settings, key)?;
-                    if token.is_empty() || token.len() > 8192 || token.chars().any(char::is_control)
-                    {
-                        return Err(AppError::Invalid("Invalid MCP bearer credential".into()));
-                    }
-                    resolved_secrets.push(token.clone());
-                    transport_config = transport_config.auth_header(token);
-                }
+                let (headers, token) = http_authorization(settings, &config)?;
+                resolved_secrets.extend(token);
                 let secrets = ConnectionSecrets::new(resolved_secrets)?;
                 let http = reqwest_mcp::Client::builder()
+                    .default_headers(headers)
                     .redirect(reqwest_mcp::redirect::Policy::none())
                     .connect_timeout(Duration::from_secs(10))
                     .timeout(REQUEST_TIMEOUT)
                     .build()
                     .map_err(|_| AppError::Other("Cannot initialize MCP HTTP client".into()))?;
                 let transport = StreamableHttpClientTransport::with_client(http, transport_config);
-                let service =
-                    bounded_startup(cancel, StartupBudget::HTTP, ().serve(transport)).await?;
+                let service = bounded_startup(
+                    cancel,
+                    StartupBudget::HTTP,
+                    ().serve_with_ct(transport, lifetime.clone()),
+                )
+                .await?;
                 (service, None, secrets)
             }
             McpTransport::Stdio => {
@@ -249,18 +250,34 @@ impl McpClient {
                     }
                 }
                 for (env, key) in &config.env_secret_refs {
-                    let value = required_secret(settings, key)?;
+                    let Some(value) = stdio_secret(settings, &config, env, key)? else {
+                        continue;
+                    };
                     command.env(env, &value);
                     resolved_secrets.push(value);
                 }
                 let secrets = ConnectionSecrets::new(resolved_secrets)?;
-                if cancel.is_cancelled() {
-                    return Err(AppError::Cancelled);
-                }
-                let mut child = command.spawn().map_err(|err| AppError::Other(match err.kind() {
-                    std::io::ErrorKind::NotFound => "找不到 MCP 启动程序。请确认已安装，并在应用的 PATH 中，或将命令设置为绝对路径。",
-                    _ => "无法启动 MCP 进程，请检查启动程序及其执行权限。",
-                }.into()))?;
+                let mut child = {
+                    // A plugin commit and the launch of its old executable must not cross.
+                    let _plugin_write = config
+                        .plugin_slug
+                        .as_ref()
+                        .map(|_| crate::transaction::write_lock());
+                    if cancel.is_cancelled() {
+                        return Err(AppError::Cancelled);
+                    }
+                    if config.plugin_slug.is_some()
+                        && !servers.get(id)?.same_connection_config(&config)
+                    {
+                        return Err(AppError::Conflict(
+                            "配置已变化，请重新确认完整连接配置".into(),
+                        ));
+                    }
+                    command.spawn().map_err(|err| AppError::Other(match err.kind() {
+                        std::io::ErrorKind::NotFound => "找不到 MCP 启动程序。请确认已安装，并在应用的 PATH 中，或将命令设置为绝对路径。",
+                        _ => "无法启动 MCP 进程，请检查启动程序及其执行权限。",
+                    }.into()))?
+                };
                 let stdout = child
                     .stdout
                     .take()
@@ -271,7 +288,22 @@ impl McpClient {
                     .ok_or_else(|| AppError::Other("Missing MCP stdin".into()))?;
                 let transport = AsyncRwTransport::<RoleClient, _, _>::new(stdout, stdin)
                     .with_max_line_length(MAX_WIRE_MESSAGE_BYTES);
-                let service = bounded_startup(cancel, budget, ().serve(transport)).await?;
+                let service = match bounded_startup(
+                    cancel,
+                    budget,
+                    ().serve_with_ct(transport, lifetime.clone()),
+                )
+                .await
+                {
+                    Ok(service) => service,
+                    Err(err) => {
+                        let _ = child.start_kill();
+                        if let Err(cleanup) = reap_child(child).await {
+                            tracing::warn!(%cleanup, "could not reap MCP child after startup failure");
+                        }
+                        return Err(err);
+                    }
+                };
                 (service, Some(child), secrets)
             }
         };
@@ -280,6 +312,7 @@ impl McpClient {
             config,
             session: Arc::new(Session {
                 service,
+                lifetime,
                 child: Mutex::new(child),
                 secrets,
             }),
@@ -292,6 +325,10 @@ impl McpClient {
 
     pub fn server_config(&self) -> &ServerConfig {
         &self.config
+    }
+
+    pub(super) async fn disconnected(&self) {
+        self.session.lifetime.cancelled().await;
     }
 
     pub fn disconnect(&self) {
@@ -308,16 +345,13 @@ impl McpClient {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(mut child) = child {
-            tokio::time::timeout(Duration::from_secs(3), child.wait())
-                .await
-                .map_err(|_| AppError::Other("MCP child shutdown timed out".into()))?
-                .map_err(|_| AppError::Other("Cannot reap MCP child".into()))?;
+        if let Some(child) = child {
+            reap_child(child).await?;
         }
         Ok(())
     }
 
-    fn ensure_current(&self) -> AppResult<()> {
+    pub(crate) fn ensure_current(&self) -> AppResult<()> {
         let current = match self.servers.get(&self.config.id) {
             Ok(config) => config,
             Err(error) => {
@@ -325,7 +359,7 @@ impl McpClient {
                 return Err(error);
             }
         };
-        if current != self.config || !current.enabled {
+        if !current.same_connection_config(&self.config) || !current.enabled {
             self.disconnect();
             return Err(AppError::Denied(
                 "MCP configuration changed or was disabled; reconnect with confirmation".into(),
@@ -341,7 +375,7 @@ impl McpClient {
 
     pub async fn list_tools(&self, cancel: &CancellationToken) -> AppResult<Vec<McpTool>> {
         self.ensure_current()?;
-        let result = bounded(cancel, REQUEST_TIMEOUT, async {
+        let discover = async {
             let mut tools = Vec::new();
             let mut cursor = None;
             let mut cursors = HashSet::new();
@@ -422,8 +456,8 @@ impl McpClient {
             Err(AppError::Invalid(
                 "MCP tool pagination exceeds limits".into(),
             ))
-        })
-        .await;
+        };
+        let result = self.request(cancel, discover).await;
         if result.is_err() {
             self.disconnect();
         }
@@ -451,13 +485,13 @@ impl McpClient {
         .await
         .map_err(|err| match err {
             AppError::Other(message) if message == TIMEOUT_MESSAGE => AppError::Other(format!(
-                "MarkItDown 转换超过 {} 秒。请拆分文档，在「设置 → MCP 服务」中重新启动 MarkItDown 后重试。",
+                "MarkItDown 转换超过 {} 秒。请拆分文档，在「设置 → 工具」中重新启动 MarkItDown 后重试。",
                 REQUEST_TIMEOUT.as_secs()
             )),
             AppError::Invalid(message) if message == RESULT_LIMIT_MESSAGE => AppError::Invalid(
-                "MarkItDown 返回的 MCP 消息超过 1 MiB。请拆分文档，在「设置 → MCP 服务」中重新启动 MarkItDown 后重试。".into()
+                "MarkItDown 返回的 MCP 消息超过 1 MiB。请拆分文档，在「设置 → 工具」中重新启动 MarkItDown 后重试。".into()
             ),
-            _ => AppError::Other("MarkItDown MCP 调用失败。请在「设置 → MCP 服务」中停止并重新启动 MarkItDown，然后重试。".into()),
+            _ => AppError::Other("MarkItDown MCP 调用失败。请在「设置 → 工具」中停止并重新启动 MarkItDown，然后重试。".into()),
         })
     }
 
@@ -477,15 +511,14 @@ impl McpClient {
         if serde_json::to_vec(&args)?.len() > MAX_ARGUMENT_BYTES {
             return Err(AppError::Invalid("MCP arguments exceed limits".into()));
         }
-        let result = bounded(
-            cancel,
-            REQUEST_TIMEOUT,
-            self.session
-                .service
-                .peer()
-                .call_tool(CallToolRequestParams::new(name.to_owned()).with_arguments(arguments)),
-        )
-        .await;
+        let result = self
+            .request(
+                cancel,
+                self.session.service.peer().call_tool(
+                    CallToolRequestParams::new(name.to_owned()).with_arguments(arguments),
+                ),
+            )
+            .await;
         match result {
             Ok(result) => {
                 let filtered = (|| {
@@ -513,17 +546,90 @@ impl McpClient {
             }
         }
     }
+    async fn request<T, E>(
+        &self,
+        cancel: &CancellationToken,
+        operation: impl Future<Output = Result<T, E>>,
+    ) -> AppResult<T> {
+        tokio::select! {
+            biased;
+            _ = self.session.lifetime.cancelled() => Err(AppError::Cancelled),
+            result = bounded(cancel, REQUEST_TIMEOUT, operation) => result,
+        }
+    }
 }
 
-fn required_secret(settings: &Settings, key: &str) -> AppResult<String> {
+async fn reap_child(mut child: Child) -> AppResult<()> {
+    tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .map_err(|_| AppError::Other("MCP child shutdown timed out".into()))?
+        .map_err(|_| AppError::Other("Cannot reap MCP child".into()))?;
+    Ok(())
+}
+
+/// The stock 3DM endpoint accepts a raw API key, while other HTTP connections use Bearer.
+pub(super) fn http_authorization(
+    settings: &Settings,
+    config: &ServerConfig,
+) -> AppResult<(reqwest_mcp::header::HeaderMap, Option<String>)> {
+    use reqwest_mcp::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+    let mut headers = HeaderMap::new();
+    let Some(key) = &config.bearer_secret_ref else {
+        return Ok((headers, None));
+    };
+    let raw_key = config.uses_3dm_authorization();
+    let Some(token) = read_secret(settings, key)? else {
+        return if raw_key || config.is_glossmod_endpoint() {
+            Ok((headers, None))
+        } else {
+            Err(missing_secret())
+        };
+    };
+    if token.chars().any(char::is_control) {
+        return Err(AppError::Invalid("MCP HTTP 凭据包含无效字符".into()));
+    }
+    let header = if raw_key {
+        HeaderValue::from_str(&token)
+    } else {
+        HeaderValue::from_str(&format!("Bearer {token}"))
+    };
+    let mut header = header.map_err(|_| AppError::Invalid("MCP HTTP 凭据格式无效".into()))?;
+    header.set_sensitive(true);
+    headers.insert(AUTHORIZATION, header);
+    Ok((headers, Some(token)))
+}
+
+fn missing_secret() -> AppError {
+    AppError::Invalid("请先在「设置 → 工具」中配置该工具所需的凭据".into())
+}
+
+fn read_secret(settings: &Settings, key: &str) -> AppResult<Option<String>> {
     let value = settings
         .read_secret(key)
-        .map_err(|_| AppError::Other("Cannot read encrypted MCP credential".into()))?
-        .ok_or_else(|| {
-            AppError::Invalid("MCP credential is not configured in encrypted storage".into())
-        })?;
-    if value.is_empty() || value.len() > 8192 || value.contains('\0') {
+        .map_err(|_| AppError::Other("Cannot read encrypted MCP credential".into()))?;
+    if value
+        .as_ref()
+        .is_some_and(|v| v.is_empty() || v.len() > 8192 || v.contains('\0'))
+    {
         return Err(AppError::Invalid("Invalid MCP credential".into()));
+    }
+    Ok(value)
+}
+
+pub(super) fn stdio_secret(
+    settings: &Settings,
+    config: &ServerConfig,
+    env: &str,
+    key: &str,
+) -> AppResult<Option<String>> {
+    let value = read_secret(settings, key)?;
+    // The stock Nexus service can browse public projects anonymously.
+    let optional = config.builtin
+        && config.id == super::config::NEXUSMODS_ID
+        && env == "NEXUSMODS_API_KEY"
+        && key == "mcp.nexusmods.api_key";
+    if value.is_none() && !optional {
+        return Err(missing_secret());
     }
     Ok(value)
 }
@@ -544,17 +650,48 @@ async fn bounded<T, E>(
     }
 }
 
-async fn bounded_startup<T, E>(
+fn startup_failure_hint(error: &ClientInitializeError, budget: StartupBudget) -> &'static str {
+    let ClientInitializeError::TransportError { error, .. } = error else {
+        return budget.hint;
+    };
+    let Some(http) = error
+        .error
+        .downcast_ref::<StreamableHttpError<reqwest_mcp::Error>>()
+    else {
+        return budget.hint;
+    };
+    // Without WWW-Authenticate, rmcp 3.10 embeds the HTTP status and body in
+    // UnexpectedServerResponse. Only inspect its SDK-generated status prefix.
+    const UNAUTHORIZED: &str = "HTTP 401，身份验证失败，请检查此连接的密钥。";
+    const FORBIDDEN: &str = "HTTP 403，服务拒绝访问，请检查密钥权限。";
+    match http {
+        StreamableHttpError::AuthRequired(_) => UNAUTHORIZED,
+        StreamableHttpError::InsufficientScope(_) => FORBIDDEN,
+        StreamableHttpError::UnexpectedServerResponse(message)
+            if message.starts_with("HTTP 401 ") =>
+        {
+            UNAUTHORIZED
+        }
+        StreamableHttpError::UnexpectedServerResponse(message)
+            if message.starts_with("HTTP 403 ") =>
+        {
+            FORBIDDEN
+        }
+        _ => budget.hint,
+    }
+}
+
+async fn bounded_startup<T>(
     cancel: &CancellationToken,
     budget: StartupBudget,
-    operation: impl Future<Output = Result<T, E>>,
+    operation: impl Future<Output = Result<T, ClientInitializeError>>,
 ) -> AppResult<T> {
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(AppError::Cancelled),
         result = tokio::time::timeout(budget.timeout, operation) => match result {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(_)) => Err(AppError::Other(format!("MCP 启动握手失败。{}未调用任何工具。", budget.hint))),
+            Ok(Err(error)) => Err(AppError::Other(format!("MCP 启动握手失败。{}未调用任何工具。", startup_failure_hint(&error, budget)))),
             Err(_) => Err(AppError::Other(format!("MCP 启动超时（{} 秒）。{}未调用任何工具。", budget.timeout.as_secs(), budget.hint))),
         }
     }
@@ -620,13 +757,17 @@ mod timeout_tests {
             timeout: Duration::from_millis(2),
             ..StartupBudget::stdio("uvx")
         };
-        let hung = std::future::pending::<Result<(), &str>>();
+        let hung = std::future::pending::<Result<(), ClientInitializeError>>();
         let timeout = bounded_startup(&cancel, budget, hung)
             .await
             .unwrap_err()
             .to_string();
         assert!(timeout.contains("超时") && timeout.contains("uvx") && !timeout.contains("npx"));
-        let failed = async { Err::<(), _>("private-token") };
+        let failed = async {
+            Err::<(), _>(ClientInitializeError::ConnectionClosed(
+                "private-token".into(),
+            ))
+        };
         let error = bounded_startup(&cancel, budget, failed)
             .await
             .unwrap_err()
@@ -638,7 +779,7 @@ mod timeout_tests {
         );
         cancel.cancel();
         assert!(matches!(
-            bounded_startup(&cancel, budget, async { Ok::<_, ()>(()) }).await,
+            bounded_startup(&cancel, budget, async { Ok(()) }).await,
             Err(AppError::Cancelled)
         ));
     }

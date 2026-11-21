@@ -119,10 +119,13 @@ pub async fn mcp_update(
     config: crate::mcp::ServerConfig,
 ) -> AppResult<()> {
     crate::mcp_connections::require_external(&config.id)?;
+    if config.plugin_slug.is_some() {
+        return Err(AppError::Denied("不能手动修改插件工具".into()));
+    }
     let servers = crate::mcp::McpServers::new(state.engine.db.clone());
     state
         .mcp_connections
-        .revoke(&agent.registry, &config.id, || servers.update(&config))
+        .revoke_if_needed(&agent.registry, &config.id, || servers.update(&config))
         .await
 }
 #[tauri::command]
@@ -145,6 +148,15 @@ pub async fn mcp_connect(
     expected_config: crate::mcp::ServerConfig,
     accepts_unsandboxed_stdio: bool,
 ) -> AppResult<crate::mcp_connections::ConnectionInfo> {
+    if expected_config.plugin_slug.is_some() {
+        // Reconcile the deployed files before accepting launch confirmation. A
+        // missing/changed package can revoke ownership or disable its MCP here.
+        blocking(state.engine.clone(), |e| {
+            crate::plugin_workflow::reconcile_deployments(&e)?;
+            Ok(())
+        })
+        .await?;
+    }
     state
         .mcp_connections
         .connect(
@@ -196,7 +208,7 @@ pub async fn mcp_server_start(
     confirmation: String,
 ) -> AppResult<crate::mcp_server::McpServerStatus> {
     if confirmation != "START_LOCAL_MCP" {
-        return Err(AppError::Denied("需在桌面确认开启本地 MCP 服务".into()));
+        return Err(AppError::Denied("需在桌面确认开启本地工具".into()));
     }
     server.start_desktop(&state.mcp_connections).await
 }
@@ -521,7 +533,6 @@ pub async fn preview_game_identity(
 #[tauri::command]
 pub async fn search_game_identity(
     state: State<'_, AppServices>,
-    agent: State<'_, AgentRuntime>,
     directory: std::path::PathBuf,
     expected_fingerprint: String,
     public_query: String,
@@ -529,7 +540,7 @@ pub async fn search_game_identity(
 ) -> AppResult<crate::game_identity::GameIdentitySearch> {
     crate::game_identity::search(
         &state.engine,
-        &agent.settings,
+        &state.runtime,
         &directory,
         &expected_fingerprint,
         &public_query,
@@ -879,15 +890,85 @@ pub async fn install_plugin(
 }
 
 #[tauri::command]
-pub async fn prepare_plugin_publication(
+pub async fn list_manager_plugin_games(
+    query: Option<String>,
+) -> AppResult<crate::manager_catalog::CatalogSearch> {
+    crate::manager_catalog::search(query.as_deref().unwrap_or("")).await
+}
+
+#[tauri::command]
+pub async fn preview_manager_plugin(
     state: State<'_, AppServices>,
-    draft_id: String,
-    metadata: crate::plugin_publish::PublicationMetadata,
-) -> AppResult<crate::plugin_publish::PublicationRecord> {
-    blocking(state.engine.clone(), move |engine| {
-        let (preview, _) = crate::plugin_publish::prepare_package(&engine, &draft_id, metadata)?;
-        crate::plugin_publish::create_publication(&engine, &preview)
+    plugin_id: String,
+    release_id: String,
+) -> AppResult<crate::manager_catalog::CatalogPreview> {
+    crate::manager_catalog::preview(&state.engine, &plugin_id, &release_id).await
+}
+
+#[tauri::command]
+pub async fn prepare_manager_plugin_import(
+    state: State<'_, AppServices>,
+    plugin_id: String,
+    release_id: String,
+) -> AppResult<crate::manager_catalog::CatalogImport> {
+    crate::manager_catalog::prepare_import(&state.engine, &plugin_id, &release_id).await
+}
+
+#[tauri::command]
+pub async fn prepare_manager_publication(
+    state: State<'_, AppServices>,
+    draft_id: Option<String>,
+    slug: Option<String>,
+    target: crate::manager_publication::PublicationTarget,
+    tags: Vec<String>,
+) -> AppResult<crate::manager_publication::PublicationRecord> {
+    blocking(state.engine.clone(), move |engine| match (draft_id, slug) {
+        (Some(id), None) => crate::manager_publication::prepare_draft(&engine, &id, target, tags),
+        (None, Some(slug)) => {
+            crate::manager_publication::prepare_installed(&engine, &slug, target, tags)
+        }
+        _ => Err(AppError::Invalid("请选择一个草稿或已安装适配包".into())),
     })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_manager_publications(
+    state: State<'_, AppServices>,
+) -> AppResult<Vec<crate::manager_publication::PublicationRecord>> {
+    blocking(state.engine.clone(), |engine| {
+        crate::manager_publication::list_publications(&engine)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_my_manager_plugins(
+    agent: State<'_, AgentRuntime>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+) -> AppResult<Vec<crate::manager_publication::PublishedPlugin>> {
+    crate::manager_publication::list_own_plugins(
+        &agent.settings,
+        limit.unwrap_or(20),
+        offset.unwrap_or(0),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn reconcile_manager_publication(
+    state: State<'_, AppServices>,
+    agent: State<'_, AgentRuntime>,
+    id: String,
+) -> AppResult<crate::manager_publication::ReconciliationOutcome> {
+    crate::manager_publication::reconcile_publication(
+        &state.engine,
+        &agent.settings,
+        &id,
+        &tokio_util::sync::CancellationToken::new(),
+    )
     .await
 }
 
@@ -917,24 +998,26 @@ pub async fn reconcile_plugin_publication(
 }
 
 #[tauri::command]
-pub async fn publish_plugin(
+pub async fn publish_manager_publication(
     state: State<'_, AppServices>,
     agent: State<'_, AgentRuntime>,
     id: String,
     digest: String,
     confirmation: String,
-) -> AppResult<crate::plugin_publish::PublicationRecord> {
+) -> AppResult<crate::manager_publication::PublicationRecord> {
     if confirmation != "PUBLISH_PLUGIN" {
-        return Err(AppError::Denied("发布适配包需要明确确认上传预览".into()));
+        return Err(AppError::Denied(
+            "发布管理器插件需要确认目标和文件原文".into(),
+        ));
     }
     let engine = state.engine.clone();
     let approve_id = id.clone();
     let approve_digest = digest.clone();
     blocking(engine.clone(), move |engine| {
-        crate::plugin_publish::approve_publication(&engine, &approve_id, &approve_digest)
+        crate::manager_publication::approve_publication(&engine, &approve_id, &approve_digest)
     })
     .await?;
-    crate::plugin_publish_remote::publish_approved(
+    crate::manager_publication::publish_approved(
         &engine,
         &agent.settings,
         &id,

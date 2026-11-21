@@ -15,8 +15,7 @@
     "prepare:mcp-runtime": "node scripts/prepare-mcp-runtime.mjs",
     "tauri": "tauri",
     "icons": "tauri icon app-icon.png --output src-tauri/icons",
-    "typecheck": "tsc --noEmit",
-    "test:ui": "playwright test"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.90.2",
@@ -44,6 +43,7 @@
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.1",
     "@vitejs/plugin-react": "^5.1.0",
+    "playwright-core": "1.65.1",
     "tailwindcss": "^4.1.17",
     "typescript": "^5.9.3",
     "vite": "^7.2.1"

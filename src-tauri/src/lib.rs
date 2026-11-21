@@ -21,6 +21,10 @@ pub mod imports;
 pub mod install;
 pub mod install_dependencies;
 mod install_file_evidence;
+pub mod manager_catalog;
+#[cfg(test)]
+mod manager_plugin_roundtrip_tests;
+pub mod manager_publication;
 pub mod mcp;
 pub mod mcp_connections;
 pub mod mcp_server;
@@ -68,10 +72,16 @@ pub fn run() {
             commands::delete_plugin_draft,
             commands::validate_plugin,
             commands::install_plugin,
-            commands::prepare_plugin_publication,
+            commands::list_manager_plugin_games,
+            commands::preview_manager_plugin,
+            commands::prepare_manager_plugin_import,
+            commands::list_manager_publications,
+            commands::prepare_manager_publication,
+            commands::publish_manager_publication,
+            commands::reconcile_manager_publication,
+            commands::list_my_manager_plugins,
             commands::list_plugin_publications,
             commands::reconcile_plugin_publication,
-            commands::publish_plugin,
             commands::list_skills,
             commands::get_skill,
             commands::plan_install_skill,
@@ -169,9 +179,10 @@ pub fn run() {
             let services = app::AppServices::initialize_paths(paths, runtime)?;
             app.manage(location);
             let handle = app.handle().clone();
-            let agent = agent::runtime::AgentRuntime::new(
+            let agent = agent::runtime::AgentRuntime::with_runtime(
                 services.engine.clone(),
                 settings::Settings::with_secret_store(services.engine.db.clone(), credentials),
+                services.runtime.clone(),
                 std::sync::Arc::new(move |event| {
                     use tauri::Emitter;
                     let _ = handle.emit(&format!("agent://{}", event.kind), event);
@@ -179,6 +190,18 @@ pub fn run() {
             )?;
             let local = mcp_server::LocalMcpServer::new(agent.clone());
             let connections = services.mcp_connections.clone();
+            {
+                use tauri::Emitter;
+                let connections = connections.clone();
+                let registry = agent.registry.clone();
+                let servers = mcp::McpServers::new(services.engine.db.clone());
+                let handle = app.handle().clone();
+                services.engine.set_plugin_mcp_change_handler(move |slug| {
+                    connections.invalidate_plugin(&registry, &servers, slug);
+                    // Settings uses the same refetch path for restoration and revocation.
+                    let _ = handle.emit("mcp://restore-progress", ());
+                });
+            }
             app.manage(local.clone());
             app.manage(agent.clone());
             app.manage(services);

@@ -96,6 +96,26 @@ pub fn record(
     )
 }
 
+/// These IDs come from the approved call to the official Mod Inn MCP endpoint.
+pub(crate) fn record_glossmod_file(
+    engine: &FileEngine,
+    artifact: &DownloadArtifact,
+    work_id: u64,
+    file_id: u64,
+) -> AppResult<()> {
+    record_with_metadata(
+        engine,
+        artifact,
+        CatalogMetadata {
+            source_id: "glossmod_http",
+            project_id: &work_id.to_string(),
+            version_id: &file_id.to_string(),
+            name: &artifact.filename,
+            version: "",
+        },
+    )
+}
+
 /// Records a completed download from the reviewed direct-web workflow.
 pub(crate) fn record_web(engine: &FileEngine, artifact: &DownloadArtifact) -> AppResult<()> {
     record_with_metadata(

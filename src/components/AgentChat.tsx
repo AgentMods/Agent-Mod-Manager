@@ -1,6 +1,6 @@
 import { displayToolArguments, displayToolResult } from "@/lib/agent-path-presentation";
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -10,6 +10,7 @@ import {
   CheckIcon,
   CircleCheckIcon,
   CircleDotIcon,
+  CircleXIcon,
   CopyIcon,
   FolderIcon,
   LoaderCircleIcon,
@@ -20,7 +21,7 @@ import {
   TriangleAlertIcon,
 } from "lucide-react";
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
-import { activeTurn, isQuestionRequest, replayConversation, trackAgentTurn, useAgent } from "../lib/agent-store";
+import { activeTurn, describeAgentTools, isQuestionRequest, latestHistoryRewrite, pendingToolApproval, replayConversation, trackAgentTurn, useAgent, type AgentToolActivity } from "../lib/agent-store";
 import { useUI } from "../lib/store";
 import type { AgentAttachment, AgentEvent, AppSettings, ComposerPreferences, Conversation, Game, Message as ChatMessage, PermissionMode, ReasoningEffort } from "../lib/types";
 import { readyAttachment, usePrepareAttachments, type DraftAttachment } from "@/lib/agent-attachments";
@@ -43,9 +44,11 @@ import {
   TraceTitle,
 } from "@/components/ui/trace";
 import { cn } from "@/lib/utils";
+import { AgentConfirmation } from "./AgentConfirmation";
 import { AgentComposer } from "./AgentComposer";
 import { AgentConversationList } from "./AgentConversationList";
 import { AgentQuestionnaire, describeQuestionnaire, QuestionnaireTrace, type Answer } from "./AgentQuestionnaire";
+import { useDidChange } from "@/lib/motion";
 
 const EMPTY_EVENTS: AgentEvent[] = [];
 const EMPTY_CONVERSATIONS: Conversation[] = [];
@@ -70,7 +73,7 @@ export function AgentChat() {
   const setConversation = useUI((s) => s.setConversation);
   const client = useQueryClient();
   const [composer, setComposer] = useState(() => emptyDraft(adapterChat?.prompt));
-  const [submitting, setSubmitting] = useState(false);
+  const [submitting, setSubmitting] = useState<"start" | "restart" | null>(null);
   const submittingRef = useRef(false);
   const composerInput = useRef<HTMLTextAreaElement>(null);
   const [edit, setEdit] = useState<(typeof composer & { conversationId: string; messageId: string }) | null>(null);
@@ -84,7 +87,21 @@ export function AgentChat() {
   const milestones = useAgent((s) => conversationId ? s.milestones[conversationId] || EMPTY_EVENTS : EMPTY_EVENTS);
   const turn = activeTurn(milestones);
   const conversations = useBackendQuery<Conversation[]>(["conversations", false], "list_conversations", { archived: false });
-  const detail = useBackendQuery<{ conversation: Conversation; messages: ChatMessage[] }>(["conversation", conversationId], "get_conversation", { id: conversationId }, !!conversationId);
+  const rewrite = useMemo(() => latestHistoryRewrite(milestones), [milestones]);
+  const detail = useQuery({
+    // A read issued before the rewrite committed must not repopulate the new snapshot.
+    queryKey: ["conversation", conversationId, ...(rewrite ? [rewrite.seq] : [])],
+    queryFn: () => api<{ conversation: Conversation; messages: ChatMessage[] }>("get_conversation", { id: conversationId }),
+    enabled: backendAvailable && !!conversationId,
+    retry: false,
+    placeholderData: (previous) => {
+      if (!rewrite || !previous || previous.conversation.id !== conversationId) return undefined;
+      // The restart anchors the retained user message, whose text/attachments may
+      // have been edited. Keep only the prefix that is known not to have changed.
+      const target = previous.messages.findIndex(({ id }) => id === rewrite.messageId);
+      return { ...previous, messages: previous.messages.slice(0, Math.max(0, target)) };
+    },
+  });
   const games = useBackendQuery<Game[]>(["games"], "list_games");
   const settings = useBackendQuery<AppSettings>(["settings"], "get_settings");
   const preferences = useBackendQuery<ComposerPreferences>(["composer-preferences"], "get_composer_preferences");
@@ -98,7 +115,7 @@ export function AgentChat() {
   const reasoningEffort = effortSelection && effortSelection.model === selectedModel && levels.includes(effortSelection.level)
     ? effortSelection.level : null;
   const end = useRef<HTMLDivElement>(null);
-  const busy = submitting || !!turn;
+  const busy = !!submitting || !!turn;
   const activeEdit = edit?.conversationId === conversationId ? edit : null;
   const draft = activeEdit ?? composer;
   function updateAttachments(apply: (items: DraftAttachment[]) => DraftAttachment[]) {
@@ -185,9 +202,9 @@ export function AgentChat() {
 
   async function send(content: string, options: { attachments?: AgentAttachment[]; restart?: { messageId: string; edit: boolean }; questionnaire?: boolean } = {}) {
     const { attachments, restart, questionnaire } = options;
-    if (busy || submittingRef.current || (!restart && !content && !attachments?.length) || archivedConversation) return false;
+    if (busy || submittingRef.current || (restart ? !conversationId : !content && !attachments?.length) || archivedConversation) return false;
     submittingRef.current = true;
-    setSubmitting(true); setError(null);
+    setSubmitting(restart ? "restart" : "start"); setError(null);
     // The native request may finish starting after the user opens a different chat.
     let selectedAtSubmit = conversationId;
     let started = false;
@@ -206,7 +223,7 @@ export function AgentChat() {
       }
       const request = { conversationId: id, content, ...(attachments && { attachments }), permissionMode: permission || null, model: selectedModel && selectedModel !== model ? selectedModel : null, reasoningEffort };
       if (restart) {
-        id = await api<string>("restart_turn", { request, ...restart });
+        await api<string>("restart_turn", { request, ...restart });
         trackAgentTurn(id);
       } else {
         const turnId = await api<string>("start_turn", { request });
@@ -220,12 +237,14 @@ export function AgentChat() {
       // Remembering the choice must never fail an already-started turn.
       api("set_composer_preferences", { preferences: remembered }).catch(() => undefined);
       if (stillSelected() && !questionnaire) {
-        setConversation(id);
         setEdit(null);
-        if (!restart || restart.edit) setComposer(emptyDraft());
-        else setComposer((current) => ({ ...current, attachments: [] }));
+        // Restarting rewrites the current chat, not the unrelated unsent draft.
+        if (!restart) {
+          setConversation(id);
+          setComposer(emptyDraft());
+        }
       }
-      await replayConversation(id);
+      await replayConversation(id, { afterPending: !!restart });
       await client.invalidateQueries({ queryKey: ["conversation", id] });
       await client.invalidateQueries({ queryKey: ["conversations"] });
     } catch (failure) {
@@ -233,7 +252,7 @@ export function AgentChat() {
       if (useUI.getState().view === "agent" && stillSelected()) setError(failure);
       else useUI.getState().notify(String(failure));
     }
-    finally { submittingRef.current = false; setSubmitting(false); }
+    finally { submittingRef.current = false; setSubmitting(null); }
     return started; // A failed refresh cannot undo a successfully started turn.
   }
 
@@ -244,14 +263,14 @@ export function AgentChat() {
   }
 
   const archivedConversation = !!detail.data?.conversation.archived;
-  const { questions, pendingQuestion, tools, toolsByMessage, questionsByMessage } = useMemo(() => {
+  const { questions, pendingQuestion, tools, awaitingApproval, toolsByMessage, questionsByMessage } = useMemo(() => {
     const questions = milestones.filter(isQuestionRequest).map((request) =>
       describeQuestionnaire(request, milestones, archivedConversation, submittedAnswers.get(request)));
-    const questionTools = new Set(questions.map(({ request }) => request.payload.toolCallId));
-    const tools = milestones.filter((event) => event.kind === "tool-start" && !questionTools.has(event.payload.toolCallId));
+    const tools = describeAgentTools(milestones);
     return {
       questions, tools, pendingQuestion: questions.find(({ outcome, valid }) => !outcome && valid),
-      toolsByMessage: groupByMessage(tools, (event) => event.messageId),
+      awaitingApproval: tools.some(pendingToolApproval),
+      toolsByMessage: groupByMessage(tools, ({ event }) => event.messageId),
       questionsByMessage: groupByMessage(questions, ({ request }) => request.messageId),
     };
   }, [milestones, archivedConversation, submittedAnswers]);
@@ -283,15 +302,21 @@ export function AgentChat() {
     void replayConversation(request.conversationId).catch((failure) => toast.error(errorText(failure)));
   }
 
+  const renderTool = (tool: AgentToolActivity) => {
+    const request = pendingToolApproval(tool);
+    return request && !archivedConversation
+      ? <AgentConfirmation key={request.seq} request={request} />
+      : <ToolTrace key={tool.event.seq} tool={tool} />;
+  };
   const renderQuestion = (questionnaire: (typeof questions)[number]) => <QuestionnaireTrace
     key={questionnaire.request.seq} questionnaire={questionnaire} disabled={busy || !!activeQuestion}
     onReanswer={writableChat ? () => setReanswerRequest(questionnaire.request) : undefined} />;
   const title = detail.data?.conversation.title || "Agent 对话";
   const conversationGame = detail.data ? detail.data.conversation.game_id : gameId;
   const gameName = adapterChat?.label ?? (games.data?.find((game) => game.id === conversationGame)?.name || "全部游戏");
-  const hasMessages = messages.length > 0 || unlinkedErrors.length > 0 || questions.length > 0;
+  const hasMessages = messages.length > 0 || tools.length > 0 || unlinkedErrors.length > 0 || questions.length > 0;
 
-  return <div className="agent-chat-shell flex h-full min-h-0 flex-col overflow-hidden bg-background md:flex-row">
+  return <div className="agent-chat-shell flex h-full min-h-0 flex-col overflow-hidden bg-background motion-safe:animate-soft-fade md:flex-row">
     <aside className="agent-chat-sidebar flex max-h-44 shrink-0 flex-col border-b bg-sidebar/70 md:max-h-none md:w-72 md:border-r md:border-b-0">
       <div className="flex items-center gap-2 border-b px-4 py-3">
         <div className="flex size-8 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground">
@@ -303,12 +328,12 @@ export function AgentChat() {
         </div>
       </div>
       <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-3">
-        <Button className="w-full justify-start gap-2 rounded-lg" onClick={() => selectConversation(null)} disabled={submitting}>
+        <Button className="w-full justify-start gap-2 rounded-lg" onClick={() => selectConversation(null)} disabled={submitting === "start"}>
           <MessageSquarePlusIcon data-icon="inline-start" />
           新建对话
         </Button>
         <AgentConversationList conversations={conversations.data ?? EMPTY_CONVERSATIONS} selectedId={conversationId}
-          disabled={submitting} onSelect={selectConversation} />
+          disabled={submitting === "start"} onSelect={selectConversation} />
         <div className="mt-auto hidden flex-col gap-2 border-t pt-3 md:flex">
           <div className="flex items-center gap-2 px-2 text-xs font-medium text-muted-foreground"><FolderIcon className="size-3.5" />工作区</div>
           <div className="flex items-center gap-2 rounded-md bg-sidebar-accent/60 px-2.5 py-2 text-sm">
@@ -329,7 +354,7 @@ export function AgentChat() {
         </div>
         <div className="flex max-w-[45%] flex-col items-end gap-0.5">
           <Badge className="min-w-0" tone={busy ? "warning" : "neutral"}>
-            <span className="truncate">{pendingQuestion ? "等待你的回答" : busy ? "运行中" : selectedModelLabel || "未配置模型"}</span>
+            <span className="truncate">{pendingQuestion ? "等待你的回答" : awaitingApproval ? "等待授权" : busy ? "运行中" : selectedModelLabel || "未配置模型"}</span>
           </Badge>
           {totalTokens !== undefined && <span className="whitespace-nowrap text-xs text-muted-foreground tabular-nums">{totalTokens.toLocaleString()} tokens</span>}
         </div>
@@ -337,8 +362,9 @@ export function AgentChat() {
 
       <div className="relative min-h-0 flex-1 overflow-y-auto" aria-live="polite" aria-relevant="additions text">
         <div className={cn("mx-auto flex min-h-full w-full max-w-4xl flex-col px-4 py-6 sm:px-8", hasMessages ? "gap-2" : "justify-center")}>
-          {!hasMessages && <div className="mx-auto flex max-w-xl flex-col items-center gap-4 pb-32 text-center">
-            <div className="flex size-14 items-center justify-center rounded-2xl border bg-card shadow-sm">
+          {!hasMessages && <div className="mx-auto flex max-w-xl flex-col items-center gap-4 pb-32 text-center motion-safe:animate-rise-in">
+            <div className="relative flex size-14 items-center justify-center rounded-2xl border bg-card shadow-sm motion-safe:animate-float">
+              <span aria-hidden="true" className="absolute inset-0 rounded-2xl border border-primary/40 motion-safe:animate-soft-ping" />
               <BotIcon aria-hidden="true" className="size-7 text-primary" />
             </div>
             <div className="flex flex-col gap-2">
@@ -353,9 +379,9 @@ export function AgentChat() {
             const hasContent = Boolean(message.content.trim());
             const attachments = message.attachments ?? [];
             const hasAttachments = attachments.length > 0;
-            const canAct = backendAvailable && !!conversationId && !busy && !activeQuestion && !archivedConversation;
+            const canAct = writableChat && !detail.isPlaceholderData && !busy && !activeQuestion;
             return <Fragment key={message.id}>
-              <article className={cn("chat-message", message.role)}>
+              <article className={cn("chat-message motion-safe:animate-rise-in", message.role)}>
                 <Message align={isAssistant ? "start" : "end"}>
                   <MessageContent className={cn(isAssistant ? "max-w-3xl" : "max-w-[min(80%,36rem)]")}>
                     {message.reasoning && <ReasoningTrace reasoning={message.reasoning} streaming={message.id === streamingReplyId} />}
@@ -369,7 +395,7 @@ export function AgentChat() {
                         </div>
                       </BubbleContent>
                     </Bubble>
-                    {toolsByMessage.get(message.id)?.map((event) => <ToolTrace key={event.seq} event={event} events={milestones} />)}
+                    {toolsByMessage.get(message.id)?.map(renderTool)}
                     {questionsByMessage.get(message.id)?.map(renderQuestion)}
                     {isAssistant && <TurnError message={failure} />}
                     {(hasContent || hasAttachments || failure) && <MessageFooter className="mt-1" role="group" aria-label="消息操作">
@@ -388,10 +414,10 @@ export function AgentChat() {
             </Fragment>;
           })}
 
-          {tools.filter((event) => !event.messageId || !visibleIds.has(event.messageId)).map((event) => <ToolTrace key={event.seq} event={event} events={milestones} />)}
+          {tools.filter(({ event }) => !event.messageId || !visibleIds.has(event.messageId)).map(renderTool)}
           {questions.filter(({ request }) => !request.messageId || !visibleIds.has(request.messageId)).map(renderQuestion)}
           {unlinkedErrors.map(({ seq, message }) => <div className="chat-message" key={seq}><TurnError message={message} /></div>)}
-          {busy && !pendingQuestion && <Trace className="max-w-3xl"><TraceLine status="running"><TraceIcon><LoaderCircleIcon className="animate-spin" /></TraceIcon><TraceTitle>正在处理请求</TraceTitle></TraceLine></Trace>}
+          {busy && !pendingQuestion && !awaitingApproval && <Trace className="max-w-3xl motion-safe:animate-soft-fade"><TraceLine status="running"><TraceIcon><LoaderCircleIcon className="animate-spin" /></TraceIcon><TraceTitle>正在处理请求</TraceTitle><TypingDots /></TraceLine></Trace>}
           <ErrorState error={error || detail.error} />
           <div ref={end} />
         </div>
@@ -453,6 +479,13 @@ const MessageMarkdown = memo(function MessageMarkdown({ content, onError }: { co
   return <Markdown remarkPlugins={[remarkGfm]} components={components}>{content}</Markdown>;
 });
 
+/** Three dots that bob in turn while the Agent works. Decorative: the status text already says what is happening. */
+function TypingDots() {
+  return <span aria-hidden="true" className="flex items-center gap-0.5">
+    {[0, 1, 2].map((dot) => <span key={dot} className="size-1 rounded-full bg-current motion-safe:animate-dot-wave" style={{ animationDelay: `${dot * 150}ms` }} />)}
+  </span>;
+}
+
 function CopyMessage({ content }: { content: string }) {
   const [copied, setCopied] = useState(false);
   const reset = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -470,12 +503,13 @@ function CopyMessage({ content }: { content: string }) {
   }
 
   return <MessageAction label={copied ? "已复制" : "复制消息"} onClick={() => void copy()}>
-    {copied ? <CheckIcon aria-hidden="true" /> : <CopyIcon aria-hidden="true" />}
+    {copied ? <CheckIcon aria-hidden="true" className="motion-safe:animate-pop-in" /> : <CopyIcon aria-hidden="true" />}
   </MessageAction>;
 }
 
 function ReasoningTrace({ reasoning, streaming }: { reasoning: string; streaming: boolean }) {
   const [open, setOpen] = useState(streaming);
+  const finished = useDidChange(streaming);
 
   useEffect(() => {
     if (!streaming) setOpen(false);
@@ -485,7 +519,7 @@ function ReasoningTrace({ reasoning, streaming }: { reasoning: string; streaming
     <TraceCollapsible open={open} onOpenChange={setOpen}>
       <TraceCollapsibleTrigger>
         <TraceLine status={streaming ? "running" : undefined}>
-          <TraceIcon>{streaming ? <LoaderCircleIcon className="animate-spin" /> : <CircleCheckIcon />}</TraceIcon>
+          <TraceIcon>{streaming ? <LoaderCircleIcon className="animate-spin" /> : <CircleCheckIcon className={cn(finished && "motion-safe:animate-pop-in")} />}</TraceIcon>
           <TraceTitle>{streaming ? "思考中" : "思考过程"}</TraceTitle>
           <TraceDescription>{streaming ? "进行中" : "已完成"}</TraceDescription>
         </TraceLine>
@@ -506,27 +540,29 @@ function TurnError({ message }: { message?: string }) {
   </Alert>;
 }
 
-const ToolTrace = memo(function ToolTrace({ event, events }: { event: AgentEvent; events: AgentEvent[] }) {
-  const result = events.find((item) => item.kind === "tool-result" && item.payload.toolCallId === event.payload.toolCallId);
-  const approval = events.find((item) => item.kind === "approval-request" && item.payload.toolCallId === event.payload.toolCallId);
-  const resolved = approval && events.find((item) => item.kind === "approval-resolved" && item.payload.approvalId === approval.payload.approvalId);
-  const resultStatus = String(result?.payload.status || "");
-  const approvalStatus = String(resolved?.payload.status || "");
-  const failed = resultStatus === "error";
-  const denied = approvalStatus === "rejected" || approvalStatus === "cancelled";
-  const pending = !!approval && !resolved && !result;
-  const status = failed ? "error" : pending ? "pending" : !result && !denied ? "running" : undefined;
-  const label = failed ? "执行失败" : denied ? "已拒绝" : pending ? "等待审批" : result ? "已执行" : "正在执行";
+const ToolTrace = memo(function ToolTrace({ tool }: { tool: AgentToolActivity }) {
+  const { event, request, result, resolution, completion } = tool;
+  const name = event.payload.name ?? request?.payload.title;
+  const settled = useDidChange(!!result);
+  const rejected = resolution?.payload.status === "rejected" || result?.payload.status === "denied";
+  const cancelled = resolution?.payload.status === "cancelled" || result?.payload.status === "cancelled" ||
+    (!result && completion?.payload.status === "cancelled");
+  const failed = !rejected && !cancelled && result?.payload.status === "error";
+  const running = !result && !rejected && !cancelled && !completion;
+  const label = rejected ? "已拒绝" : cancelled ? "已取消" : failed ? "执行失败" : result ? "已执行"
+    : completion ? (completion.payload.status === "interrupted" ? "已中断" : "已结束")
+    : resolution?.payload.status === "approved" ? "已批准，正在执行" : "正在执行";
+  const Icon = failed ? TriangleAlertIcon : rejected || cancelled ? CircleXIcon : result ? CheckIcon : CircleDotIcon;
   const payload = useMemo(() => JSON.stringify({
-    arguments: displayToolArguments(event.payload.name, event.payload.arguments),
-    ...(result ? { result: displayToolResult(event.payload.name, result.payload.result) } : {}),
-  }, null, 2), [event, result]);
+    arguments: displayToolArguments(name, event.payload.arguments),
+    ...(result ? { result: displayToolResult(name, result.payload.result) } : {}),
+  }, null, 2), [event, name, result]);
   return <Trace>
-    <TraceCollapsible defaultOpen={pending || failed}>
+    <TraceCollapsible defaultOpen={failed}>
       <TraceCollapsibleTrigger>
-        <TraceLine status={status}>
-          <TraceIcon>{failed ? <TriangleAlertIcon /> : pending || !result ? <CircleDotIcon /> : <CheckIcon />}</TraceIcon>
-          <TraceTitle>{String(event.payload.name)}</TraceTitle>
+        <TraceLine status={failed ? "error" : running ? "running" : undefined}>
+          <TraceIcon><Icon className={cn(settled && "motion-safe:animate-pop-in")} /></TraceIcon>
+          <TraceTitle>{String(name)}</TraceTitle>
           <TraceDescription>{label}</TraceDescription>
         </TraceLine>
       </TraceCollapsibleTrigger>

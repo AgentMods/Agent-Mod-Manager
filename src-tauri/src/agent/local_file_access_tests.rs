@@ -152,6 +152,61 @@ async fn agent_can_inspect_game_parent_and_sibling_files_without_registering_the
 }
 
 #[tokio::test]
+async fn archive_sample_pages_keep_global_metadata_and_validate_unreturned_entries() {
+    let f = Fixture::new();
+    let ctx = f.agent();
+    let archive = f.external.join("sample.zip");
+    let make_zip = |second: &str| {
+        let mut zip = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+        for name in ["release/readme.txt", second] {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"fixture").unwrap();
+        }
+        zip.finish().unwrap();
+    };
+    make_zip("release/Mods/Sample/manifest.json");
+    let first = f
+        .call(&ctx, "extract_preview", json!({"path":archive, "limit":1}))
+        .await
+        .unwrap();
+    assert_eq!(first["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(first["entries"][0]["path"], "release/readme.txt");
+    assert_eq!(first["stripped_root"], "release");
+    assert_eq!(first["total_entries"], 2);
+    assert_eq!(first["next_offset"], 1);
+    let second = f
+        .call(
+            &ctx,
+            "extract_preview",
+            json!({"path":archive, "offset":first["next_offset"], "limit":1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        second["entries"][0]["path"],
+        "release/Mods/Sample/manifest.json"
+    );
+    assert_eq!(second["next_offset"], Value::Null);
+    assert_eq!(second["total_size"], first["total_size"]);
+    for limit in [0, 201] {
+        assert!(f
+            .call(
+                &ctx,
+                "extract_preview",
+                json!({"path":archive, "limit":limit})
+            )
+            .await
+            .is_err());
+    }
+    make_zip("../unsafe.txt");
+    assert!(f
+        .call(&ctx, "extract_preview", json!({"path":archive, "limit":1}))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
 async fn mixed_external_plan_is_reviewed_and_cannot_be_claimed_by_mcp() {
     let f = Fixture::new();
     let src = f.external.join("source.txt");

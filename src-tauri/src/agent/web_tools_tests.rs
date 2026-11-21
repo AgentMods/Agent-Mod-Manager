@@ -1,45 +1,25 @@
 use super::*;
-use crate::{
-    db::Db,
-    error::{AppError, AppResult},
-    settings::SecretStore,
-    storage::AppPaths,
-    transaction::FileEngine,
-};
-use std::sync::Arc;
+use crate::{db::Db, storage::AppPaths, transaction::FileEngine};
 use tokio_util::sync::CancellationToken;
 
-struct NoSecrets;
-
-impl SecretStore for NoSecrets {
-    fn read(&self, _: &str) -> AppResult<Option<String>> {
-        Ok(None)
-    }
-
-    fn write(&self, _: &str, _: &str) -> AppResult<()> {
-        Ok(())
-    }
-}
-
-fn fixture() -> (tempfile::TempDir, Settings, ToolContext) {
+fn fixture() -> (tempfile::TempDir, ToolContext) {
     let dir = tempfile::tempdir().unwrap();
     let paths = AppPaths::new(dir.path().join("data")).unwrap();
     let db = Db::open(&paths.db_file()).unwrap();
-    let settings = Settings::with_secret_store(db.clone(), Arc::new(NoSecrets));
     let context = ToolContext {
         engine: FileEngine::new(db, paths),
         cancel: CancellationToken::new(),
         progress: None,
         resolution_scope: crate::sources::resolutions::ResolutionScope::Desktop,
     };
-    (dir, settings, context)
+    (dir, context)
 }
 
 #[tokio::test]
 async fn registers_read_only_public_query_tool_and_reports_missing_configuration() {
-    let (_dir, settings, context) = fixture();
+    let (_dir, context) = fixture();
     let registry = ToolRegistry::default();
-    register(&registry, settings).unwrap();
+    register(&registry, McpRuntime::default()).unwrap();
     let tool = registry.get("web_search").unwrap();
     let definition = tool.definition();
     assert_eq!(definition.effect, Effect::Read);
@@ -57,21 +37,23 @@ async fn registers_read_only_public_query_tool_and_reports_missing_configuration
     let args = json!({"query":"public mod info", "count":3});
     let prepared = tool.prepare(&context, &args).await.unwrap();
     assert_eq!(prepared.effect, Effect::Read);
-    assert_eq!(prepared.preview["provider"], "brave");
+    assert_eq!(prepared.preview["provider"], "bing");
     assert_eq!(prepared.preview["count"], 3);
     assert_eq!(prepared.preview["untrustedResults"], true);
     assert!(prepared.preview.get("query").is_none());
 
     let result = tool.execute(&context, args, prepared).await.unwrap();
-    assert_eq!(result["provider"], "brave");
+    assert_eq!(result["provider"], "bing");
     assert_eq!(result["status"], "needs_configuration");
     assert_eq!(result["results"], json!([]));
 }
 
 #[tokio::test]
 async fn rejects_unknown_or_invalid_query_fields_and_obeys_cancellation() {
-    let (_dir, settings, context) = fixture();
-    let tool = WebSearchTool { settings };
+    let (_dir, context) = fixture();
+    let tool = WebSearchTool {
+        runtime: McpRuntime::default(),
+    };
 
     for args in [
         json!({"query":"public terms", "extra":"must reject"}),

@@ -57,9 +57,7 @@ const markitdownPreset = {
   name: "MarkItDown MCP",
   transport: "stdio",
   command: "uvx",
-  args: [
-    "--with", "azure-ai-contentunderstanding==1.2.0b3", "markitdown-mcp==0.0.1a8",
-  ],
+  args: ["--prerelease", "allow", "markitdown-mcp@latest"],
   url: null,
   env_secret_refs: {},
   bearer_secret_ref: null,
@@ -67,14 +65,18 @@ const markitdownPreset = {
   builtin: true,
 };
 
-async function installMarkitdownMock(page: Page) {
-  await page.addInitScript((preset) => {
+type MarkitdownMockOptions = {holdConnect?: boolean; failConnect?: string};
+
+async function installMarkitdownMock(page: Page, {holdConnect = false, failConnect}: MarkitdownMockOptions) {
+  await page.addInitScript(({preset, holdConnect, failConnect}) => {
     window.addEventListener("DOMContentLoaded", () => {
       const target = window as any;
       const fixture = target.__AMM_TEST__;
       const tauri = target.__TAURI_INTERNALS__;
       const originalInvoke = tauri.invoke.bind(tauri);
       let config = preset;
+      const connection = {failConnect, finishConnect: undefined as (() => void) | undefined};
+      target.__AMM_MARKITDOWN_TEST__ = connection;
       tauri.invoke = async (command: string, args: any = {}, ...rest: unknown[]) => {
         if (command === "mcp_list") {
           fixture.calls.push({command, args});
@@ -87,17 +89,19 @@ async function installMarkitdownMock(page: Page) {
         }
         if (command === "mcp_connect") {
           fixture.calls.push({command, args});
+          if (holdConnect) await new Promise<void>((resolve) => { connection.finishConnect = resolve; });
+          if (connection.failConnect) throw new Error(connection.failConnect);
           return {serverId: args.expectedConfig.id, tools: []};
         }
         return originalInvoke(command, args, ...rest);
       };
     }, {once: true});
-  }, markitdownPreset);
+  }, {preset: markitdownPreset, holdConnect, failConnect});
 }
 
-async function openAgent(page: Page, outcomes: ConversionOutcome[] = [], withMarkitdownPreset = false) {
+async function openAgent(page: Page, outcomes: ConversionOutcome[] = [], markitdown?: MarkitdownMockOptions) {
   await installAttachmentMock(page, outcomes);
-  if (withMarkitdownPreset) await installMarkitdownMock(page);
+  if (markitdown) await installMarkitdownMock(page, markitdown);
   await page.goto("/");
   await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await expect(page.getByRole("textbox", {name: "告诉 Agent 你想做什么", exact: true})).toBeVisible();
@@ -205,7 +209,7 @@ test("转换未完成时切换会话，迟到结果不会进入新会话", async
   expect(await commandCalls(page, "start_turn")).toEqual([]);
 });
 
-test("首次使用 MarkItDown 可取消后再确认，连接后自动重试多文件", async ({page}) => {
+test("添加文档不会授权启动，点击 MarkItDown 按钮后直接连接并自动重试多文件", async ({page}) => {
   const firstMarkdown = "# First document";
   const secondMarkdown = "# Second document";
   await openAgent(page, [
@@ -213,7 +217,7 @@ test("首次使用 MarkItDown 可取消后再确认，连接后自动重试多�
     {kind: "consent", message: "需要确认启动 MarkItDown MCP"},
     {kind: "resolve", markdown: firstMarkdown},
     {kind: "resolve", markdown: secondMarkdown},
-  ], true);
+  ], {holdConnect: true});
 
   const composer = page.getByRole("textbox", {name: "告诉 Agent 你想做什么", exact: true});
   await composer.fill("请读取这两份文件");
@@ -229,22 +233,20 @@ test("首次使用 MarkItDown 可取消后再确认，连接后自动重试多�
   await expect(page.getByRole("button", {name: "发送消息", exact: true})).toBeDisabled();
   await expect.poll(async () => (await commandCalls(page, "convert_agent_attachment")).length).toBe(2);
 
-  await launchButton.click();
-  let dialog = page.getByRole("dialog", {name: "启动 MarkItDown MCP", exact: true});
-  await expect(dialog).toBeVisible();
-  await expect(dialog).toContainText([markitdownPreset.command, ...markitdownPreset.args].join(" "));
-  await dialog.getByRole("button", {name: "取消", exact: true}).click();
-  await expect(dialog).toHaveCount(0);
+  expect(await commandCalls(page, "mcp_list")).toEqual([]);
   expect(await commandCalls(page, "mcp_update")).toEqual([]);
   expect(await commandCalls(page, "mcp_connect")).toEqual([]);
 
   await launchButton.click();
-  dialog = page.getByRole("dialog", {name: "启动 MarkItDown MCP", exact: true});
-  await expect(dialog).toContainText([markitdownPreset.command, ...markitdownPreset.args].join(" "));
-  await dialog.getByRole("button", {name: "启动并转换", exact: true}).click();
-  await expect(dialog).toHaveCount(0);
+  await expect(launchButton).toBeDisabled();
+  await expect(launchButton).toHaveAttribute("aria-busy", "true");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect.poll(async () => (await commandCalls(page, "mcp_connect")).length).toBe(1);
+  expect(await commandCalls(page, "convert_agent_attachment")).toHaveLength(2);
+  await page.evaluate(() => (window as any).__AMM_MARKITDOWN_TEST__.finishConnect());
 
   await expect.poll(async () => (await commandCalls(page, "convert_agent_attachment")).length).toBe(4);
+  await expect(launchButton).toHaveCount(0);
   await expect(page.getByRole("button", {name: "发送消息", exact: true})).toBeEnabled();
   const enabledPreset = {...markitdownPreset, enabled: true};
   expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls
@@ -263,6 +265,48 @@ test("首次使用 MarkItDown 可取消后再确认，连接后自动重试多�
     {kind: "document", name: "first.md", markdown: firstMarkdown},
     {kind: "document", name: "second.md", markdown: secondMarkdown},
   ]);
+});
+
+test("MarkItDown 启动期间切换会话，不会自动重试新会话中的附件", async ({page}) => {
+  await openAgent(page, [
+    {kind: "consent", message: "需要确认启动 MarkItDown MCP"},
+    {kind: "consent", message: "需要确认启动 MarkItDown MCP"},
+  ], {holdConnect: true});
+  const fileInput = page.locator('input[type="file"]');
+  const launchButton = page.getByRole("button", {name: "启动 MarkItDown MCP", exact: true});
+  await fileInput.setInputFiles({name: "old.md", mimeType: "text/markdown", buffer: toBuffer("old")});
+  await launchButton.click();
+  await expect.poll(async () => (await commandCalls(page, "mcp_connect")).length).toBe(1);
+
+  await page.getByRole("button", {name: "新建对话", exact: true}).click();
+  await expect(page.getByText("old.md", {exact: true})).toHaveCount(0);
+  await fileInput.setInputFiles({name: "new.md", mimeType: "text/markdown", buffer: toBuffer("new")});
+  await expect(launchButton).toBeDisabled();
+  await page.evaluate(() => (window as any).__AMM_MARKITDOWN_TEST__.finishConnect());
+  await expect(launchButton).toBeEnabled();
+  await expect(page.getByText("等待启动 MarkItDown MCP", {exact: true})).toBeVisible();
+  expect(await commandCalls(page, "convert_agent_attachment")).toHaveLength(2);
+});
+
+test("MarkItDown 启动失败会在聊天中显示原因，可再次点击启动", async ({page}) => {
+  const failure = "MarkItDown 连接失败：fixture";
+  await openAgent(page, [
+    {kind: "consent", message: "需要确认启动 MarkItDown MCP"},
+    {kind: "resolve", markdown: "# Retried document"},
+  ], {failConnect: failure});
+  await page.locator('input[type="file"]').setInputFiles({name: "retry.md", mimeType: "text/markdown", buffer: toBuffer("retry source")});
+  const launchButton = page.getByRole("button", {name: "启动 MarkItDown MCP", exact: true});
+  await launchButton.click();
+  await expect(page.getByRole("alert").filter({hasText: failure})).toBeVisible();
+  await expect(launchButton).toBeEnabled();
+  expect(await commandCalls(page, "convert_agent_attachment")).toHaveLength(1);
+
+  await page.evaluate(() => { (window as any).__AMM_MARKITDOWN_TEST__.failConnect = undefined; });
+  await launchButton.click();
+  await expect(page.getByRole("button", {name: "发送消息", exact: true})).toBeEnabled();
+  await expect(page.getByRole("alert").filter({hasText: failure})).toHaveCount(0);
+  expect(await commandCalls(page, "mcp_connect")).toHaveLength(2);
+  expect(await commandCalls(page, "convert_agent_attachment")).toHaveLength(2);
 });
 
 test("剪贴板图片添加为附件，普通文本粘贴仍写入草稿", async ({page, context}) => {

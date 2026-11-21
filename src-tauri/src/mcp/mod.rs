@@ -3,6 +3,7 @@
 pub mod bridge;
 pub mod client;
 pub mod config;
+mod glossmod_download;
 mod redaction;
 mod runtime;
 
@@ -12,4 +13,4 @@ pub use config::{McpServers, McpTransport, ServerConfig};
 pub use runtime::McpRuntime;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

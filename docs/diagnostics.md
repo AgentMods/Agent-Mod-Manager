@@ -90,7 +90,7 @@ With Node, `curl`, JDK 21 (set `JAVA_HOME` as needed), and network access:
 ```sh
 node scripts/run-fabric-resolver-smoke.mjs
 AMM_FABRIC_SMOKE_DIR=/path/printed/by/script \
-  cargo test --manifest-path src-tauri/Cargo.toml --lib fabric_replays_real_resolver_smoke -- --ignored
+  node scripts/test-rust.mjs --lib fabric_replays_real_resolver_smoke -- --ignored
 ```
 
 The first command downloads checksum-pinned public Minecraft 1.21.1 and Fabric

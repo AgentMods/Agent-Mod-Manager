@@ -2,22 +2,26 @@
 
 The local marker scanner remains authoritative for adapter matching. Online
 search supplies untrusted evidence only, never executable instructions or an
-installation layout. This workflow does not need a configured language model;
-Brave Search requires the `sources.brave` credential in Settings.
+installation layout. This workflow does not need a configured language model
+or search API key. The app-provided built-in search opens Bing and is independent
+of the user-configurable Playwright MCP connection in Settings → Tools; that
+MCP connection does not need to be configured or enabled for game identification.
+Windows prefers the installed Microsoft Edge browser.
 
 ## Desktop Workflow
 
 1. Check a chosen game directory in the library. Low-confidence candidates
    offer online identification.
 2. Review the local name signals and editable public query. A separate consent
-   checkbox must be selected before the exact query is sent to Brave.
+   checkbox must be selected before the exact query is sent to Bing through the
+   app-provided browser.
 3. Choose a web result, correct the display name, and independently confirm
    directory registration. No candidate is automatically selected.
 
 Changing the search query discards results and both consents. Changing the
 selected candidate or display name clears registration consent. Closing the
 dialog discards consent; a refreshed local fingerprint also resets its state.
-Missing credentials and unavailable searches never become fabricated matches.
+Unavailable browser or search results never become fabricated matches.
 Registration does not attach an adapter or trigger a download or installation.
 
 ## Backend Contract
@@ -26,8 +30,10 @@ Registration does not attach an adapter or trigger a download or installation.
   matches, a metadata fingerprint and a suggested query. No game content is read.
 - `search_game_identity(directory, expectedFingerprint, publicQuery,
   confirmation)` requires the exact `SEARCH_GAME_IDENTITY` confirmation. It
-  validates consent, cancellation, query and fingerprint before accessing
-  credentials or the network.
+  validates consent, cancellation, query and fingerprint before starting the
+  built-in browser search. `needs_configuration` means the browser could not
+  start or required components are missing; `unavailable` means a network,
+  CAPTCHA or result-page parsing failure. Neither state produces candidates.
 - `confirm_game_identity(searchId, candidateIndex, name, confirmation)` requires
   `CONFIRM_GAME_IDENTITY`. It reloads stored evidence rather than trusting
   caller-supplied results and rechecks the directory before and after the write.
@@ -40,15 +46,16 @@ overlap and sensitive credential/system containers are denied. Standard
 Steam/Minecraft exceptions are limited to specific game directories, not all
 of macOS Library or Windows AppData.
 
-Only the reviewed public query reaches the fixed Brave endpoint. Local paths,
-signals and game bytes are not added to the request. Query validation rejects
-private paths, unsafe URL terms and known raw or URL-encoded credentials.
+Only the reviewed public query is entered into Bing through the app-provided
+browser. Local paths, signals and game bytes are not added to the query.
+Query validation rejects private paths, unsafe URL terms and known raw or
+URL-encoded credentials.
 Results reuse the bounded URL/text sanitization of the existing search service;
 the manager never fetches the result pages automatically.
 
 Search evidence lives in `game_identity_searches`. An available result can be
-reused for 24 hours only for the same root, fingerprint and query. Credentials
-must still be present; a missing key does not make cached candidates available.
+reused for 24 hours only for the same root, fingerprint and query. Unavailable
+browser searches never create or expose fabricated candidates.
 Record columns and a content digest are checked on load. The digest detects
 accidental/stale record modification; it is not a signature against an attacker
 who can rewrite the database and recompute it. New evidence invalidates earlier
@@ -66,7 +73,7 @@ registration. A changed directory, expired evidence or invalid index fails close
 
 `preview_game_identity` is local/read-only. `search_game_identity` uses the
 publication effect so default and AutoApprove sessions require review of the
-exact outbound query and destination. FullTrust still obeys validation and
+exact outbound query and Bing destination. FullTrust still obeys validation and
 path restrictions. The Agent cannot confirm or register the result; the user
 must do so in the desktop library. Neither identity tool is automatically added
 to the external MCP server's deliberate native-tool allowlist.
@@ -80,14 +87,13 @@ model. Exact prompts are in the ignored local artifact
 saved images are in its sibling `identity/` directory. Implemented screenshots
 are in `output/playwright/screenshots/*-identity-{light,dark}.png`.
 
-The backend has 16 focused tests, the Agent tools have 4, and a mock OpenAI SSE
-integration test rejects search approval under both review policies. Twelve
-Playwright cases cover independent consent, changed queries/names, reopened
-dialogs, missing keys, stale evidence and light/dark layouts at 1280, 1440 and
-390 pixels. The full Rust and frontend suites also pass as recorded in the
-implementation status document.
+Rust tests cover query consent, directory fingerprints, cache reuse and the
+original source of saved evidence. The Agent integration test rejects a search
+under both review policies. UI tests exercise consent, edited queries and
+names, reopened dialogs, missing browsers, service failures and both themes
+at 1280, 1440 and 390 pixels.
 
-No live authenticated Brave search or native Windows/Linux acceptance has been
-performed for this workflow. Fingerprints are metadata observations, not
-descriptor-held filesystem authority or proof of game compatibility. The
-project-wide descriptor-level TOCTOU hardening requirement remains open.
+A Windows live test returned Bing results through the bundled runtime and
+shared Rust search function. The full game-registration dialog was tested with
+mocked IPC. Directory fingerprints record filesystem metadata. Descriptor-level
+filesystem hardening remains open.

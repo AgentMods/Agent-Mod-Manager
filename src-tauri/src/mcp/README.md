@@ -32,9 +32,8 @@ servers.seed_presets()?;
 servers.write_secret(&settings, "mcp.glossmod_http.api_key", &token)?;
 servers.set_enabled("glossmod_http", true)?;
 let config = servers.get("glossmod_http")?;
-// Display config (command, arguments, endpoint, secret refs) and require the user
-// to confirm this connection. For stdio also require acknowledgement of the
-// unsandboxed OS-user process boundary; pass true only after acknowledgement.
+// The desktop Start action authorizes the displayed configuration.
+// Pass false here because this example uses HTTP.
 let consent = mcp::ConnectionConsent::after_user_confirmation(&config, false)?;
 let runtime = mcp::McpRuntime::default(); // HTTP does not need a bundled launcher.
 let client = mcp::McpClient::connect(servers, &settings, &config.id, consent, &runtime, &cancel).await?;
@@ -52,29 +51,39 @@ env/header credential fields. `env_json` stores env-name -> encrypted-Store
 references only. `write_secret` delegates to existing Settings/SecretStore;
 secret values enter neither SQLite nor config serialization/debug output.
 
-Presets configure third-party services; they do not bundle the runtimes:
+The presets below appear in Settings → 工具.
 
 - Mod客栈: Streamable HTTP at `https://www.glossmod.com/api/v1/mcp`, Bearer token
-  reference `mcp.glossmod_http.api_key`.
-- 3DM: `uvx glossmod-mcp`, environment `GLOSSMOD_API_KEY` resolved from reference
-  `mcp.glossmod_3dm.api_key` at launch.
+  reference `mcp.glossmod_http.api_key`. With no saved key the public tools are available to guests.
+- 3DM: Streamable HTTP at `https://mod.3dmgame.com/mcp`. Tool discovery works without an API key. Some queries require authentication.
+  If configured, `mcp.glossmod_3dm.api_key` supplies the raw `Authorization` header.
+
+| Mod source | Bundled uvx arguments | Settings → 工具 → 凭据 |
+| --- | --- | --- |
+| mod.io | `modio-mcp@latest` | Dashboard HTTPS `/v1` API path in `MODIO_API_BASE_URL` and matching `MODIO_API_KEY` |
+| CurseForge | `curseforge-mcp@latest` | `CURSEFORGE_API_KEY` from CurseForge for Studios |
+| GameBanana | `gamebanana-mcp@latest` | Anonymous |
+| Nexus Mods | `--upgrade --from glossmod-nexusmods-mcp nexusmods-mcp` | Anonymous public lookup, optional `NEXUSMODS_API_KEY` for account-authorized operations |
+
+Schema v9 migrates the stock 3DM stdio preset to the remote endpoint and revokes the old launch consent. Reconnect from Settings to use the new transport.
+
 - [Playwright MCP](https://github.com/microsoft/playwright-mcp):
   on Windows the preset uses the installed Microsoft Edge:
-  `npx.cmd --yes @playwright/mcp@0.0.85 --headless --isolated --no-webmcp --browser=msedge`.
-  macOS and Linux keep `npx --yes @playwright/mcp@0.0.85 --headless --isolated --no-webmcp`
+  `npx.cmd --yes @playwright/mcp@latest --headless --isolated --no-webmcp --browser=msedge`.
+  macOS and Linux keep `npx --yes @playwright/mcp@latest --headless --isolated --no-webmcp`
   (Chrome by default). Node.js and npm are bundled. The selected browser must be available separately.
-  To select a different browser, edit the arguments in Settings → MCP 服务.
+  The stock preset also passes `--file-paths=absolute` and `--output-dir` pointing to
+  `Agent Mod Manager/Playwright` under the user’s downloads directory or a user-writable fallback.
+  Schema v12 upgrades the old stock arguments; start the updated service once from Settings.
+  To select a different browser, edit the arguments in Settings → 工具.
   Uses a separate temporary browser profile;
   it does not attach to an existing signed-in browser. No API key is needed.
 - [MarkItDown MCP](https://github.com/microsoft/markitdown/tree/main/packages/markitdown-mcp):
-  `uvx --with azure-ai-contentunderstanding==1.2.0b3 markitdown-mcp==0.0.1a8`,
-  with bundled uv and a compatible Python (uv may download it). The explicit dependency pin lets uv resolve the
-  prerelease required by MarkItDown without allowing all prerelease packages.
+  `uvx --prerelease allow markitdown-mcp@latest`. This preset accepts prereleases for MarkItDown and its dependencies.
   Converts documents to Markdown via stdio, without an API key. Its `file:`
   URIs can read files available to the OS user, outside the manager's game roots.
 
-Enable and connect from Settings. For stdio, verify the displayed command and
-acknowledge its OS permissions before connecting. Bare `npx`, `npx.cmd`, `npx.exe`, `uvx` and `uvx.exe` (case-insensitive) use
+Click Start on a service in Settings to connect immediately. A stdio command runs with the current OS user’s permissions. Bare `npx`, `npx.cmd`, `npx.exe`, `uvx` and `uvx.exe` (case-insensitive) use
 application-owned launchers. Their child environments select npmmirror
 (`npm_config_registry`) or the Tsinghua PyPI mirror (`UV_DEFAULT_INDEX`).
 Explicit CLI registry options take precedence. MarkItDown inherits the bundled uvx default.
@@ -82,6 +91,9 @@ Other commands, including absolute paths, keep their own executable and package 
 MCP packages, Python interpreter downloads and browsers are separate from the launchers.
 Schema v4 revokes old auto-start consent for affected bare aliases, including custom connections,
 while preserving commands, arguments and credentials.
+Schema v11 updates the six stock package-backed presets to resolve current versions at launch.
+After migration, click Start once to restore automatic reconnection for each changed command.
+User-supplied commands and package arguments are preserved.
 Schema v6 removes the redundant index argument from the stock MarkItDown preset.
 Users who had enabled automatic startup confirm the updated command once. Custom commands,
 arguments and package indexes are preserved.
@@ -96,7 +108,7 @@ HTTP timeout in the child environment. A failed start can be retried from Settin
 
 ## Trust Boundary
 
-- All external tools are `Effect::ExternalWrite`, even when annotations claim
+- Generic external tools use `Effect::ExternalWrite`, even when annotations claim
   read-only behavior. `AgentRuntime` is responsible for approval before execute.
   Its existing explicit `FullTrust` policy bypasses external approval; this
   module does not claim an additional unforgeable approval capability.
@@ -108,8 +120,13 @@ HTTP timeout in the child environment. A failed start can be retried from Settin
   and registration. Stop, edit, disable or remove revokes the receipt. A failed
   restore leaves it available for the next launch, until explicitly cancelled.
   Agent registry registration never starts a process.
+- The official Mod 客栈 `get_work_file_download` has a desktop-only adapter. The approval
+  names the work and file IDs and covers signing and transferring that one archive.
+  `Effect::UncatalogedDownload` always requires approval. Only the adapter consumes the
+  signed URL, using the bounded public HTTPS downloader with no MCP authorization header.
+  The model and download catalog receive the resulting local artifact.
 - **stdio is NOT sandboxed.** Its command and descendants have the user's OS
-  filesystem/network permissions. User acknowledgement is mandatory. A malicious
+  filesystem/network permissions. The user authorizes the selected connection with Start. A malicious
   server can directly delete or alter local files outside FileEngine; per-tool
   approval cannot contain that process. Use only trusted executables/packages,
   or keep stdio disabled. A real OS sandbox/container is required for stronger
@@ -120,7 +137,7 @@ HTTP timeout in the child environment. A failed start can be retried from Settin
   Cancellation/disconnect kills the direct child, not a guaranteed hostile
   descendant process tree. Disconnect does not roll back external effects.
 - Each connection retains a private, non-Debug/non-Serialize credential filter
-  for the exact Bearer/env values resolved at startup, including after credential
+  for the exact HTTP and environment credential values resolved at startup, including after credential
   rotation. Before results reach Agent/history, it redacts strings, object keys,
   structured content, metadata and canonical JSON-escaped text as `[REDACTED]`.
   Both successful and `isError` results are filtered. Remote RPC/transport and
@@ -178,7 +195,7 @@ HTTP/stdio credential echo filtering (including quoted environment values),
 key rotation, `isError`/RPC errors, filtered history/tool-call persistence,
 provider errors and post-redaction expansion limits.
 Default tests use no production endpoint credentials or actual uvx invocation.
-Opt-in native smoke: `cargo test --lib live_markitdown_preset_initializes_and_lists_conversion_tool -- --ignored`
+Opt-in native smoke from the repository root: `node scripts/test-rust.mjs --lib live_markitdown_preset_initializes_and_lists_conversion_tool -- --ignored`
 (from `src-tauri`). It prepares the preset, initializes it and lists tools, but
 never converts a document or sends one to the server.
 

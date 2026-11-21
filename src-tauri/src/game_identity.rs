@@ -2,7 +2,7 @@
 use crate::{
     error::{AppError, AppResult},
     games::{self, Game, GameCandidate},
-    settings::Settings,
+    mcp::McpRuntime,
     sources::web_search::{self, WebSearchQuery, WebSearchResult, WebSearchStatus},
     transaction::FileEngine,
 };
@@ -24,6 +24,7 @@ const MAX_NAME_BYTES: usize = 512;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_EVIDENCE_BYTES: usize = 32 * 1024;
 const TTL_SECONDS: i64 = 24 * 60 * 60;
+const LEGACY_PROVIDER: &str = "brave";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -64,9 +65,16 @@ pub struct GameIdentitySearch {
     pub message: String,
     pub candidates: Vec<GameIdentityCandidate>,
     pub created_at: String,
+    // Legacy Brave records omitted this field. Keep their serialized bytes (and IDs) stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
 }
 
 impl GameIdentitySearch {
+    fn evidence_provider(&self) -> &str {
+        self.provider.as_deref().unwrap_or(LEGACY_PROVIDER)
+    }
+
     pub(crate) fn into_user_paths(mut self) -> Self {
         crate::paths::set_user_path_text(&mut self.root_path);
         self
@@ -394,7 +402,7 @@ pub fn preview(engine: &FileEngine, directory: &Path) -> AppResult<GameIdentityP
     Ok(GameIdentityPreview {
         root_path: crate::paths::display_path(&scan.root), fingerprint: scan.fingerprint,
         local_candidate: candidate, signals: scan.signals, suggested_query,
-        warnings: vec!["仅将你确认的公开搜索词发送给 Brave；本地名称信号留在本机。网页候选未经验证，不会自动关联适配包。".into()],
+        warnings: vec!["仅将你确认的公开搜索词发送给 Bing；本地名称信号留在本机。网页候选未经验证，不会自动关联适配包。".into()],
     })
 }
 
@@ -409,7 +417,7 @@ fn check_cancel(cancel: &CancellationToken) -> AppResult<()> {
 /// The only network request receives the reviewed query, never the snapshot.
 pub async fn search(
     engine: &FileEngine,
-    settings: &Settings,
+    runtime: &McpRuntime,
     directory: &Path,
     expected_fingerprint: &str,
     public_query: &str,
@@ -423,23 +431,11 @@ pub async fn search(
         public_query,
         confirmation,
         cancel,
-        || {
-            // Deferred until consent, cancellation, query and fingerprint validation.
-            // Missing credentials must report their real state even with a cache.
-            match settings.read_secret(web_search::SECRET_REF) {
-                Ok(Some(key)) if !key.trim().is_empty() && key.len() <= 4096 => {
-                    web_search::validate_query_secret(public_query, &key)?;
-                    Ok(true)
-                }
-                _ => Ok(false),
-            }
-        },
-        |query| async move { web_search::search(settings, &query, cancel).await },
+        |query| async move { web_search::search(runtime, &query, cancel).await },
     )
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn search_with<F, Fut>(
     engine: &FileEngine,
     directory: &Path,
@@ -447,7 +443,6 @@ async fn search_with<F, Fut>(
     query: &str,
     confirmation: &str,
     cancel: &CancellationToken,
-    use_cache: impl FnOnce() -> AppResult<bool>,
     provider: F,
 ) -> AppResult<GameIdentitySearch>
 where
@@ -468,23 +463,24 @@ where
         .to_str()
         .ok_or_else(|| invalid("Root must be UTF-8"))?;
     check_cancel(cancel)?;
-    if use_cache()? {
+    let cached = {
         let conn = engine.db.conn();
         let id: Option<String> = conn.query_row(
             "SELECT id FROM game_identity_searches WHERE root_path=?1 AND fingerprint=?2 AND query=?3 AND invalidated=0 ORDER BY created_at DESC LIMIT 1",
             params![root,expected_fingerprint,query.query], |row| row.get(0)).optional()?;
-        if let Some(id) = id {
-            if let Ok(cached) = load_evidence(&conn, &id) {
-                if cached.status == GameIdentityStatus::Available && !cached.candidates.is_empty() {
-                    drop(conn);
-                    check_cancel(cancel)?;
-                    if snapshot(engine, directory)?.fingerprint != scan.fingerprint {
-                        return Err(invalid("Directory changed"));
-                    }
-                    return Ok(cached);
-                }
-            }
+        id.and_then(|id| load_evidence(&conn, &id).ok())
+    };
+    // An earlier Brave search is confirmable by its ID, but cannot satisfy a Bing lookup.
+    if let Some(cached) = cached.filter(|cached| {
+        cached.evidence_provider() == web_search::PROVIDER
+            && cached.status == GameIdentityStatus::Available
+            && !cached.candidates.is_empty()
+    }) {
+        check_cancel(cancel)?;
+        if snapshot(engine, directory)?.fingerprint != scan.fingerprint {
+            return Err(invalid("Directory changed"));
         }
+        return Ok(cached);
     }
     check_cancel(cancel)?;
     if snapshot(engine, directory)?.fingerprint != scan.fingerprint {
@@ -524,6 +520,7 @@ where
         message: result.message.into(),
         candidates,
         created_at: Utc::now().to_rfc3339(),
+        provider: Some(result.provider.into()),
     };
     let digest = hex::encode(Sha256::digest(serde_json::to_vec(&evidence)?));
     evidence.id = format!("{}_{digest}", evidence.id);
@@ -649,7 +646,7 @@ pub fn confirm(
         name,
         json!({
             "searchId":search_id, "candidateIndex":candidate_index, "name":name,
-            "source":"brave", "url":candidate.url, "title":candidate.title, "snippet":candidate.snippet,
+            "source":evidence.evidence_provider(), "url":candidate.url, "title":candidate.title, "snippet":candidate.snippet,
             "confirmedAt":Utc::now().to_rfc3339(), "query":evidence.query, "fingerprint":evidence.fingerprint,
             "untrusted":true
         }),

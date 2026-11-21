@@ -72,7 +72,7 @@ fn insert_skill(f: &Fixture, name: &str, source: &str, path: &Path) {
 
 fn install_plugin(f: &Fixture) {
     let mut adapter: serde_json::Value =
-        serde_json::from_str(plugins::BUILTIN_PACKAGES[0].1).unwrap();
+        serde_json::from_str(plugins::test_fixtures::PACKAGES[0].1).unwrap();
     adapter["slug"] = serde_json::json!(NAME);
     let draft = crate::plugin_workflow::plan_write_draft(
         &f.engine,
@@ -155,19 +155,27 @@ fn external_plugin_toggle_masks_get_and_list_but_preserves_skill_preference() {
 }
 
 #[test]
-fn builtin_plugin_toggle_masks_get_and_list_but_preserves_skill_preference() {
-    for preference in [true, false] {
-        let f = Fixture::new();
-        plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
-        assert_effective_plugin_skill_preference(&f, plugins::BUILTIN_PACKAGES[0].0, preference);
-    }
+fn uninstalled_game_package_name_is_available_for_a_standalone_skill() {
+    let f = Fixture::new();
+    let name = plugins::test_fixtures::PACKAGES[0].0;
+    assert!(matches!(
+        get_skill(&f.engine, name),
+        Err(AppError::NotFound(_))
+    ));
+    let text = markdown(name, "standalone");
+    let plan = plan_install_skill(&f.engine, name, &text).unwrap();
+    apply(&f.engine, &plan.plan);
+    let detail = get_skill(&f.engine, name).unwrap();
+    assert_eq!(detail.skill.kind, SkillKind::Standalone);
+    assert_eq!(detail.markdown, text);
+    assert_eq!(f.count("plugins"), 0);
 }
 
 #[test]
 fn planned_plugin_deployment_reserves_name_before_it_is_registered() {
     let f = Fixture::new();
     let mut adapter: serde_json::Value =
-        serde_json::from_str(plugins::BUILTIN_PACKAGES[0].1).unwrap();
+        serde_json::from_str(plugins::test_fixtures::PACKAGES[0].1).unwrap();
     adapter["slug"] = serde_json::json!(NAME);
     let draft = crate::plugin_workflow::plan_write_draft(
         &f.engine,
@@ -200,7 +208,7 @@ fn embedded_catalog_lists_three_readable_system_skills_with_persisted_preference
     let guides = [
         ("system-adapter-authoring", "read_plugin_package"),
         ("system-web-search", "web_search"),
-        ("system-mod-download", "download_mod"),
+        ("system-mod-download", "GameBanana"),
     ];
     let listed = list_skills(&f.engine).unwrap();
     assert_eq!(listed.len(), guides.len());
@@ -374,16 +382,12 @@ fn unicode_description_limit_and_crlf_are_validated_by_shared_parser() {
 }
 
 #[test]
-fn builtin_and_plugin_skills_cannot_be_overwritten_or_uninstalled() {
+fn installed_package_skills_cannot_be_overwritten_or_removed_as_standalone_skills() {
     let f = Fixture::new();
-    plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
-    for (name, _, text) in plugins::BUILTIN_PACKAGES {
+    plugins::test_fixtures::install(&f.engine.db, &f.engine.paths).unwrap();
+    for (name, _, text) in plugins::test_fixtures::PACKAGES {
         assert!(plan_install_skill(&f.engine, name, text).is_err());
         assert!(plan_uninstall_skill(&f.engine, name).is_err());
-        assert_eq!(
-            get_skill(&f.engine, name).unwrap().skill.kind,
-            SkillKind::Builtin
-        );
     }
     f.engine.db.conn().execute("INSERT INTO plugins(slug,name,game_name,version,install_path,adapter_json,source,created_at,updated_at) VALUES (?1,'Test','Test','1.0.0','arbitrary','{}','external','now','now')",[NAME]).unwrap();
     assert!(plan_install_skill(&f.engine, NAME, &markdown(NAME, "one")).is_err());
@@ -809,17 +813,16 @@ fn standalone_location_replaced_by_foreign_registration_is_not_mutated() {
 }
 
 #[test]
-fn builtin_toggle_preserves_builtin_ownership_and_requires_valid_file() {
+fn package_skill_rejects_undeclared_backup_files() {
     let f = Fixture::new();
-    plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
-    let name = plugins::BUILTIN_PACKAGES[0].0;
-    assert!(!set_enabled(&f.engine, name, false).unwrap().enabled);
-    assert!(set_enabled(&f.engine, name, true).unwrap().enabled);
-    let p = get_skill(&f.engine, name).unwrap().skill.location;
-    write(&p, markdown(name, "unapproved"));
-    assert!(set_enabled(&f.engine, name, true).is_err());
-    assert!(!set_enabled(&f.engine, name, false).unwrap().enabled);
-    assert_eq!(f.count("skills_deployments"), 0);
+    install_plugin(&f);
+    let location = get_skill(&f.engine, NAME).unwrap().skill.location;
+    write(
+        &location.with_file_name(".previous_00000000000000000000000000000000"),
+        "untracked backup",
+    );
+    assert!(get_skill(&f.engine, NAME).is_err());
+    assert!(set_enabled(&f.engine, NAME, true).is_err());
 }
 
 #[test]

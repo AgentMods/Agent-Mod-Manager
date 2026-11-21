@@ -86,18 +86,57 @@ impl Db {
                 }
                 crate::mcp::config::migrate_credential_urls(&tx)?;
             }
+            if version < 8 {
+                let has_plugin_slug: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mcp_servers') WHERE name='plugin_slug')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if !has_plugin_slug {
+                    tx.execute(
+                        "ALTER TABLE mcp_servers ADD COLUMN plugin_slug TEXT REFERENCES plugins(slug) ON DELETE CASCADE",
+                        [],
+                    )?;
+                }
+                tx.execute(
+                    "CREATE INDEX IF NOT EXISTS mcp_servers_plugin_slug ON mcp_servers(plugin_slug)
+                     WHERE plugin_slug IS NOT NULL",
+                    [],
+                )?;
+            }
+            if version < 9 {
+                crate::mcp::config::migrate_3dm_to_http(&tx)?;
+            }
+            if version < 10 {
+                let has_description: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mcp_servers') WHERE name='description')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if !has_description {
+                    tx.execute("ALTER TABLE mcp_servers ADD COLUMN description TEXT", [])?;
+                }
+                crate::mcp::config::migrate_descriptions(&tx)?;
+            }
+            if version < 11 {
+                crate::mcp::config::migrate_unpinned_presets(&tx)?;
+            }
+            if version < 12 {
+                crate::mcp::config::migrate_playwright_downloads(&tx)?;
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
         drop(c);
         crate::skills::migrate(self)?;
         crate::plugin_publish::migrate(&self.conn())?;
+        crate::manager_publication::migrate(&self.conn())?;
         crate::game_identity::migrate(&self.conn())?;
         Ok(())
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 12;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS games (
@@ -278,7 +317,7 @@ CREATE TABLE IF NOT EXISTS plugins (
   game_name TEXT NOT NULL,
   version TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
-  source TEXT NOT NULL DEFAULT 'builtin',
+  source TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
   validated INTEGER NOT NULL DEFAULT 1,
   install_path TEXT NOT NULL,
@@ -291,7 +330,7 @@ CREATE TABLE IF NOT EXISTS skills (
   name TEXT PRIMARY KEY,
   description TEXT NOT NULL,
   location TEXT NOT NULL,
-  source TEXT NOT NULL DEFAULT 'builtin',
+  source TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
   created_at TEXT NOT NULL
 );
@@ -330,6 +369,7 @@ CREATE TABLE IF NOT EXISTS plugin_deployments (
 CREATE TABLE IF NOT EXISTS mcp_servers (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
+  description TEXT,
   transport TEXT NOT NULL,
   command TEXT,
   args_json TEXT NOT NULL DEFAULT '[]',

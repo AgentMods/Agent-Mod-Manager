@@ -34,7 +34,14 @@ impl Attachment {
     }
 }
 
-pub(super) fn validate_attachments(attachments: &[Attachment]) -> AppResult<()> {
+pub(crate) fn validate_user_input(content: &str, attachments: &[Attachment]) -> AppResult<()> {
+    if content.len() > 128 * 1024 || (content.trim().is_empty() && attachments.is_empty()) {
+        return Err(AppError::Invalid("消息为空或超过128KiB".into()));
+    }
+    validate_attachments(attachments)
+}
+
+fn validate_attachments(attachments: &[Attachment]) -> AppResult<()> {
     if attachments.len() > MAX_ATTACHMENTS {
         return Err(AppError::Invalid(format!(
             "每条消息最多 {MAX_ATTACHMENTS} 个附件"

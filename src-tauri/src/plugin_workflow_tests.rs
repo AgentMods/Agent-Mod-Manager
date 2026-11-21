@@ -1,6 +1,17 @@
 use super::*;
-use crate::{db::Db, storage::AppPaths};
-use serde_json::json;
+use crate::{
+    agent::tools::ToolRegistry,
+    db::Db,
+    mcp::{
+        tests::{mock_http, MockSecrets},
+        McpServers, McpTransport,
+    },
+    mcp_connections::McpConnections,
+    settings::Settings,
+    storage::AppPaths,
+};
+use serde_json::{json, Value};
+use std::sync::Arc;
 
 const SLUG: &str = "test-game";
 struct Fixture {
@@ -30,11 +41,16 @@ impl Fixture {
         preview
     }
     fn deployed(&self, version: &str) -> DeploymentPreview {
-        let draft = self.draft(version);
-        let preview = plan_install_plugin(&self.engine, &draft.draft.id).unwrap();
-        apply(&self.engine, &preview.plan);
+        let (adapter, skill) = content(SLUG, version);
+        self.install_content(SLUG, &adapter, &skill)
+    }
+    fn install_content(&self, slug: &str, adapter: &str, skill: &str) -> DeploymentPreview {
+        let draft = plan_write_draft(&self.engine, slug, adapter, skill).unwrap();
+        apply(&self.engine, &draft.plan);
+        let deployment = plan_install_plugin(&self.engine, &draft.draft.id).unwrap();
+        apply(&self.engine, &deployment.plan);
         reconcile_deployments(&self.engine).unwrap();
-        preview
+        deployment
     }
     fn flags(&self) -> (String, bool, bool, bool) {
         self.engine.db.conn().query_row("SELECT p.version,p.enabled,p.validated,s.enabled FROM plugins p JOIN skills s ON s.name=p.slug WHERE p.slug=?1",[SLUG],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap()
@@ -49,12 +65,31 @@ impl Fixture {
 }
 fn content(slug: &str, version: &str) -> (String, String) {
     let mut adapter: serde_json::Value =
-        serde_json::from_str(plugins::BUILTIN_PACKAGES[0].1).unwrap();
+        serde_json::from_str(plugins::test_fixtures::PACKAGES[0].1).unwrap();
     adapter["slug"] = json!(slug);
     adapter["name"] = json!("Test Game");
     adapter["version"] = json!(version);
     (serde_json::to_string_pretty(&adapter).unwrap(),format!("---\nname: {slug}\ndescription: Declarative test package\n---\n\nVersion {version}. Read only declared registered roots.\n"))
 }
+fn content_with_mcp(slug: &str, version: &str, servers: Value) -> (String, String) {
+    let (adapter, skill) = content(slug, version);
+    let mut adapter: Value = serde_json::from_str(&adapter).unwrap();
+    adapter["mcpServers"] = servers;
+    (serde_json::to_string_pretty(&adapter).unwrap(), skill)
+}
+fn deploy_package(f: &Fixture, slug: &str, version: &str, mcp_servers: Value) -> DeploymentPreview {
+    let (adapter, skill) = content_with_mcp(slug, version, mcp_servers);
+    f.install_content(slug, &adapter, &skill)
+}
+fn owned_mcp_servers(f: &Fixture, slug: &str) -> Vec<crate::mcp::ServerConfig> {
+    McpServers::new(f.engine.db.clone())
+        .list()
+        .unwrap()
+        .into_iter()
+        .filter(|server| server.plugin_slug.as_deref() == Some(slug))
+        .collect()
+}
+
 fn apply(engine: &FileEngine, plan: &FilePlan) {
     engine.approve_plan(&plan.id).unwrap();
     engine.apply_file_ops(&plan.id).unwrap();
@@ -124,14 +159,20 @@ fn invalid_content_is_saved_but_structurally_explained_and_never_installable() {
 }
 
 #[test]
-fn builtin_slugs_dynamic_builtin_sources_and_unsafe_slugs_cannot_be_taken_over() {
+fn unsafe_slugs_system_skills_and_other_skill_owners_are_rejected() {
     let f = Fixture::new();
-    for slug in ["minecraft-java", "../escape", "TestGame", "con", ""] {
+    for slug in [
+        "../escape",
+        "TestGame",
+        "con",
+        "",
+        "system-adapter-authoring",
+    ] {
         let (adapter, skill) = content(slug, "1.0.0");
         assert!(plan_write_draft(&f.engine, slug, &adapter, &skill).is_err());
     }
     let (adapter, skill) = content(SLUG, "1.0.0");
-    f.engine.db.conn().execute("INSERT INTO skills(name,description,location,source,created_at) VALUES (?1,'reserved','somewhere','builtin','now')",[SLUG]).unwrap();
+    f.engine.db.conn().execute("INSERT INTO skills(name,description,location,source,created_at) VALUES (?1,'manual skill','somewhere','local','now')",[SLUG]).unwrap();
     assert!(plan_write_draft(&f.engine, SLUG, &adapter, &skill).is_err());
     assert_eq!(f.count("file_transactions"), 0);
     assert_eq!(f.count("plugin_drafts"), 0);
@@ -591,72 +632,47 @@ fn plugin_toggle_preserves_independent_skill_preference_and_survives_reconciliat
 }
 
 #[test]
-fn builtin_toggle_checks_embedded_content_and_preserves_preference_on_reseed() {
+fn former_adapter_slugs_install_and_read_as_external_packages() {
     let f = Fixture::new();
-    plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
-    let slug = "minecraft-java";
-    assert!(!set_enabled(&f.engine, slug, false).unwrap().enabled);
-    plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
-    assert!(
-        !plugins::list_plugins(&f.engine.db)
-            .unwrap()
-            .into_iter()
-            .find(|p| p.slug == slug)
-            .unwrap()
-            .enabled
-    );
-    assert!(set_enabled(&f.engine, slug, true).unwrap().enabled);
-    let target = install_path(&f.engine, slug).unwrap();
-    write(
-        &target.join("SKILL.md"),
-        format!(
-            "{}\nUnapproved instructions.\n",
-            plugins::BUILTIN_PACKAGES[0].2
-        ),
-    );
-    assert!(set_enabled(&f.engine, slug, true).is_err());
-    assert!(!set_enabled(&f.engine, slug, false).unwrap().enabled);
+    for (slug, adapter, markdown) in plugins::test_fixtures::PACKAGES {
+        let deployment = f.install_content(slug, adapter, markdown);
+        let info = registered_plugin(&f.engine, slug).unwrap();
+        assert_eq!(info.source, "external");
+        assert!(info.validated && info.enabled);
+        let baseline = read_plugin_package(&f.engine, slug).unwrap();
+        assert_eq!(baseline.adapter_json, adapter);
+        assert_eq!(baseline.skill_markdown, markdown);
+        let detail = crate::skills::get_skill(&f.engine, slug).unwrap();
+        assert!(detail.skill.valid);
+        assert_eq!(detail.markdown, markdown);
+        assert_eq!(
+            deployment.install_path,
+            f.engine.paths.plugins().join("games").join(slug)
+        );
+    }
 }
 
 #[test]
-fn builtin_package_and_skill_remain_readable_after_reseed() {
+fn former_adapter_slug_can_be_updated_in_place_and_rejects_undeclared_files() {
     let f = Fixture::new();
-    let (slug, adapter, markdown) = plugins::BUILTIN_PACKAGES[0];
-    plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
-    let directory = install_path(&f.engine, slug).unwrap();
-    let old_adapter = format!("{adapter}\n");
-    write(&directory.join("adapter.json"), &old_adapter);
-    plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
-
-    let backup = fs::read_dir(&directory)
-        .unwrap()
-        .map(|entry| entry.unwrap())
-        .find(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".previous_")
-        })
-        .unwrap();
-    assert_eq!(fs::read_to_string(backup.path()).unwrap(), old_adapter);
-    assert!(validate_package_directory(&f.engine, &directory, false).is_err());
-
-    let baseline = read_plugin_package(&f.engine, slug).unwrap();
-    assert_eq!(baseline.adapter_json, adapter);
-    assert_eq!(baseline.skill_markdown, markdown);
-    let detail = crate::skills::get_skill(&f.engine, slug).unwrap();
-    assert!(detail.skill.valid);
-    assert_eq!(detail.markdown, markdown);
-
-    write(&directory.join(".previous_extra.exe"), "undeclared asset");
-    assert!(matches!(
-        read_plugin_package(&f.engine, slug),
-        Err(AppError::Denied(_))
-    ));
-    assert!(matches!(
-        crate::skills::get_skill(&f.engine, slug),
-        Err(AppError::Denied(_))
-    ));
+    let slug = plugins::test_fixtures::PACKAGES[0].0;
+    let first = deploy_package(&f, slug, "1.0.0", json!([]));
+    set_enabled(&f.engine, slug, false).unwrap();
+    let second = deploy_package(&f, slug, "2.0.0", json!([]));
+    assert_eq!(first.install_path, second.install_path);
+    let reopened = f.reopened();
+    let updated = read_plugin_package(&reopened, slug).unwrap();
+    assert_eq!(updated.version, "2.0.0");
+    assert!(!updated.enabled);
+    assert!(set_enabled(&reopened, slug, true).unwrap().enabled);
+    let extra = second
+        .install_path
+        .join(".previous_0123456789abcdef0123456789abcdef");
+    write(&extra, "undeclared file");
+    assert!(read_plugin_package(&reopened, slug).is_err());
+    assert!(crate::skills::get_skill(&reopened, slug).is_err());
+    assert!(set_enabled(&reopened, slug, true).is_err());
+    assert_eq!(fs::read_to_string(extra).unwrap(), "undeclared file");
 }
 
 #[test]
@@ -878,4 +894,267 @@ fn reviewed_install_cannot_use_out_of_band_recreated_files_of_a_deleted_draft() 
         Err(AppError::Conflict(_))
     ));
     assert!(!deployment.install_path.exists());
+}
+
+#[test]
+fn plugin_mcp_servers_are_inert_until_install_commit_and_support_both_transports() {
+    let f = Fixture::new();
+    let declared = json!([
+        {
+            "id":"lookup",
+            "name":"Lookup",
+            "transport":"streamable_http",
+            "url":"https://example.com/mcp"
+        },
+        {
+            "id":"local-helper",
+            "name":"Local helper",
+            "transport":"stdio",
+            "command":"node",
+            "args":["server.js","--quiet"]
+        }
+    ]);
+    let (adapter, skill) = content_with_mcp(SLUG, "1.0.0", declared);
+    let draft = plan_write_draft(&f.engine, SLUG, &adapter, &skill).unwrap();
+
+    assert!(owned_mcp_servers(&f, SLUG).is_empty());
+    apply(&f.engine, &draft.plan);
+    assert!(validate_draft(&f.engine, &draft.draft.id).unwrap().valid);
+    assert!(owned_mcp_servers(&f, SLUG).is_empty());
+
+    let deployment = plan_install_plugin(&f.engine, &draft.draft.id).unwrap();
+    assert!(owned_mcp_servers(&f, SLUG).is_empty());
+    apply(&f.engine, &deployment.plan);
+    reconcile_deployments(&f.engine).unwrap();
+
+    let mut servers = owned_mcp_servers(&f, SLUG);
+    assert_eq!(servers.len(), 2);
+    assert!(servers.iter().all(|server| !server.enabled));
+    assert!(servers.iter().all(|server| !server.builtin));
+    assert!(servers
+        .iter()
+        .all(|server| server.plugin_slug.as_deref() == Some(SLUG)));
+    servers.sort_by(|left, right| left.name.cmp(&right.name));
+    let helper = &servers[0];
+    assert_eq!(helper.transport, McpTransport::Stdio);
+    assert_eq!(helper.command.as_deref(), Some("node"));
+    assert_eq!(
+        helper.args,
+        vec!["server.js".to_string(), "--quiet".to_string()]
+    );
+    let lookup = &servers[1];
+    assert_eq!(lookup.transport, McpTransport::StreamableHttp);
+    assert_eq!(lookup.url.as_deref(), Some("https://example.com/mcp"));
+}
+
+#[test]
+fn plugin_mcp_ownership_conflict_revokes_the_old_declaration() {
+    let f = Fixture::new();
+    deploy_package(
+        &f,
+        SLUG,
+        "1.0.0",
+        json!([{
+            "id": "catalog", "name": "Catalog", "transport": "stdio", "command": "catalog-mcp"
+        }]),
+    );
+    let id = owned_mcp_servers(&f, SLUG).pop().unwrap().id;
+    let servers = McpServers::new(f.engine.db.clone());
+    servers.set_enabled(&id, true).unwrap();
+    f.engine
+        .db
+        .conn()
+        .execute("UPDATE skills SET source='user' WHERE name=?1", [SLUG])
+        .unwrap();
+    let report = reconcile_deployments(&f.engine).unwrap();
+    assert!(report.issues.iter().any(|issue| issue.code == "ownership"));
+    assert!(matches!(servers.get(&id), Err(AppError::NotFound(_))));
+}
+
+#[test]
+fn plugin_mcp_local_ids_are_unique_across_owners() {
+    let f = Fixture::new();
+    let shared_id = |url: &str| {
+        json!([{
+            "id":"lookup",
+            "name":"Lookup",
+            "transport":"streamable_http",
+            "url":url
+        }])
+    };
+    deploy_package(
+        &f,
+        "first-game",
+        "1.0.0",
+        shared_id("https://first.example/mcp"),
+    );
+    deploy_package(
+        &f,
+        "second-game",
+        "1.0.0",
+        shared_id("https://second.example/mcp"),
+    );
+
+    let first = owned_mcp_servers(&f, "first-game");
+    let second = owned_mcp_servers(&f, "second-game");
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_ne!(first[0].id, second[0].id);
+    assert_eq!(first[0].plugin_slug.as_deref(), Some("first-game"));
+    assert_eq!(second[0].plugin_slug.as_deref(), Some("second-game"));
+    assert_eq!(first[0].url.as_deref(), Some("https://first.example/mcp"));
+    assert_eq!(second[0].url.as_deref(), Some("https://second.example/mcp"));
+}
+
+#[tokio::test]
+async fn plugin_mcp_upgrade_disable_reenable_removal_and_rollback_stay_owner_scoped() {
+    let f = Fixture::new();
+    legacy(&f); // An older package has no mcpServers declaration.
+    assert!(owned_mcp_servers(&f, SLUG).is_empty());
+
+    let (url, stop_server, _) = mock_http("echo").await;
+    let v1_servers = json!([{
+        "id":"lookup",
+        "name":"Lookup",
+        "transport":"streamable_http",
+        "url":url
+    }]);
+    let first = deploy_package(&f, SLUG, "1.0.0", v1_servers);
+    let servers = McpServers::new(f.engine.db.clone());
+    let initial = owned_mcp_servers(&f, SLUG);
+    assert_eq!(initial.len(), 1);
+    let server_id = initial[0].id.clone();
+    assert!(!initial[0].enabled);
+
+    // A successful, explicit connection is the only operation that grants startup restore.
+    let settings =
+        Settings::with_secret_store(f.engine.db.clone(), Arc::new(MockSecrets::default()));
+    let connections = McpConnections::default();
+    let registry = ToolRegistry::default();
+    let mut expected = servers.get(&server_id).unwrap();
+    expected.enabled = true;
+    connections
+        .connect(settings.clone(), &registry, expected, false)
+        .await
+        .unwrap();
+    assert!(servers.get(&server_id).unwrap().enabled);
+    assert_eq!(servers.startup_requests().unwrap(), vec![server_id.clone()]);
+    drop((connections, registry));
+
+    let upgraded_url = format!("{url}/upgraded");
+    let second = deploy_package(
+        &f,
+        SLUG,
+        "2.0.0",
+        json!([{
+            "id":"lookup",
+            "name":"Lookup v2",
+            "transport":"streamable_http",
+            "url":upgraded_url
+        }]),
+    );
+    let upgraded = owned_mcp_servers(&f, SLUG);
+    assert_eq!(upgraded.len(), 1);
+    assert_eq!(upgraded[0].id, server_id);
+    assert_eq!(upgraded[0].url.as_deref(), Some(upgraded_url.as_str()));
+    assert!(servers.startup_requests().unwrap().is_empty());
+
+    f.engine.rollback_transaction(&second.plan.id).unwrap();
+    reconcile_deployments(&f.engine).unwrap();
+    let restored = owned_mcp_servers(&f, SLUG);
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].url.as_deref(), Some(url.as_str()));
+    assert!(servers.startup_requests().unwrap().is_empty());
+
+    // Recreate a remembered start after rollback, then ensure plugin disable revokes it.
+    let connections = McpConnections::default();
+    let registry = ToolRegistry::default();
+    let mut expected = servers.get(&server_id).unwrap();
+    expected.enabled = true;
+    connections
+        .connect(settings.clone(), &registry, expected, false)
+        .await
+        .unwrap();
+    assert_eq!(servers.startup_requests().unwrap(), vec![server_id.clone()]);
+    drop((connections, registry));
+
+    assert!(!set_enabled(&f.engine, SLUG, false).unwrap().enabled);
+    assert!(owned_mcp_servers(&f, SLUG).is_empty());
+    assert!(!servers.get(&server_id).unwrap().enabled);
+    assert!(servers.startup_requests().unwrap().is_empty());
+    assert!(servers.set_enabled(&server_id, true).is_err());
+
+    // A disabled owner rejects a connect request even when the UI marks it enabled.
+    let connections = McpConnections::default();
+    let registry = ToolRegistry::default();
+    connections
+        .restore_requested(&settings, &registry, || {})
+        .await;
+    assert!(connections.list().await.is_empty());
+    let mut expected = servers.get(&server_id).unwrap();
+    expected.enabled = true;
+    assert!(matches!(
+        connections
+            .connect(settings.clone(), &registry, expected, false)
+            .await,
+        Err(AppError::Denied(_))
+    ));
+    assert!(connections.list().await.is_empty());
+
+    assert!(set_enabled(&f.engine, SLUG, true).unwrap().enabled);
+    let reenabled = owned_mcp_servers(&f, SLUG);
+    assert_eq!(reenabled.len(), 1);
+    assert!(!reenabled[0].enabled);
+    assert!(servers.startup_requests().unwrap().is_empty());
+    connections
+        .restore_requested(&settings, &registry, || {})
+        .await;
+    assert!(connections.list().await.is_empty());
+
+    // Re-enabling the plugin does not reconnect it; an explicit connect starts it manually.
+    let mut expected = servers.get(&server_id).unwrap();
+    expected.enabled = true;
+    connections
+        .connect(settings.clone(), &registry, expected, false)
+        .await
+        .unwrap();
+    assert!(servers.get(&server_id).unwrap().enabled);
+    assert_eq!(connections.list().await.len(), 1);
+    connections
+        .disconnect(&registry, &servers, &server_id)
+        .await
+        .unwrap();
+
+    let parked = f.engine.paths.staging().join("removed-plugin-package");
+    let removal = f
+        .engine
+        .plan_file_ops(
+            ["adapter.json", "SKILL.md"]
+                .iter()
+                .map(|name| FileOp::Move {
+                    src: first.install_path.join(name),
+                    dst: parked.join(name),
+                })
+                .collect(),
+            "Remove plugin package".into(),
+        )
+        .unwrap();
+    apply(&f.engine, &removal);
+    reconcile_deployments(&f.engine).unwrap();
+    assert!(owned_mcp_servers(&f, SLUG).is_empty());
+    assert!(servers.get(&server_id).is_err());
+
+    f.engine.rollback_transaction(&removal.id).unwrap();
+    reconcile_deployments(&f.engine).unwrap();
+    let after_remove_rollback = owned_mcp_servers(&f, SLUG);
+    assert_eq!(after_remove_rollback.len(), 1);
+    assert_eq!(after_remove_rollback[0].url.as_deref(), Some(url.as_str()));
+    assert!(servers.startup_requests().unwrap().is_empty());
+
+    // Rolling the first MCP-capable deployment back restores the pre-existing legacy package.
+    f.engine.rollback_transaction(&first.plan.id).unwrap();
+    reconcile_deployments(&f.engine).unwrap();
+    assert!(owned_mcp_servers(&f, SLUG).is_empty());
+    assert!(servers.startup_requests().unwrap().is_empty());
+    stop_server.cancel();
 }

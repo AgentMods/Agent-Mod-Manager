@@ -21,6 +21,7 @@ const exec = promisify(execFile);
 const xdo = args => exec('xdotool', args, { timeout: 5_000 });
 const elementKey = 'element-6066-11e4-a52e-4f735466cecf';
 const game = 'Minecraft Java Edition';
+const marker = 'amm-smoke-instance.esm';
 const minecraft = '1.21.1';
 const fabric = '0.16.14';
 const note = 'smoke-note.txt';
@@ -193,6 +194,7 @@ async function createFixture(root) {
   ].join('\n');
   await Promise.all([
     writeFile(join(root, 'options.txt'), 'fullscreen:false\n'),
+    writeFile(join(root, marker), 'AMM smoke fixture\n'),
     writeFile(join(root, note), noteContents),
     writeFile(join(root, 'logs/latest.log'), log),
     ...mods.map(mod => writeFile(join(root, 'mods', `${mod.id}.jar`), metadataJar(mod.id, mod.disk))),
@@ -213,14 +215,16 @@ const pathIs = path => {
   return `(${translated}=${literal(expected)} or ${translated}=${literal(`//?/${expected}`)})`;
 };
 const textAt = (scope, text, tag = '*') => `${scope}//${tag}[${exact(text)}]`;
+const planPath = (scope, path) => `${scope}//tbody//td//span[${pathIs(path)}]`;
 const main = '//main';
 const button = (text, scope = main) => textAt(scope, text, 'button');
-const gameTile = root => `${main}//button[.//h2[${exact(game)}] and .//small[${pathIs(root)}]]`;
-const dialog = '//dialog[@open and @aria-label="确认文件变更"]';
+const gameTile = `${main}//button[.//*[@data-slot="card-title" and ${exact(game)}]]`;
+const modal = title => `//*[@role="dialog" and .//*[@data-slot="dialog-title" and ${exact(title)}]]`;
+const dialog = modal('确认文件变更');
 const afterPlan = `${main}[not(${dialog})]`;
-const nav = label => `//nav[@aria-label="主导航"]/button[@title=${literal(label)}]`;
+const nav = label => `//nav[@aria-label="主导航"]//button[${exact(label)}]`;
 const composer = `${main}//textarea[@aria-label="告诉 Agent 你想做什么"]`;
-const assistantAnswer = text => `${main}//article[contains(@class,"chat-message assistant")]//p[${exact(text)}]`;
+const assistantAnswer = text => `${main}//article[contains(concat(' ', normalize-space(@class), ' '), ' assistant ')]//p[${exact(text)}]`;
 const evidencePath = (path, suffix) => path.replace(/(?:\.png)?$/i, `.${suffix}.png`);
 
 async function startLinuxSession(application) {
@@ -239,26 +243,57 @@ async function startLinuxSession(application) {
   }
 }
 
+async function installExternalMinecraftAdapter(ui) {
+  const fixtures = new URL('../src-tauri/tests/fixtures/game-adapters/minecraft-java/', import.meta.url);
+  const adapter = JSON.parse(await readFile(new URL('adapter.json', fixtures), 'utf8'));
+  // The smoke owns this marker and can therefore check unattended recognition.
+  adapter.markers = [{ path: marker, kind: 'file', required: true, platforms: adapter.platforms }];
+  delete adapter.coverUrl;
+  const skill = await readFile(new URL('SKILL.md', fixtures), 'utf8');
+
+  await ui.click(nav('插件中心'));
+  await ui.visible(textAt(main, '暂无已安装适配包'));
+  await ui.click(button('新建草稿'));
+  const editor = modal('声明式适配包草稿');
+  await ui.fill(`${editor}//input[@id="draft-slug"]`, adapter.slug);
+  await ui.fill(`${editor}//textarea[@id="draft-adapter"]`, JSON.stringify(adapter));
+  await ui.fill(`${editor}//textarea[@id="draft-skill"]`, skill.replaceAll('\r\n', '\n'));
+  await ui.click(button('预览保存草稿', editor));
+  await ui.click(button('批准并执行', dialog));
+
+  const draftRow = `${main}//tr[.//strong[${exact(adapter.slug)}]]`;
+  await ui.click(button('验证', draftRow));
+  await ui.click(button('安装预览', modal(`验证：${adapter.slug}`)));
+  await ui.click(button('批准并执行', dialog));
+  await ui.click(`${afterPlan}//button[@role="tab" and ${exact('已安装')}]`);
+  await ui.visible(`${main}//tr[.//strong[${exact(adapter.name)}]]`);
+  await ui.click(nav('游戏库'));
+}
+
 async function registerAndOpen(ui, root) {
   const packagedUrl = windows ? /^https?:\/\/tauri\.localhost(?:[/?#]|$)/ : /^tauri:\/\/localhost(?:[/?#]|$)/;
   // A fresh profile starts with first-run onboarding before the normal shell is shown.
   await ui.visible(textAt(main, '先找到你想管理的游戏', 'h2'));
   assert.equal(await ui.count('//nav[@aria-label="主导航"]'), 0, 'Onboarding must replace the normal navigation');
   await ui.click(button('退出引导'));
-  await ui.visible(`${main}//input[@aria-label="游戏目录"]`);
+  await installExternalMinecraftAdapter(ui);
   assert.match(await ui.url(), packagedUrl,
     'Expected assets from the packaged Tauri protocol, not a dev server');
-  await ui.visible(textAt('//header', '本地服务', 'span'));
-  await ui.fill(`${main}//input[@aria-label="游戏目录"]`, root);
-  await ui.click(button('检查目录'));
-  const candidate = `${main}//div[./div/strong[${exact(game)}] and ./div/p[${pathIs(root)}]]`;
+
+  const scanDialog = modal('扫描游戏');
+  await ui.click(button('扫描游戏'));
+  // Opening the dialog starts a common-directory scan before we check the fixture.
+  await ui.visible(`${scanDialog}//*[@role="status"]//p[starts-with(normalize-space(.), '已检查 ')]`);
+  await ui.fill(`${scanDialog}//input[@aria-label="游戏目录"]`, root);
+  await ui.click(button('检查单个游戏', scanDialog));
+  const candidate = `${scanDialog}//*[@data-slot="item" and .//*[@data-slot="item-title" and ${exact(game)}] and .//*[@data-slot="item-description"]//*[${pathIs(root)}]]`;
   await ui.click(button('添加', candidate));
 
-  // Registration opens the detail view automatically; reopen the persisted library entry.
+  // Registration updates the same result in place. Open details from the library card after closing the dialog.
+  await ui.visible(button('管理中', candidate));
+  await ui.click(button('关闭', scanDialog));
+  await ui.click(`${gameTile}[not(${scanDialog})]`);
   await ui.visible(textAt(main, game, 'h1'));
-  await ui.click(`${main}//button[@aria-label="返回游戏库"]`);
-  await ui.click(gameTile(root));
-  await ui.visible(`${main}//header[./div/h1[${exact(game)}]]/div/p[${pathIs(root)}]`);
 }
 
 async function diagnose(ui) {
@@ -299,7 +334,7 @@ async function moveAndRestore(ui, root) {
   await ui.click(textAt(main, note, 'td'));
   await ui.visible(textAt(`${main}//aside`, noteContents.trim(), 'span'));
   await ui.click(button('移入回收站'));
-  await ui.visible(`${dialog}//small[${pathIs(original)}]`);
+  await ui.visible(planPath(dialog, original));
   assert.equal(await readFile(original, 'utf8'), noteContents, 'Trash preview must not move the file');
   await ui.click(button('批准并执行', dialog));
   await ui.visible(textAt(`${afterPlan}//aside`, '未选择文件', 'p'));
@@ -310,14 +345,14 @@ async function moveAndRestore(ui, root) {
 async function restoreNote(ui, root) {
   const original = join(root, note);
   await ui.click(nav('回收站'));
-  const item = `//table[@aria-label="回收站文件"]/tbody/tr[.//small[${pathIs(original)}]]`;
+  const item = `//table[@aria-label="回收站文件"]/tbody/tr[.//span[${pathIs(original)}]]`;
   await ui.visible(textAt(item, '在回收站', 'span'));
-  await ui.click(`${item}//input[@type="checkbox" and @aria-label="选择 ${note}"]`);
+  await ui.click(`${item}//*[@role="checkbox" and @aria-label="选择 ${note}"]`);
   await ui.click(button('恢复所选'));
-  await ui.visible(`${dialog}//div[${pathIs(original)}]`);
+  await ui.visible(planPath(dialog, original));
   await assert.rejects(access(original), { code: 'ENOENT' }, 'Restore preview must not recreate the file');
   await ui.click(button('批准并执行', dialog));
-  await ui.visible(textAt(afterPlan, '回收站为空', 'h2'));
+  await ui.visible(`${afterPlan}//*[@data-slot="empty-title" and ${exact('回收站为空')}]`);
   assert.equal(await readFile(original, 'utf8'), noteContents, 'Restore must preserve the original bytes');
 }
 
@@ -404,12 +439,12 @@ async function importAgentFixture(ui, root, profile) {
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   const destination = join(root, 'mods', installFilename);
   await writeFile(source, bytes, { flag: 'wx' });
-  const install = '//dialog[@open and @aria-label="归档安装预览"]';
+  const install = modal('归档安装预览');
   await ui.click(button('安装归档'));
   await ui.click(button('导入本地归档', install));
   await ui.chooseArchive(source);
   const importPath = windows ? `translate(., '\\', '/')` : '.';
-  await ui.visible(`${dialog}//tbody//div[contains(${importPath}, '/staging/imports/')]`);
+  await ui.visible(`${dialog}//tbody//td//span[contains(${importPath}, '/staging/imports/')]`);
   await assert.rejects(access(destination), { code: 'ENOENT' });
   await ui.click(button('批准并执行', dialog));
   const path = await ui.inputValue(`${install}//input[@aria-label="管理器内归档路径"]`);
@@ -442,9 +477,9 @@ async function runAgentTurns(ui, model, root, artifact, screenshot) {
   await ui.visible(textAt(main, '19 tokens', 'span'));
   console.log('Agent: rendered an unfinished stream, then ran the real read-only Fabric diagnostic tool.');
 
-  const approval = '//dialog[@open and @aria-label="操作审批"]';
+  const approval = `${main}//*[@role="group" and @aria-label="操作审批"]`;
   await send(ui, installPrompt);
-  await ui.visible(`${approval}//td/div[${pathIs(artifact.destination)}]`);
+  await ui.visible(planPath(approval, artifact.destination));
   assert.equal(model.calls(), 3);
   await assert.rejects(access(artifact.destination), { code: 'ENOENT' }, 'Agent installation preview must not deploy');
   await ui.screenshot(evidencePath(screenshot, 'agent-install-approval'));
@@ -455,7 +490,7 @@ async function runAgentTurns(ui, model, root, artifact, screenshot) {
   console.log('Agent: reviewed and installed the inert JAR selected in the native archive chooser.');
 
   await send(ui, trashPrompt);
-  await ui.visible(`${approval}//small[${pathIs(original)}]`);
+  await ui.visible(planPath(approval, original));
   assert.equal(model.calls(), 5);
   assert.equal(await readFile(original, 'utf8'), noteContents, 'Agent approval preview mutated the fixture');
   await ui.screenshot(evidencePath(screenshot, 'agent-approval'));
@@ -476,7 +511,7 @@ async function runAgentTurns(ui, model, root, artifact, screenshot) {
 
   await ui.click(nav('历史对话'));
   await ui.click(`${main}//button[@title=${literal(`归档：${diagnosePrompt}`)}]`);
-  await ui.visible(textAt(main, '暂无历史对话', 'h2'));
+  await ui.visible(`${main}//*[@data-slot="empty-title" and ${exact('暂无历史对话')}]`);
   console.log(`Agent: ${model.calls()} chat completions and ${model.summaryCalls()} context summaries.`);
 }
 
@@ -498,7 +533,7 @@ async function reopenAgentHistory(ui, model, root, screenshot) {
   console.log('Agent: reopened the archived conversation after relaunch and restored the fixture note exactly.');
 
   await ui.click(nav('游戏库'));
-  await ui.click(gameTile(root));
+  await ui.click(gameTile);
   await ui.click(`${main}//button[@role="tab" and ${exact('已装 Mod')}]`);
   const installRow = `${main}//tbody/tr[.//strong[${exact(installName)}]]`;
   await ui.visible(textAt(installRow, '1 个文件', 'small'));
@@ -513,12 +548,13 @@ async function verifyWindowsState(profile, root) {
     const games = db.prepare('SELECT root_path FROM games').all();
     assert.deepEqual(games.map(row => pathIdentity(row.root_path)), [pathIdentity(root)]);
     const txns = db.prepare('SELECT status FROM file_transactions ORDER BY status').all();
-    assert.deepEqual(txns.map(row => row.status), Array(4).fill('committed'));
+    assert.deepEqual(txns.map(row => row.status), Array(6).fill('committed'));
+    assert.equal(db.prepare("SELECT source FROM plugins WHERE slug='minecraft-java'").get()?.source, 'external');
     const turns = db.prepare('SELECT status FROM agent_turns ORDER BY status').all();
     assert.deepEqual(turns.map(row => row.status), ['cancelled', 'done', 'done', 'done']);
     const conversations = db.prepare('SELECT archived FROM conversations').all();
     assert.deepEqual(conversations.map(row => row.archived), [1]);
-    console.log('SQLite quick_check: ok; one fixture game, four commits, three completed turns, one cancelled turn, one archived conversation.');
+    console.log('SQLite quick_check: ok; one fixture game, six commits including the adapter draft and deployment, three completed turns, one cancelled turn, one archived conversation.');
   } finally {
     db.close();
   }

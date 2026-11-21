@@ -13,6 +13,9 @@ use tokio_util::sync::CancellationToken;
 const PYPI_INDEX: &str = "https://pypi.tuna.tsinghua.edu.cn/simple";
 const NPM_REGISTRY: &str = "https://registry.npmmirror.com";
 const NPX_CLI: &str = "npm/bin/npx-cli.js";
+const BING_HELPER: &str = "bin/bing-search.cjs";
+const PLAYWRIGHT_PACKAGE: &str = "bin/node_modules/playwright-core/package.json";
+const PLAYWRIGHT_ENTRY: &str = "bin/node_modules/playwright-core/index.js";
 const NODE: &str = if cfg!(windows) { "node.exe" } else { "node" };
 const UVX: &str = if cfg!(windows) { "uvx.exe" } else { "uvx" };
 const UV: &str = if cfg!(windows) { "uv.exe" } else { "uv" };
@@ -62,21 +65,95 @@ impl McpRuntime {
             }
             return Ok(cmd);
         };
+        let root = self.prepare_root(cancel, Bundle::root).await?;
+        bundled_command(launcher, &root, path)
+    }
+
+    pub(crate) async fn bing_search_command(
+        &self,
+        cancel: &CancellationToken,
+    ) -> AppResult<Command> {
+        let root = self.prepare_root(cancel, Bundle::bing_root).await?;
+        let root = dunce::simplified(&root);
+        let mut cmd = Command::new(root.join("bin").join(NODE));
+        cmd.arg("--no-global-search-paths")
+            .arg(root.join(BING_HELPER))
+            .current_dir(root.join("bin"))
+            .kill_on_drop(true)
+            .env_clear();
+        for key in BROWSER_ENV {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
+        #[cfg(windows)]
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        Ok(cmd)
+    }
+
+    async fn prepare_root(
+        &self,
+        cancel: &CancellationToken,
+        prepare: fn(&Bundle) -> AppResult<PathBuf>,
+    ) -> AppResult<PathBuf> {
         let bundle = self
             .0
             .clone()
             .ok_or_else(|| AppError::NotFound("未配置应用内置的 MCP 启动程序".into()))?;
         // Serialize cold preparation on a blocking worker. Cancellation may finish the cache,
         // but cannot start a child: the worker only returns a path.
-        let root = tokio::select! {
+        tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(AppError::Cancelled),
-            result = tokio::task::spawn_blocking(move || bundle.root()) => result
-                .map_err(|_| AppError::Other("准备内置 MCP 运行时失败".into()))??,
-        };
-        bundled_command(launcher, &root, path)
+            _ = cancel.cancelled() => Err(AppError::Cancelled),
+            result = tokio::task::spawn_blocking(move || prepare(&bundle)) => result
+                .map_err(|_| AppError::Other("准备内置 MCP 运行时失败".into()))?,
+        }
     }
 }
+
+// Browser discovery and OS integration only. Do not inherit NODE_*, proxy or
+// service credentials, Playwright executable overrides, or MCP connection env.
+#[cfg(windows)]
+const BROWSER_ENV: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "SystemRoot",
+    "WINDIR",
+    "SystemDrive",
+    "COMSPEC",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "TEMP",
+    "TMP",
+];
+#[cfg(not(windows))]
+const BROWSER_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XAUTHORITY",
+    "XDG_RUNTIME_DIR",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+];
+
 fn bundled_command(launcher: Launcher, root: &Path, path: Option<OsString>) -> AppResult<Command> {
     // npm package shims must find this same Node; avoid verbatim paths in Windows .cmd files.
     let root = dunce::simplified(root);
@@ -99,6 +176,18 @@ fn bundled_command(launcher: Launcher, root: &Path, path: Option<OsString>) -> A
     Ok(cmd)
 }
 impl Bundle {
+    fn bing_root(&self) -> AppResult<PathBuf> {
+        let root = self.root()?;
+        // Keep Bing-only requirements out of the independent MCP launcher paths.
+        verify_files([
+            root.join("bin").join(NODE),
+            root.join(BING_HELPER),
+            root.join(PLAYWRIGHT_PACKAGE),
+            root.join(PLAYWRIGHT_ENTRY),
+        ])?;
+        Ok(root)
+    }
+
     fn root(&self) -> AppResult<PathBuf> {
         let mut ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(root) = &*ready {
@@ -132,14 +221,19 @@ impl Bundle {
         Ok(root)
     }
 }
+
 fn verify_layout(root: &Path) -> AppResult<()> {
-    for path in [
+    verify_files([
         root.join("bin").join(NODE),
         root.join("bin").join(UVX),
         root.join("bin").join(UV),
         root.join(NPX_CLI),
         root.join("npm/bin/npm-cli.js"),
-    ] {
+    ])
+}
+
+fn verify_files(paths: impl IntoIterator<Item = PathBuf>) -> AppResult<()> {
+    for path in paths {
         if !path.is_file() || path.canonicalize()? != path {
             return Err(AppError::Other(
                 "内置 MCP 运行时不完整或被重定向，请检查运行时缓存与安装包。".into(),
@@ -168,7 +262,10 @@ fn extract(input: File, root: &Path) -> AppResult<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if path.starts_with(root.join("bin")) || entry.unix_mode().unwrap_or(0) & 0o111 != 0 {
+            if path.parent() == Some(root.join("bin").as_path())
+                && [NODE, UV, UVX].iter().any(|name| path.ends_with(name))
+                || entry.unix_mode().unwrap_or(0) & 0o111 != 0
+            {
                 file.set_permissions(fs::Permissions::from_mode(0o700))?;
             }
         }
@@ -178,8 +275,8 @@ fn extract(input: File, root: &Path) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    fn archive(dir: &Path, extra: Option<&str>) -> McpRuntime {
+    use std::{collections::HashMap, io::Write};
+    fn archive(dir: &Path, extras: &[&str]) -> McpRuntime {
         let path = dir.join("fixture.zip");
         let mut zip = zip::ZipWriter::new(File::create(&path).unwrap());
         for name in [
@@ -190,7 +287,7 @@ mod tests {
             "npm/bin/npm-cli.js".into(),
         ]
         .into_iter()
-        .chain(extra.map(str::to_owned))
+        .chain(extras.iter().map(|name| (*name).to_owned()))
         {
             zip.start_file(name, zip::write::SimpleFileOptions::default())
                 .unwrap();
@@ -204,7 +301,7 @@ mod tests {
     async fn bare_commands_use_packaged_launchers_path_and_only_their_own_mirror() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().canonicalize().unwrap();
-        let runtime = archive(&dir, None);
+        let runtime = archive(&dir, &[]);
         let cancel = CancellationToken::new();
         for alias in ["npx", "NPX.CMD", "npx.exe", "uvx", "UVX.EXE"] {
             let cmd = runtime.command(alias, &cancel).await.unwrap();
@@ -256,9 +353,86 @@ mod tests {
         }
         assert!(runtime.command("npx", &cancel).await.is_err());
         let dir = tempfile::tempdir().unwrap();
-        let runtime = archive(&dir.path().canonicalize().unwrap(), Some("../escape"));
+        let runtime = archive(&dir.path().canonicalize().unwrap(), &["../escape"]);
         assert!(runtime.command("uvx", &cancel).await.is_err());
         assert_eq!(dir.path().join("cache").read_dir().unwrap().count(), 0);
         assert!(!dir.path().join("escape").exists());
+    }
+
+    #[tokio::test]
+    async fn bing_uses_only_its_bundled_node_and_browser_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let runtime = archive(&dir, &[BING_HELPER, PLAYWRIGHT_PACKAGE, PLAYWRIGHT_ENTRY]);
+        let cancel = CancellationToken::new();
+        let cmd = runtime.bing_search_command(&cancel).await.unwrap();
+        let cmd = cmd.as_std();
+        let bin = Path::new(cmd.get_program()).parent().unwrap();
+        assert!(bin.is_absolute());
+        assert_eq!(Path::new(cmd.get_program()), bin.join(NODE));
+        assert_eq!(cmd.get_current_dir(), Some(bin));
+        let args = cmd.get_args().collect::<Vec<_>>();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--no-global-search-paths");
+        assert_eq!(Path::new(args[1]), bin.join("bing-search.cjs"));
+        assert!(bin
+            .join("node_modules/playwright-core/package.json")
+            .is_file());
+        let actual = cmd.get_envs().collect::<HashMap<_, _>>();
+        let expected = BROWSER_ENV
+            .iter()
+            .filter_map(|key| std::env::var_os(key).map(|val| (*key, val)))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(actual.len(), expected.len());
+        for (key, value) in actual {
+            let name = key.to_str().unwrap();
+            let expected_value = expected
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_os_str());
+            assert!(value.is_some());
+            assert_eq!(value, expected_value);
+            assert!(![
+                "NODE_OPTIONS",
+                "NODE_PATH",
+                "AMM_BING_BROWSER_PATH",
+                "OPENAI_API_KEY",
+                "HTTPS_PROXY"
+            ]
+            .iter()
+            .any(|key| key.eq_ignore_ascii_case(name)));
+        }
+        cancel.cancel();
+        assert!(matches!(
+            runtime.bing_search_command(&cancel).await,
+            Err(AppError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn missing_or_redirected_bing_files_do_not_break_npx_or_uvx() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let cancel = CancellationToken::new();
+        let legacy = archive(&dir, &[]);
+        assert!(legacy.bing_search_command(&cancel).await.is_err());
+        legacy.command("npx", &cancel).await.unwrap();
+
+        let runtime = archive(&dir, &[BING_HELPER, PLAYWRIGHT_PACKAGE, PLAYWRIGHT_ENTRY]);
+        let cmd = runtime.bing_search_command(&cancel).await.unwrap();
+        let bin = Path::new(cmd.as_std().get_program()).parent().unwrap();
+        let root = bin.parent().unwrap();
+        let entry = root.join(PLAYWRIGHT_ENTRY);
+        let reopened = McpRuntime::bundled(dir.join("fixture.zip"), dir.join("cache"));
+        reopened.bing_search_command(&cancel).await.unwrap();
+
+        fs::remove_file(&entry).unwrap();
+        assert!(reopened.bing_search_command(&cancel).await.is_err());
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join(BING_HELPER), &entry).unwrap();
+        #[cfg(windows)]
+        fs::create_dir(&entry).unwrap();
+        assert!(runtime.bing_search_command(&cancel).await.is_err());
+        runtime.command("uvx", &cancel).await.unwrap();
     }
 }

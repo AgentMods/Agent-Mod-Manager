@@ -1,5 +1,6 @@
+import type { Game } from "@/lib/types";
 import { displayPath } from "@/lib/paths";
-import { useLayoutEffect, useState } from 'react';
+import { type ComponentProps, useLayoutEffect, useState } from 'react';
 import { CheckIcon, GlobeIcon, SearchIcon } from 'lucide-react';
 import { api, useBackendQuery } from '@/lib/api';
 import { Badge, EmptyState, ErrorState, Modal, PathText } from './ui';
@@ -24,8 +25,9 @@ type IdentitySearch = {
   candidates: IdentityCandidate[]; createdAt: string;
 };
 
-export function GameIdentityDialog({ directory, writable, onClose, onConfirmed }: {
-  directory: string; writable: boolean; onClose: () => void; onConfirmed: () => Promise<void>;
+export function GameIdentityDialog({ directory, writable, onClose, onCloseAutoFocus, onConfirmed }: {
+  directory: string; writable: boolean; onClose: () => void; onConfirmed: (game: Game) => Promise<void>;
+  onCloseAutoFocus: ComponentProps<typeof Modal>["onCloseAutoFocus"];
 }) {
   const preview = useBackendQuery<IdentityPreview>(['identity-preview', directory], 'preview_game_identity', { directory });
   const [query, setQuery] = useState('');
@@ -63,16 +65,16 @@ export function GameIdentityDialog({ directory, writable, onClose, onConfirmed }
     if (!result || result.status !== 'available' || selected === null || !registrationConsent || !name.trim() || busy || !writable) return;
     setBusy(true); setError(null);
     try {
-      await api('confirm_game_identity', {
+      const game = await api<Game>('confirm_game_identity', {
         searchId: result.id, candidateIndex: selected, name: name.trim(), confirmation: 'CONFIRM_GAME_IDENTITY',
       });
-      await onConfirmed(); onClose();
+      await onConfirmed(game); onClose();
     } catch (failure) { setError(failure); }
     finally { setRegistrationConsent(false); setBusy(false); }
   }
   const canConfirm = writable && !busy && result?.status === 'available' && selected !== null && registrationConsent && !!name.trim();
 
-  return <Modal title="联网识别游戏" onClose={() => { if (!busy) onClose(); }} className="sm:max-w-2xl" actions={<>
+  return <Modal title="联网识别游戏" onCloseAutoFocus={onCloseAutoFocus} onClose={() => { if (!busy) onClose(); }} className="sm:max-w-2xl" actions={<>
     <Button variant="outline" disabled={busy} onClick={onClose}>取消</Button>
     <Button disabled={!canConfirm} onClick={() => { void confirm(); }}><CheckIcon data-icon="inline-start"/>添加</Button>
   </>}>
@@ -80,7 +82,7 @@ export function GameIdentityDialog({ directory, writable, onClose, onConfirmed }
     {!preview.data ? <EmptyState title={preview.isLoading ? '正在检查本地目录…' : '无法检查目录'}/> : <div className="flex flex-col gap-4 text-sm">
       <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2">
         <dt className="text-muted-foreground">本地目录</dt><dd><PathText>{displayPath(preview.data.rootPath)}</PathText></dd>
-        <dt className="text-muted-foreground">搜索目的地</dt><dd>Brave Search API</dd>
+        <dt className="text-muted-foreground">搜索目的地</dt><dd>Bing（应用内置搜索）</dd>
         <dt className="text-muted-foreground">发送内容</dt><dd>仅下方搜索词</dd>
       </dl>
       <details className="rounded-md border px-3 py-2">
@@ -90,13 +92,15 @@ export function GameIdentityDialog({ directory, writable, onClose, onConfirmed }
       {preview.data.warnings.map((warning, i) => <Alert variant="warning" key={i}><AlertDescription>{warning}</AlertDescription></Alert>)}
       <FieldGroup>
         <Field><FieldLabel htmlFor="identity-query">公开搜索词</FieldLabel><Input id="identity-query" aria-label="公开搜索词" value={query} maxLength={512} disabled={busy} onChange={event => changeQuery(event.target.value)}/></Field>
-        <Label className="items-start font-normal"><Checkbox aria-label="同意发送公开搜索词" checked={searchConsent} disabled={busy} onCheckedChange={checked => setSearchConsent(checked === true)}/><span>我已核对搜索词不含本机路径、密钥或私人信息，同意将其发送给 Brave。</span></Label>
+        <Label className="items-start font-normal"><Checkbox aria-label="同意发送公开搜索词" checked={searchConsent} disabled={busy} onCheckedChange={checked => setSearchConsent(checked === true)}/><span>我已核对搜索词不含本机路径、密钥或私人信息，同意将其发送给 Bing。</span></Label>
         <div><Button disabled={busy || !searchConsent || !query.trim()} onClick={() => { void search(); }}>{busy ? <Spinner data-icon="inline-start"/> : <SearchIcon data-icon="inline-start"/>}{busy ? '正在处理…' : '搜索候选'}</Button></div>
       </FieldGroup>
       {result && <section className="flex flex-col gap-4" aria-label="联网识别候选">
         <Separator/>
         <div className="flex items-center justify-between gap-2"><h3 className="flex items-center gap-2 font-medium"><GlobeIcon className="size-4"/>网络候选</h3><Badge tone="warning">未验证</Badge></div>
-        {result.status === 'needs_configuration' ? <Alert variant="warning" role="status"><AlertDescription>请在「设置 → Skills → 联网搜索」中配置 Brave Search API Key。</AlertDescription></Alert> : result.status === 'unavailable' ? <Alert variant="warning" role="status"><AlertDescription>联网搜索暂不可用，未确认任何游戏身份。</AlertDescription></Alert> : <>
+        {result.status !== 'available'
+          ? <Alert variant="warning" role="status"><AlertDescription>{result.message}</AlertDescription></Alert>
+          : <>
           {result.candidates.length ? <RadioGroup aria-label="选择游戏候选" value={selected === null ? '' : String(selected)} disabled={busy} onValueChange={value => { const index = Number(value); setSelected(index); setName(result.candidates[index].name); setRegistrationConsent(false); }}>
             <ItemGroup className="gap-2">{result.candidates.map((candidate, index) => <Item asChild variant="outline" key={`${index}:${candidate.url}`}>
               <label className="cursor-pointer items-start">

@@ -1,5 +1,10 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import { installMockTauri } from "./mock-tauri";
+
+async function expectAdapterResearchPrompt(composer: Locator) {
+  await expect(composer).toHaveValue(/使用已有的 Mod 平台 MCP.*不同安装类型的代表性 Mod.*分析并核实各类型的安装规则/);
+  await expect(composer).toHaveValue(/自行核实游戏识别标记，只在信息无法核实或需要我决定偏好时向我提问/);
+}
 
 test("browser preview never pretends to have native filesystem access", async ({page}) => {
   await page.goto("/");
@@ -19,22 +24,25 @@ test("streams pre-invoke deltas once, previews approval and persists completion"
   await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await page.getByRole("textbox", {name: "告诉 Agent 你想做什么"}).fill("帮我检查 Minecraft 模组");
   await page.getByRole("button", {name: "发送消息", exact: true}).click();
-  const approval = page.getByRole("dialog", {name: "操作审批", exact: true});
+  const approval = page.getByRole("group", {name: "操作审批", exact: true});
+  await expect(page.getByRole("dialog", {name: "操作审批", exact: true})).toHaveCount(0);
   await expect(approval).toBeVisible();
   await expect(approval).toContainText("/sandbox/minecraft/mods/Example.jar");
   await expect(approval).toContainText("txn-fixture");
   await expect(page.locator('[data-message-id="assistant-fixture"]')).toHaveText("正在检查模组文件。");
-  await approval.getByRole("button", {name: "批准并执行", exact: true}).click();
-  await expect(approval).not.toBeVisible();
+  const approve = approval.getByRole("button", {name: "批准并执行", exact: true});
+  await approve.click();
+  await expect(approve).toHaveCount(0);
   await expect(page.locator('[data-message-id="assistant-fixture"]')).toContainText("检查完成，文件计划已执行。");
   await expect(page.getByText("120 tokens", {exact: true})).toBeVisible();
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
   await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await expect(page.locator('[data-message-id="assistant-fixture"]')).toHaveCount(1);
   await expect(page.locator('[data-message-id="assistant-fixture"]')).toHaveText(/正在检查模组文件。\s*检查完成，文件计划已执行。/);
+  await expect(page.getByRole("button", {name: "apply_file_ops 已执行", exact: true})).toBeVisible();
   const responses = await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "respond_approval"));
   expect(responses).toHaveLength(1);
-  expect(responses[0].args.response.approved).toBe(true);
+  expect(responses[0].args.response).toEqual({approved: true, answer: null});
 });
 
 test("trash restore needs a visible plan and separate apply confirmation", async ({page}) => {
@@ -153,8 +161,8 @@ test("model credentials use the dedicated secret command, not public settings", 
   expect(settings.api_key_ref).toBe("model.api_key");
   expect(JSON.stringify(settings)).not.toContain("sk-fixture-only");
   expect(await page.evaluate(() => JSON.stringify({...localStorage}))).not.toContain("sk-fixture-only");
-  await page.getByRole("tab", {name: "MCP 服务", exact: true}).click();
-  await expect(page.getByRole("button", {name: "开启服务", exact: true})).toBeEnabled();
+  await page.getByRole("tab", {name: "工具", exact: true}).click();
+  await expect(page.getByRole("button", {name: "开启工具", exact: true})).toBeEnabled();
   await expect(page.locator("main [role=alert]")).toHaveCount(0);
   await page.getByRole("tab", {name: "Skills", exact: true}).click();
   await expect(page.getByRole("button", {name: "导入 Skill", exact: true})).toBeEnabled();
@@ -167,16 +175,94 @@ test("rejecting approval never reports a committed file operation", async ({page
   await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await page.getByRole("textbox", {name: "告诉 Agent 你想做什么"}).fill("检查文件");
   await page.getByRole("button", {name: "发送消息", exact: true}).click();
-  const approval = page.getByRole("dialog", {name: "操作审批", exact: true});
+  const approval = page.getByRole("group", {name: "操作审批", exact: true});
+  await expect(page.getByRole("dialog", {name: "操作审批", exact: true})).toHaveCount(0);
   await expect(approval).toBeVisible();
-  await approval.getByRole("button", {name: "拒绝", exact: true}).click();
+  const reject = approval.getByRole("button", {name: "拒绝", exact: true});
+  await reject.click();
+  await expect(reject).toHaveCount(0);
   await expect(page.locator('[data-message-id="assistant-fixture"]')).toContainText("未执行文件操作。");
+  await expect(page.getByRole("button", {name: "apply_file_ops 已拒绝", exact: true})).toBeVisible();
   const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
   expect(calls.filter((call: any) => call.command === "apply_plan")).toHaveLength(0);
+  expect(calls.find((call: any) => call.command === "respond_approval")?.args.response).toEqual({approved: false, answer: null});
+});
+
+test("cancelled tool approval keeps its own status in conversation history", async ({page}) => {
+  await installMockTauri(page, {holdAgentTurn: true});
+  await page.goto("/");
+  await page.getByRole("button", {name: "游戏库", exact: true}).click();
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
+  await page.getByRole("textbox", {name: "告诉 Agent 你想做什么", exact: true}).fill("检查文件");
+  await page.getByRole("button", {name: "发送消息", exact: true}).click();
+  await expect(page.getByRole("button", {name: "停止生成", exact: true})).toBeVisible();
+
+  await page.evaluate(() => {
+    const fixture = (window as any).__AMM_TEST__;
+    const plan = {
+      id: "txn-fixture",
+      summary: "还原 Example.jar",
+      total_bytes: 1024,
+      created_at: "2026-11-18T00:00:00Z",
+      requires_review: true,
+      entries: [{
+        operation: {op: "move", src: "/sandbox/data/trash/trash_fixture/payload", dst: "/sandbox/minecraft/mods/Example.jar"},
+        before: null,
+        source: {kind: "file", size: 1024, sha256: "a".repeat(64)},
+        impact: "move",
+      }],
+    };
+    fixture.emit("tool-start", {toolCallId: "tool-fixture", name: "apply_file_ops", arguments: {plan_id: plan.id}});
+    fixture.emit("approval-request", {approvalId: "approval-fixture", toolCallId: "tool-fixture", title: "apply_file_ops", preview: plan});
+  });
+
+  const approval = page.getByRole("group", {name: "操作审批", exact: true});
+  await expect(approval).toBeVisible();
+  await expect(approval.getByRole("button", {name: "批准并执行", exact: true})).toBeVisible();
+  await page.evaluate(() => {
+    const fixture = (window as any).__AMM_TEST__;
+    fixture.emit("approval-resolved", {approvalId: "approval-fixture", status: "cancelled"}, undefined, null);
+    fixture.emit("done", {status: "cancelled"}, undefined, null);
+  });
+
+  await expect(page.getByRole("button", {name: "apply_file_ops 已取消", exact: true})).toBeVisible();
+  await expect(page.getByRole("button", {name: "apply_file_ops 已拒绝", exact: true})).toHaveCount(0);
+});
+
+test("approval can retry an IPC failure and waits for the definitive tool outcome", async ({page}) => {
+  await installMockTauri(page, {holdAgentTurn: true});
+  await page.goto("/");
+  await page.getByRole("textbox", {name: "告诉 Agent 你想做什么"}).fill("下载模组");
+  await page.getByRole("button", {name: "发送消息", exact: true}).click();
+  await expect(page.getByRole("button", {name: "停止生成", exact: true})).toBeVisible();
+  await page.evaluate(() => {
+    const {__AMM_TEST__: mock, __TAURI_INTERNALS__: ipc} = window as any;
+    const invoke = ipc.invoke;
+    let attempts = 0;
+    ipc.invoke = (command: string, args: unknown) => {
+      if (command !== "respond_approval") return invoke(command, args);
+      if (++attempts === 1) return Promise.reject(new Error("暂时无法提交授权"));
+      return Promise.resolve(); // The durable resolution and tool result can arrive later.
+    };
+    mock.emit("approval-request", {approvalId: "download-request", toolCallId: "download-call", title: "download_mod", preview: {filename: "Example.jar"}});
+  });
+  const card = page.getByRole("group", {name: "操作审批", exact: true});
+  const approve = card.getByRole("button", {name: "批准并执行", exact: true});
+  await expect(card).toContainText("Example.jar");
+  await approve.click();
+  await expect(card.getByRole("alert")).toHaveText("暂时无法提交授权");
+  await approve.click();
+  await expect(approve).toBeDisabled();
+  await expect(card.getByRole("button", {name: "拒绝", exact: true})).toBeDisabled();
+  await page.evaluate(() => (window as any).__AMM_TEST__.emit("approval-resolved", {approvalId: "download-request", status: "approved"}));
+  await expect(card).toHaveCount(0);
+  await expect(page.getByRole("button", {name: "download_mod 已批准，正在执行", exact: true})).toBeVisible();
+  await page.evaluate(() => (window as any).__AMM_TEST__.emit("tool-result", {toolCallId: "download-call", status: "error", result: {error: "下载失败"}}));
+  await expect(page.getByRole("button", {name: "download_mod 执行失败", exact: true})).toBeVisible();
 });
 
 test("plugin enable control uses the backend and survives navigation", async ({page}) => {
-  await installMockTauri(page);
+  await installMockTauri(page, {withExternalAdapter: true});
   await page.goto("/");
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
   await page.getByRole("button", {name: "插件中心", exact: true}).click();
@@ -199,14 +285,15 @@ test("plugin enable control uses the backend and survives navigation", async ({p
 });
 
 test("adapter center previews the game Skill and prefills Agent creation and revision", async ({page}) => {
-  await installMockTauri(page);
+  await installMockTauri(page, {withExternalAdapter: true});
   await page.goto("/");
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
   const adapterCenter = page.getByRole("button", {name: "插件中心", exact: true});
   const composer = page.getByRole("textbox", {name: "告诉 Agent 你想做什么", exact: true});
   await adapterCenter.click();
   await page.getByRole("button", {name: "用 Agent 创建", exact: true}).click();
-  await expect(composer).toHaveValue(/创建.*适配包/);
+  await expect(composer).toHaveValue(/创建.*适配包.*若目标游戏不明确，请先向我确认/);
+  await expectAdapterResearchPrompt(composer);
 
   await adapterCenter.click();
   await page.getByRole("row").getByRole("button", {name: /Minecraft Java Edition/}).click();
@@ -231,8 +318,68 @@ test("adapter center previews the game Skill and prefills Agent creation and rev
   expect(calls.some((call: any) => call.command === "start_turn")).toBe(false);
 });
 
+test("empty package center stays empty until an external draft is installed", async ({page}) => {
+  await installMockTauri(page);
+  await page.goto("/");
+  await page.getByRole("button", {name: "游戏库", exact: true}).click();
+  await page.getByRole("button", {name: "插件中心", exact: true}).click();
+
+  await expect(page.getByRole("heading", {name: "适配包", exact: true})).toBeVisible();
+  await expect(page.getByText("暂无已安装适配包", {exact: true})).toBeVisible();
+  await expect(page.getByRole("row")).toHaveCount(1);
+  await expect(page.getByRole("heading", {name: "适配包详情", exact: true})).toBeVisible();
+
+  await page.getByRole("button", {name: "新建草稿", exact: true}).click();
+  const draft = page.getByRole("dialog", {name: "声明式适配包草稿", exact: true});
+  await draft.getByLabel("Slug", {exact: true}).fill("external-fixture");
+  await draft.getByLabel("adapter.json", {exact: true}).fill(JSON.stringify({
+    schemaVersion: 1,
+    slug: "external-fixture",
+    name: "External Fixture",
+    version: "1.0.0",
+    platforms: ["windows"],
+    markers: [{path: "game.exe", kind: "file", required: true, platforms: ["windows"]}],
+    steamAppId: null,
+    installRoots: [{id: "game", kind: "game", relativePath: ".", platforms: ["windows"], discoveryHints: [], notes: "Fixture root."}],
+    modTypes: [{id: "game-file", name: "Game file", root: "game", extensions: ["zip"], notes: "Review fixture files."}],
+    archiveRules: [{modType: "game-file", layout: "single_file", sourcePrefix: null, requiredFiles: [], notes: "Keep the archive intact."}],
+    loadOrder: {kind: "none", paths: [], notes: "No load order."},
+    savePaths: [],
+    logPaths: [],
+    uninstallNotes: ["Remove only files from this installation."],
+    sources: [{title: "Fixture documentation", url: "https://example.com/fixture", checkedAt: "2026-11-21"}],
+  }, null, 2));
+  await draft.getByLabel("SKILL.md", {exact: true}).fill("---\nname: external-fixture\ndescription: External fixture\n---\n\nTest package.");
+  await draft.getByRole("button", {name: "预览保存草稿", exact: true}).click();
+  const writeReview = page.getByRole("dialog", {name: "确认文件变更", exact: true});
+  await expect(writeReview).toContainText("保存外部适配包草稿 external-fixture");
+  await writeReview.getByRole("button", {name: "批准并执行", exact: true}).click();
+
+  await page.getByRole("tab", {name: /^草稿/}).click();
+  const row = page.getByRole("row").filter({hasText: "external-fixture"});
+  await expect(row).toBeVisible();
+  await row.getByRole("button", {name: "验证", exact: true}).click();
+  const validation = page.getByRole("dialog", {name: "验证：external-fixture", exact: true});
+  await expect(validation).toContainText("验证通过");
+  await validation.getByRole("button", {name: "安装预览", exact: true}).click();
+  const installReview = page.getByRole("dialog", {name: "确认文件变更", exact: true});
+  await expect(installReview).toContainText("安装外部适配包 external-fixture");
+  await installReview.getByRole("button", {name: "批准并执行", exact: true}).click();
+
+  await page.getByRole("tab", {name: "已安装", exact: true}).click();
+  const installedRow = page.getByRole("row").filter({hasText: "External Fixture"});
+  await expect(installedRow).toContainText("External Fixture");
+  await expect(installedRow).toContainText("本地导入");
+  await installedRow.getByRole("button", {name: /External Fixture/}).click();
+  await expect(page.getByText("external-fixture", {exact: true})).toBeVisible();
+  const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
+  expect(calls.filter((call: any) => call.command === "apply_plan").map((call: any) => call.args.planId)).toEqual([
+    "txn-write-external-fixture", "txn-install-external-fixture",
+  ]);
+});
+
 test("library prefills adapter creation for an unbound game and displays its bound cover", async ({page}) => {
-  await installMockTauri(page, {gameWithoutAdapter: true});
+  await installMockTauri(page, {gameWithoutAdapter: true, withExternalAdapter: true});
   await page.goto("/");
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
   const library = page.getByTestId("library-page");
@@ -241,7 +388,8 @@ test("library prefills adapter creation for an unbound game and displays its bou
   await expect(cover).toHaveCount(0);
   await card.getByRole("button", {name: "创建适配包", exact: true}).click();
   const composer = page.getByRole("textbox", {name: "告诉 Agent 你想做什么", exact: true});
-  await expect(composer).toHaveValue(/Minecraft Java Edition.*创建适配包/);
+  await expect(composer).toHaveValue(/Minecraft Java Edition.*创建适配包.*校验通过后安装并绑定到这款游戏/);
+  await expectAdapterResearchPrompt(composer);
 
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
   await card.getByRole("button", {name: "更多操作", exact: true}).click();
@@ -264,6 +412,7 @@ test("library prefills adapter creation for an unbound game and displays its bou
 test("library explains adapter conflicts and lets the player release pending tasks", async ({page}) => {
   await installMockTauri(page, {
     gameWithoutAdapter: true,
+    withExternalAdapter: true,
     gamePlanConflicts: [
       {id: "txn-pbz-mods", kind: "file_plan", status: "planned", title: "文件任务", summary: "创建 Mods 目录", paths: ["/sandbox/minecraft/Content/Paks/~mods"], detail: "这项任务尚未执行，不会自动修改游戏文件。", canResolve: true, resolutionHint: null},
       {id: "approval-pbz", kind: "approval", status: "pending", title: "安装 PBZ", summary: "等待确认安装计划", paths: [], detail: "这是一个等待审批的安装任务。", canResolve: true, resolutionHint: null},
@@ -297,7 +446,7 @@ test("library explains adapter conflicts and lets the player release pending tas
 });
 
 test("library retains the game cover placeholder when the adapter image fails", async ({page}) => {
-  await installMockTauri(page);
+  await installMockTauri(page, {withExternalAdapter: true});
   await page.route("**/favicon.png", (route) => route.abort());
   const failedImage = page.waitForEvent("requestfailed", (request) => request.resourceType() === "image" && request.url().endsWith("/favicon.png"));
   await page.goto("/");
@@ -318,7 +467,7 @@ test("Settings separates system and standalone Skills from game Skills", async (
 
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await expect(page.getByRole("tablist", {name: "设置分类"}).getByRole("tab")).toHaveText([
-    "AI 与模型", "MCP 服务", "Skills", "外观与存储",
+    "AI 与模型", "工具", "Skills", "外观与存储",
   ]);
   const panel = page.getByRole("tabpanel", {name: "Skills", exact: true});
   const system = panel.getByRole("region", {name: "系统 Skills", exact: true});
@@ -344,13 +493,9 @@ test("Settings separates system and standalone Skills from game Skills", async (
   await system.getByRole("button", {name: "联网搜索", exact: true}).click();
   const details = page.getByRole("dialog", {name: "联网搜索", exact: true});
   await expect(details).toContainText("仅发送公开的搜索关键词。");
-  const braveKey = details.getByLabel("Brave Search API Key", {exact: true});
-  await expect(braveKey).toHaveAttribute("type", "password");
-  await braveKey.fill("brave-fixture-key");
-  await details.getByRole("button", {name: "保存Brave Search API Key", exact: true}).click();
-  await expect(braveKey).toHaveValue("");
-  const secret = await page.evaluate(() => (window as any).__AMM_TEST__.calls.find((call: any) => call.command === "set_secret"));
-  expect(secret?.args).toEqual({key: "sources.brave", value: "brave-fixture-key"});
+  await expect(details.getByLabel("Brave Search API Key", {exact: true})).toHaveCount(0);
+  const braveSecret = await page.evaluate(() => (window as any).__AMM_TEST__.calls.find((call: any) => call.command === "set_secret" && call.args.key === "sources.brave"));
+  expect(braveSecret).toBeUndefined();
   await expect(details.getByRole("button", {name: /卸载 Skill/})).toHaveCount(0);
   await page.keyboard.press("Escape");
 
@@ -419,37 +564,47 @@ test("file details discard cached content after a reviewed trash commit", async 
 });
 
 test("directory picker scans only the chosen library without registering games", async ({page}) => {
-  await installMockTauri(page);
+  await installMockTauri(page, {withExternalAdapter: true});
   await page.goto("/");
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
-  const directory = page.getByLabel("游戏目录", {exact: true});
+  await page.getByRole("button", {name: "扫描游戏", exact: true}).click();
+  const discovery = page.getByRole("dialog", {name: "扫描游戏", exact: true});
+  await expect(discovery).toBeVisible();
+  await expect(discovery.getByRole("status").filter({hasText: "已检查"})).toBeVisible();
+  const directory = discovery.getByLabel("游戏目录", {exact: true});
   await directory.fill("/sandbox/original");
-  await page.getByRole("button", {name: "选择游戏目录", exact: true}).click();
+  await discovery.getByRole("button", {name: "选择游戏目录", exact: true}).click();
   await expect(directory).toHaveValue("/sandbox/new-game");
-  const adapted = page.getByText("已适配", {exact: true});
+  const adapted = discovery.getByText("已适配", {exact: true});
   await expect(adapted).toHaveAttribute("data-variant", "success");
   await expect(adapted.locator("svg")).toBeVisible();
-  await expect(page.getByText("Fixture Game", {exact: true})).toBeVisible();
-  await expect(page.getByText("未匹配", {exact: true})).toBeVisible();
-  await expect(page.getByText("60% 匹配", {exact: true})).toHaveCount(0);
-  await page.getByRole("button", {name: "选择游戏目录", exact: true}).click();
+  await expect(discovery.getByText("Fixture Game", {exact: true})).toBeVisible();
+  await expect(discovery.getByText("未匹配", {exact: true})).toBeVisible();
+  await expect(discovery.getByText("60% 匹配", {exact: true})).toHaveCount(0);
+  await discovery.getByRole("button", {name: "选择游戏目录", exact: true}).click();
   await expect(directory).toHaveValue("/sandbox/new-game");
   await expect(adapted).toBeVisible();
   const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
   expect(calls.filter((call: any) => ["register_game", "identify_game", "register_user_root"].includes(call.command))).toHaveLength(0);
   expect(calls.filter((call: any) => call.command === "plugin:dialog|open")).toHaveLength(2);
-  expect(calls.filter((call: any) => call.command === "scan_games").map((call: any) => call.args.options)).toEqual([{userRoots: ["/sandbox/new-game"], includeCommonRoots: false}]);
+  expect(calls.filter((call: any) => call.command === "scan_games").map((call: any) => call.args.options)).toEqual([
+    {userRoots: [], includeCommonRoots: true},
+    {userRoots: ["/sandbox/new-game"], includeCommonRoots: false},
+  ]);
 
   await directory.fill("/sandbox/empty  ");
   await directory.press("Enter");
-  await expect(page.getByText(/未发现候选游戏/)).toBeVisible();
+  await expect(discovery.getByText(/未发现候选游戏/)).toBeVisible();
   await expect(adapted).toHaveCount(0);
   const lastScan = await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "scan_games").at(-1));
   expect(lastScan.args.options).toEqual({userRoots: ["/sandbox/empty  "], includeCommonRoots: false});
+  await page.keyboard.press("Escape");
+  await expect(discovery).toBeHidden();
+  await expect(page.getByTestId("library-page")).toBeVisible();
 });
 
 test("local archive import and game installation have separate approvals", async ({page}) => {
-  await installMockTauri(page);
+  await installMockTauri(page, {withExternalAdapter: true});
   await page.goto("/");
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
   await page.getByRole("button").filter({hasText: "Minecraft Java Edition"}).click();
@@ -485,7 +640,7 @@ async function openFomodInstall(page: Page) {
 }
 
 test("FOMOD preview requires an explicit option before sending mappings to install", async ({page}) => {
-  await installMockTauri(page);
+  await installMockTauri(page, {withExternalAdapter: true});
   await page.goto("/");
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
   const install = await openFomodInstall(page);
@@ -510,7 +665,7 @@ test("FOMOD preview requires an explicit option before sending mappings to insta
 
 for (const theme of ["light", "dark"] as const) {
   test(`safe FOMOD local archive previews deterministic mappings for review in ${theme} theme`, async ({page}) => {
-    await installMockTauri(page, {fomodSelection: "safe"});
+    await installMockTauri(page, {fomodSelection: "safe", withExternalAdapter: true});
     await page.emulateMedia({colorScheme: theme});
     await page.goto("/");
     await page.getByRole("button", {name: "游戏库", exact: true}).click();

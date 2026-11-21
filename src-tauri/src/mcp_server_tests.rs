@@ -674,7 +674,7 @@ async fn diagnose_game_exports_fabric_failure_evidence_without_approval() {
     crate::agent::diagnostic_tools::register(&fixture.runtime.registry).unwrap();
     set_mode(&fixture.runtime, "request_approval");
     let engine = &fixture.runtime.engine;
-    crate::plugins::seed_builtins(&engine.db, &engine.paths).unwrap();
+    crate::plugins::test_fixtures::install(&engine.db, &engine.paths).unwrap();
     let root = fixture._dir.path().join("fabric-instance");
     std::fs::create_dir_all(root.join("logs")).unwrap();
     std::fs::create_dir_all(root.join("mods")).unwrap();
@@ -1338,9 +1338,7 @@ async fn local_connection_failure_rolls_back_and_saved_intent_can_be_cancelled()
         )
         .unwrap();
     let error = server.start_desktop(&connections).await.unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("无法将本地 MCP 服务连接到 Agent"));
+    assert!(error.to_string().contains("无法将本地工具连接到 Agent"));
     assert!(!server.startup_requested().unwrap());
     assert!(server.status().await.endpoint.is_none());
     assert!(connections.list().await.is_empty());

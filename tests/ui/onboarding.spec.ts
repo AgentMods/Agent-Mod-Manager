@@ -1,9 +1,72 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { installMockTauri } from "./mock-tauri";
+
+const onboardingHttpConfig = {
+  id: "fixture-http",
+  name: "Remote HTTP",
+  transport: "streamable_http" as const,
+  command: null,
+  args: [],
+  url: "https://mcp.example.test",
+  env_secret_refs: {},
+  bearer_secret_ref: null,
+  enabled: false,
+  builtin: false,
+};
+
+const onboardingStdioConfig = {
+  id: "fixture-stdio",
+  name: "Local Stdio",
+  transport: "stdio" as const,
+  command: "fixture-mcp",
+  args: ["--stdio"],
+  url: null,
+  env_secret_refs: {},
+  bearer_secret_ref: null,
+  enabled: true,
+  builtin: false,
+};
+
+async function openOnboardingWithMcp(page: Page, {active = []}: {active?: string[]} = {}) {
+  await installMockTauri(page, {onboarding: true});
+  await page.goto("/");
+  await page.evaluate(({configs, active}) => {
+    const internals = (window as any).__TAURI_INTERNALS__;
+    const invoke = internals.invoke.bind(internals);
+    const state = {configs: structuredClone(configs), active: [...active] as string[], calls: [] as Array<{command: string; args: any}>};
+    (window as any).__ONBOARDING_MCP__ = state;
+    internals.invoke = async (command: string, args: any = {}, ...rest: unknown[]) => {
+      if (command === "mcp_list") return structuredClone(state.configs);
+      if (command === "mcp_startup_requests") return [];
+      if (command === "mcp_connections") return state.active.map((serverId) => ({serverId, tools: ["fixture_search"]}));
+      if (command === "mcp_update") {
+        state.calls.push({command, args: structuredClone(args)});
+        state.configs = state.configs.map((config: any) => config.id === args.config.id ? args.config : config);
+        return null;
+      }
+      if (command === "mcp_connect") {
+        state.calls.push({command, args: structuredClone(args)});
+        const serverId = args.expectedConfig.id;
+        if (!state.active.includes(serverId)) state.active.push(serverId);
+        return {serverId, tools: ["fixture_search"]};
+      }
+      if (command === "mcp_disconnect") {
+        state.calls.push({command, args: structuredClone(args)});
+        state.active = state.active.filter((serverId) => serverId !== args.id);
+        return null;
+      }
+      return invoke(command, args, ...rest);
+    };
+  }, {configs: [onboardingHttpConfig, onboardingStdioConfig], active});
+}
+
+const onboardingMcpCalls = (page: Page) => page.evaluate(() => (window as any).__ONBOARDING_MCP__.calls);
+const onboardingMcpRow = (page: Page, name: string) => page.getByRole("list", {name: "外部 MCP 连接", exact: true})
+  .getByRole("listitem").filter({hasText: name});
 
 test.describe("首次启动引导", () => {
   test("扫描候选不会自动添加，失败候选不影响其他候选", async ({page}) => {
-    await installMockTauri(page, {onboarding: true, failRegistration: true});
+    await installMockTauri(page, {onboarding: true, failRegistration: true, withExternalAdapter: true});
     await page.goto("/");
     await expect(page.getByRole("heading", {name: "先找到你想管理的游戏"})).toBeVisible();
     await expect(page.getByRole("navigation", {name: "主导航"})).toHaveCount(0);
@@ -53,8 +116,7 @@ test.describe("首次启动引导", () => {
   });
 
   test("配置 Agent 时密钥走 set_secret，完成导览后进入游戏库", async ({page}) => {
-    await installMockTauri(page, {onboarding: true});
-    await page.goto("/");
+    await openOnboardingWithMcp(page);
     await page.getByRole("button", {name: "稍后再扫"}).click();
     await expect(page.getByRole("heading", {name: "配置你的 AI Agent"})).toBeVisible();
     await expect(page.getByRole("link", {name: "没有AI？从这里获取"})).toHaveAttribute("href", "https://one.gloscai.com/keys");
@@ -76,6 +138,11 @@ test.describe("首次启动引导", () => {
     await page.keyboard.press("Escape");
     await page.getByRole("combobox", {name: "默认模型", exact: true}).selectOption("fixture-thinking");
     await page.getByRole("button", {name: "保存并继续"}).click();
+    await expect(page.getByRole("heading", {name: "启用 MCP 工具", exact: true})).toBeVisible();
+    await expect(onboardingMcpRow(page, "Remote HTTP")).toContainText("未启动");
+    await expect(onboardingMcpRow(page, "Local Stdio")).toContainText("未启动");
+    expect(await onboardingMcpCalls(page)).toEqual([]);
+    await page.getByRole("button", {name: "继续功能导览", exact: true}).click();
     await expect(page.getByRole("heading", {name: "认识 Agent Mod Manager"})).toBeVisible();
     await expect(page.getByRole("tab", {name: "Mod 发现", exact: true})).toHaveCount(0);
     await page.getByRole("tab", {name: "Agent 对话", exact: true}).click();
@@ -99,6 +166,82 @@ test.describe("首次启动引导", () => {
     await expect(page.getByRole("navigation", {name: "主导航"})).toBeVisible();
     const completed = await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "set_onboarding_completed"));
     expect(completed.at(-1)?.args.completed).toBe(true);
+  });
+
+  test("进入或跳过 Agent 配置不会自动连接 MCP，主动启动与返回后状态正确", async ({page}) => {
+    await openOnboardingWithMcp(page);
+    await page.getByRole("button", {name: "稍后再扫", exact: true}).click();
+    await expect(page.getByRole("heading", {name: "配置你的 AI Agent", exact: true})).toBeVisible();
+    await page.getByRole("button", {name: "跳过配置", exact: true}).click();
+
+    const mcpHeading = page.getByRole("heading", {name: "启用 MCP 工具", exact: true});
+    const httpRow = onboardingMcpRow(page, onboardingHttpConfig.name);
+    const stdioRow = onboardingMcpRow(page, onboardingStdioConfig.name);
+    await expect(mcpHeading).toBeVisible();
+    await expect(httpRow).toContainText("未启动");
+    await expect(stdioRow).toContainText("未启动");
+    expect(await onboardingMcpCalls(page)).toEqual([]);
+
+    await page.getByRole("button", {name: "上一步", exact: true}).click();
+    await expect(page.getByRole("heading", {name: "配置你的 AI Agent", exact: true})).toBeVisible();
+    await page.getByRole("button", {name: "上一步", exact: true}).click();
+    await expect(page.getByRole("heading", {name: "先找到你想管理的游戏", exact: true})).toBeVisible();
+    await page.getByRole("button", {name: "稍后再扫", exact: true}).click();
+    await page.getByRole("button", {name: "跳过配置", exact: true}).click();
+    await expect(mcpHeading).toBeVisible();
+    expect(await onboardingMcpCalls(page)).toEqual([]);
+
+    await httpRow.getByRole("button", {name: `启动 ${onboardingHttpConfig.name}`, exact: true}).click();
+    await expect(httpRow).toContainText("运行中");
+    await expect(httpRow.getByRole("button", {name: `停止 ${onboardingHttpConfig.name}`, exact: true})).toBeVisible();
+    const httpCalls = [
+      {command: "mcp_update", args: {config: {...onboardingHttpConfig, enabled: true}}},
+      {command: "mcp_connect", args: {expectedConfig: {...onboardingHttpConfig, enabled: true}, acceptsUnsandboxedStdio: false}},
+    ];
+    expect(await onboardingMcpCalls(page)).toEqual(httpCalls);
+
+    await expect(stdioRow).toContainText("fixture-mcp --stdio");
+    await stdioRow.getByRole("button", {name: `启动 ${onboardingStdioConfig.name}`, exact: true}).click();
+    await expect(stdioRow).toContainText("运行中");
+    const connectedCalls = [...httpCalls, {
+      command: "mcp_connect",
+      args: {expectedConfig: onboardingStdioConfig, acceptsUnsandboxedStdio: true},
+    }];
+    expect(await onboardingMcpCalls(page)).toEqual(connectedCalls);
+
+    await page.getByRole("button", {name: "继续功能导览", exact: true}).click();
+    await expect(page.getByRole("heading", {name: "认识 Agent Mod Manager", exact: true})).toBeVisible();
+    await page.getByRole("button", {name: "上一步", exact: true}).click();
+    await expect(mcpHeading).toBeVisible();
+    await expect(httpRow).toContainText("运行中");
+    await expect(stdioRow).toContainText("运行中");
+    await page.getByRole("button", {name: "上一步", exact: true}).click();
+    await page.getByRole("button", {name: "跳过配置", exact: true}).click();
+    await expect(mcpHeading).toBeVisible();
+    await expect(httpRow).toContainText("运行中");
+    await expect(stdioRow).toContainText("运行中");
+    expect(await onboardingMcpCalls(page)).toEqual(connectedCalls);
+  });
+
+  test("全部启用只连接尚未运行的 MCP，全部运行后禁用批量按钮", async ({page}) => {
+    await openOnboardingWithMcp(page, {active: [onboardingStdioConfig.id]});
+    await page.getByRole("button", {name: "稍后再扫", exact: true}).click();
+    await page.getByRole("button", {name: "跳过配置", exact: true}).click();
+
+    const httpRow = onboardingMcpRow(page, onboardingHttpConfig.name);
+    const stdioRow = onboardingMcpRow(page, onboardingStdioConfig.name);
+    const enableAll = page.getByRole("button", {name: "全部启用", exact: true});
+    await expect(stdioRow).toContainText("运行中");
+    await expect(httpRow).toContainText("未启动");
+    await enableAll.click();
+
+    await expect(httpRow).toContainText("运行中");
+    await expect(stdioRow).toContainText("运行中");
+    await expect(enableAll).toBeDisabled();
+    expect(await onboardingMcpCalls(page)).toEqual([
+      {command: "mcp_update", args: {config: {...onboardingHttpConfig, enabled: true}}},
+      {command: "mcp_connect", args: {expectedConfig: {...onboardingHttpConfig, enabled: true}, acceptsUnsandboxedStdio: false}},
+    ]);
   });
 
   test("Agent composer supports per-turn model and reasoning controls", async ({page}) => {
@@ -145,10 +288,12 @@ test.describe("首次启动引导", () => {
     const modelTrigger = page.getByRole("button", {name: "本轮模型", exact: true});
     const startTurns = () => page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "start_turn"));
     const finishCurrentTurn = async () => {
-      const approval = page.getByRole("dialog", {name: "操作审批", exact: true});
+      const approval = page.getByRole("group", {name: "操作审批", exact: true});
+      await expect(page.getByRole("dialog", {name: "操作审批", exact: true})).toHaveCount(0);
       await expect(approval).toBeVisible();
-      await approval.getByRole("button", {name: "拒绝", exact: true}).click();
-      await expect(approval).toBeHidden();
+      const reject = approval.getByRole("button", {name: "拒绝", exact: true});
+      await reject.click();
+      await expect(reject).toHaveCount(0);
       await expect(send).toBeVisible();
     };
 
@@ -244,9 +389,11 @@ test.describe("首次启动引导", () => {
     await expect(page.getByText(/暂时无法读取 BaseLLM/)).toBeVisible();
     await page.getByLabel("local-model 上下文预算").fill("20480");
     await page.getByRole("button", {name: "保存并继续"}).click();
-    await expect(page.getByRole("heading", {name: "认识 Agent Mod Manager"})).toBeVisible();
+    await expect(page.getByRole("heading", {name: "启用 MCP 工具", exact: true})).toBeVisible();
     const models = await page.evaluate(() => (window as any).__AMM_TEST__.calls.find((call: any) => call.command === "set_settings").args.settings.models);
     expect(models).toEqual([{display_name: "local-model", id: "local-model", context_budget: 20480, reasoning_levels: []}]);
+    await page.getByRole("button", {name: "继续功能导览", exact: true}).click();
+    await expect(page.getByRole("heading", {name: "认识 Agent Mod Manager", exact: true})).toBeVisible();
   });
 
   test("退出引导会持久化完成状态并解除阻断", async ({page}) => {
@@ -279,27 +426,44 @@ test.describe("首次启动引导", () => {
   });
 
   test("引导页在亮色和暗色主题下没有横向溢出", async ({page}, info) => {
-    await installMockTauri(page, {onboarding: true});
-    await page.goto("/");
+    await openOnboardingWithMcp(page);
     for (const theme of ["light", "dark"]) {
       if (await page.locator("html").getAttribute("data-theme") !== theme) {
         await page.getByRole("button", {name: theme === "dark" ? "切换暗色主题" : "切换亮色主题"}).click();
       }
       await page.getByRole("button", {name: /扫描已安装游戏|重新扫描/}).click();
       await expect(page.getByText("Fixture Game", {exact: true})).toBeVisible();
-      for (const name of ["稍后再扫", "继续配置 Agent"]) {
-        const next = page.getByRole("button", {name});
-        if (await next.count()) { await next.click(); break; }
-      }
+      await page.getByRole("button", {name: "继续配置 Agent", exact: true}).click();
       await expect(page.getByRole("heading", {name: "配置你的 AI Agent"})).toBeVisible();
       await page.getByRole("button", {name: "跳过配置"}).click();
-      await expect(page.getByRole("tab", {name: "设置"})).toBeVisible();
-      await page.getByRole("tab", {name: "设置"}).click();
-      await expect(page.getByText(/外部 stdio MCP 进程拥有当前用户的系统权限/)).toBeVisible();
+
+      await expect(page.getByRole("heading", {name: "启用 MCP 工具", exact: true})).toBeVisible();
+      if (info.project.name === "narrow-390") {
+        await expect(page.getByText("步骤 2 / 3", {exact: true})).toBeVisible();
+      }
+      if (info.project.name.startsWith("desktop-")) {
+        const navigation = page.getByRole("list", {name: "引导步骤", exact: true});
+        await expect(navigation).toBeVisible();
+        await expect(navigation.getByRole("listitem")).toHaveCount(3);
+        await expect(navigation).toContainText("添加");
+        await expect(navigation).toContainText("配置 Agent");
+        await expect(navigation).toContainText("功能导览");
+        await expect(navigation).not.toContainText("启用 MCP 工具");
+        await expect(navigation.getByRole("listitem").filter({hasText: "配置 Agent"})).toHaveAttribute("aria-current", "step");
+      }
       expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), `${theme}/${info.project.name}`).toBe(false);
-      await page.screenshot({path: `output/playwright/screenshots/onboarding-${info.project.name}-${theme}.png`, fullPage: true});
+      await page.screenshot({path: `output/playwright/screenshots/onboarding-mcp-${info.project.name}-${theme}.png`, fullPage: true, animations: "disabled"});
+
+      await page.getByRole("button", {name: "继续功能导览", exact: true}).click();
+      await expect(page.getByRole("heading", {name: "认识 Agent Mod Manager", exact: true})).toBeVisible();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), `${theme}/${info.project.name}/tour`).toBe(false);
+
       await page.getByRole("button", {name: "上一步"}).click();
+      await expect(page.getByRole("heading", {name: "启用 MCP 工具", exact: true})).toBeVisible();
       await page.getByRole("button", {name: "上一步"}).click();
+      await expect(page.getByRole("heading", {name: "配置你的 AI Agent"})).toBeVisible();
+      await page.getByRole("button", {name: "上一步"}).click();
+      await expect(page.getByRole("heading", {name: "先找到你想管理的游戏"})).toBeVisible();
     }
   });
 });

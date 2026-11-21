@@ -1,6 +1,6 @@
 # Mod sources
 
-All sources use the same `ModSource` search/resolve interface and the existing
+Native catalog providers use the same `ModSource` search/resolve interface and the existing
 download manager. Resolving is not permission to install. Missing or malformed
 credentials disable only that provider. Search failures are isolated so another
 provider can still return results.
@@ -28,9 +28,15 @@ rebuilds model context. Old on-disk history and arbitrary conversation text are
 not rewritten. These changes do not retroactively verify the origin of old
 downloads. `download_mod` does not accept uncataloged links.
 
+## Agent downloads from Mod sites
+
+The Agent checks the selected file against the connected source MCP first. The native catalog is independent of the connected services. On Mod 客栈, `list_works` and `list_work_files` identify the exact attachment. The official MCP's `get_work_file_download` issues a short-lived link and counts the download. The desktop adapter requests the signed link and transfers the selected attachment under one approval, returning the local archive receipt for later review. Signed URLs stay out of the conversation and the database.
+
+When the source cannot deliver the attachment, the Agent uses the connected Playwright MCP to download the same file through the official page and checks the saved file. A denied approval stops the operation. The stock browser reports absolute file paths and writes under `Agent Mod Manager/Playwright` in the user’s downloads directory (or a user-writable fallback). Browser downloads and local files saved by third-party MCPs use the desktop archive import flow for installation.
+
 ## Reviewed public archive links
 
-When a catalog cannot provide a download, the desktop Agent can use
+For an explicitly requested native direct-link transfer, the desktop Agent can use
 `download_web_mod` with `{"url":"https://…/release.zip"}`. The link must be
 explicitly provided or present in evidence; a search hit on a project page is
 not a direct download. The tool requires per-transfer approval even in Full
@@ -65,7 +71,7 @@ The Agent approval and refusal paths are separately tested with scripted SSE
 and an inert loopback ZIP.
 
 ```sh
-cargo test --manifest-path src-tauri/Cargo.toml --locked --lib \
+node scripts/test-rust.mjs --locked --lib \
   opt_in_live_public_archive_has_no_catalog_provenance -- --ignored --nocapture
 ```
 
@@ -181,7 +187,7 @@ files and the application database are in temporary directories; no API key,
 existing game profile, or loader is used.
 
 ```sh
-cargo test --manifest-path src-tauri/Cargo.toml --locked --lib \
+node scripts/test-rust.mjs --locked --lib \
   opt_in_live_modrinth_agent_install_and_rollback -- --ignored --nocapture
 ```
 
@@ -214,13 +220,13 @@ provider integrity or authenticity proof. The artifact required review, and
 no game root, extraction, installation, or file transaction was created.
 
 ```sh
-cargo test --manifest-path src-tauri/Cargo.toml --locked --lib \
+node scripts/test-rust.mjs --locked --lib \
   opt_in_live_thunderstore_download_stays_inert -- --ignored --nocapture
 ```
 
 ## 3DM API v3
 
-Configure new 3DM connections under **MCP 服务** in Settings. The direct adapter
+Configure new 3DM connections under **工具** in Settings. The direct adapter
 can still read an existing `sources.3dm` credential. It uses only
 `https://mod.3dmgame.com/api/v3/mods` and `/mods/<id>`, with the raw key in the
 sensitive `Authorization` header, not in a URL or `Bearer` prefix. Redirects
@@ -228,8 +234,8 @@ are disabled for API requests. The shared HTTP cache isolates credential scopes
 and applies the existing rate limit and response-size limits.
 
 The direct source does not start an MCP process, connect a server, reuse a
-Mod 客栈 credential, or infer connection consent. The optional `uvx glossmod-mcp`
-preset remains a separate user-confirmed, unsandboxed stdio connection.
+Mod 客栈 credential, or infer connection consent. The optional 3DM MCP preset connects separately to `https://mod.3dmgame.com/mcp`
+using Streamable HTTP.
 
 Search uses the provider-native numeric `game_ids["3dm"]` when supplied, not a
 Steam App ID or adapter slug. Search text is limited to 100 Unicode characters.

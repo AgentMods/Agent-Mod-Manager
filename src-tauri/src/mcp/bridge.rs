@@ -26,7 +26,23 @@ impl McpClient {
             .list_tools(cancel)
             .await?
             .into_iter()
+            // The built-in publication workflow binds consent to an exact package and target.
+            .filter(|tool| {
+                !(self.server_config().is_glossmod_endpoint()
+                    && matches!(
+                        tool.remote_name.as_str(),
+                        "publish_manager_plugin" | "publish_manager_plugin_release"
+                    ))
+            })
             .map(|tool| {
+                if self.server_config().is_glossmod_endpoint()
+                    && tool.remote_name == super::glossmod_download::TOOL
+                {
+                    return Arc::new(super::glossmod_download::GlossModDownload::new(
+                        self.clone(),
+                        tool.name,
+                    )) as Arc<dyn AgentTool>;
+                }
                 Arc::new(McpAgentTool {
                     client: self.clone(),
                     tool,
@@ -53,8 +69,9 @@ impl AgentTool for McpAgentTool {
         ToolDefinition {
             name: self.tool.name.clone(),
             description: format!(
-                "[External untrusted MCP: {}] {}",
+                "[External untrusted MCP: {}] {} — {}",
                 self.client.server_id(),
+                self.tool.remote_name,
                 self.tool.description
             ),
             parameters: self.tool.input_schema.clone(),
@@ -71,9 +88,11 @@ impl AgentTool for McpAgentTool {
                 "Invalid or oversized MCP arguments".into(),
             ));
         }
+        let mut server = self.client.server_config().clone();
+        server.description = None;
         Ok(PreparedTool {
             preview: json!({
-                "server": self.client.server_config(), "tool": self.tool.remote_name, "arguments":args,
+                "server": server, "tool": self.tool.remote_name, "arguments":args,
                 "trust":"untrusted_external", "localFileWhitelistEnforced":false,
                 "warning":"External MCP may change remote state. Stdio runs with OS user privileges and can bypass local file guards. No remote annotation is trusted."
             }),

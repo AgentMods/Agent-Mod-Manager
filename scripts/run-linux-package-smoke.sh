@@ -51,12 +51,13 @@ db="$profile/data/com.glossmod.amm/manager.db"
 test -f "$db"
 actual=$(sqlite3 -readonly -batch -noheader "$db" '
     PRAGMA quick_check;
+    SELECT source FROM plugins;
     SELECT status, count(*) FROM file_transactions GROUP BY status ORDER BY status;
     SELECT status, count(*) FROM agent_turns GROUP BY status ORDER BY status;
     SELECT count(*) FROM conversations WHERE archived = 1;
 ')
 printf 'SQLite verification:\n%s\n' "$actual" | tee -a "$evidence/smoke.log"
-if [[ $actual != $'ok\ncommitted|4\ncancelled|1\ndone|3\n1' ]]; then
-    printf 'Expected a healthy database, four commits, one cancelled and three completed turns, and one archived conversation.\n' >&2
+if [[ $actual != $'ok\nexternal\ncommitted|6\ncancelled|1\ndone|3\n1' ]]; then
+    printf 'Expected a healthy database, one external adapter, six commits, one cancelled and three completed turns, and one archived conversation.\n' >&2
     exit 1
 fi

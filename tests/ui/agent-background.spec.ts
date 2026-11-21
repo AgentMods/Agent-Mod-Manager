@@ -45,3 +45,38 @@ test("replays a completed turn while Agent is in the background", async ({page})
     (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "cancel_turn")
   ))).toHaveLength(0);
 });
+
+test("background pending approval shortcut returns to its inline authorization", async ({page}) => {
+  await installMockTauri(page, {holdAgentTurn: true});
+  await page.goto("/");
+  await page.getByRole("button", {name: "游戏库", exact: true}).click();
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
+  await page.getByRole("textbox", {name: "告诉 Agent 你想做什么", exact: true}).fill("检查文件");
+  await page.getByRole("button", {name: "发送消息", exact: true}).click();
+  await expect(page.getByRole("button", {name: "停止生成", exact: true})).toBeVisible();
+
+  await page.getByRole("button", {name: "游戏库", exact: true}).click();
+  await page.evaluate(() => {
+    const fixture = (window as any).__AMM_TEST__;
+    const preview = {
+      id: "txn-background-fixture",
+      summary: "检查后台文件计划",
+      total_bytes: 1024,
+      created_at: "2026-11-21T00:00:00Z",
+      entries: [{operation: {op: "write", dst: "/sandbox/minecraft/mods/Example.jar"}, impact: "write", before: null, source: null}],
+    };
+    fixture.emit("tool-start", {toolCallId: "tool-fixture", name: "apply_file_ops", arguments: {plan_id: preview.id}});
+    fixture.emit("approval-request", {approvalId: "approval-fixture", toolCallId: "tool-fixture", title: "apply_file_ops", preview});
+  });
+
+  const shortcut = page.getByRole("button", {name: "查看待授权操作", exact: true});
+  await expect(shortcut).toBeVisible();
+  await shortcut.click();
+  const approval = page.getByRole("group", {name: "操作审批", exact: true});
+  await expect(page.getByRole("dialog", {name: "操作审批", exact: true})).toHaveCount(0);
+  await expect(approval).toContainText("/sandbox/minecraft/mods/Example.jar");
+  await approval.getByRole("button", {name: "批准并执行", exact: true}).click();
+  await expect(page.getByRole("button", {name: "apply_file_ops 已执行", exact: true})).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "respond_approval").at(-1)?.args.response))
+    .toEqual({approved: true, answer: null});
+});

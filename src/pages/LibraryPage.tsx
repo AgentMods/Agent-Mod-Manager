@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { open } from "@tauri-apps/plugin-dialog";
-import { EllipsisIcon, FolderOpenIcon, FolderPlusIcon, Gamepad2Icon, GlobeIcon, PencilIcon, PlayIcon, PuzzleIcon, RefreshCwIcon, SearchIcon, SparklesIcon, Trash2Icon, XIcon } from "lucide-react";
+import { EllipsisIcon, FolderOpenIcon, Gamepad2Icon, GlobeIcon, PencilIcon, PlayIcon, PuzzleIcon, RefreshCwIcon, SearchIcon, SparklesIcon, Trash2Icon, XIcon } from "lucide-react";
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { useUI } from "@/lib/store";
 import { displayPath, gameDirectoryKey } from "@/lib/paths";
@@ -10,11 +10,12 @@ import type { BootstrapState, Game, GameCandidate, Plugin, ScanReport } from "@/
 import { Badge, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, PathText } from "@/components/ui";
 import { GameConflictPanel, useGameConflicts } from "@/components/GameConflictPanel";
 import { GameCover } from "@/components/GameCover";
+import { ManagerPluginCatalog } from "@/components/ManagerPluginCatalog";
 import { GameMatchBadge } from "@/components/GameMatchBadge";
 import { GameIdentityDialog } from "@/components/GameIdentityDialog";
 import { AlertDialog, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group";
@@ -22,17 +23,18 @@ import { Item, ItemActions, ItemContent, ItemDescription, ItemGroup, ItemMedia, 
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { stagger } from "@/lib/motion";
 
 const storedLaunchPath = (game: Game) => typeof game.metadata?.launchPath === "string" ? game.metadata.launchPath : "";
 const launchPathDraft = (raw: string) => ({ raw, text: displayPath(raw) });
 
-function GameCard({ game, coverUrl, disabled, busy, onOpen, onLaunch, onLocation, onEdit, onRemove, onChooseAdapter, onCreateAdapter }: {
-  game: Game; coverUrl: string | null; disabled: boolean; busy: string | null;
+function GameCard({ game, index, coverUrl, disabled, busy, onOpen, onLaunch, onLocation, onEdit, onRemove, onChooseAdapter, onCreateAdapter }: {
+  game: Game; index: number; coverUrl: string | null; disabled: boolean; busy: string | null;
   onOpen: () => void; onLaunch: () => void; onLocation: (target: "root" | "mods") => void; onEdit: () => void; onRemove: () => void;
   onChooseAdapter: () => void; onCreateAdapter: () => void;
 }) {
   const working = busy === game.id;
-  return <Card className="gap-0 overflow-hidden py-0">
+  return <Card className="gap-0 overflow-hidden py-0 motion-safe:animate-rise-in motion-safe:transition-[box-shadow,border-color] motion-safe:duration-300 motion-safe:ease-out hover:border-primary/40 hover:shadow-md" style={stagger(index)}>
     <button type="button" onClick={onOpen} className="flex flex-col text-left outline-none transition-colors hover:bg-muted/40 focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:ring-inset">
       <GameCover name={game.name} url={coverUrl} />
       <CardHeader className="gap-1 px-5 pt-4 pb-4">
@@ -116,12 +118,16 @@ function EditGameDialog({ game, onClose, onSaved }: { game: Game; onClose: () =>
   </Modal>;
 }
 
-function ChooseAdapterDialog({ game, plugins, onClose, onSaved }: {
-  game: Game; plugins: Plugin[]; onClose: () => void; onSaved: (updated: Game) => Promise<void>;
+function ChooseAdapterDialog({ game, plugins, writable, onClose, onSaved }: {
+  game: Game; plugins: Plugin[]; writable: boolean; onClose: () => void; onSaved: (updated: Game) => Promise<void>;
 }) {
   const choices = plugins.filter((plugin) => plugin.enabled && plugin.validated);
   const currentSlug = game.adapterSlug ?? "";
   const [slug, setSlug] = useState(currentSlug);
+  const [showCatalog, setShowCatalog] = useState(false);
+  const [importedSlug, setImportedSlug] = useState<string | null>(null);
+  const catalogButton = useRef<HTMLButtonElement>(null);
+  const adapterSelect = useRef<HTMLSelectElement>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const conflicts = useGameConflicts(game.id, "select_adapter");
@@ -141,23 +147,35 @@ function ChooseAdapterDialog({ game, plugins, onClose, onSaved }: {
     }
     finally { setBusy(false); }
   }
-  return <Modal title="选择适配包" description={removing
+  function returnToSelection(installedSlug?: string) {
+    setShowCatalog(false);
+    if (installedSlug) {
+      setImportedSlug(installedSlug);
+      if (choices.some((plugin) => plugin.slug === installedSlug)) setSlug(installedSlug);
+    }
+    requestAnimationFrame(() => (installedSlug && !adapterSelect.current?.disabled ? adapterSelect.current : catalogButton.current)?.focus());
+  }
+  return <Modal title="选择适配包" description={showCatalog ? `为「${game.name}」查找云端适配包。` : removing
     ? `将解除「${game.name}」与适配包的绑定，保留游戏和已安装的 Mod。`
     : `为「${game.name}」选择已启用的适配包。应用时会核对游戏目录中的识别标记。`} onClose={() => { if (!working) onClose(); }}
-    actions={<>
+    actions={showCatalog ? <Button variant="outline" onClick={() => returnToSelection()}>返回选择适配包</Button> : <>
       <Button variant="outline" disabled={working} onClick={onClose}>取消</Button>
-      <Button disabled={!canApply || working} onClick={() => { void apply(); }}>{busy && <Spinner data-icon="inline-start" />}{removing ? "移除适配包" : "应用适配包"}</Button>
+      <Button disabled={!writable || !canApply || working} onClick={() => { void apply(); }}>{busy && <Spinner data-icon="inline-start" />}{removing ? "移除适配包" : "应用适配包"}</Button>
     </>}>
     <ErrorState error={error} />
-    <GameConflictPanel state={conflicts} busy={busy} />
-    <Field>
-      <FieldLabel htmlFor="game-adapter">游戏适配包</FieldLabel>
-      <NativeSelect id="game-adapter" value={slug} disabled={working || (!currentSlug && !choices.length)} onChange={(event) => setSlug(event.target.value)}>
-        <NativeSelectOption value="" disabled={!currentSlug}>{currentSlug ? "移除适配包" : choices.length ? "请选择适配包" : "暂无已启用的适配包"}</NativeSelectOption>
-        {currentSlug && !choices.some((plugin) => plugin.slug === currentSlug) && <NativeSelectOption value={currentSlug} disabled>{currentSlug}（当前适配包不可用）</NativeSelectOption>}
-        {choices.map((plugin) => <NativeSelectOption key={plugin.slug} value={plugin.slug}>{plugin.name} · {plugin.slug}</NativeSelectOption>)}
-      </NativeSelect>
-    </Field>
+    {showCatalog ? <ManagerPluginCatalog writable={writable} initialQuery={game.steamAppId || game.name} onReturnToGame={returnToSelection} /> : <>
+      <GameConflictPanel state={conflicts} busy={busy} />
+      <Field>
+        <FieldLabel htmlFor="game-adapter">游戏适配包</FieldLabel>
+        <NativeSelect ref={adapterSelect} id="game-adapter" value={slug} disabled={working || (!currentSlug && !choices.length)} onChange={(event) => setSlug(event.target.value)}>
+          <NativeSelectOption value="" disabled={!currentSlug}>{currentSlug ? "移除适配包" : choices.length ? "请选择适配包" : "暂无已启用的适配包"}</NativeSelectOption>
+          {currentSlug && !choices.some((plugin) => plugin.slug === currentSlug) && <NativeSelectOption value={currentSlug} disabled>{currentSlug}（当前适配包不可用）</NativeSelectOption>}
+          {choices.map((plugin) => <NativeSelectOption key={plugin.slug} value={plugin.slug}>{plugin.name} · {plugin.slug}</NativeSelectOption>)}
+        </NativeSelect>
+      </Field>
+      {importedSlug && !choices.some((plugin) => plugin.slug === importedSlug) && <p role="status" className="text-sm text-muted-foreground">请在插件中心确认 {importedSlug} 已启用并通过验证，再绑定到游戏。</p>}
+      <Button ref={catalogButton} className="self-start" variant="outline" disabled={!backendAvailable || working} onClick={() => { setError(null); setShowCatalog(true); }}><GlobeIcon data-icon="inline-start" />查找云端插件</Button>
+    </>}
   </Modal>;
 }
 
@@ -201,6 +219,8 @@ export default function LibraryPage() {
   const startAdapterChat = useUI((state) => state.startAdapterChat);
   const notify = useUI((state) => state.notify);
   const [search, setSearch] = useState("");
+  const scanButton = useRef<HTMLButtonElement>(null);
+  const [scanOpen, setScanOpen] = useState(false);
   const [directory, setDirectory] = useState("");
   const [candidates, setCandidates] = useState<GameCandidate[]>([]);
   const [report, setReport] = useState<ScanReport | null>(null);
@@ -210,14 +230,15 @@ export default function LibraryPage() {
   const [busy, setBusy] = useState(false);
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [error, setError] = useState<unknown>(null);
-  const [identityRoot, setIdentityRoot] = useState<string | null>(null);
+  const directoryInput = useRef<HTMLInputElement>(null);
+  const [identity, setIdentity] = useState<{ directory: string; trigger: HTMLButtonElement } | null>(null);
   const [editing, setEditing] = useState<Game | null>(null);
   const [choosingAdapter, setChoosingAdapter] = useState<Game | null>(null);
   const [removing, setRemoving] = useState<Game | null>(null);
 
   async function discover(action: () => Promise<void>) {
     if (!backendAvailable || busy) return;
-    setBusy(true); setError(null); setDiscoveryError(null);
+    setBusy(true); setDiscoveryError(null);
     try { await action(); } catch (failure) { setDiscoveryError(failure); } finally { setBusy(false); setScanning(false); }
   }
   async function scan(root?: string) {
@@ -226,7 +247,6 @@ export default function LibraryPage() {
     const result = await api<ScanReport>("scan_games", { options: { userRoots: root ? [root] : [], includeCommonRoots: !root } });
     const distinct = reconcileCandidates(result.candidates);
     setReport(result); setCandidates(distinct);
-    notify(`${result.truncated ? "扫描达到上限" : "扫描完成"}，发现 ${distinct.length} 个候选目录`);
   }
   async function identify() {
     setReport(null); setCandidates([]);
@@ -239,13 +259,19 @@ export default function LibraryPage() {
       await scan(selected);
     }
   }
+  async function finishRegistration(directory: string, game: Game) {
+    const key = gameDirectoryKey(directory);
+    setCandidates((items) => items.map((item) => gameDirectoryKey(item.rootPath) === key
+      ? { ...item, registeredGameId: game.id } : item));
+    notify(`已将「${game.name}」添加到游戏库`);
+    await games.refetch();
+  }
   async function register(candidate: GameCandidate) {
-    if (!writable || busy || candidate.registeredGameId) return;
-    setBusy(true); setError(null);
-    try {
+    if (!writable || candidate.registeredGameId) return;
+    await discover(async () => {
       const game = await api<Game>("register_game", { directory: candidate.rootPath, adapterSlug: candidate.suggestedAdapterSlug, fromDiscovery: true });
-      await games.refetch(); setCandidates((items) => items.filter((item) => gameDirectoryKey(item.rootPath) !== gameDirectoryKey(candidate.rootPath))); selectGame(game.id);
-    } catch (failure) { setError(failure); } finally { setBusy(false); }
+      await finishRegistration(candidate.rootPath, game);
+    });
   }
   /** Runs one card action. Failures are shown on the page; the native error text is already user-facing Chinese. */
   async function perform(game: Game, command: string, args: Record<string, unknown>, done?: string) {
@@ -261,7 +287,10 @@ export default function LibraryPage() {
   const actionsDisabled = !backendAvailable || !!actionBusy;
   return <Page data-testid="library-page">
     <PageHeader title="游戏库" subtitle={backendAvailable ? `${games.data?.length ?? 0} 个管理中的游戏` : "桌面能力未连接"}
-      actions={<Button variant="outline" disabled={!backendAvailable || busy} onClick={() => { void discover(() => scan()); }}><RefreshCwIcon data-icon="inline-start" className={scanning && !scanRoot ? "animate-spin" : undefined} />扫描游戏</Button>} />
+      actions={<Button ref={scanButton} variant="outline" aria-haspopup="dialog" disabled={!backendAvailable} onClick={() => {
+        setScanOpen(true);
+        void discover(() => scan());
+      }}><RefreshCwIcon data-icon="inline-start" />扫描游戏</Button>} />
     <div className="flex flex-wrap items-center gap-3">
       <InputGroup className="max-w-sm"><InputGroupAddon><SearchIcon /></InputGroupAddon><InputGroupInput aria-label="搜索游戏" placeholder="搜索游戏…" value={search} onChange={(event) => setSearch(event.target.value)} /></InputGroup>
       <Badge className="ml-auto">{backendAvailable ? "本机游戏" : "浏览器预览"}</Badge>
@@ -269,7 +298,7 @@ export default function LibraryPage() {
     {games.error && <ErrorState error={games.error} />}
     {error != null && <ErrorState error={error} />}
     {rows.length > 0 && <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,17rem),1fr))] gap-4">
-      {rows.map((game) => <GameCard key={game.id} game={game} disabled={actionsDisabled} busy={actionBusy}
+      {rows.map((game, index) => <GameCard key={game.id} game={game} index={index} disabled={actionsDisabled} busy={actionBusy}
         coverUrl={plugins.data?.find((plugin) => plugin.slug === game.adapterSlug && plugin.enabled && plugin.validated)?.coverUrl ?? null}
         onCreateAdapter={() => startAdapterChat({ name: game.name, gameId: game.id })}
         onChooseAdapter={() => setChoosingAdapter(game)}
@@ -280,48 +309,52 @@ export default function LibraryPage() {
     </div>}
     {!rows.length && !games.error && <EmptyState icon={<Gamepad2Icon />} title={!backendAvailable ? "桌面能力未连接" : games.isLoading ? "正在读取游戏库…" : search ? "没有匹配的游戏" : "尚无管理中的游戏"} />}
 
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-base"><FolderPlusIcon className="size-4" />添加</CardTitle>
-        <CardDescription>选择存放多个游戏的文件夹即可自动扫描，也可以输入路径后按回车。扫描不会自动添加游戏。</CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-4">
-        <form className="flex flex-wrap items-center gap-2" onSubmit={(event) => { event.preventDefault(); void discover(() => scan(directory)); }}>
-          <InputGroup className="min-w-40 flex-1"><InputGroupInput aria-label="游戏目录" placeholder="输入游戏或游戏库目录的完整路径" value={directory} disabled={busy} onChange={(event) => setDirectory(event.target.value)} /></InputGroup>
-          <IconButton type="button" title="选择游戏目录" variant="outline" size="icon" disabled={!backendAvailable || busy} onClick={() => { void discover(chooseDirectory); }}><FolderOpenIcon /></IconButton>
-          <Button type="submit" disabled={!backendAvailable || !directory.trim() || busy}>{scanning && scanRoot ? <><Spinner data-icon="inline-start" />扫描中…</> : "扫描此目录"}</Button>
-          <Button type="button" variant="outline" disabled={!backendAvailable || !directory.trim() || busy} onClick={() => { void discover(identify); }}>检查单个游戏</Button>
-        </form>
-        <ErrorState error={discoveryError} />
-        {report && <div role="status" className="flex flex-col gap-1 text-sm text-muted-foreground">
-          {scanRoot && <PathText>扫描目录：{displayPath(scanRoot)}</PathText>}
-          <p>已检查 {report.directoriesChecked} 个目录、{report.entriesChecked} 个条目{report.truncated ? " · 已达到扫描上限" : ""}</p>
-          {!report.candidates.length && <p>{scanRoot ? "未发现候选游戏。若已选择单个游戏的安装目录，可使用“检查单个游戏”。" : "未在常用位置发现候选游戏，可指定目录扫描。"}</p>}
-          {report.warnings.map((warning, index) => <PathText className="text-warning" key={index}>{displayPath(warning.path)}：{warning.message}</PathText>)}
-        </div>}
-        {discoveryRows.length > 0 && <ItemGroup className="gap-2">
-          {discoveryRows.map((candidate) => <Item variant="outline" key={gameDirectoryKey(candidate.rootPath)}>
-            <ItemMedia variant="icon"><Gamepad2Icon /></ItemMedia>
-            <ItemContent>
-              <ItemTitle>{candidate.name}</ItemTitle>
-              <ItemDescription className="line-clamp-none"><PathText>{displayPath(candidate.rootPath)}</PathText></ItemDescription>
-              {candidate.warnings.map((warning) => <p key={warning} className="text-xs text-warning">{warning}</p>)}
-            </ItemContent>
-            <ItemActions className="flex-wrap">
-              <GameMatchBadge candidate={candidate} />
-              {!candidate.suggestedAdapterSlug && !candidate.registeredGameId && <Button variant="outline" size="sm" disabled={!backendAvailable || busy || games.isLoading} onClick={() => setIdentityRoot(candidate.rootPath)}><GlobeIcon data-icon="inline-start" />联网识别</Button>}
-              <Button size="sm" disabled={!writable || busy || games.isLoading || !!candidate.registeredGameId} onClick={() => { void register(candidate); }}>{candidate.registeredGameId ? "管理中" : "添加"}</Button>
-            </ItemActions>
-          </Item>)}
-        </ItemGroup>}
-      </CardContent>
-    </Card>
+    {scanOpen && <Modal title="扫描游戏" description="扫描常用位置或指定目录，然后选择要添加的游戏。" className="sm:max-w-3xl"
+      onClose={() => setScanOpen(false)} onCloseAutoFocus={(event) => { event.preventDefault(); scanButton.current?.focus(); }}>
+      <form className="flex flex-col gap-2" onSubmit={(event) => { event.preventDefault(); if (directory.trim()) void discover(() => scan(directory)); }}>
+        <div className="flex items-center gap-2">
+          <InputGroup className="min-w-0 flex-1"><InputGroupInput ref={directoryInput} aria-label="游戏目录" placeholder="输入游戏或游戏库目录的完整路径" value={directory} disabled={busy} onChange={(event) => setDirectory(event.target.value)} /></InputGroup>
+          <IconButton type="button" title="选择游戏目录" variant="outline" size="icon" disabled={busy} onClick={() => { void discover(chooseDirectory); }}><FolderOpenIcon /></IconButton>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button type="submit" disabled={!directory.trim() || busy}>扫描此目录</Button>
+          <Button type="button" variant="outline" disabled={!directory.trim() || busy} onClick={() => { void discover(identify); }}>检查单个游戏</Button>
+          <Button type="button" variant="ghost" disabled={busy} onClick={() => { void discover(() => scan()); }}>扫描常用位置</Button>
+        </div>
+      </form>
+      {scanning && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner />{scanRoot ? "正在扫描指定目录…" : "正在扫描常用位置…"}</p>}
+      <ErrorState error={discoveryError} />
+      {report && <div role="status" className="flex flex-col gap-1 text-sm text-muted-foreground">
+        {scanRoot && <PathText>扫描目录：{displayPath(scanRoot)}</PathText>}
+        <p>已检查 {report.directoriesChecked} 个目录、{report.entriesChecked} 个条目，发现 {discoveryRows.length} 个候选目录{report.truncated ? " · 已达到扫描上限" : ""}</p>
+        {!report.candidates.length && <p>{scanRoot ? "未发现候选游戏。若已选择单个游戏的安装目录，可使用“检查单个游戏”。" : "未在常用位置发现候选游戏，可指定目录扫描。"}</p>}
+        {report.warnings.map((warning, index) => <PathText className="text-warning" key={index}>{displayPath(warning.path)}：{warning.message}</PathText>)}
+      </div>}
+      {discoveryRows.length > 0 && <ItemGroup aria-label="扫描候选游戏" className="gap-2">
+        {discoveryRows.map((candidate, index) => <Item variant="outline" key={gameDirectoryKey(candidate.rootPath)} className="motion-safe:animate-rise-in" style={stagger(index)}>
+          <ItemMedia variant="icon"><Gamepad2Icon /></ItemMedia>
+          <ItemContent className="min-w-0">
+            <ItemTitle className="max-w-full break-all">{candidate.name}</ItemTitle>
+            <ItemDescription className="line-clamp-none"><PathText>{displayPath(candidate.rootPath)}</PathText></ItemDescription>
+            {candidate.warnings.map((warning) => <p key={warning} className="text-xs text-warning">{warning}</p>)}
+          </ItemContent>
+          <ItemActions className="w-full flex-wrap sm:w-auto">
+            <GameMatchBadge candidate={candidate} />
+            {!candidate.suggestedAdapterSlug && !candidate.registeredGameId && <Button variant="outline" size="sm" disabled={!backendAvailable || busy || games.isLoading} onClick={(event) => setIdentity({ directory: candidate.rootPath, trigger: event.currentTarget })}><GlobeIcon data-icon="inline-start" />联网识别</Button>}
+            <Button size="sm" variant={candidate.registeredGameId ? "outline" : "default"} disabled={!writable || busy || games.isLoading || !!candidate.registeredGameId} onClick={() => { void register(candidate); }}>{candidate.registeredGameId ? "管理中" : "添加"}</Button>
+          </ItemActions>
+        </Item>)}
+      </ItemGroup>}
+      {identity && <GameIdentityDialog key={identity.directory} directory={identity.directory} writable={writable} onClose={() => setIdentity(null)}
+        onCloseAutoFocus={(event) => {
+          event.preventDefault();
+          (identity.trigger.isConnected ? identity.trigger : directoryInput.current)?.focus();
+        }}
+        onConfirmed={(game) => finishRegistration(identity.directory, game)} />}
+    </Modal>}
 
-    {identityRoot && <GameIdentityDialog key={identityRoot} directory={identityRoot} writable={writable} onClose={() => setIdentityRoot(null)} onConfirmed={async () => {
-      await games.refetch(); setCandidates((items) => items.filter((candidate) => gameDirectoryKey(candidate.rootPath) !== gameDirectoryKey(identityRoot))); notify("已确认游戏身份并添加");
-    }} />}
     {editing && <EditGameDialog key={editing.id} game={editing} onClose={() => setEditing(null)} onSaved={async () => { await games.refetch(); notify("已保存游戏设置"); }} />}
-    {choosingAdapter && <ChooseAdapterDialog key={choosingAdapter.id} game={choosingAdapter} plugins={plugins.data ?? []} onClose={() => setChoosingAdapter(null)} onSaved={async (updated) => {
+    {choosingAdapter && <ChooseAdapterDialog key={choosingAdapter.id} game={choosingAdapter} writable={writable} plugins={plugins.data ?? []} onClose={() => setChoosingAdapter(null)} onSaved={async (updated) => {
       client.setQueryData(["game", updated.id], updated);
       client.removeQueries({ queryKey: ["game-adapter", updated.id] });
       await games.refetch();

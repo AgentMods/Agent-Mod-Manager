@@ -1,31 +1,10 @@
 use super::*;
-use crate::{agent::policy::PermissionMode, settings::SecretStore, transaction::tests::setup};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::{agent::policy::PermissionMode, transaction::tests::setup};
 use tokio_util::sync::CancellationToken;
 
-#[derive(Default)]
-struct NoSecrets(AtomicUsize);
-impl SecretStore for NoSecrets {
-    fn read(&self, _: &str) -> AppResult<Option<String>> {
-        self.0.fetch_add(1, Ordering::SeqCst);
-        Ok(None)
-    }
-    fn write(&self, _: &str, _: &str) -> AppResult<()> {
-        Ok(())
-    }
-}
-
-fn fixture() -> (
-    tempfile::TempDir,
-    ToolContext,
-    IdentityTool,
-    Value,
-    Arc<NoSecrets>,
-) {
+fn fixture() -> (tempfile::TempDir, ToolContext, IdentityTool, Value) {
     let (temp, engine, game) = setup();
     std::fs::write(game.join("FixtureGame.exe"), b"inert fixture").unwrap();
-    let secrets = Arc::new(NoSecrets::default());
-    let settings = Settings::with_secret_store(engine.db.clone(), secrets.clone());
     let args = json!({"directory":game,"public_query":"FixtureGame game executable"});
     (
         temp,
@@ -36,19 +15,19 @@ fn fixture() -> (
             resolution_scope: crate::sources::resolutions::ResolutionScope::Desktop,
         },
         IdentityTool {
-            settings,
+            runtime: McpRuntime::default(),
             search: true,
         },
         args,
-        secrets,
     )
 }
 
 #[tokio::test]
-async fn search_preparation_requires_review_without_credentials_or_root_registration() {
-    let (_temp, context, tool, args, secrets) = fixture();
+async fn search_requires_review_and_does_not_register_the_root() {
+    let (_temp, context, tool, args) = fixture();
     let registry = ToolRegistry::default();
-    register(&registry, tool.settings.clone()).unwrap();
+    register(&registry, tool.runtime).unwrap();
+    let tool = registry.get("search_game_identity").unwrap();
     assert!(registry.get("confirm_game_identity").is_err());
     assert_eq!(
         registry
@@ -64,15 +43,19 @@ async fn search_preparation_requires_review_without_credentials_or_root_registra
     let prepared = tool.prepare(&context, &args).await.unwrap();
     assert_eq!(prepared.effect, Effect::Publish);
     assert!(prepared.plan.is_none());
-    assert_eq!(prepared.preview["destination"], web_search::ENDPOINT);
+    assert_eq!(prepared.preview["provider"], "bing");
+    assert_eq!(
+        prepared.preview["destination"],
+        "https://www.bing.com/search"
+    );
     assert_eq!(prepared.preview["arguments"], args);
     assert_eq!(prepared.preview["untrustedResults"], true);
     assert!(prepared.preview["fingerprint"]
         .as_str()
         .is_some_and(|value| value.len() == 64));
-    assert_eq!(secrets.0.load(Ordering::SeqCst), 0);
     let result = tool.execute(&context, args, prepared).await.unwrap();
     assert_eq!(result["status"], "needs_configuration");
+    assert_eq!(result["provider"], "bing");
     assert_eq!(result["candidates"], json!([]));
     assert_eq!(
         context
@@ -86,8 +69,8 @@ async fn search_preparation_requires_review_without_credentials_or_root_registra
 }
 
 #[tokio::test]
-async fn invalid_fields_private_queries_and_cancellation_never_read_credentials() {
-    let (_temp, context, tool, args, secrets) = fixture();
+async fn invalid_fields_private_queries_and_cancellation_never_store_evidence() {
+    let (_temp, context, tool, args) = fixture();
     for change in [
         json!({"unknown":true}),
         json!({"public_query":"/Users/alice/private.txt"}),
@@ -111,12 +94,21 @@ async fn invalid_fields_private_queries_and_cancellation_never_read_credentials(
         tool.prepare(&context, &args).await,
         Err(AppError::Cancelled)
     ));
-    assert_eq!(secrets.0.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        context
+            .engine
+            .db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM game_identity_searches", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
-async fn stale_directory_changed_arguments_and_effect_cannot_reuse_search_approval() {
-    let (_temp, context, tool, args, secrets) = fixture();
+async fn changed_directory_arguments_or_approval_metadata_cannot_reuse_search_approval() {
+    let (_temp, context, tool, args) = fixture();
     let prepared = tool.prepare(&context, &args).await.unwrap();
     let mut changed = args.clone();
     changed["public_query"] = json!("Different public game");
@@ -130,6 +122,21 @@ async fn stale_directory_changed_arguments_and_effect_cannot_reuse_search_approv
         tool.execute(&context, args.clone(), prepared).await,
         Err(AppError::Denied(_))
     ));
+    for (field, value) in [
+        ("provider", json!("brave")),
+        (
+            "destination",
+            json!("https://api.search.brave.com/res/v1/web/search"),
+        ),
+        ("untrustedResults", json!(false)),
+    ] {
+        let mut prepared = tool.prepare(&context, &args).await.unwrap();
+        prepared.preview[field] = value;
+        assert!(matches!(
+            tool.execute(&context, args.clone(), prepared).await,
+            Err(AppError::Denied(_))
+        ));
+    }
     let prepared = tool.prepare(&context, &args).await.unwrap();
     std::fs::write(
         PathBuf::from(args["directory"].as_str().unwrap()).join("new-file.txt"),
@@ -137,12 +144,11 @@ async fn stale_directory_changed_arguments_and_effect_cannot_reuse_search_approv
     )
     .unwrap();
     assert!(tool.execute(&context, args, prepared).await.is_err());
-    assert_eq!(secrets.0.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
 async fn local_preview_never_searches_or_grants_identity_and_rejects_extra_fields() {
-    let (_temp, context, mut tool, args, secrets) = fixture();
+    let (_temp, context, mut tool, args) = fixture();
     tool.search = false;
     assert!(tool.prepare(&context, &args).await.is_err());
     let args = json!({"directory":args["directory"]});
@@ -150,5 +156,4 @@ async fn local_preview_never_searches_or_grants_identity_and_rejects_extra_field
     assert_eq!(prepared.effect, Effect::Read);
     let result = tool.execute(&context, args, prepared).await.unwrap();
     assert_eq!(result["localCandidate"]["requiresConfirmation"], true);
-    assert_eq!(secrets.0.load(Ordering::SeqCst), 0);
 }

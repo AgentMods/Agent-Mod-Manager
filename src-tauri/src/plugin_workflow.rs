@@ -3,6 +3,7 @@
 //! Registration is replayable and never executes package content or publishes it.
 use crate::{
     error::{AppError, AppResult},
+    mcp::config::{revoke_plugin_servers, sync_plugin_servers},
     paths,
     plugins::{self, GamePackage},
     transaction::{self, FileEngine, FileOp, FilePlan, PlannedEntry},
@@ -20,8 +21,8 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-const ADAPTER_LIMIT: usize = 256 * 1024;
-const SKILL_LIMIT: usize = 128 * 1024;
+pub(crate) const ADAPTER_LIMIT: usize = 256 * 1024;
+pub(crate) const SKILL_LIMIT: usize = 128 * 1024;
 const RECORD_LIMIT: usize = 1024 * 1024;
 const SOURCE: &str = "external";
 static WORKFLOW_LOCK: Mutex<()> = Mutex::new(());
@@ -65,7 +66,6 @@ pub struct WorkflowIssue {
 pub(crate) struct PluginPackageBaseline {
     pub slug: String,
     pub version: String,
-    pub builtin: bool,
     pub enabled: bool,
     pub adapter_json: String,
     pub skill_markdown: String,
@@ -108,12 +108,17 @@ struct Content {
     skill_markdown: String,
     hashes: PackageHashes,
 }
-impl Content {
-    fn new(adapter_json: String, skill_markdown: String) -> Self {
-        let hashes = PackageHashes {
+impl PackageHashes {
+    pub(crate) fn of(adapter_json: &str, skill_markdown: &str) -> Self {
+        Self {
             adapter_sha256: hex::encode(Sha256::digest(adapter_json.as_bytes())),
             skill_sha256: hex::encode(Sha256::digest(skill_markdown.as_bytes())),
-        };
+        }
+    }
+}
+impl Content {
+    fn new(adapter_json: String, skill_markdown: String) -> Self {
+        let hashes = PackageHashes::of(&adapter_json, &skill_markdown);
         Self {
             adapter_json,
             skill_markdown,
@@ -124,7 +129,7 @@ impl Content {
         if self.adapter_json.len() > ADAPTER_LIMIT || self.skill_markdown.len() > SKILL_LIMIT {
             return Err(invalid("包内容超出大小限制"));
         }
-        if Self::new(self.adapter_json.clone(), self.skill_markdown.clone()).hashes != self.hashes {
+        if PackageHashes::of(&self.adapter_json, &self.skill_markdown) != self.hashes {
             return Err(AppError::Conflict(
                 "持久包记录的 SHA-256 与原文不一致".into(),
             ));
@@ -194,14 +199,6 @@ fn checked_path(engine: &FileEngine, path: &Path) -> AppResult<PathBuf> {
 
 fn external_slug(engine: &FileEngine, slug: &str) -> AppResult<()> {
     plugins::validate_slug(slug)?;
-    if plugins::BUILTIN_PACKAGES
-        .iter()
-        .any(|(name, _, _)| *name == slug)
-    {
-        return Err(AppError::Denied(
-            "禁止覆盖内置适配包 slug，请使用新 slug".into(),
-        ));
-    }
     if crate::skills::is_system_skill(slug) {
         return Err(AppError::Denied(
             "系统 Skill slug 已保留，请使用新 slug".into(),
@@ -272,11 +269,7 @@ fn read_text(engine: &FileEngine, path: &Path, limit: usize) -> AppResult<String
     }
     String::from_utf8(bytes).map_err(|_| invalid("包文件必须是 UTF-8"))
 }
-pub(crate) fn validate_package_directory(
-    engine: &FileEngine,
-    directory: &Path,
-    builtin: bool,
-) -> AppResult<()> {
+pub(crate) fn validate_package_directory(engine: &FileEngine, directory: &Path) -> AppResult<()> {
     checked_path(engine, directory)?;
     if !fs::symlink_metadata(directory)?.is_dir() {
         return Err(invalid("包路径不是普通目录"));
@@ -289,18 +282,6 @@ pub(crate) fn validate_package_directory(
             count += 1;
             continue;
         }
-        // Reseeding a built-in package retains the old declaration through atomic_write.
-        if builtin
-            && name
-                .to_str()
-                .and_then(|name| name.strip_prefix(".previous_"))
-                .is_some_and(|id| {
-                    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-                })
-            && entry.file_type()?.is_file()
-        {
-            continue;
-        }
         return Err(AppError::Denied(
             "声明包只能包含 adapter.json 与 SKILL.md，不接管其他文件".into(),
         ));
@@ -311,8 +292,8 @@ pub(crate) fn validate_package_directory(
     Ok(())
 }
 
-fn read_content(engine: &FileEngine, directory: &Path, builtin: bool) -> AppResult<Content> {
-    validate_package_directory(engine, directory, builtin)?;
+fn read_content(engine: &FileEngine, directory: &Path) -> AppResult<Content> {
+    validate_package_directory(engine, directory)?;
     Ok(Content::new(
         read_text(engine, &directory.join("adapter.json"), ADAPTER_LIMIT)?,
         read_text(engine, &directory.join("SKILL.md"), SKILL_LIMIT)?,
@@ -369,6 +350,16 @@ pub fn plan_write_draft(
         format!("写入声明式插件草稿 {slug}"),
     )?;
     let plan = engine.require_review(&plan.id)?;
+    // The approval displays the caller's exact text. Bind it to the persisted copy sources
+    // even if a scratch file changed before the transaction took its snapshot.
+    verify_copy_plan(
+        &plan,
+        &plan.id,
+        &scratch,
+        &target,
+        &Content::new(adapter_json.into(), skill_markdown.into()),
+        true,
+    )?;
     let draft = DraftInfo {
         id,
         slug: slug.into(),
@@ -634,7 +625,7 @@ fn validate_inner(engine: &FileEngine, id: &str) -> AppResult<DraftValidation> {
         if report.transaction_status != "committed" {
             return Err(AppError::Conflict("草稿写入事务尚未提交或已回滚".into()));
         }
-        let content = read_content(engine, &expected, false)?;
+        let content = read_content(engine, &expected)?;
         verify_copy_plan(
             &engine.get_plan(&report.draft.write_transaction_id)?,
             &report.draft.write_transaction_id,
@@ -830,11 +821,24 @@ pub fn plan_install_plugin(engine: &FileEngine, draft_id: &str) -> AppResult<Dep
         ));
     }
     let draft = validation.draft;
-    let content = read_content(engine, &draft.path, false)?;
+    let content = read_content(engine, &draft.path)?;
     if validation.hashes.as_ref() != Some(&content.hashes) {
         return Err(AppError::Conflict("验证之后草稿已改变".into()));
     }
     let package = content.package(&draft.slug)?;
+    for config in package.adapter.mcp_configs()? {
+        let collision: bool = engine.db.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM mcp_servers WHERE id=?1 AND plugin_slug IS NOT ?2)",
+            params![config.id, draft.slug],
+            |row| row.get(0),
+        )?;
+        if collision {
+            return Err(AppError::Conflict(format!(
+                "工具标识已被其他连接占用：{}",
+                config.id
+            )));
+        }
+    }
     external_slug(engine, &draft.slug)?;
     let target = install_path(engine, &draft.slug)?;
     let state = registry_state(engine, &draft.slug, &target)?;
@@ -845,7 +849,7 @@ pub fn plan_install_plugin(engine: &FileEngine, draft_id: &str) -> AppResult<Dep
                 "目标包含未登记的包，不覆盖未知文件".into(),
             ));
         }
-        let old = read_content(engine, &target, false)?;
+        let old = read_content(engine, &target)?;
         let old_package = old.package(&draft.slug)?;
         let state = state.as_ref().unwrap();
         if state.validated
@@ -936,7 +940,12 @@ fn register(
     let now = util::now();
     tx.execute("INSERT INTO plugins(slug,name,game_name,version,description,source,enabled,validated,install_path,adapter_json,created_at,updated_at) VALUES (?1,?2,?2,?3,?4,'external',?5,1,?6,?7,?8,?8) ON CONFLICT(slug) DO UPDATE SET name=excluded.name,game_name=excluded.game_name,version=excluded.version,description=excluded.description,enabled=excluded.enabled,validated=1,install_path=excluded.install_path,adapter_json=excluded.adapter_json,updated_at=excluded.updated_at",params![slug,package.adapter.name,package.adapter.version,package.skill.description,plugin_enabled,target.to_string_lossy(),content.adapter_json,now])?;
     tx.execute("INSERT INTO skills(name,description,location,source,enabled,created_at) VALUES (?1,?2,?3,'external',?4,?5) ON CONFLICT(name) DO UPDATE SET description=excluded.description,location=excluded.location,enabled=excluded.enabled",params![slug,package.skill.description,target.join("SKILL.md").to_string_lossy(),skill_enabled,now])?;
+    let mcp_changed = sync_plugin_servers(&tx, slug, &package.adapter.mcp_configs()?)?;
     tx.commit()?;
+    drop(conn);
+    if mcp_changed {
+        engine.notify_plugin_mcp_changed(slug);
+    }
     Ok(())
 }
 fn disable(engine: &FileEngine, slug: &str, target: &Path) -> AppResult<bool> {
@@ -949,7 +958,12 @@ fn disable(engine: &FileEngine, slug: &str, target: &Path) -> AppResult<bool> {
         "UPDATE skills SET enabled=0 WHERE name=?1 AND source='external' AND location=?2",
         params![slug, target.join("SKILL.md").to_string_lossy()],
     )?;
+    let mcp_changed = sync_plugin_servers(&tx, slug, &[])?;
     tx.commit()?;
+    drop(conn);
+    if mcp_changed {
+        engine.notify_plugin_mcp_changed(slug);
+    }
     Ok(count != 0)
 }
 
@@ -971,6 +985,15 @@ fn reconcile_locked(engine: &FileEngine) -> AppResult<ReconcileReport> {
         let target = match resolved {
             Ok(path) => path,
             Err(e) => {
+                // The registry conflict prevents touching the plugin or Skill. Its
+                // former MCP declarations can no longer be attributed to a verified package.
+                let removed = engine
+                    .db
+                    .conn()
+                    .execute("DELETE FROM mcp_servers WHERE plugin_slug=?1", [&slug])?;
+                if removed != 0 {
+                    engine.notify_plugin_mcp_changed(&slug);
+                }
                 report.issues.push(WorkflowIssue {
                     code: "ownership".into(),
                     message: format!("{slug}: {e}"),
@@ -993,7 +1016,7 @@ fn reconcile_locked(engine: &FileEngine) -> AppResult<ReconcileReport> {
             });
             continue;
         }
-        let disk = read_content(engine, &target, false).and_then(|c| {
+        let disk = read_content(engine, &target).and_then(|c| {
             c.package(&slug)?;
             Ok(c)
         });
@@ -1039,15 +1062,26 @@ fn reconcile_locked(engine: &FileEngine) -> AppResult<ReconcileReport> {
             }
         }
         if let Some((content, plugin_enabled, skill_enabled)) = selected {
-            register(
+            match register(
                 engine,
                 &slug,
                 &target,
                 &content,
                 plugin_enabled,
                 skill_enabled,
-            )?;
-            report.registered.push(slug);
+            ) {
+                Ok(()) => report.registered.push(slug),
+                Err(AppError::Conflict(reason)) => {
+                    if disable(engine, &slug, &target)? {
+                        report.disabled.push(slug.clone());
+                    }
+                    report.issues.push(WorkflowIssue {
+                        code: "registration_conflict".into(),
+                        message: format!("{slug}: {reason}"),
+                    });
+                }
+                Err(err) => return Err(err),
+            }
         } else {
             if disable(engine, &slug, &target)? {
                 report.disabled.push(slug.clone());
@@ -1089,7 +1123,7 @@ fn verified_installed_content(
     if !info.validated {
         return Err(AppError::Denied("适配包未通过完整性校验".into()));
     }
-    let content = read_content(engine, target, info.source == "builtin")?;
+    let content = read_content(engine, target)?;
     let package = content.package(&info.slug)?;
     let registered: String = engine.db.conn().query_row(
         "SELECT CASE WHEN length(CAST(adapter_json AS BLOB))<=?2 THEN adapter_json ELSE '' END FROM plugins WHERE slug=?1",
@@ -1101,33 +1135,15 @@ fn verified_installed_content(
     {
         return Err(AppError::Denied("适配包内容与已校验登记不一致".into()));
     }
-    let proven = if info.source == "builtin" {
-        plugins::BUILTIN_PACKAGES
-            .iter()
-            .any(|(slug, adapter, skill)| {
-                *slug == info.slug
-                    && *adapter == content.adapter_json
-                    && *skill == content.skill_markdown
-            })
-    } else {
-        let mut matched = false;
-        for row in deployment_rows(engine)?
-            .iter()
-            .filter(|row| row.slug == info.slug && row.status == "committed")
-        {
-            if deployment_record(engine, row)?.content.hashes == content.hashes {
-                matched = true;
-                break;
-            }
+    for row in deployment_rows(engine)?
+        .iter()
+        .filter(|row| row.slug == info.slug && row.status == "committed")
+    {
+        if deployment_record(engine, row)?.content.hashes == content.hashes {
+            return Ok(content);
         }
-        matched
-    };
-    if !proven {
-        return Err(AppError::Denied(
-            "适配包缺少匹配的内置版本或已提交部署".into(),
-        ));
     }
-    Ok(content)
+    Err(AppError::Denied("适配包缺少匹配的已提交部署".into()))
 }
 
 /// Returns verified package files regardless of the user's activation setting.
@@ -1135,15 +1151,11 @@ pub(crate) fn read_plugin_package(
     engine: &FileEngine,
     slug: &str,
 ) -> AppResult<PluginPackageBaseline> {
-    plugins::validate_slug(slug)?;
     let _lock = lock();
     let _files = crate::transaction::write_lock();
+    external_slug(engine, slug)?;
     reconcile_locked(engine)?;
     let info = registered_plugin(engine, slug)?;
-    let builtin = info.source == "builtin";
-    if !builtin {
-        external_slug(engine, slug)?;
-    }
     let target = install_path(engine, slug)?;
     if Path::new(&info.install_path) != target {
         return Err(AppError::Denied("适配包安装位置与登记不一致".into()));
@@ -1162,7 +1174,6 @@ pub(crate) fn read_plugin_package(
     Ok(PluginPackageBaseline {
         slug: info.slug,
         version: info.version,
-        builtin,
         enabled: info.enabled,
         adapter_json: content.adapter_json,
         skill_markdown: content.skill_markdown,
@@ -1183,9 +1194,7 @@ pub fn set_enabled(
     reconcile_locked(engine)?;
     let info = registered_plugin(engine, slug)?;
     let target = engine.paths.plugins().join("games").join(slug);
-    if !matches!(info.source.as_str(), "builtin" | SOURCE)
-        || Path::new(&info.install_path) != target
-    {
+    if info.source != SOURCE || Path::new(&info.install_path) != target {
         return Err(AppError::Denied(
             "不能切换来源或安装位置未知的适配包".into(),
         ));
@@ -1193,12 +1202,20 @@ pub fn set_enabled(
     if enabled {
         verified_installed_content(engine, &info, &target)?;
     }
-    let count = engine.db.conn().execute(
+    let mut conn = engine.db.conn();
+    let tx = conn.transaction()?;
+    let count = tx.execute(
         "UPDATE plugins SET enabled=?2,updated_at=?3 WHERE slug=?1 AND source=?4 AND install_path=?5",
         params![slug, enabled, util::now(), info.source, info.install_path],
     )?;
     if count != 1 {
         return Err(AppError::Conflict("适配包归属在切换时已改变".into()));
+    }
+    let mcp_revoked = !enabled && revoke_plugin_servers(&tx, slug)?;
+    tx.commit()?;
+    drop(conn);
+    if mcp_revoked {
+        engine.notify_plugin_mcp_changed(slug);
     }
     Ok(plugins::PluginInfo { enabled, ..info })
 }

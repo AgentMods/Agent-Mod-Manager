@@ -11,8 +11,10 @@ type McpFixture = {
   credential_url?: string | null;
   env_secret_refs: Record<string, string>;
   bearer_secret_ref: string | null;
+  description?: string;
   enabled: boolean;
   builtin: boolean;
+  plugin_slug?: string;
 };
 
 const httpConfig: McpFixture = {
@@ -71,7 +73,7 @@ async function openMcpSettings(page: Page) {
   }, [httpConfig, stdioConfig, noCredentialsConfig]);
 
   await page.getByRole("button", {name: "设置", exact: true}).click();
-  await page.getByRole("tab", {name: "MCP 服务", exact: true}).click();
+  await page.getByRole("tab", {name: "工具", exact: true}).click();
 }
 
 async function secretCalls(page: Page) {
@@ -202,35 +204,44 @@ test("stdio credentials save all nonempty values and retry only failed reference
 });
 
 // Stateful stand-in for the MCP lifecycle commands. Every call is recorded for exact assertions.
-async function openLifecycle(page: Page, configs: McpFixture[], {failConnect, remembered = [], localRequested = false}: {failConnect?: string; remembered?: string[]; localRequested?: boolean} = {}) {
+async function openLifecycle(page: Page, configs: McpFixture[], {failConnect, failConnectId, holdConnect = false, remembered = [], localRequested = false, localRunning = false, active = []}: {
+  failConnect?: string; failConnectId?: string; holdConnect?: boolean; remembered?: string[]; localRequested?: boolean; localRunning?: boolean; active?: string[];
+} = {}) {
   await installMockTauri(page);
   await page.goto("/");
-  await page.evaluate(({configs, failConnect, remembered, localRequested}) => {
+  await page.evaluate(({configs, failConnect, failConnectId, holdConnect, remembered, localRequested, localRunning, active}) => {
     const internals = (window as any).__TAURI_INTERNALS__;
     const invoke = internals.invoke.bind(internals);
-    const state = {configs: structuredClone(configs), remembered, localRequested, active: [] as string[], calls: [] as Array<{command: string; args: any}>};
+    const state = {
+      configs: structuredClone(configs), remembered, localRequested, localRunning, failConnect, failConnectId,
+      finishConnect: undefined as (() => void) | undefined,
+      active: [...active] as string[], calls: [] as Array<{command: string; args: any}>,
+    };
     (window as any).__MCP__ = state;
     internals.invoke = async (command: string, args: any, ...rest: unknown[]) => {
-      if (command === "mcp_server_status") return {...await invoke(command, args, ...rest), startupRequested: state.localRequested};
-      if (command === "mcp_server_stop") { state.localRequested = false; return; }
-      if (!command.startsWith("mcp_") || command.startsWith("mcp_server")) return invoke(command, args, ...rest);
+      if (command === "mcp_server_status") return {...await invoke(command, args, ...rest), startupRequested: state.localRequested, running: state.localRunning};
+      if (!command.startsWith("mcp_")) return invoke(command, args, ...rest);
       state.calls.push({command, args: structuredClone(args)});
+      if (command === "mcp_server_start") { state.localRequested = true; state.localRunning = true; return; }
+      if (command === "mcp_server_stop") { state.localRequested = false; state.localRunning = false; return; }
       if (command === "mcp_list") return structuredClone(state.configs);
       if (command === "mcp_startup_requests") return [...state.remembered];
       if (command === "mcp_connections") return state.active.map((serverId) => ({serverId, tools: ["fixture_search", "fixture_read"]}));
       if (command === "mcp_update") { state.configs = state.configs.map((item) => item.id === args.config.id ? args.config : item); return null; }
       if (command === "mcp_create") { state.configs.push(args.config); return null; }
+      if (command === "mcp_remove") { state.configs = state.configs.filter((item) => item.id !== args.id); return null; }
       if (command === "mcp_connect") {
-        if (failConnect) throw new Error(failConnect);
+        if (holdConnect) await new Promise<void>((resolve) => { state.finishConnect = resolve; });
+        if (state.failConnect && (!state.failConnectId || state.failConnectId === args.expectedConfig.id)) throw new Error(state.failConnect);
         state.active.push(args.expectedConfig.id);
         return {serverId: args.expectedConfig.id, tools: ["fixture_search", "fixture_read"]};
       }
       if (command === "mcp_disconnect") { state.remembered = state.remembered.filter((id) => id !== args.id); state.active = state.active.filter((id) => id !== args.id); return null; }
       return invoke(command, args, ...rest);
     };
-  }, {configs, failConnect, remembered, localRequested});
+  }, {configs, failConnect, failConnectId, holdConnect, remembered, localRequested, localRunning, active});
   await page.getByRole("button", {name: "设置", exact: true}).click();
-  await page.getByRole("tab", {name: "MCP 服务", exact: true}).click();
+  await page.getByRole("tab", {name: "工具", exact: true}).click();
 }
 
 // Scoped to the MCP list: toasts are also list items and repeat the service name.
@@ -242,6 +253,44 @@ const lifecycleCalls = (page: Page) => page.evaluate(() => (window as any).__MCP
 
 const mcpWriteCalls = (page: Page) => page.evaluate(() => (window as any).__MCP__.calls
   .filter((call: any) => ["mcp_create", "mcp_update"].includes(call.command)));
+
+test("plugin details and draft validation list declared MCP services", async ({ page }) => {
+  await installMockTauri(page);
+  await page.goto("/");
+  await page.evaluate(() => {
+    const ipc = (window as any).__TAURI_INTERNALS__;
+    const invoke = ipc.invoke.bind(ipc);
+    ipc.invoke = async (command: string, ...args: unknown[]) => {
+      const result = await invoke(command, ...args);
+      if (command === "list_plugins") return [{ slug: "catalog-game", gameName: "Catalog Game", name: "Catalog Game", version: "1.0.0", description: "Catalog Skill", source: "external", enabled: true, validated: true, installPath: "/fixtures/catalog-game", coverUrl: null, mcpServerNames: ["Local catalog"] }];
+      if (command === "validate_plugin") result.package.adapter.mcpServers = [{id: "catalog", name: "Draft catalog"}];
+      return result;
+    };
+  });
+  await page.getByRole("button", { name: "游戏库", exact: true }).click();
+  await page.getByRole("button", { name: "插件中心", exact: true }).click();
+  await page.getByRole("row").getByRole("button", { name: /Catalog Game/ }).click();
+  await expect(page.getByText("Local catalog", { exact: true })).toBeVisible();
+  await page.getByRole("tab", { name: /^草稿/ }).click();
+  await page.getByRole("button", { name: "验证", exact: true }).first().click();
+  await expect(page.getByRole("dialog")).toContainText("Draft catalog");
+});
+
+for (const base of [stdioConfig, httpConfig]) {
+  test(`a plugin ${base.transport} service starts from its row without rewriting the owned config`, async ({page}) => {
+    const config = {...base, id: "plugin_example_catalog", name: "Catalog", plugin_slug: "example", enabled: false};
+    await openLifecycle(page, [config]);
+    const row = mcpRow(page, config.name);
+    await expect(row).toContainText("来自适配包 · example");
+    await expect(row.getByRole("button", {name: "编辑 Catalog", exact: true})).toHaveCount(0);
+    await row.getByRole("button", {name: "启动 Catalog", exact: true}).click();
+    await expect(row).toContainText("运行中");
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    expect(await lifecycleCalls(page)).toEqual([
+      {command: "mcp_connect", args: {expectedConfig: {...config, enabled: true}, acceptsUnsandboxedStdio: base.transport === "stdio"}},
+    ]);
+  });
+}
 
 test("an HTTP service starts and stops from one button and shows its state", async ({page}) => {
   await openLifecycle(page, [{...httpConfig, enabled: false}]);
@@ -270,54 +319,143 @@ test("an already enabled HTTP service connects without rewriting its config", as
   expect((await lifecycleCalls(page)).map((call: any) => call.command)).toEqual(["mcp_connect"]);
 });
 
-test("a stdio service asks once, with its command line, before it starts", async ({page}) => {
-  await openLifecycle(page, [{...stdioConfig, command: "fixture-mcp", args: ["--stdio"]}]);
-  const row = mcpRow(page, "Local Stdio");
-
-  await row.getByRole("button", {name: "启动 Local Stdio", exact: true}).click();
-  const dialog = page.getByRole("dialog", {name: "启动 Local Stdio", exact: true});
-  await expect(dialog).toContainText("fixture-mcp --stdio");
-  await expect(dialog.getByText("首次准备 Python", {exact: false})).toHaveCount(0);
-  await expect(dialog.getByText("--help", {exact: true})).toHaveCount(0);
-  await expect(dialog.getByRole("checkbox")).toHaveCount(0);
-  await dialog.getByRole("button", {name: "取消", exact: true}).click();
-  await expect(dialog).toBeHidden();
+test("a stdio service starts directly with its exact config and prevents concurrent starts", async ({page}) => {
+  const config = {...stdioConfig, args: ["--stdio"]};
+  await openLifecycle(page, [config, httpConfig], {holdConnect: true});
+  const row = mcpRow(page, config.name);
+  const start = row.getByRole("button", {name: "启动 Local Stdio", exact: true});
+  await expect(row).toContainText("fixture-mcp --stdio");
   expect(await lifecycleCalls(page)).toEqual([]);
-  await expect(row).toContainText("未启动");
 
-  await row.getByRole("button", {name: "启动 Local Stdio", exact: true}).click();
-  await dialog.getByRole("button", {name: "启动", exact: true}).click();
-  await expect(dialog).toBeHidden();
-  await expect(row).toContainText("运行中");
-  expect(await lifecycleCalls(page)).toEqual([
-    {command: "mcp_connect", args: {expectedConfig: {...stdioConfig, command: "fixture-mcp", args: ["--stdio"]}, acceptsUnsandboxedStdio: true}},
+  await start.click();
+  await expect(row).toContainText("启动中");
+  await expect(start).toBeDisabled();
+  await expect(page.getByRole("button", {name: "启动 Remote HTTP", exact: true})).toBeDisabled();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect.poll(() => lifecycleCalls(page)).toEqual([
+    {command: "mcp_connect", args: {expectedConfig: config, acceptsUnsandboxedStdio: true}},
   ]);
+
+  await page.evaluate(() => (window as any).__MCP__.finishConnect());
+  await expect(row).toContainText("运行中");
+  await expect(page.getByRole("button", {name: "启动 Remote HTTP", exact: true})).toBeEnabled();
 });
 
-for (const [command, mirror] of [
-  ["uvx", "清华 PyPI"], ["UVX.EXE", "清华 PyPI"], ["npx", "npmmirror"], ["npx.cmd", "npmmirror"], ["NPX.EXE", "npmmirror"],
-  ["/opt/uv/bin/uvx", ""], [String.raw`C:\Program Files\nodejs\npx.cmd`, ""], ["/opt/tools/not-uvx.exe", ""],
-]) {
-  test(`package mirror disclosure follows the configured launcher: ${command}`, async ({page}) => {
-    const config = {...stdioConfig, command, args: ["fixture-package"]};
-    await openLifecycle(page, [config]);
-    await mcpRow(page, config.name).getByRole("button", {name: `启动 ${config.name}`, exact: true}).click();
-    const dialog = page.getByRole("dialog", {name: `启动 ${config.name}`, exact: true});
-    await expect(dialog).toContainText(`${command} fixture-package`);
-    if (mirror) await expect(dialog).toContainText(mirror);
-    else await expect(dialog).not.toContainText("使用应用内置的");
-    await dialog.getByRole("button", {name: "取消", exact: true}).click();
-    expect(await lifecycleCalls(page)).toEqual([]);
-  });
-}
-
 test("a failed start stays visible with its reason and can be retried", async ({page}) => {
-  await openLifecycle(page, [httpConfig], {failConnect: "连接被拒绝：fixture"});
-  const row = mcpRow(page, "Remote HTTP");
-  await row.getByRole("button", {name: "启动 Remote HTTP", exact: true}).click();
+  await openLifecycle(page, [stdioConfig], {failConnect: "连接被拒绝：fixture"});
+  const row = mcpRow(page, stdioConfig.name);
+  const start = row.getByRole("button", {name: "启动 Local Stdio", exact: true});
+  await start.click();
   await expect(row).toContainText("启动失败");
   await expect(row).toContainText("连接被拒绝：fixture");
-  await expect(row.getByRole("button", {name: "启动 Remote HTTP", exact: true})).toBeEnabled();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(start).toBeEnabled();
+
+  await page.evaluate(() => { (window as any).__MCP__.failConnect = undefined; });
+  await start.click();
+  await expect(row).toContainText("运行中");
+  await expect(row).not.toContainText("连接被拒绝：fixture");
+  expect(await lifecycleCalls(page)).toHaveLength(2);
+});
+
+test("bulk enable starts remaining MCPs, retries a partial failure, then offers bulk disable", async ({page}) => {
+  await openLifecycle(page, [httpConfig, stdioConfig], {failConnect: "连接被拒绝：fixture", failConnectId: httpConfig.id});
+  const httpRow = mcpRow(page, httpConfig.name);
+  const stdioRow = mcpRow(page, stdioConfig.name);
+  const availableTools = page.locator('[data-slot="card"]').filter({has: page.getByRole("heading", {name: "可用工具", exact: true})});
+  const enableAll = availableTools.getByRole("button", {name: "全部启用", exact: true});
+  const batchMenu = availableTools.getByRole("button", {name: "选择批量操作", exact: true});
+  await expect(enableAll).toBeVisible();
+  await expect(batchMenu).toBeVisible();
+
+  await enableAll.click();
+  await expect(httpRow).toContainText("启动失败");
+  await expect(httpRow).toContainText("连接被拒绝：fixture");
+  await expect(stdioRow).toContainText("运行中");
+  expect((await lifecycleCalls(page)).filter((call: any) => call.command === "mcp_connect").map((call: any) => call.args.expectedConfig.id).sort()).toEqual([
+    httpConfig.id,
+    stdioConfig.id,
+  ].sort());
+  await expect(enableAll).toBeEnabled();
+
+  await page.evaluate(() => { (window as any).__MCP__.failConnect = undefined; });
+  await enableAll.click();
+  await expect(httpRow).toContainText("运行中");
+  await expect(stdioRow).toContainText("运行中");
+  await expect(page.getByRole("button", {name: "全部禁用", exact: true})).toBeVisible();
+  expect((await lifecycleCalls(page)).filter((call: any) => call.command === "mcp_connect").map((call: any) => call.args.expectedConfig.id).sort()).toEqual([
+    httpConfig.id,
+    httpConfig.id,
+    stdioConfig.id,
+  ].sort());
+});
+
+test("bulk disable clears a remembered disconnected MCP without stopping the separate local server", async ({page}) => {
+  await openLifecycle(page, [httpConfig, stdioConfig], {
+    active: [httpConfig.id],
+    remembered: [stdioConfig.id],
+    localRequested: true,
+    localRunning: true,
+  });
+  const httpRow = mcpRow(page, httpConfig.name);
+  const stdioRow = mcpRow(page, stdioConfig.name);
+  await expect(httpRow).toContainText("运行中");
+  await expect(stdioRow).toContainText("未启动");
+  await expect(stdioRow.getByRole("button", {name: "取消 Local Stdio 自动启动", exact: true})).toBeVisible();
+
+  const availableTools = page.locator('[data-slot="card"]').filter({has: page.getByRole("heading", {name: "可用工具", exact: true})});
+  await expect(availableTools.getByRole("button", {name: "全部启用", exact: true})).toBeVisible();
+  await availableTools.getByRole("button", {name: "选择批量操作", exact: true}).click();
+  const menu = page.getByRole("menu");
+  await expect(menu.getByRole("menuitem", {name: "全部启用", exact: true})).toBeVisible();
+  await menu.getByRole("menuitem", {name: "全部禁用", exact: true}).click();
+
+  await expect(httpRow).toContainText("未启动");
+  await expect(stdioRow).toContainText("未启动");
+  await expect(stdioRow.getByRole("button", {name: "取消 Local Stdio 自动启动", exact: true})).toHaveCount(0);
+  const localCard = page.locator('[data-slot="card"]').filter({has: page.getByRole("heading", {name: "本地工具", exact: true})});
+  await expect(localCard).toContainText("运行中");
+  await expect(localCard.getByRole("button", {name: "停止工具", exact: true})).toBeVisible();
+  expect((await lifecycleCalls(page)).filter((call: any) => call.command === "mcp_disconnect").map((call: any) => call.args.id).sort()).toEqual([
+    httpConfig.id,
+    stdioConfig.id,
+  ].sort());
+  expect(await page.evaluate(() => (window as any).__MCP__.calls.filter((call: any) => call.command === "mcp_server_stop" || call.command === "mcp_server_start"))).toEqual([]);
+  expect(await page.evaluate(() => (window as any).__MCP__.remembered)).toEqual([]);
+});
+
+test("starting inbound local tools still requires confirmation", async ({page}) => {
+  await openLifecycle(page, []);
+  const start = page.getByRole("button", {name: "开启工具", exact: true});
+  const dialog = page.getByRole("dialog", {name: "开启本地工具", exact: true});
+  const localStarts = () => page.evaluate(() => (window as any).__MCP__.calls.filter((call: any) => call.command === "mcp_server_start"));
+  await start.click();
+  await expect(dialog).toBeVisible();
+  expect(await localStarts()).toEqual([]);
+  await dialog.getByRole("button", {name: "取消", exact: true}).click();
+  await expect(dialog).toBeHidden();
+  expect(await localStarts()).toEqual([]);
+
+  await start.click();
+  await dialog.getByRole("button", {name: "开启工具", exact: true}).click();
+  await expect(dialog).toBeHidden();
+  await expect(page.getByRole("button", {name: "停止工具", exact: true})).toBeVisible();
+  expect(await localStarts()).toEqual([{command: "mcp_server_start", args: {confirmation: "START_LOCAL_MCP"}}]);
+});
+
+test("removing a saved external connection still requires confirmation", async ({page}) => {
+  await openLifecycle(page, [httpConfig]);
+  const row = mcpRow(page, httpConfig.name);
+  await row.getByRole("button", {name: "编辑 Remote HTTP", exact: true}).click();
+  await page.getByRole("dialog", {name: "编辑 MCP 连接", exact: true}).getByRole("button", {name: "移除配置", exact: true}).click();
+  const dialog = page.getByRole("dialog", {name: "移除 MCP 配置", exact: true});
+  await expect(dialog).toBeVisible();
+  const removals = () => page.evaluate(() => (window as any).__MCP__.calls.filter((call: any) => call.command === "mcp_remove"));
+  expect(await removals()).toEqual([]);
+  await dialog.getByRole("button", {name: "确认移除", exact: true}).click();
+  await expect(dialog).toBeHidden();
+  await expect(row).toHaveCount(0);
+  expect(await removals()).toEqual([{command: "mcp_remove", args: {id: httpConfig.id}}]);
 });
 
 test("the editor has no separate enable switch", async ({page}) => {
@@ -327,6 +465,86 @@ test("the editor has no separate enable switch", async ({page}) => {
   await expect(dialog.getByLabel("名称", {exact: true})).toBeVisible();
   await expect(dialog.getByRole("checkbox")).toHaveCount(0);
   await expect(dialog.getByRole("button", {name: "移除配置", exact: true})).toBeVisible();
+});
+
+test("MCP descriptions stay on one line and reveal their full text on hover and focus", async ({page}) => {
+  const description = "A long service description that explains the purpose, supported operations, and expected behavior of this remote MCP connection. The complete text remains available when the inline summary is shortened.";
+  const config = {...httpConfig, name: "Described MCP", description};
+  const noDescriptionConfig = {...httpConfig, id: "fixture-no-description", name: "No description"};
+  await openLifecycle(page, [config, noDescriptionConfig]);
+
+  const row = mcpRow(page, config.name);
+  const descriptionText = row.getByText(description, {exact: true});
+  await expect(descriptionText).toBeVisible();
+  await expect(row.getByText(config.name, {exact: true})).toBeVisible();
+  const nameBox = await row.getByText(config.name, {exact: true}).boundingBox();
+  const descriptionBox = await descriptionText.boundingBox();
+  expect(nameBox && descriptionBox).toBeTruthy();
+  if (nameBox && descriptionBox) {
+    expect(Math.abs(nameBox.y - descriptionBox.y)).toBeLessThanOrEqual(3);
+  }
+
+  const overflow = await descriptionText.evaluate((element) => {
+    const node = element as HTMLElement;
+    return {clientWidth: node.clientWidth, scrollWidth: node.scrollWidth, clientHeight: node.clientHeight, scrollHeight: node.scrollHeight};
+  });
+  expect(overflow.clientWidth).toBeGreaterThan(0);
+  expect(overflow.scrollWidth).toBeGreaterThan(overflow.clientWidth);
+  expect(overflow.clientHeight).toBeGreaterThan(0);
+  expect(overflow.scrollHeight).toBeLessThanOrEqual(overflow.clientHeight + 1);
+
+  const tooltip = page.getByRole("tooltip", {name: description, exact: true});
+  await descriptionText.hover();
+  await expect(tooltip).toHaveText(description);
+  const bounds = await tooltip.boundingBox();
+  expect(bounds).toBeTruthy();
+  expect(bounds!.x).toBeGreaterThanOrEqual(0);
+  expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+  await page.mouse.move(0, 0);
+  await expect(tooltip).toBeHidden();
+
+  await row.getByRole("button", {name: `配置 ${config.name} 凭据`, exact: true}).focus();
+  await page.keyboard.press("Shift+Tab");
+  await expect(descriptionText).toBeFocused();
+  await expect(tooltip).toHaveText(description);
+
+  const emptyDescriptionRow = mcpRow(page, noDescriptionConfig.name);
+  await expect(emptyDescriptionRow).toBeVisible();
+  await expect(emptyDescriptionRow).not.toContainText("undefined");
+  await expect(emptyDescriptionRow).not.toContainText("null");
+});
+
+test("MCP descriptions can be added and edited, then appear in the connection list", async ({page}) => {
+  await openLifecycle(page, []);
+  const name = "Described HTTP service";
+  const initialDescription = "Created service description";
+  const updatedDescription = "Updated service description";
+  const editor = page.getByRole("dialog", {name: "添加 MCP 连接", exact: true});
+
+  await page.getByRole("button", {name: "添加连接", exact: true}).click();
+  await expect(editor.getByLabel("描述（可选）", {exact: true})).toHaveValue("");
+  await editor.getByLabel("名称", {exact: true}).fill(name);
+  await editor.getByLabel("描述（可选）", {exact: true}).fill(initialDescription);
+  await editor.getByLabel("URL", {exact: true}).fill("https://described.example.test/mcp");
+  await editor.getByRole("button", {name: "保存配置", exact: true}).click();
+  await expect(editor).toBeHidden();
+
+  const created = (await mcpWriteCalls(page)).findLast((call: any) => call.command === "mcp_create")?.args.config;
+  expect(created).toMatchObject({name, description: initialDescription});
+  const row = mcpRow(page, name);
+  await expect(row.getByText(initialDescription, {exact: true})).toBeVisible();
+
+  await row.getByRole("button", {name: `编辑 ${name}`, exact: true}).click();
+  const editDialog = page.getByRole("dialog", {name: "编辑 MCP 连接", exact: true});
+  await expect(editDialog.getByLabel("描述（可选）", {exact: true})).toHaveValue(initialDescription);
+  await editDialog.getByLabel("描述（可选）", {exact: true}).fill(updatedDescription);
+  await editDialog.getByRole("button", {name: "保存配置", exact: true}).click();
+  await expect(editDialog).toBeHidden();
+
+  const updated = (await mcpWriteCalls(page)).findLast((call: any) => call.command === "mcp_update")?.args.config;
+  expect(updated).toMatchObject({name, description: updatedDescription});
+  await expect(row.getByText(updatedDescription, {exact: true})).toBeVisible();
+  await expect(row.getByText(initialDescription, {exact: true})).toHaveCount(0);
 });
 
 test("credential URLs can be set and cleared when adding and editing either transport", async ({page}) => {
@@ -415,6 +633,38 @@ test("invalid credential URLs do not create or update MCP configs", async ({page
   expect(await mcpWriteCalls(page)).toEqual([]);
 });
 
+test("the 3DM HTTPS endpoint labels its API key and allows an anonymous configuration", async ({page}) => {
+  const config = {...httpConfig, url: "HTTPS://MOD.3DMGAME.COM:443/mcp/", bearer_secret_ref: "mcp.custom.api_key"};
+  await openLifecycle(page, [config]);
+  const row = mcpRow(page, config.name);
+  const credentials = page.getByRole("dialog", {name: "配置 MCP 凭据", exact: true});
+  await row.getByRole("button", {name: "配置 Remote HTTP 凭据", exact: true}).click();
+  await expect(credentials.getByLabel("3DM API Key", {exact: true})).toHaveAttribute("type", "password");
+  await credentials.getByRole("button", {name: "返回", exact: true}).click();
+
+  await row.getByRole("button", {name: "编辑 Remote HTTP", exact: true}).click();
+  const editor = page.getByRole("dialog", {name: "编辑 MCP 连接", exact: true});
+  const url = editor.getByLabel("URL", {exact: true});
+  const keyRef = editor.getByLabel("3DM API Key 引用", {exact: true});
+  await expect(keyRef).toHaveValue(config.bearer_secret_ref);
+  for (const other of [
+    "https://mod.3dmgame.com.example.test/mcp",
+    "https://mod.3dmgame.com:8443/mcp",
+    "https://mod.3dmgame.com/mcp/other",
+    "http://mod.3dmgame.com/mcp",
+  ]) {
+    await url.fill(other);
+    await expect(editor.getByLabel("Bearer 密钥引用", {exact: true})).toBeVisible();
+  }
+  await url.fill("https://mod.3dmgame.com/mcp");
+  await expect(keyRef).toHaveAccessibleDescription(/留空可匿名连接/);
+  await keyRef.fill("");
+  await editor.getByRole("button", {name: "保存配置", exact: true}).click();
+  await expect(editor).toBeHidden();
+  expect((await mcpWriteCalls(page)).at(-1)?.args.config).toMatchObject({url: "https://mod.3dmgame.com/mcp", bearer_secret_ref: null});
+  await expect(row.getByRole("button", {name: "配置 Remote HTTP 凭据", exact: true})).toHaveCount(0);
+});
+
 test("a configured credential URL is offered in the credentials dialog and opens externally", async ({page}) => {
   const credentialUrl = "https://keys.example.test/account";
   await openLifecycle(page, [{...httpConfig, credential_url: credentialUrl}]);
@@ -440,7 +690,7 @@ test("remembered MCP services refresh after background restore and can be forgot
   await cancel.click();
   await expect(cancel).toHaveCount(0);
   expect(await lifecycleCalls(page)).toEqual([{command: "mcp_disconnect", args: {id: httpConfig.id}}]);
-  const cancelLocal = page.getByRole("button", {name: "取消本地 MCP 自动启动", exact: true});
+  const cancelLocal = page.getByRole("button", {name: "取消本地工具自动启动", exact: true});
   await cancelLocal.click();
   await expect(cancelLocal).toHaveCount(0);
   await page.evaluate(() => {

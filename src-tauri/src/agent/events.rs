@@ -65,7 +65,7 @@ impl Events {
         Ok(())
     }
 
-    fn record(
+    pub(super) fn record(
         conn: &Connection,
         turn: &str,
         conv: &str,

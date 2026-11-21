@@ -5,6 +5,7 @@ use crate::{
     transaction::{serialize_user_plan, FileEngine, FileOp, FilePlan},
     trash,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
@@ -182,6 +183,44 @@ fn text<'a>(args: &'a Value, key: &str) -> AppResult<&'a str> {
         .as_str()
         .ok_or_else(|| AppError::Invalid(format!("缺少字符串参数: {key}")))
 }
+const MAX_ARCHIVE_PAGE: usize = 200;
+
+#[derive(Deserialize)]
+struct ArchivePreviewRequest {
+    path: PathBuf,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+fn preview_archive(engine: &FileEngine, args: Value) -> AppResult<Value> {
+    let request: ArchivePreviewRequest = serde_json::from_value(args)
+        .map_err(|error| AppError::Invalid(format!("归档预览参数无效: {error}")))?;
+    let limit = request.limit.unwrap_or(50);
+    if !(1..=MAX_ARCHIVE_PAGE).contains(&limit) {
+        return Err(AppError::Invalid(format!(
+            "归档预览 limit 必须在 1 到 {MAX_ARCHIVE_PAGE} 之间"
+        )));
+    }
+    let path = engine.resolve_file_path(&request.path)?;
+    let mut listing = crate::archive::list_archive(&path)?;
+    if request.offset.is_none() && request.limit.is_none() {
+        return Ok(json!(listing));
+    }
+    let total = listing.entries.len();
+    let start = request.offset.unwrap_or(0).min(total);
+    let end = start.saturating_add(limit).min(total);
+    listing.entries = listing
+        .entries
+        .into_iter()
+        .skip(start)
+        .take(limit)
+        .collect();
+    let mut page = json!(listing);
+    page["total_entries"] = json!(total);
+    page["next_offset"] = json!((end < total).then_some(end));
+    Ok(page)
+}
+
 fn schema(properties: Value, required: &[&str]) -> Value {
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
@@ -205,8 +244,8 @@ impl Builtin {
                 Effect::Read,
             ),
             "extract_preview" => (
-                "安全检查归档并列出条目，不解压安装",
-                schema(json!({"path":string}), &["path"]),
+                "只读检查归档并列出内部条目。分析 Mod 样本时传 limit 分页，按 next_offset 继续；省略分页参数返回完整目录。",
+                schema(json!({"path":string,"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":MAX_ARCHIVE_PAGE}}), &["path"]),
                 Effect::Read,
             ),
             "preview_fomod" => (
@@ -389,10 +428,7 @@ impl AgentTool for Builtin {
                     &engine,
                     &PathBuf::from(text(&args, "path")?)
                 )?)),
-                "extract_preview" => {
-                    let path = engine.resolve_file_path(&PathBuf::from(text(&args, "path")?))?;
-                    Ok(json!(crate::archive::list_archive(&path)?))
-                }
+                "extract_preview" => preview_archive(&engine, args),
                 "preview_fomod" => Ok(json!(crate::fomod::preview(
                     &engine,
                     &PathBuf::from(text(&args, "path")?)

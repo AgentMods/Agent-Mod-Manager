@@ -30,7 +30,7 @@ async function openPlugins(page: Page) {
 }
 
 async function prepareCachedQueries(page: Page, activePage: "detail" | "plugins") {
-  await installMockTauri(page);
+  await installMockTauri(page, {withExternalAdapter: true});
   await page.goto("/");
   await expect(page.getByRole("button", { name: "游戏库", exact: true })).toBeVisible();
 

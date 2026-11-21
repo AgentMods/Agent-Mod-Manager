@@ -1,4 +1,25 @@
-# Plugin Publication
+# Manager plugin publication
+
+## Public catalog
+
+The desktop plugin center, library, and local Agent use the public Mod客栈 manager plugin catalog. The Rust client reads `GET /api/v1/manager-plugins/games` anonymously. Selecting an immutable release loads `adapter.json` and `SKILL.md` from `/api/v1/manager-plugins/releases/{releaseId}/` on the same host. Both original texts, their hashes, declared MCP services, and any installed version are available for review. Import commits a draft. Installation and binding to a registered game use the existing reviewed operations.
+
+## Publish a manager plugin
+
+Use a Mod客栈 creator API key in the built-in Mod客栈 MCP settings. An approved creator with `manager_plugins.publish` can publish a first release or enter the numeric ID of their existing plugin to publish a new version. Grant `manager_plugins.read` to select a plugin from the author's list or to reconcile an uncertain result. The public catalog requires no key.
+
+| Operation | MCP tool | Arguments |
+| --- | --- | --- |
+| First release | `publish_manager_plugin` | `adapter`, `skill`, optional `tags` |
+| Subsequent release | `publish_manager_plugin_release` | `plugin_id`, both original texts, and the full tag set for the new version |
+| List author's plugins | `list_my_manager_plugins` | `offset`, `limit` |
+| Read author's current release texts | `get_my_manager_plugin_texts` | `plugin_id` |
+
+The approval covers the publication target, original UTF-8 texts, source provenance and tags. Reviewers can compare the complete two files. After approval the app checks its source again and records the intent before sending a write. A successful release records both plugin ID and release ID. Moderation applies to subsequent releases too. When the provider reports that a plugin is hidden, the app identifies that state separately from a publicly visible release. An uncertain submission is reconciled with read-only tools. A timeout does not trigger a second submission.
+
+## Earlier ordinary-work publication records
+
+Earlier versions published ZIP attachments as ordinary works. Their stored approvals, hashes, IDs and events belong to that workflow. Existing records can be inspected and eligible uncertain states can be reconciled. All new publications use the manager-plugin tools above. The remaining sections describe the historical format for maintenance and recovery.
 
 ## Scope and Trust
 
@@ -15,8 +36,8 @@ JSON parameter. The public DTOs use PascalCase Rust names and camelCase JSON.
 Publication is permitted for either:
 
 - A valid draft whose original, reviewed write transaction is committed.
-- An installed, validated package at its derived managed location. Built-ins
-  must match embedded bytes exactly. External packages must match a committed
+- An installed, validated external package at its derived managed location.
+  Its files must match a committed
   deployment, its recorded raw content, both file fingerprints and the reviewed
   draft/write/deployment paths. A registry boolean alone is insufficient.
 
@@ -196,7 +217,7 @@ for this check; a newly publishable record needs fresh explicit confirmation.
 
 ## Verification Status
 
-The desktop IPC exposes `prepare_plugin_publication`, `list_plugin_publications`,
+The earlier desktop IPC exposed `prepare_plugin_publication`, `list_plugin_publications`,
 `reconcile_plugin_publication`, and `publish_plugin`. Preparation is local only.
 The publish IPC requires `PUBLISH_PLUGIN` and the exact preview digest; it uses
 the same injected encrypted credential store as the Agent runtime. The UI shows

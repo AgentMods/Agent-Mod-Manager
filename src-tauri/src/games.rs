@@ -231,17 +231,9 @@ fn canonical_directory(path: &Path) -> AppResult<PathBuf> {
     Ok(root)
 }
 
-/// Read only enabled, validated adapters. An entirely unseeded database can
-/// discover embedded packages; disabling every seeded package stays disabled.
+/// Discovery only uses installed, enabled and validated adapters.
 fn active_adapters(db: &Db) -> AppResult<Vec<GameAdapter>> {
-    let packages = plugins::list_plugins(db)?;
-    if packages.is_empty() {
-        return Ok(plugins::builtin_packages()?
-            .into_iter()
-            .map(|p| p.adapter)
-            .collect());
-    }
-    packages
+    plugins::list_plugins(db)?
         .into_iter()
         .filter(|p| p.enabled && p.validated)
         .map(|p| plugins::adapter_for(db, &p.slug))
@@ -503,7 +495,7 @@ pub(crate) fn inspect_game_adapter_selection(
     root: &Path,
     slug: &str,
 ) -> AppResult<GameAdapterSelection> {
-    // Unlike ordinary discovery, require the chosen package to be registered.
+    // Validate the chosen package directly before checking its disk markers.
     let adapter = plugins::adapter_for(db, slug)?;
     let candidate = identify_at(
         root,
@@ -1708,9 +1700,17 @@ pub fn scan_games(db: &Db, options: &ScanOptions) -> AppResult<ScanReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{plugins::test_fixtures, storage::AppPaths};
 
     fn db(temp: &tempfile::TempDir) -> Db {
         Db::open(&temp.path().join("manager/db.sqlite")).unwrap()
+    }
+
+    fn db_with_adapters(temp: &tempfile::TempDir) -> Db {
+        let paths = AppPaths::new(temp.path().join("manager")).unwrap();
+        let db = Db::open(&paths.db_file()).unwrap();
+        test_fixtures::install(&db, &paths).unwrap();
+        db
     }
     fn make_file(root: &Path, relative: &str) {
         let path = root.join(relative);
@@ -1834,7 +1834,7 @@ mod tests {
     #[test]
     fn distinctive_required_markers_beat_generic_or_partial_layouts() {
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
+        let db = db_with_adapters(&temp);
         let game = temp.path().join("unrelated-folder-name");
         skyrim(&game);
         let result = identify_game(&db, &game).unwrap();
@@ -1881,7 +1881,7 @@ mod tests {
     #[test]
     fn generic_bg3_data_marker_keeps_8_percent_evidence_without_guessing_identity() {
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
+        let db = db_with_adapters(&temp);
         let game = temp.path().join("unrelated-folder");
         fs::create_dir_all(game.join("Data")).unwrap();
 
@@ -1926,7 +1926,7 @@ mod tests {
     #[test]
     fn discovered_registration_respects_a_launcher_downgrade() {
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
+        let db = db_with_adapters(&temp);
         let steam = temp.path().join("Steam");
         let game = steam.join("steamapps/common/game-root");
         bg3(&game);
@@ -1963,7 +1963,7 @@ mod tests {
     #[test]
     fn discovered_registration_rechecks_a_stale_strong_suggestion_before_binding() {
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
+        let db = db_with_adapters(&temp);
         let game = temp.path().join("game-root");
         bg3(&game);
 
@@ -2002,8 +2002,8 @@ mod tests {
     #[test]
     fn all_six_adapter_layouts_are_identified_without_claiming_native_runtime_support() {
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
-        for package in plugins::builtin_packages().unwrap() {
+        let db = db_with_adapters(&temp);
+        for package in test_fixtures::packages().unwrap() {
             let adapter = package.adapter;
             let root = temp.path().join(&adapter.slug);
             fs::create_dir_all(&root).unwrap();
@@ -2040,7 +2040,7 @@ mod tests {
         let root = temp.path().join("game");
         skyrim(&root);
         let root = root.canonicalize().unwrap();
-        let first = plugins::builtin_packages().unwrap().remove(1).adapter;
+        let first = test_fixtures::packages().unwrap().remove(1).adapter;
         let mut second = first.clone();
         second.slug = "other-layout".into();
         let result = identify_at(&root, &[first, second], vec![]).unwrap();
@@ -2054,7 +2054,7 @@ mod tests {
     #[test]
     fn minecraft_generic_markers_stay_candidates_until_explicit_identity_selection() {
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
+        let db = db_with_adapters(&temp);
         let game = temp.path().join("instance");
         make_file(&game, "options.txt");
         fs::create_dir_all(game.join("versions")).unwrap();
@@ -2074,7 +2074,7 @@ mod tests {
     #[test]
     fn explicit_registration_is_idempotent_and_preserves_install_state() {
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
+        let db = db_with_adapters(&temp);
         let game = temp.path().join("game");
         skyrim(&game);
         let first = register_game(&db, &game, None).unwrap();
@@ -2101,7 +2101,7 @@ mod tests {
     #[test]
     fn scan_follows_secondary_steam_library_but_does_not_register_or_write_games() {
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
+        let db = db_with_adapters(&temp);
         let steam = temp.path().join("Steam");
         let second = temp.path().join("Other Library");
         let game = second.join("steamapps/common/Actual Name");
@@ -2175,7 +2175,7 @@ mod tests {
     #[test]
     fn steam_macos_runtime_is_reported_once_at_the_adapter_root() {
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
+        let db = db_with_adapters(&temp);
         let steam = temp.path().join("Steam");
         let game = steam.join("steamapps/common/Stardew Valley");
         make_file(&game, "Contents/MacOS/Stardew Valley.dll");
@@ -2208,7 +2208,7 @@ mod tests {
     #[test]
     fn steam_app_id_alone_does_not_confirm_an_empty_install_directory() {
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
+        let db = db_with_adapters(&temp);
         let steam = temp.path().join("Steam");
         let game = steam.join("steamapps/common/Empty");
         fs::create_dir_all(&game).unwrap();
@@ -2238,7 +2238,7 @@ mod tests {
     #[test]
     fn epic_item_and_legendary_metadata_are_read_without_running_launch_commands() {
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
+        let db = db_with_adapters(&temp);
         let game = temp.path().join("EpicGame");
         make_file(&game, "bin/x64/Cyberpunk2077.exe");
         let manifests = temp.path().join("manifests");
@@ -2270,7 +2270,7 @@ mod tests {
     #[test]
     fn chosen_library_lists_adapted_and_unadapted_installs_without_registering() {
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
+        let db = db_with_adapters(&temp);
         let root = temp.path().join("Games");
         skyrim(&root.join("Skyrim"));
         make_file(&root, "Portable/StartGame.EXE");
@@ -2298,7 +2298,7 @@ mod tests {
     #[test]
     fn user_scan_is_shallow_bounded_deduplicated_and_reports_existing_registrations() {
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
+        let db = db_with_adapters(&temp);
         let parent = temp.path().join("games");
         let game = parent.join("Skyrim");
         skyrim(&game);
@@ -2524,21 +2524,83 @@ mod tests {
     }
 
     #[test]
-    fn disabled_adapters_do_not_reappear_via_builtin_fallback() {
+    fn fresh_database_discovers_and_registers_games_without_an_adapter() {
         let temp = tempfile::tempdir().unwrap();
         let db = db(&temp);
-        let paths = crate::storage::AppPaths::new(temp.path().join("storage")).unwrap();
-        plugins::seed_builtins(&db, &paths).unwrap();
+        let steam = temp.path().join("Steam");
+        let game = steam.join("steamapps/common/Skyrim");
+        skyrim(&game);
+        fs::write(
+            steam.join("steamapps/appmanifest_489830.acf"),
+            acf("489830", "Skyrim"),
+        )
+        .unwrap();
+
+        let identified = identify_game(&db, &game).unwrap();
+        assert_eq!(identified.status, IdentificationStatus::Unidentified);
+        assert!(identified.matches.is_empty());
+        assert!(identified.suggested_adapter_slug.is_none());
+
+        let scanned = scan_games(
+            &db,
+            &ScanOptions {
+                steam_roots: vec![steam],
+                ..scan_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(scanned.candidates.len(), 1);
+        let candidate = &scanned.candidates[0];
+        assert_eq!(candidate.name, "A game");
+        assert_eq!(candidate.status, IdentificationStatus::Unidentified);
+        assert!(candidate.matches.is_empty());
+        assert!(candidate.suggested_adapter_slug.is_none());
+        assert!(candidate.requires_confirmation);
+        assert_eq!(candidate.sources[0].steam_app_id.as_deref(), Some("489830"));
+        assert!(list_games(&db).unwrap().is_empty());
+        assert!(matches!(
+            register_game(&db, &game, Some("skyrim-se")),
+            Err(AppError::NotFound(_))
+        ));
+        assert!(list_games(&db).unwrap().is_empty());
+
+        let registered = register_discovered_game(
+            &db,
+            Path::new(&candidate.root_path),
+            candidate.suggested_adapter_slug.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(registered.slug, "unknown");
+        assert!(registered.adapter_slug.is_none());
+        assert!(registered.adapter_version.is_none());
+        assert!(registered.steam_app_id.is_none());
+        assert!(plugins::list_plugins(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn disabled_installed_adapters_do_not_match_or_bind() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db_with_adapters(&temp);
+        let game = temp.path().join("game");
+        skyrim(&game);
+        let reviewed = identify_game(&db, &game).unwrap();
+        assert_eq!(reviewed.status, IdentificationStatus::HighConfidence);
+        assert_eq!(
+            reviewed.suggested_adapter_slug.as_deref(),
+            Some("skyrim-se")
+        );
         db.conn()
             .execute("UPDATE plugins SET enabled=0", [])
             .unwrap();
-        let game = temp.path().join("game");
-        skyrim(&game);
         assert_eq!(
             identify_game(&db, &game).unwrap().status,
             IdentificationStatus::Unidentified
         );
         assert!(register_game(&db, &game, Some("skyrim-se")).is_err());
+        let registered =
+            register_discovered_game(&db, &game, reviewed.suggested_adapter_slug.as_deref())
+                .unwrap();
+        assert!(registered.adapter_slug.is_none());
     }
 
     #[cfg(unix)]
@@ -2546,7 +2608,7 @@ mod tests {
     fn marker_and_steam_directory_symlinks_cannot_escape_scan_roots() {
         use std::os::unix::fs::symlink;
         let temp = tempfile::tempdir().unwrap();
-        let db = db(&temp);
+        let db = db_with_adapters(&temp);
         let outside = temp.path().join("outside");
         skyrim(&outside);
         let fake = temp.path().join("fake");
