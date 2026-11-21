@@ -76,6 +76,26 @@ pub(crate) fn migrate_markitdown_to_launcher_index(conn: &rusqlite::Connection) 
     Ok(())
 }
 
+const GLOSSMOD_HTTP_ID: &str = "glossmod_http";
+const GLOSSMOD_3DM_ID: &str = "glossmod_3dm";
+const GLOSSMOD_HTTP_CREDENTIAL_URL: &str = "https://www.glossmod.com/creator/ai";
+const GLOSSMOD_3DM_CREDENTIAL_URL: &str = "https://mod.3dmgame.com/Workshop/Api";
+
+/// Schema v7: backfill the credential page for built-ins without changing their launch config.
+pub(crate) fn migrate_credential_urls(conn: &rusqlite::Connection) -> AppResult<()> {
+    for (id, url) in [
+        (GLOSSMOD_HTTP_ID, GLOSSMOD_HTTP_CREDENTIAL_URL),
+        (GLOSSMOD_3DM_ID, GLOSSMOD_3DM_CREDENTIAL_URL),
+    ] {
+        conn.execute(
+            "UPDATE mcp_servers SET credential_url=?2
+             WHERE id=?1 AND builtin=1 AND credential_url IS NULL",
+            params![id, url],
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum McpTransport {
@@ -104,6 +124,9 @@ pub struct ServerConfig {
     #[serde(default)]
     pub args: Vec<String>,
     pub url: Option<String>,
+    /// Optional web page for obtaining credentials; never used as a transport endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_url: Option<String>,
     #[serde(default)]
     pub env_secret_refs: BTreeMap<String, String>,
     pub bearer_secret_ref: Option<String>,
@@ -122,6 +145,7 @@ impl ServerConfig {
             command: Some(command.into()),
             args,
             url: None,
+            credential_url: None,
             env_secret_refs: BTreeMap::new(),
             bearer_secret_ref: None,
             enabled: false,
@@ -137,6 +161,7 @@ impl ServerConfig {
             command: None,
             args: Vec::new(),
             url: Some(url.into()),
+            credential_url: None,
             env_secret_refs: BTreeMap::new(),
             bearer_secret_ref: None,
             enabled: false,
@@ -144,9 +169,12 @@ impl ServerConfig {
         }
     }
 
-    // Stable for this DTO (env bindings are sorted); changed serialization fails closed.
+    // Keep the pre-v7 digest: the credential page is UI metadata, not a launch setting.
+    // All other serialized fields still participate (env bindings are sorted).
     pub(crate) fn confirmation_digest(&self) -> AppResult<[u8; 32]> {
-        Ok(Sha256::digest(serde_json::to_vec(self)?).into())
+        let mut launch_config = self.clone();
+        launch_config.credential_url = None;
+        Ok(Sha256::digest(serde_json::to_vec(&launch_config)?).into())
     }
 
     pub fn validate(&self) -> AppResult<()> {
@@ -195,6 +223,9 @@ impl ServerConfig {
         if let Some(key) = &self.bearer_secret_ref {
             validate_secret_ref(key)?;
         }
+        if let Some(url) = &self.credential_url {
+            validate_credential_url(url)?;
+        }
         match self.transport {
             McpTransport::Stdio => {
                 let command = self.command.as_deref().unwrap_or_default();
@@ -230,6 +261,35 @@ impl ServerConfig {
     }
 }
 
+fn validate_credential_url(raw: &str) -> AppResult<()> {
+    let invalid = || {
+        AppError::Invalid(
+            "MCP credential URL must be an absolute HTTP(S) URL without user info".into(),
+        )
+    };
+    // The URL parser normalizes some inputs (missing slashes, backslashes, empty user info).
+    // Require an explicit authority and reject those spellings before parsing.
+    let (_, rest) = raw.split_once("://").ok_or_else(invalid)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty()
+        || authority.contains('@')
+        || raw
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace() || ch == '\\')
+    {
+        return Err(invalid());
+    }
+    let url = url::Url::parse(raw).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 fn validate_secret_ref(key: &str) -> AppResult<()> {
     if !key.starts_with("mcp.")
         || key.len() > 128
@@ -256,7 +316,7 @@ impl McpServers {
 
     pub fn list(&self) -> AppResult<Vec<ServerConfig>> {
         let conn = self.db.conn();
-        let mut stmt = conn.prepare("SELECT id,name,transport,command,args_json,url,env_json,secret_ref,enabled,builtin FROM mcp_servers ORDER BY builtin DESC,name,id")?;
+        let mut stmt = conn.prepare("SELECT id,name,transport,command,args_json,url,env_json,secret_ref,enabled,builtin,credential_url FROM mcp_servers ORDER BY builtin DESC,name,id")?;
         let result = stmt
             .query_map([], from_row)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -268,7 +328,7 @@ impl McpServers {
     }
 
     fn get_from(conn: &rusqlite::Connection, id: &str) -> AppResult<ServerConfig> {
-        conn.query_row("SELECT id,name,transport,command,args_json,url,env_json,secret_ref,enabled,builtin FROM mcp_servers WHERE id=?1", [id], from_row)
+        conn.query_row("SELECT id,name,transport,command,args_json,url,env_json,secret_ref,enabled,builtin,credential_url FROM mcp_servers WHERE id=?1", [id], from_row)
             .optional()?.ok_or_else(|| AppError::NotFound("MCP server".into()))
     }
 
@@ -320,10 +380,10 @@ impl McpServers {
     fn insert(&self, config: &ServerConfig, builtin: bool) -> AppResult<()> {
         config.validate()?;
         self.db.conn().execute(
-            "INSERT INTO mcp_servers(id,name,transport,command,args_json,url,env_json,secret_ref,enabled,builtin,created_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            "INSERT INTO mcp_servers(id,name,transport,command,args_json,url,env_json,secret_ref,enabled,builtin,created_at,credential_url)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             params![config.id,config.name,config.transport.as_str(),config.command,serde_json::to_string(&config.args)?,config.url,
-                serde_json::to_string(&config.env_secret_refs)?,config.bearer_secret_ref,config.enabled,builtin,now()],
+                serde_json::to_string(&config.env_secret_refs)?,config.bearer_secret_ref,config.enabled,builtin,now(),config.credential_url],
         )?;
         Ok(())
     }
@@ -331,9 +391,9 @@ impl McpServers {
     pub fn update(&self, config: &ServerConfig) -> AppResult<()> {
         config.validate()?;
         let count = self.db.conn().execute(
-            "UPDATE mcp_servers SET name=?2,transport=?3,command=?4,args_json=?5,url=?6,env_json=?7,secret_ref=?8,enabled=?9,startup_digest=NULL WHERE id=?1",
+            "UPDATE mcp_servers SET name=?2,transport=?3,command=?4,args_json=?5,url=?6,env_json=?7,secret_ref=?8,enabled=?9,credential_url=?10,startup_digest=NULL WHERE id=?1",
             params![config.id,config.name,config.transport.as_str(),config.command,serde_json::to_string(&config.args)?,config.url,
-                serde_json::to_string(&config.env_secret_refs)?,config.bearer_secret_ref,config.enabled],
+                serde_json::to_string(&config.env_secret_refs)?,config.bearer_secret_ref,config.enabled,config.credential_url],
         )?;
         if count == 0 {
             return Err(AppError::NotFound("MCP server".into()));
@@ -374,17 +434,19 @@ impl McpServers {
     /// Insert-only seeding never overwrites edits or re-enables a disabled server.
     pub fn seed_presets(&self) -> AppResult<()> {
         let mut http = ServerConfig::http(
-            "glossmod_http",
+            GLOSSMOD_HTTP_ID,
             "Mod客栈",
             "https://www.glossmod.com/api/v1/mcp",
         );
+        http.credential_url = Some(GLOSSMOD_HTTP_CREDENTIAL_URL.into());
         http.bearer_secret_ref = Some("mcp.glossmod_http.api_key".into());
         let mut stdio = ServerConfig::stdio(
-            "glossmod_3dm",
-            "3DM MCP (glossmod-mcp)",
+            GLOSSMOD_3DM_ID,
+            "3DM MCP",
             "uvx",
             vec!["glossmod-mcp".into()],
         );
+        stdio.credential_url = Some(GLOSSMOD_3DM_CREDENTIAL_URL.into());
         stdio
             .env_secret_refs
             .insert("GLOSSMOD_API_KEY".into(), "mcp.glossmod_3dm.api_key".into());
@@ -444,5 +506,6 @@ fn from_row(row: &Row<'_>) -> rusqlite::Result<ServerConfig> {
         bearer_secret_ref: row.get(7)?,
         enabled: row.get(8)?,
         builtin: row.get(9)?,
+        credential_url: row.get(10)?,
     })
 }

@@ -1,12 +1,13 @@
 import { McpLaunchDetails } from "@/components/McpLaunchDetails";
 import { startMcpConnection, type McpConfig } from "@/lib/mcp-connection";
 import { appendPathLeaf, displayPath } from "@/lib/paths";
-import { Fragment, useEffect, useState } from "react";
+import { Fragment, useEffect, useId, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useQueryClient } from "@tanstack/react-query";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { FolderOpenIcon } from "lucide-react";
-import { BoxIcon, DownloadIcon, FileTextIcon, KeyRoundIcon, MoonIcon, PencilIcon, PlayIcon, PlusIcon, RotateCcwIcon, SaveIcon, SearchIcon, ServerIcon, SquareIcon, SunIcon, Trash2Icon } from "lucide-react";
+import { BoxIcon, DownloadIcon, ExternalLinkIcon, FileTextIcon, KeyRoundIcon, MoonIcon, PencilIcon, PlayIcon, PlusIcon, RotateCcwIcon, SaveIcon, SearchIcon, ServerIcon, SquareIcon, SunIcon, Trash2Icon } from "lucide-react";
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { useUI } from "@/lib/store";
 import type { FilePlan } from "@/lib/types";
@@ -55,6 +56,17 @@ function ModelSettings() {
   </Card>;
 }
 
+function isCredentialUrl(value: string) {
+  const authority = /^https?:\/\/([^/?#]+)/i.exec(value)?.[1];
+  if (!authority || authority.includes("@") || /[\s\\]/.test(value)) return false;
+  try {
+    const url = new URL(value);
+    return Boolean(url.hostname) && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
 function SecretField({ label, reference }: { label: string; reference: string }) {
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
@@ -92,6 +104,68 @@ function mcpCredentialFields(config: McpConfig) {
     else labelsByReference.set(reference, [label]);
   }
   return [...labelsByReference].map(([reference, labels]) => ({ reference, label: labels.join(" / ") }));
+}
+
+function McpCredentialDialog({ config, trigger, onClose }: { config: McpConfig; trigger: HTMLButtonElement; onClose: () => void }) {
+  const formId = useId();
+  const fields = mcpCredentialFields(config);
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const notify = useUI((s) => s.notify);
+  const pending = fields.filter(({ reference }) => values[reference]?.trim());
+  const credentialUrl = config.credential_url;
+
+  async function save() {
+    if (saving || !pending.length) return;
+    setSaving(true);
+    setError(null);
+    for (const { reference, label } of pending) {
+      try {
+        await api("set_secret", { key: reference, value: values[reference] });
+        setValues((current) => ({ ...current, [reference]: "" }));
+      } catch (failure) {
+        setError(`${label} 保存失败：${errorText(failure)}`);
+        setSaving(false);
+        return;
+      }
+    }
+    notify("MCP 凭据已保存");
+    onClose();
+  }
+
+  return <Modal title="配置 MCP 凭据" description={config.name} className="sm:max-w-md [overflow-wrap:anywhere]"
+    onClose={() => { if (!saving) onClose(); }}
+    onCloseAutoFocus={(event) => { event.preventDefault(); trigger.focus(); }}
+    actions={<div className="flex justify-end gap-2">
+      <Button type="button" variant="outline" disabled={saving} onClick={onClose}>返回</Button>
+      <Button type="submit" form={formId} disabled={!backendAvailable || saving || !pending.length}>
+        {saving && <Spinner data-icon="inline-start" />}保存
+      </Button>
+    </div>}>
+    <p className="text-sm text-muted-foreground">凭据仅在本机加密保存。输入新值可替换已保存的凭据。</p>
+    <form id={formId} onSubmit={(event) => { event.preventDefault(); void save(); }}>
+      <FieldGroup className="gap-4">
+        {fields.map(({ reference, label }, index) => <Field key={reference}>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <FieldLabel htmlFor={`secret-${reference}`}>{label}</FieldLabel>
+            {index === 0 && credentialUrl && isCredentialUrl(credentialUrl) && <Button asChild variant="link" size="xs">
+              <a href={credentialUrl} target="_blank" rel="noreferrer" onClick={(event) => {
+                if (!backendAvailable) return;
+                event.preventDefault();
+                setError(null);
+                void openUrl(credentialUrl).catch(setError);
+              }}>获取 Key <ExternalLinkIcon aria-hidden="true" /></a>
+            </Button>}
+          </div>
+          <Input id={`secret-${reference}`} type="password" autoComplete="new-password" placeholder={reference}
+            value={values[reference] ?? ""} disabled={!backendAvailable || saving}
+            onChange={(event) => setValues({ ...values, [reference]: event.target.value })} />
+        </Field>)}
+      </FieldGroup>
+    </form>
+    <ErrorState error={error} />
+  </Modal>;
 }
 
 function McpSettings() {
@@ -153,7 +227,7 @@ function McpSettings() {
       <CardHeader className="px-3 sm:px-5">
         <CardTitle>外部 MCP 连接</CardTitle>
         <CardDescription>已启动的连接会在下次打开应用时自动重连。停止或编辑连接会取消自动启动。</CardDescription>
-        <CardAction><Button size="sm" variant="outline" disabled={!backendAvailable} onClick={() => { setFresh(true); setEdit({ id: `custom_${Date.now()}`, name: "自定义 MCP", transport: "streamable_http", command: null, args: [], url: "https://", env_secret_refs: {}, bearer_secret_ref: null, enabled: false, builtin: false }); }}><PlusIcon data-icon="inline-start" />添加连接</Button></CardAction>
+        <CardAction><Button size="sm" variant="outline" disabled={!backendAvailable} onClick={() => { setFresh(true); setEdit({ id: `custom_${Date.now()}`, name: "自定义 MCP", transport: "streamable_http", command: null, args: [], url: "https://", env_secret_refs: {}, bearer_secret_ref: null, credential_url: null, enabled: false, builtin: false }); }}><PlusIcon data-icon="inline-start" />添加连接</Button></CardAction>
       </CardHeader>
       <CardContent className="flex flex-col gap-3 px-3 sm:px-5">
         <ErrorState error={configs.error || startup.error || connections.error || local.error || error} />
@@ -207,15 +281,7 @@ function McpSettings() {
       </CardContent>
     </Card>
 
-    {credentials && <Modal title="配置 MCP 凭据" description={credentials.config.name} className="sm:max-w-md [overflow-wrap:anywhere]"
-      onClose={() => setCredentials(null)}
-      onCloseAutoFocus={(event) => { event.preventDefault(); credentials.trigger.focus(); }}
-      actions={<Button variant="outline" onClick={() => setCredentials(null)}>返回列表</Button>}>
-      <p className="text-sm text-muted-foreground">凭据仅在本机加密保存。输入新值可替换已保存的凭据。</p>
-      <FieldGroup className="gap-4">
-        {mcpCredentialFields(credentials.config).map(({ reference, label }) => <SecretField key={reference} label={label} reference={reference} />)}
-      </FieldGroup>
-    </Modal>}
+    {credentials && <McpCredentialDialog {...credentials} onClose={() => setCredentials(null)} />}
     {edit && <McpEditor config={edit} fresh={fresh} onClose={() => setEdit(null)} onSaved={async () => { forget(edit.id); setEdit(null); await refresh(); }} />}
     {confirm && <Modal title={confirm === "local" ? "开启本地 MCP 服务" : `启动 ${confirm.name}`} onClose={() => { if (!busy) setConfirm(null); }} className="sm:max-w-md" actions={<>
       <Button variant="outline" disabled={busy} onClick={() => setConfirm(null)}>取消</Button>
@@ -245,7 +311,20 @@ function McpEditor({ config, fresh, onClose, onSaved }: { config: McpConfig; fre
     try {
       if (remove) { await api("mcp_remove", { id: draft.id }); }
       else {
-        const next = { ...draft, command: draft.transport === "stdio" ? draft.command : null, args: draft.transport === "stdio" ? draft.args : [], url: draft.transport === "streamable_http" ? draft.url : null, env_secret_refs: draft.transport === "stdio" ? JSON.parse(env) : {}, bearer_secret_ref: draft.transport === "streamable_http" ? draft.bearer_secret_ref || null : null };
+        const credentialUrl = draft.credential_url?.trim() || null;
+        if (credentialUrl && !isCredentialUrl(credentialUrl)) {
+          throw new Error("获取 Key 链接必须是有效的 HTTP 或 HTTPS 网址，且不能包含用户名或密码。");
+        }
+        const stdio = draft.transport === "stdio";
+        const next = {
+          ...draft,
+          credential_url: credentialUrl,
+          command: stdio ? draft.command : null,
+          args: stdio ? draft.args : [],
+          url: stdio ? null : draft.url,
+          env_secret_refs: stdio ? JSON.parse(env) : {},
+          bearer_secret_ref: stdio ? null : draft.bearer_secret_ref || null,
+        };
         await api(fresh ? "mcp_create" : "mcp_update", { config: next });
       }
       await onSaved();
@@ -272,6 +351,10 @@ function McpEditor({ config, fresh, onClose, onSaved }: { config: McpConfig; fre
         <Field><FieldLabel htmlFor="mcp-args">参数，每行一项</FieldLabel><Textarea id="mcp-args" rows={3} value={draft.args.join("\n")} onChange={(e) => setDraft({ ...draft, args: e.target.value ? e.target.value.split("\n") : [] })} /></Field>
         <Field><FieldLabel htmlFor="mcp-env">环境变量与密钥引用 JSON</FieldLabel><Textarea id="mcp-env" rows={4} className="font-mono text-xs" value={env} onChange={(e) => setEnv(e.target.value)} /></Field>
       </>}
+      <Field>
+        <FieldLabel htmlFor="mcp-credential-url">获取 Key 链接（可选）</FieldLabel>
+        <Input id="mcp-credential-url" type="url" placeholder="https://example.com/api-keys" value={draft.credential_url ?? ""} onChange={(e) => setDraft({ ...draft, credential_url: e.target.value })} />
+      </Field>
     </FieldGroup>}
     <ErrorState error={error} />
   </Modal>;

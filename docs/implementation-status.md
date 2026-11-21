@@ -501,7 +501,11 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   Stdio is an explicitly acknowledged unsandboxed OS-user process, not contained
   by FileEngine; stronger cross-platform sandboxing remains required.
 - External MCP connections use a compact list with a per-service credentials
-  dialog for Bearer and stdio environment secrets. Each row shows 未启动,
+  dialog for Bearer and stdio environment secrets. Its footer has 返回 and 保存.
+  保存 submits the nonblank fields together. Each connection can store an
+  optional `credential_url`. The 获取 Key link opens that page in the system
+  browser. The Mod客栈 and 3DM presets include their key-management pages.
+  Each row shows 未启动,
   启动中, 运行中 (tool count) or 启动失败 with the reason, and has one start/stop
   button. Starting saves `enabled` itself, so the editor has no enable switch.
   On desktop launch, previously started connections restore in the background.

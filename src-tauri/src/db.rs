@@ -75,6 +75,17 @@ impl Db {
             if version < 6 {
                 crate::mcp::config::migrate_markitdown_to_launcher_index(&tx)?;
             }
+            if version < 7 {
+                let has_credential_url: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mcp_servers') WHERE name='credential_url')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if !has_credential_url {
+                    tx.execute("ALTER TABLE mcp_servers ADD COLUMN credential_url TEXT", [])?;
+                }
+                crate::mcp::config::migrate_credential_urls(&tx)?;
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
@@ -86,7 +97,7 @@ impl Db {
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS games (
@@ -323,6 +334,7 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
   command TEXT,
   args_json TEXT NOT NULL DEFAULT '[]',
   url TEXT,
+  credential_url TEXT,
   env_json TEXT NOT NULL DEFAULT '{}',
   secret_ref TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,

@@ -11,6 +11,7 @@ use crate::{
     transaction::FileEngine,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{
@@ -108,12 +109,23 @@ fn sqlite_crud_presets_markitdown_inherits_uvx_default_and_secret_references() {
     let markitdown = servers.get("markitdown").unwrap();
     assert_eq!(markitdown.command.as_deref(), Some("uvx"));
     assert_eq!(markitdown.args, markitdown_args());
+    assert!(markitdown.credential_url.is_none());
+    assert!(servers.get("playwright").unwrap().credential_url.is_none());
     let http = servers.get("glossmod_http").unwrap();
     assert_eq!(
         http.url.as_deref(),
         Some("https://www.glossmod.com/api/v1/mcp")
     );
+    assert_eq!(
+        http.credential_url.as_deref(),
+        Some("https://www.glossmod.com/creator/ai")
+    );
     let stdio = servers.get("glossmod_3dm").unwrap();
+    assert_eq!(stdio.name, "3DM MCP");
+    assert_eq!(
+        stdio.credential_url.as_deref(),
+        Some("https://mod.3dmgame.com/Workshop/Api")
+    );
     assert_eq!(stdio.command.as_deref(), Some("uvx"));
     assert_eq!(stdio.args, vec!["glossmod-mcp"]);
     let key = &stdio.env_secret_refs["GLOSSMOD_API_KEY"];
@@ -148,6 +160,204 @@ fn sqlite_crud_presets_markitdown_inherits_uvx_default_and_secret_references() {
     assert!(servers
         .write_secret(&settings, "model.api_key", "wrong scope")
         .is_err());
+}
+
+const LEGACY_3DM_JSON: &str = concat!(
+    r#"{"id":"glossmod_3dm","name":"3DM MCP (glossmod-mcp)","transport":"stdio","command":"uvx","args":["glossmod-mcp"],"url":null,"#,
+    r#""env_secret_refs":{"GLOSSMOD_API_KEY":"mcp.glossmod_3dm.api_key"},"bearer_secret_ref":null,"enabled":true,"builtin":true}"#,
+);
+const LEGACY_HTTP_JSON: &str = concat!(
+    r#"{"id":"glossmod_http","name":"Edited Mod provider","transport":"streamable_http","command":null,"args":[],"url":"https://example.com/edited-mcp","#,
+    r#""env_secret_refs":{},"bearer_secret_ref":"mcp.glossmod_http.api_key","enabled":true,"builtin":true}"#,
+);
+
+#[test]
+fn credential_url_is_serde_compatible_and_excluded_from_the_legacy_launch_digest() {
+    for legacy_json in [LEGACY_3DM_JSON, LEGACY_HTTP_JSON] {
+        let mut config: ServerConfig = serde_json::from_str(legacy_json).unwrap();
+        let legacy_digest: [u8; 32] = Sha256::digest(legacy_json.as_bytes()).into();
+        assert!(config.credential_url.is_none());
+        assert_eq!(serde_json::to_vec(&config).unwrap(), legacy_json.as_bytes());
+        assert_eq!(config.confirmation_digest().unwrap(), legacy_digest);
+
+        let mut json = serde_json::to_value(&config).unwrap();
+        json["credential_url"] = Value::Null;
+        assert_eq!(
+            serde_json::from_value::<ServerConfig>(json).unwrap(),
+            config
+        );
+
+        config.credential_url = Some("https://example.test/account/keys".into());
+        assert_eq!(config.confirmation_digest().unwrap(), legacy_digest);
+        assert_eq!(
+            serde_json::from_value::<ServerConfig>(serde_json::to_value(&config).unwrap()).unwrap(),
+            config
+        );
+        config.enabled = false;
+        assert_ne!(config.confirmation_digest().unwrap(), legacy_digest);
+    }
+}
+
+#[test]
+fn credential_url_requires_an_absolute_http_url_without_user_info() {
+    for mut config in [
+        ServerConfig::stdio("stdio", "stdio", "example", vec![]),
+        ServerConfig::http("http", "http", "https://example.com/mcp"),
+    ] {
+        for url in [
+            "https://example.com/keys",
+            "http://example.com/keys",
+            "HTTPS://[::1]:8443/keys/@me?lang=en#account",
+            "https://example.com/user%20portal",
+        ] {
+            config.credential_url = Some(url.into());
+            assert!(config.validate().is_ok(), "should accept {url:?}");
+        }
+        for url in [
+            "",
+            "/keys",
+            "//example.com/keys",
+            "javascript:alert(1)",
+            "ftp://example.com/keys",
+            "https://",
+            "https:///example.com/keys",
+            "https:example.com/keys",
+            "https:/example.com/keys",
+            "https://user@example.com/keys",
+            "https://user:pass@example.com/keys",
+            "https://:pass@example.com/keys",
+            "https://@example.com/keys",
+            "https://%75ser@example.com/keys",
+            "https://example.com:invalid/keys",
+            "https://example.com/with space",
+            "https://example.com/with\nnewline",
+            r"https://example.com\@another.com/keys",
+        ] {
+            config.credential_url = Some(url.into());
+            assert!(
+                matches!(config.validate(), Err(AppError::Invalid(message)) if message.contains("credential URL")),
+                "should reject {url:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn credential_url_round_trips_through_create_list_update_and_clear() {
+    let (_dir, servers, _, ctx) = fixture();
+    let mut config = ServerConfig::stdio("custom", "Custom MCP", "example", vec![]);
+    config.credential_url = Some("http://example.test/account?lang=en#keys".into());
+    servers.create(&config).unwrap();
+    assert_eq!(servers.get("custom").unwrap(), config);
+    assert_eq!(servers.list().unwrap(), vec![config.clone()]);
+
+    let invalid = ServerConfig {
+        id: "invalid".into(),
+        credential_url: Some("https://user:secret@example.test/".into()),
+        ..config.clone()
+    };
+    assert!(matches!(
+        servers.create(&invalid),
+        Err(AppError::Invalid(_))
+    ));
+    assert!(matches!(servers.get("invalid"), Err(AppError::NotFound(_))));
+    let invalid_update = ServerConfig {
+        id: config.id.clone(),
+        ..invalid
+    };
+    assert!(matches!(
+        servers.update(&invalid_update),
+        Err(AppError::Invalid(_))
+    ));
+    assert_eq!(servers.get("custom").unwrap(), config);
+
+    config.credential_url = Some("https://example.test/new-portal".into());
+    servers.update(&config).unwrap();
+    drop(servers);
+    let reopened = McpServers::new(Db::open(&ctx.engine.paths.db_file()).unwrap());
+    assert_eq!(reopened.get("custom").unwrap(), config);
+    config.credential_url = None;
+    reopened.update(&config).unwrap();
+    assert_eq!(reopened.get("custom").unwrap(), config);
+}
+
+#[test]
+fn credential_url_v6_migration_backfills_builtins_once_and_preserves_remembered_grants() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy-v6.sqlite");
+    let servers = McpServers::new(Db::open(&path).unwrap());
+    servers.seed_presets().unwrap();
+    let custom = ServerConfig::http("custom", "Custom", "https://example.com/mcp");
+    servers.create(&custom).unwrap();
+    let fixtures = [
+        (LEGACY_HTTP_JSON, "https://www.glossmod.com/creator/ai"),
+        (LEGACY_3DM_JSON, "https://mod.3dmgame.com/Workshop/Api"),
+    ];
+    for (json, _) in fixtures {
+        let config: ServerConfig = serde_json::from_str(json).unwrap();
+        servers.update(&config).unwrap();
+        let v6_digest: [u8; 32] = Sha256::digest(json.as_bytes()).into();
+        servers
+            .db
+            .conn()
+            .execute(
+                "UPDATE mcp_servers SET startup_digest=?2 WHERE id=?1",
+                rusqlite::params![config.id, v6_digest],
+            )
+            .unwrap();
+    }
+    servers
+        .db
+        .conn()
+        .execute_batch("ALTER TABLE mcp_servers DROP COLUMN credential_url; PRAGMA user_version=6;")
+        .unwrap();
+    drop(servers);
+
+    let migrated = McpServers::new(Db::open(&path).unwrap());
+    assert_eq!(
+        migrated.startup_requests().unwrap(),
+        ["glossmod_3dm", "glossmod_http"]
+    );
+    for (json, default_url) in fixtures {
+        let mut expected: ServerConfig = serde_json::from_str(json).unwrap();
+        expected.credential_url = Some(default_url.into());
+        let stored = migrated.get(&expected.id).unwrap();
+        let v6_digest = Sha256::digest(json.as_bytes()).to_vec();
+        assert_eq!(stored, expected);
+        assert_eq!(
+            migrated.startup_digest(&stored.id).unwrap(),
+            Some(v6_digest)
+        );
+        assert!(ConnectionConsent::from_remembered(&migrated, &stored).is_ok());
+    }
+    assert_eq!(migrated.get("custom").unwrap(), custom);
+    let mut http = migrated.get("glossmod_http").unwrap();
+    http.credential_url = None;
+    migrated.update(&http).unwrap();
+    let mut stdio = migrated.get("glossmod_3dm").unwrap();
+    stdio.credential_url = Some("https://example.com/user-edited-portal".into());
+    migrated.update(&stdio).unwrap();
+    drop(migrated);
+
+    let reopened = McpServers::new(Db::open(&path).unwrap());
+    reopened.seed_presets().unwrap();
+    assert_eq!(reopened.get("glossmod_http").unwrap(), http);
+    assert_eq!(reopened.get("glossmod_3dm").unwrap(), stdio);
+}
+
+#[test]
+fn credential_url_v6_migration_does_not_backfill_custom_rows_with_builtin_ids() {
+    let (_dir, servers, _, ctx) = fixture();
+    let custom = ServerConfig::http("glossmod_http", "Custom", "https://example.com/mcp");
+    servers.create(&custom).unwrap();
+    servers
+        .db
+        .conn()
+        .execute_batch("ALTER TABLE mcp_servers DROP COLUMN credential_url; PRAGMA user_version=6;")
+        .unwrap();
+    let reopened = McpServers::new(Db::open(&ctx.engine.paths.db_file()).unwrap());
+    reopened.seed_presets().unwrap();
+    assert_eq!(reopened.get(&custom.id).unwrap(), custom);
 }
 
 #[test]

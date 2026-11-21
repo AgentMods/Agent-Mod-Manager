@@ -9,6 +9,7 @@ export interface McpConfig {
   url: string | null;
   env_secret_refs: Record<string, string>;
   bearer_secret_ref: string | null;
+  credential_url?: string | null;
   enabled: boolean;
   builtin: boolean;
 }
