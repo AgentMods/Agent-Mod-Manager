@@ -10,6 +10,13 @@ export interface Conversation {
   id: string; title: string; game_id: string | null; task_summary: string | null;
   archived: boolean; pinned: boolean; message_count: number; created_at: string;
   updated_at: string; permission_mode: PermissionMode | null;
+  /** Durable checkpoint attached by list_conversations, not create/get_conversation. */
+  agent_status?: {
+    turn_id: string | null;
+    turn_status: string | null;
+    event_seq: number;
+    pending: { approval_id: string; status: "waiting-answer" | "waiting-approval" } | null;
+  };
 }
 export interface Message {
   id: string; role: string; content: string; reasoning: string | null;
@@ -46,6 +53,7 @@ export interface BootstrapState {
   dataRoot: string; recoveredTransactions: string[]; recoveryError: string | null; onboardingCompleted: boolean; isFirstRun: boolean; resumeOnboarding: boolean;
 }
 export interface GameCandidate {
+  status: "high_confidence" | "candidate" | "unidentified";
   rootPath: string; name: string; confidence: number; suggestedAdapterSlug: string | null; registeredGameId: string | null; platform: string; warnings: string[];
 }
 export interface ScanReport {

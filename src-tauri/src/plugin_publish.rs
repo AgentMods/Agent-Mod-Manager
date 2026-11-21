@@ -14,6 +14,7 @@ use std::{
     fs,
     io::{Cursor, Read, Write},
     path::{Component, Path},
+    sync::MutexGuard,
 };
 
 pub const DESTINATION: &str = "https://www.glossmod.com/api/v1/mcp";
@@ -354,31 +355,48 @@ pub fn prepare_package(
             "Only a valid committed draft can be published".into(),
         ));
     }
-    let _files = crate::transaction::write_lock();
+    let source = PublicationSource::Draft {
+        draft_id: draft_id.into(),
+        write_transaction_id: validation.draft.write_transaction_id,
+    };
+    let _files = lock_live_draft_source(engine, &source)?;
     let files = read_files(engine, &validation.draft.path)?;
     let hashes = validation
         .hashes
         .ok_or_else(|| invalid("Draft provenance has no hashes"))?;
-    let status: String = engine.db.conn().query_row(
-        "SELECT status FROM file_transactions WHERE id=?1",
-        [&validation.draft.write_transaction_id],
-        |r| r.get(0),
-    )?;
-    if status != "committed"
-        || files[0].sha256 != hashes.adapter_sha256
-        || files[1].sha256 != hashes.skill_sha256
-    {
+    if files[0].sha256 != hashes.adapter_sha256 || files[1].sha256 != hashes.skill_sha256 {
         return Err(conflict("Draft changed after validation"));
     }
-    build_preview(
-        PublicationSource::Draft {
-            draft_id: draft_id.into(),
-            write_transaction_id: validation.draft.write_transaction_id,
-        },
-        &validation.draft.slug,
-        files,
-        metadata,
-    )
+    build_preview(source, &validation.draft.slug, files, metadata)
+}
+
+// FileEngine deletion and restoration share this lock. Recheck after fresh
+// preview verification and hold it through each durable publication transition
+// that starts work. A step already durably pending may finish or be reconciled.
+fn lock_live_draft_source(
+    engine: &FileEngine,
+    source: &PublicationSource,
+) -> AppResult<Option<MutexGuard<'static, ()>>> {
+    let PublicationSource::Draft {
+        draft_id,
+        write_transaction_id,
+    } = source
+    else {
+        return Ok(None);
+    };
+    let guard = crate::transaction::write_lock();
+    let conn = engine.db.conn();
+    plugin_workflow::ensure_draft_not_deleted(&conn, draft_id)?;
+    let committed: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM plugin_drafts d JOIN file_transactions f
+         ON f.id=d.write_transaction_id WHERE d.id=?1 AND f.id=?2 AND f.status='committed')",
+        params![draft_id, write_transaction_id],
+        |r| r.get(0),
+    )?;
+    if !committed {
+        return Err(conflict("插件草稿写入事务不再处于已提交状态"));
+    }
+    Ok(Some(guard))
 }
 
 fn verify_plan(
@@ -831,6 +849,7 @@ pub fn create_publication(
     if json.len() > PREVIEW_LIMIT {
         return Err(invalid("Publication preview is too large"));
     }
+    let _files = lock_live_draft_source(engine, &preview.source)?;
     let mut conn = engine.db.conn();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Some(id) = tx
@@ -888,6 +907,7 @@ pub fn approve_publication(
 ) -> AppResult<PublicationRecord> {
     let current = get_publication(engine, id)?;
     fresh_preview(engine, &current.preview)?;
+    let _files = lock_live_draft_source(engine, &current.preview.source)?;
     update(engine, id, |record| {
         if record.preview.digest != approved_digest {
             return Err(conflict("Approval digest differs from the preview"));
@@ -921,7 +941,8 @@ pub fn begin_step(
     approved_digest: &str,
     step: PublicationStep,
 ) -> AppResult<PublicationRecord> {
-    verified_upload_artifact(engine, id, approved_digest)?;
+    let (current, _) = verified_upload_artifact(engine, id, approved_digest)?;
+    let _files = lock_live_draft_source(engine, &current.preview.source)?;
     update(engine, id, |record| {
         consent(record, approved_digest)?;
         let (before, pending, _) = step.phases();

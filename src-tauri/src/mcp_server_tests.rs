@@ -6,6 +6,8 @@ use crate::{
         tools::{AgentTool, PreparedTool, ToolDefinition, ToolRegistry},
     },
     db::Db,
+    mcp::{McpServers, ServerConfig},
+    mcp_connections::LOCAL_SERVER_ID,
     settings::{SecretStore, Settings},
     sources::{
         resolutions::ResolutionScope, FileHashes, ResolveResult, ResolvedMod, SourceState,
@@ -227,10 +229,9 @@ async fn loopback_random_port_auth_origin_host_token_storage_and_rotation() {
         .read_secret(TOKEN_REF)
         .unwrap()
         .is_none());
-    let status = server.start().await.unwrap();
-    assert!(status.running);
+    let endpoint = server.start().await.unwrap();
+    assert!(server.status().await.running);
     assert!(server.start().await.is_err());
-    let endpoint = status.endpoint.unwrap();
     let url = url::Url::parse(&endpoint).unwrap();
     assert_eq!(url.host_str(), Some("127.0.0.1"));
     assert!(url.port().unwrap() > 0);
@@ -332,7 +333,7 @@ async fn loopback_random_port_auth_origin_host_token_storage_and_rotation() {
 
 #[tokio::test]
 async fn tools_are_allowlisted_and_real_reads_reuse_desktop_file_guards() {
-    let fixture = fixture_with_native_tools(&["read_file", "download_web_mod"]);
+    let fixture = fixture_with_native_tools(&["read_file", "plan_file_ops", "download_web_mod"]);
     let count = Arc::new(AtomicUsize::new(0));
     for name in [
         "mcp__remote__write",
@@ -357,8 +358,17 @@ async fn tools_are_allowlisted_and_real_reads_reuse_desktop_file_guards() {
     server.start().await.unwrap();
     let client = connect(&server, &fixture.runtime).await;
     let listed = client.peer().list_tools(None).await.unwrap();
-    assert_eq!(listed.tools.len(), 3);
+    assert_eq!(listed.tools.len(), 4);
     assert!(listed.tools.iter().any(|tool| tool.name == "read_file"));
+    let planner = listed
+        .tools
+        .iter()
+        .find(|t| t.name == "plan_file_ops")
+        .unwrap();
+    assert_eq!(
+        planner.input_schema["properties"]["operations"]["items"]["properties"]["op"]["enum"],
+        json!(["copy", "move", "mkdir"])
+    );
     for name in [
         "mcp__remote__write",
         "purge_trash",
@@ -977,7 +987,8 @@ async fn cancelled_stop_command_still_drains_and_persists_inflight_blocking_comm
     let barrier = Arc::new((StdMutex::new(false), Condvar::new()));
     let (_, started) = register_write(&fixture, Effect::ManagerWrite, Some(barrier.clone()), None);
     let server = LocalMcpServer::new(fixture.runtime.clone());
-    server.start().await.unwrap();
+    let connections = McpConnections::default();
+    server.start_desktop(&connections).await.unwrap();
     let client = connect(&server, &fixture.runtime).await;
     let request = client
         .peer()
@@ -994,11 +1005,13 @@ async fn cancelled_stop_command_still_drains_and_persists_inflight_blocking_comm
         .unwrap();
     request.cancel(None).await.unwrap();
     let owner = server.clone();
-    let stop = tokio::spawn(async move { owner.stop().await });
+    let stop_connections = connections.clone();
+    let stop = tokio::spawn(async move { owner.stop_desktop(&stop_connections).await });
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert!(!stop.is_finished());
     let status = server.status().await;
     assert!(status.stopping);
+    assert!(!status.startup_requested);
     assert_eq!(status.active_calls, 1);
     stop.abort();
     let _ = stop.await;
@@ -1021,6 +1034,7 @@ async fn cancelled_stop_command_still_drains_and_persists_inflight_blocking_comm
     })
     .await
     .unwrap();
+    assert!(connections.list().await.is_empty());
     let status: String = fixture
         .runtime
         .engine
@@ -1104,7 +1118,7 @@ async fn independent_sessions_and_auth_token_echo_never_enter_history_or_events(
 async fn stdio_proxy_forwards_real_protocol_to_existing_authenticated_http_server() {
     let fixture = fixture();
     let server = LocalMcpServer::new(fixture.runtime.clone());
-    let endpoint = server.start().await.unwrap().endpoint.unwrap();
+    let endpoint = server.start().await.unwrap();
     let token = fixture
         .runtime
         .settings
@@ -1163,4 +1177,213 @@ async fn proxy_rejects_remote_credential_urls_and_invalid_tokens_without_connect
         let result = run_proxy_io(endpoint, token, tokio::io::empty(), tokio::io::sink()).await;
         assert!(matches!(result, Err(AppError::Invalid(_))));
     }
+}
+
+#[tokio::test]
+async fn started_local_server_is_registered_for_the_agent_and_revoked_on_stop() {
+    let fixture = fixture();
+    let runtime = &fixture.runtime;
+    let server = LocalMcpServer::new(runtime.clone());
+    let connections = McpConnections::default();
+    let status = server.start_desktop(&connections).await.unwrap();
+    assert!(status.running && status.startup_requested);
+    let endpoint = status.endpoint.unwrap();
+    let entries = connections.list().await;
+    assert_eq!(entries.len(), 1);
+    let info = &entries[0];
+    assert_eq!(info.server_id, LOCAL_SERVER_ID);
+    assert!(info
+        .tools
+        .iter()
+        .any(|name| name.starts_with("mcp__amm_local__")));
+    for name in &info.tools {
+        assert!(runtime.registry.get(name).is_ok());
+    }
+    let servers = McpServers::new(runtime.engine.db.clone());
+    let stored = servers.get(LOCAL_SERVER_ID).unwrap();
+    assert_eq!(stored.url.as_deref(), Some(endpoint.as_str()));
+    assert_eq!(stored.bearer_secret_ref.as_deref(), Some(TOKEN_REF));
+    // The private preference is a boolean only, and public settings saves leave it alone.
+    runtime
+        .settings
+        .save(&runtime.settings.load().unwrap())
+        .unwrap();
+    let preference: String = runtime
+        .settings
+        .db
+        .conn()
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [STARTUP_REQUEST_KEY],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(preference, "true");
+    assert!(runtime.settings.get(STARTUP_REQUEST_KEY).is_err());
+
+    // A late startup hook must not detach an explicit desktop start that already won.
+    server.restore_if_requested(&connections).await.unwrap();
+    assert_eq!(
+        server.status().await.endpoint.as_deref(),
+        Some(endpoint.as_str())
+    );
+    server.stop_desktop(&connections).await.unwrap();
+    for name in &info.tools {
+        assert!(runtime.registry.get(name).is_err());
+    }
+    assert!(matches!(
+        servers.get(LOCAL_SERVER_ID),
+        Err(AppError::NotFound(_))
+    ));
+    assert!(connections.list().await.is_empty());
+    assert!(!server.startup_requested().unwrap());
+    assert!(!server.status().await.running);
+    server.stop_desktop(&connections).await.unwrap();
+    LocalMcpServer::new(runtime.clone())
+        .restore_if_requested(&connections)
+        .await
+        .unwrap();
+    assert!(connections.list().await.is_empty());
+}
+
+#[tokio::test]
+async fn restored_local_server_replaces_stale_entry_and_rotates_token() {
+    let fixture = fixture();
+    let runtime = &fixture.runtime;
+    let servers = McpServers::new(runtime.engine.db.clone());
+    let connections = McpConnections::default();
+    let first = LocalMcpServer::new(runtime.clone());
+    first.start_desktop(&connections).await.unwrap();
+    let old_token = runtime.settings.read_secret(TOKEN_REF).unwrap().unwrap();
+    // Shut down the listener without the desktop opt-out, then leave an expired
+    // config on disk as if the previous process had exited without cleaning up.
+    first.stop_with_agent(&connections).await.unwrap();
+    drop(first);
+    let stale = ServerConfig::http(
+        LOCAL_SERVER_ID,
+        "previous session",
+        "http://127.0.0.1:1/mcp",
+    );
+    servers.create(&stale).unwrap();
+
+    let mut next_runtime = runtime.clone();
+    next_runtime.settings = Settings::with_secret_store(
+        Db::open(&runtime.engine.paths.db_file()).unwrap(),
+        Arc::new(MockSecrets::default()),
+    );
+    let next = LocalMcpServer::new(next_runtime.clone());
+    assert!(next.startup_requested().unwrap());
+    assert!(!next.status().await.running);
+    let connections = McpConnections::default();
+    next.restore_if_requested(&connections).await.unwrap();
+    let status = next.status().await;
+    assert!(status.running && status.startup_requested);
+    assert_eq!(servers.get(LOCAL_SERVER_ID).unwrap().url, status.endpoint);
+    assert_ne!(status.endpoint, stale.url);
+    let token = next_runtime
+        .settings
+        .read_secret(TOKEN_REF)
+        .unwrap()
+        .unwrap();
+    assert_ne!(token, old_token);
+    assert_eq!(connections.list().await[0].server_id, LOCAL_SERVER_ID);
+    next.stop_desktop(&connections).await.unwrap();
+    assert!(!next.startup_requested().unwrap());
+}
+
+#[tokio::test]
+async fn fresh_local_server_cleans_stale_entry_without_starting() {
+    let fixture = fixture();
+    let runtime = &fixture.runtime;
+    let servers = McpServers::new(runtime.engine.db.clone());
+    let stale = ServerConfig::http(
+        LOCAL_SERVER_ID,
+        "previous session",
+        "http://127.0.0.1:1/mcp",
+    );
+    servers.create(&stale).unwrap();
+    let server = LocalMcpServer::new(runtime.clone());
+    let connections = McpConnections::default();
+    assert!(!server.startup_requested().unwrap());
+    server.restore_if_requested(&connections).await.unwrap();
+    let status = server.status().await;
+    assert!(!status.running && !status.startup_requested && status.endpoint.is_none());
+    assert!(connections.list().await.is_empty());
+    assert!(matches!(
+        servers.get(LOCAL_SERVER_ID),
+        Err(AppError::NotFound(_))
+    ));
+    assert!(runtime.settings.read_secret(TOKEN_REF).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn local_connection_failure_rolls_back_and_saved_intent_can_be_cancelled() {
+    let fixture = fixture();
+    let runtime = &fixture.runtime;
+    let connections = McpConnections::default();
+    let server = LocalMcpServer::new(runtime.clone());
+    runtime
+        .engine
+        .db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_local_connection BEFORE INSERT ON mcp_servers
+         WHEN NEW.id='amm_local' BEGIN SELECT RAISE(ABORT, 'test connection failure'); END;",
+        )
+        .unwrap();
+    let error = server.start_desktop(&connections).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("无法将本地 MCP 服务连接到 Agent"));
+    assert!(!server.startup_requested().unwrap());
+    assert!(server.status().await.endpoint.is_none());
+    assert!(connections.list().await.is_empty());
+
+    // Simulate startup with an existing opt-in while the same failure persists.
+    server.remember_startup_request().unwrap();
+    let error = server.restore_if_requested(&connections).await.unwrap_err();
+    assert!(error.to_string().contains("test connection failure"));
+    let status = server.status().await;
+    assert!(status.startup_requested && !status.running && status.endpoint.is_none());
+    assert_eq!(
+        serde_json::to_value(status).unwrap()["startupRequested"],
+        json!(true)
+    );
+    assert!(connections.list().await.is_empty());
+    server.stop_desktop(&connections).await.unwrap();
+    assert!(!server.startup_requested().unwrap());
+    server.restore_if_requested(&connections).await.unwrap();
+    assert!(!server.status().await.running);
+}
+
+#[tokio::test]
+async fn failure_to_save_local_intent_rolls_back_the_agent_and_listener() {
+    let fixture = fixture();
+    let runtime = &fixture.runtime;
+    let servers = McpServers::new(runtime.engine.db.clone());
+    let connections = McpConnections::default();
+    let server = LocalMcpServer::new(runtime.clone());
+    runtime
+        .settings
+        .db
+        .conn()
+        .execute_batch(&format!(
+            "CREATE TRIGGER reject_local_startup_request BEFORE INSERT ON settings
+         WHEN NEW.key='{STARTUP_REQUEST_KEY}' BEGIN SELECT RAISE(ABORT, 'test save failure'); END;"
+        ))
+        .unwrap();
+    let error = server.start_desktop(&connections).await.unwrap_err();
+    assert!(error.to_string().contains("无法保存本地 MCP 启动偏好"));
+    assert!(server.status().await.endpoint.is_none());
+    assert!(!server.startup_requested().unwrap());
+    assert!(connections.list().await.is_empty());
+    assert!(!runtime.registry.definitions().iter().any(|definition| {
+        definition["function"]["name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("mcp__amm_local__"))
+    }));
+    assert!(matches!(
+        servers.get(LOCAL_SERVER_ID),
+        Err(AppError::NotFound(_))
+    ));
 }

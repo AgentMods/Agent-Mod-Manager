@@ -12,6 +12,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
+    "prepare:mcp-runtime": "node scripts/prepare-mcp-runtime.mjs",
     "tauri": "tauri",
     "icons": "tauri icon app-icon.png --output src-tauri/icons",
     "typecheck": "tsc --noEmit",

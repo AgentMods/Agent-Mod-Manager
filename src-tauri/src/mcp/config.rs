@@ -6,10 +6,75 @@ use crate::{
 };
 use rusqlite::{params, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 // Windows Node distributions expose npx as a .cmd shim, not npx.exe.
 const NPX_COMMAND: &str = if cfg!(windows) { "npx.cmd" } else { "npx" };
+
+const PLAYWRIGHT_V2_ARGS: [&str; 5] = [
+    "--yes",
+    "@playwright/mcp@0.0.85",
+    "--headless",
+    "--isolated",
+    "--no-webmcp",
+];
+
+fn playwright_args() -> Vec<String> {
+    PLAYWRIGHT_V2_ARGS
+        .into_iter()
+        .chain(cfg!(windows).then_some("--browser=msedge"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Schema v3: only the stock Windows launch changes; its old consent cannot be reused.
+#[cfg(windows)]
+pub(crate) fn migrate_playwright_browser(conn: &rusqlite::Connection) -> AppResult<()> {
+    conn.execute(
+        "UPDATE mcp_servers SET args_json=?1, startup_digest=NULL
+         WHERE id='playwright' AND builtin=1 AND name='Playwright MCP'
+           AND transport='stdio' AND command='npx.cmd' AND args_json=?2
+           AND url IS NULL AND env_json='{}' AND secret_ref IS NULL",
+        params![
+            serde_json::to_string(&playwright_args())?,
+            serde_json::to_string(&PLAYWRIGHT_V2_ARGS)?
+        ],
+    )?;
+    Ok(())
+}
+
+// Allow the specific prerelease required by MarkItDown's all extra, not all prereleases.
+const MARKITDOWN_PACKAGES: [&str; 3] = [
+    "--with",
+    "azure-ai-contentunderstanding==1.2.0b3",
+    "markitdown-mcp==0.0.1a8",
+];
+
+fn markitdown_args() -> Vec<String> {
+    ["--default-index", super::runtime::PYPI_INDEX]
+        .into_iter()
+        .chain(MARKITDOWN_PACKAGES)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Schema v2: change only an untouched built-in launch specification. The
+/// mirror is part of the visible command, so any prior launch consent expires.
+/// Running once (not on every seed) lets users opt back into the upstream index.
+pub(crate) fn migrate_markitdown_index(conn: &rusqlite::Connection) -> AppResult<()> {
+    conn.execute(
+        "UPDATE mcp_servers SET args_json=?1, startup_digest=NULL
+         WHERE id='markitdown' AND builtin=1 AND name='MarkItDown MCP'
+           AND transport='stdio' AND command='uvx' AND args_json=?2
+           AND url IS NULL AND env_json='{}' AND secret_ref IS NULL",
+        params![
+            serde_json::to_string(&markitdown_args())?,
+            serde_json::to_string(&MARKITDOWN_PACKAGES)?
+        ],
+    )?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,6 +142,11 @@ impl ServerConfig {
             enabled: false,
             builtin: false,
         }
+    }
+
+    // Stable for this DTO (env bindings are sorted); changed serialization fails closed.
+    pub(crate) fn confirmation_digest(&self) -> AppResult<[u8; 32]> {
+        Ok(Sha256::digest(serde_json::to_vec(self)?).into())
     }
 
     pub fn validate(&self) -> AppResult<()> {
@@ -194,8 +264,53 @@ impl McpServers {
     }
 
     pub fn get(&self, id: &str) -> AppResult<ServerConfig> {
-        self.db.conn().query_row("SELECT id,name,transport,command,args_json,url,env_json,secret_ref,enabled,builtin FROM mcp_servers WHERE id=?1", [id], from_row)
+        Self::get_from(&self.db.conn(), id)
+    }
+
+    fn get_from(conn: &rusqlite::Connection, id: &str) -> AppResult<ServerConfig> {
+        conn.query_row("SELECT id,name,transport,command,args_json,url,env_json,secret_ref,enabled,builtin FROM mcp_servers WHERE id=?1", [id], from_row)
             .optional()?.ok_or_else(|| AppError::NotFound("MCP server".into()))
+    }
+
+    pub(crate) fn startup_requests(&self) -> AppResult<Vec<String>> {
+        let conn = self.db.conn();
+        let mut stmt = conn.prepare("SELECT id FROM mcp_servers WHERE startup_digest IS NOT NULL AND enabled=1 AND id<>?1 ORDER BY id")?;
+        let ids = stmt
+            .query_map([crate::mcp_connections::LOCAL_SERVER_ID], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    }
+
+    pub(super) fn startup_digest(&self, id: &str) -> AppResult<Option<Vec<u8>>> {
+        Ok(self.db.conn().query_row(
+            "SELECT startup_digest FROM mcp_servers WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub(crate) fn remember_start(&self, confirmed: &ServerConfig) -> AppResult<()> {
+        let digest = confirmed.confirmation_digest()?;
+        let conn = self.db.conn();
+        let current = Self::get_from(&conn, &confirmed.id)?;
+        if current != *confirmed {
+            return Err(AppError::Conflict(
+                "配置已变化，请重新确认完整连接配置".into(),
+            ));
+        }
+        conn.execute(
+            "UPDATE mcp_servers SET startup_digest=?2 WHERE id=?1",
+            params![confirmed.id, digest],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn forget_start(&self, id: &str) -> AppResult<()> {
+        self.db.conn().execute(
+            "UPDATE mcp_servers SET startup_digest=NULL WHERE id=?1",
+            [id],
+        )?;
+        Ok(())
     }
 
     pub fn create(&self, config: &ServerConfig) -> AppResult<()> {
@@ -216,7 +331,7 @@ impl McpServers {
     pub fn update(&self, config: &ServerConfig) -> AppResult<()> {
         config.validate()?;
         let count = self.db.conn().execute(
-            "UPDATE mcp_servers SET name=?2,transport=?3,command=?4,args_json=?5,url=?6,env_json=?7,secret_ref=?8,enabled=?9 WHERE id=?1",
+            "UPDATE mcp_servers SET name=?2,transport=?3,command=?4,args_json=?5,url=?6,env_json=?7,secret_ref=?8,enabled=?9,startup_digest=NULL WHERE id=?1",
             params![config.id,config.name,config.transport.as_str(),config.command,serde_json::to_string(&config.args)?,config.url,
                 serde_json::to_string(&config.env_secret_refs)?,config.bearer_secret_ref,config.enabled],
         )?;
@@ -242,7 +357,7 @@ impl McpServers {
 
     pub fn set_enabled(&self, id: &str, enabled: bool) -> AppResult<()> {
         let changed = self.db.conn().execute(
-            "UPDATE mcp_servers SET enabled=?2 WHERE id=?1",
+            "UPDATE mcp_servers SET enabled=?2,startup_digest=NULL WHERE id=?1",
             params![id, enabled],
         )?;
         if changed == 0 {
@@ -277,28 +392,10 @@ impl McpServers {
             "playwright",
             "Playwright MCP",
             NPX_COMMAND,
-            [
-                "--yes",
-                "@playwright/mcp@0.0.85",
-                "--headless",
-                "--isolated",
-                "--no-webmcp",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
+            playwright_args(),
         );
-        let markitdown = ServerConfig::stdio(
-            "markitdown",
-            "MarkItDown MCP",
-            "uvx",
-            vec![
-                // Enable only the prerelease dependency required by MarkItDown's all extra.
-                "--with".into(),
-                "azure-ai-contentunderstanding==1.2.0b3".into(),
-                "markitdown-mcp==0.0.1a8".into(),
-            ],
-        );
+        let markitdown =
+            ServerConfig::stdio("markitdown", "MarkItDown MCP", "uvx", markitdown_args());
         for config in [http, stdio, playwright, markitdown] {
             match self.insert(&config, true) {
                 Ok(()) => {}

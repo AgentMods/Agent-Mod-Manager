@@ -64,6 +64,7 @@ pub fn run() {
             commands::set_plugin_enabled,
             commands::write_plugin_draft,
             commands::list_plugin_drafts,
+            commands::delete_plugin_draft,
             commands::validate_plugin,
             commands::install_plugin,
             commands::prepare_plugin_publication,
@@ -107,6 +108,7 @@ pub fn run() {
             commands::plan_uninstall,
             commands::rollback_transaction,
             commands::start_turn,
+            commands::restart_turn,
             commands::cancel_turn,
             commands::respond_approval,
             commands::replay_agent_events,
@@ -129,7 +131,6 @@ pub fn run() {
             commands::resolve_mod,
             commands::list_mod_versions,
             commands::resolve_modrinth_dependency_graph,
-            commands::list_mod_sources,
             commands::read_logs,
             commands::diagnose_game,
             commands::mcp_list,
@@ -139,6 +140,7 @@ pub fn run() {
             commands::mcp_connect,
             commands::mcp_disconnect,
             commands::mcp_connections,
+            commands::mcp_startup_requests,
             commands::mcp_server_status,
             commands::mcp_server_start,
             commands::mcp_server_stop,
@@ -154,7 +156,13 @@ pub fn run() {
             let credentials = encrypted_store::open(app.handle(), location.default_root())?;
             let root = location.startup_root()?;
             let paths = storage::AppPaths::new(root)?.with_control_root(location.default_root());
-            let services = app::AppServices::initialize_paths(paths)?;
+            let mut services = app::AppServices::initialize_paths(paths)?;
+            // Keep executables outside relocatable game data and Agent-accessible roots.
+            services.mcp_connections =
+                mcp_connections::McpConnections::with_runtime(mcp::McpRuntime::bundled(
+                    app.path().resource_dir()?.join("mcp-runtime/runtime.zip"),
+                    location.default_root().join("private/mcp-runtime"),
+                ));
             app.manage(location);
             let handle = app.handle().clone();
             let agent = agent::runtime::AgentRuntime::new(
@@ -165,9 +173,25 @@ pub fn run() {
                     let _ = handle.emit(&format!("agent://{}", event.kind), event);
                 }),
             )?;
-            app.manage(mcp_server::LocalMcpServer::new(agent.clone()));
-            app.manage(agent);
+            let local = mcp_server::LocalMcpServer::new(agent.clone());
+            let connections = services.mcp_connections.clone();
+            app.manage(local.clone());
+            app.manage(agent.clone());
             app.manage(services);
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use tauri::Emitter;
+                let progress = || {
+                    let _ = handle.emit("mcp://restore-progress", ());
+                };
+                if let Err(error) = local.restore_if_requested(&connections).await {
+                    tracing::warn!(%error, "could not restore local MCP server");
+                }
+                progress();
+                connections
+                    .restore_requested(&agent.settings, &agent.registry, progress)
+                    .await;
+            });
             Ok(())
         })
         .run(tauri::generate_context!())

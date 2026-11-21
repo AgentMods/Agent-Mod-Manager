@@ -1,23 +1,21 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { open } from '@tauri-apps/plugin-dialog';
-import { ArrowLeftIcon, ArrowUpIcon, CameraIcon, FileIcon, FolderIcon, FolderOpenIcon, Gamepad2Icon, InboxIcon, PackagePlusIcon, RefreshCwIcon, SearchIcon, ShieldCheckIcon, Trash2Icon, TriangleAlertIcon, Undo2Icon } from 'lucide-react';
+import { ArrowLeftIcon, CameraIcon, FolderOpenIcon, Gamepad2Icon, InboxIcon, PackagePlusIcon, ShieldCheckIcon, Trash2Icon, TriangleAlertIcon, Undo2Icon } from 'lucide-react';
 import { BethesdaPluginEvidence, type BethesdaEvidence } from '@/components/BethesdaPluginEvidence';
 import { FabricDiskEvidence, type FabricDisk } from '@/components/FabricDiskEvidence';
 import { FabricStartupEvidence, type FabricStartup } from '@/components/FabricStartupEvidence';
+import { GameFileBrowser } from '@/components/GameFileBrowser';
 import { FomodOptions } from '@/components/FomodOptions';
-import { Badge, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, PathText, bytes, date } from '@/components/ui';
+import { Badge, ErrorState, IconButton, Modal, Page, PageHeader, PathText, bytes, date } from '@/components/ui';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Empty, EmptyContent, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty';
 import { Field, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
-import { InputGroup, InputGroupAddon, InputGroupInput } from '@/components/ui/input-group';
 import { Item, ItemActions, ItemContent, ItemDescription, ItemGroup, ItemTitle } from '@/components/ui/item';
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select';
-import { ScrollArea } from '@/components/ui/scroll-area';
-import { Separator } from '@/components/ui/separator';
 import { Spinner } from '@/components/ui/spinner';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
@@ -26,7 +24,6 @@ import { initialFomodSelections, selectedFomodMappings, validFomodSelection, typ
 import { useUI } from '@/lib/store';
 import type { FilePlan, Game } from '@/lib/types';
 
-type DirEntry = { name: string; path: string; is_dir: boolean; size: number; modified: string };
 type DownloadOrigin = { artifactId: string; sourceId: string; projectId: string; versionId: string };
 type Installed = {
   id: string; name: string; version: string | null; status: string; source: string; downloadOrigin?: DownloadOrigin | null;
@@ -128,9 +125,7 @@ function GameDetails({ gameId }: { gameId: string }) {
   const reviewPlan = useUI(s => s.reviewPlan);
   const notify = useUI(s => s.notify);
   const [tab, setTab] = useState('mods');
-  const [location, setLocation] = useState<string | null>(null);
-  const [search, setSearch] = useState('');
-  const [file, setFile] = useState<DirEntry | null>(null);
+  const [fileRootPath, setFileRootPath] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const [rollback, setRollback] = useState<ReplacementRollback | null>(null);
@@ -153,29 +148,12 @@ function GameDetails({ gameId }: { gameId: string }) {
   const adapter = useBackendQuery<Adapter>(['game-adapter', gameId], 'get_game_adapter', { gameId }, !!game.data?.adapterSlug);
   const bootstrap = useBackendQuery<{ recoveryError: string | null }>(['bootstrap'], 'get_bootstrap_state');
   const writable = backendAvailable && !!bootstrap.data && !bootstrap.data.recoveryError;
-  const path = location ?? game.data?.rootPath ?? '';
-  const directory = useBackendQuery<DirEntry[]>(['directory', path], 'read_dir', { path }, !!path && tab === 'files');
-  const content = useBackendQuery<{ lines: { line: number; text: string }[]; truncated: boolean }>(['file', file?.path], 'read_file', { path: file?.path }, !!file && !file.is_dir);
   const installs = useBackendQuery<Installed[]>(['installs', gameId], 'list_installs', { gameId }, !!gameId);
   const rollbackCurrent = !!rollback && replacementTransaction(installs.data?.find(mod => mod.id === rollback.installId)) === rollback.plan.id;
   const snapshots = useBackendQuery<Snapshot[]>(['snapshots', gameId], 'list_snapshots', { gameId }, !!gameId);
   const roots = useBackendQuery<Record<string, string>>(['user-roots', gameId], 'list_user_roots', { gameId }, !!gameId);
-  const clearFilePreview = useCallback(() => {
-    setFile(null);
-    if (!file) return;
-    const filters = { queryKey: ['file', file.path], exact: true };
-    void client.cancelQueries(filters);
-    client.removeQueries(filters);
-  }, [client, file]);
-  useEffect(() => {
-    if (file && directory.isSuccess && !directory.isFetching &&
-      !directory.data.some(entry => entry.path === file.path && !entry.is_dir)) {
-      clearFilePreview();
-    }
-  }, [clearFilePreview, directory.data, directory.isFetching, directory.isSuccess, file]);
   function refresh() {
-    clearFilePreview();
-    void installs.refetch(); void snapshots.refetch(); void directory.refetch(); void game.refetch();
+    void installs.refetch(); void snapshots.refetch(); void game.refetch();
     void client.invalidateQueries({ queryKey: ['games'] });
   }
   async function run(work: () => Promise<void>) {
@@ -221,7 +199,6 @@ function GameDetails({ gameId }: { gameId: string }) {
         notify('版本替换已回滚');
       } catch (e) { setRollbackError(e); }
       finally {
-        clearFilePreview();
         await client.invalidateQueries();
       }
     });
@@ -251,14 +228,9 @@ function GameDetails({ gameId }: { gameId: string }) {
       setFomodSelections(initialFomodSelections(preview));
     });
   }
-  function parent() {
-    const normalized = path.replace(/\\/g, '/').replace(/\/$/, '');
-    const next = normalized.slice(0, normalized.lastIndexOf('/'));
-    const anchors = [game.data?.rootPath, ...Object.values(roots.data ?? {})].filter((value): value is string => !!value).map(value => value.replace(/\\/g, '/').replace(/\/$/, ''));
-    const anchor = anchors.filter(value => normalized === value || normalized.startsWith(`${value}/`)).sort((a, b) => b.length - a.length)[0];
-    if (anchor && next && next.length >= anchor.length && normalized !== anchor) { setLocation(next); setFile(null); }
-  }
-  const visibleEntries = (directory.data ?? []).filter(item => item.name.toLowerCase().includes(search.toLowerCase()));
+  const fileRoots = [{ name: '游戏目录', path: game.data?.rootPath ?? '' },
+    ...Object.entries(roots.data ?? {}).map(([name, path]) => ({ name, path }))];
+  const fileRoot = fileRoots.find(root => root.path === fileRootPath) ?? fileRoots[0];
   const installTypeNotes = adapter.data?.modTypes.find(type => type.id === modType)?.notes;
 
   return <Page className="min-w-0" data-testid="game-detail-page">
@@ -293,85 +265,12 @@ function GameDetails({ gameId }: { gameId: string }) {
         <TabsTrigger value="diagnostics">诊断</TabsTrigger>
       </TabsList>
 
-      <TabsContent value="files" className="min-w-0">
-        <div className="grid min-w-0 items-start gap-4 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
-          <Card className="min-w-0">
-            <CardHeader>
-              <div className="flex min-w-0 items-center gap-2">
-                <IconButton title="上一级目录" onClick={parent} disabled={!path || path === game.data?.rootPath}><ArrowUpIcon data-icon="inline-start" /></IconButton>
-                <PathText className="min-w-0 flex-1">{path}</PathText>
-                <IconButton title="刷新目录" disabled={!backendAvailable} onClick={() => { void directory.refetch(); }}><RefreshCwIcon data-icon="inline-start" /></IconButton>
-              </div>
-              <InputGroup>
-                <InputGroupAddon><SearchIcon /></InputGroupAddon>
-                <InputGroupInput placeholder="搜索当前目录…" value={search} onChange={e => setSearch(e.target.value)} />
-              </InputGroup>
-            </CardHeader>
-            <CardContent className="flex min-w-0 flex-col gap-3">
-              <ErrorState error={directory.error} />
-              <div className="grid min-w-0 items-start gap-3 sm:grid-cols-[minmax(0,9rem)_minmax(0,1fr)]">
-                <aside className="min-w-0">
-                  <ScrollArea className="min-w-0 rounded-md border [&_[data-slot=scroll-area-viewport]]:max-h-48 [&_[data-slot=scroll-area-viewport]>div]:block!">
-                    <div className="flex min-w-0 flex-col gap-1 p-1">
-                      <Button className="h-auto min-h-8 min-w-0 justify-start whitespace-normal" size="sm" variant={location === null ? 'secondary' : 'ghost'} onClick={() => { setLocation(null); setFile(null); }}>
-                        <FolderOpenIcon data-icon="inline-start" /><span className="min-w-0 wrap-anywhere text-left">游戏目录</span>
-                      </Button>
-                      {Object.entries(roots.data ?? {}).map(([id, value]) => <Button className="h-auto min-h-8 min-w-0 justify-start whitespace-normal" size="sm" variant={location === value ? 'secondary' : 'ghost'} key={id} onClick={() => { setLocation(value); setFile(null); }}>
-                        <FolderIcon data-icon="inline-start" /><span className="min-w-0 wrap-anywhere text-left">{id}</span>
-                      </Button>)}
-                    </div>
-                  </ScrollArea>
-                </aside>
-                <div className="flex min-w-0 flex-col gap-3">
-                  <Table className="table-fixed" aria-busy={directory.isFetching}>
-                    <colgroup><col className="w-[46%]" /><col className="w-[22%]" /><col /></colgroup>
-                    <TableHeader><TableRow><TableHead>名称</TableHead><TableHead>大小</TableHead><TableHead>修改时间</TableHead></TableRow></TableHeader>
-                    <TableBody>{visibleEntries.map(item => <TableRow key={item.path} data-state={file?.path === item.path ? 'selected' : undefined} className="cursor-pointer" onClick={() => item.is_dir ? (setLocation(item.path), setFile(null)) : setFile(item)}>
-                      <TableCell className="whitespace-normal">
-                        <Button variant="ghost" size="sm" className="h-auto min-h-8 max-w-full justify-start whitespace-normal has-[>svg]:px-1">
-                          {item.is_dir ? <FolderIcon data-icon="inline-start" /> : <FileIcon data-icon="inline-start" />}
-                          <span className="min-w-0 wrap-anywhere text-left">{item.name}</span>
-                        </Button>
-                      </TableCell>
-                      <TableCell className="whitespace-normal">{item.is_dir ? '—' : bytes(item.size)}</TableCell>
-                      <TableCell className="whitespace-normal">{date(item.modified)}</TableCell>
-                    </TableRow>)}</TableBody>
-                  </Table>
-                  {!directory.data?.length && <DetailEmptyState loading={directory.isLoading} title={directory.isLoading ? '正在读取目录…' : '目录中没有可显示的文件'} />}
-                </div>
-              </div>
-            </CardContent>
-          </Card>
-          <aside className="min-w-0">
-            <Card>
-              <CardHeader><CardTitle>文件详情</CardTitle></CardHeader>
-              <CardContent className="flex min-w-0 flex-col gap-3">
-                {file ? <>
-                  <div className="flex min-w-0 flex-col gap-1">
-                    <h3 className="wrap-anywhere text-sm font-medium">{file.name}</h3>
-                    <PathText>{file.path}</PathText>
-                    <p className="text-sm text-muted-foreground">{bytes(file.size)} · {date(file.modified)}</p>
-                  </div>
-                  <ErrorState error={content.error} />
-                  {content.data && !content.isError && <>
-                    <Separator />
-                    <h3 className="text-sm font-medium">文件预览</h3>
-                    <ScrollArea className="file-viewer min-w-0 overflow-hidden rounded-md border bg-muted p-0 [&_[data-slot=scroll-area-viewport]]:max-h-[420px] [&_[data-slot=scroll-area-viewport]>div]:block!">
-                      <div className="flex min-w-0 flex-col gap-0.5 p-3 font-mono text-xs">
-                        {content.data.lines.map(line => <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-3" key={line.line}>
-                          <span className="min-w-8 text-right text-muted-foreground select-none">{line.line}</span>
-                          <span className="wrap-anywhere whitespace-pre-wrap">{line.text}</span>
-                        </div>)}
-                      </div>
-                    </ScrollArea>
-                    {content.data.truncated && <Alert role="note" variant="warning"><TriangleAlertIcon /><AlertDescription>内容已截断</AlertDescription></Alert>}
-                  </>}
-                  <Button variant="destructive" className="self-start" disabled={!writable || busy} onClick={() => preview('trash_paths', { request: { paths: [file.path], game_id: gameId, reason: '用户从文件浏览器移除' } })}><Trash2Icon data-icon="inline-start" />移入回收站</Button>
-                </> : <EmptyState title="未选择文件" icon={<FileIcon />} />}
-              </CardContent>
-            </Card>
-          </aside>
-        </div>
+      <TabsContent value="files" forceMount className={tab === 'files' ? 'min-w-0' : 'hidden'}>
+        <ErrorState error={roots.error} />
+        {fileRoot.path ? <GameFileBrowser key={fileRoot.path} root={fileRoot} roots={fileRoots} onRootChange={setFileRootPath}
+          active={tab === 'files'} busy={busy} writable={writable}
+          onTrash={path => preview('trash_paths', { request: { paths: [path], game_id: gameId, reason: '用户从文件浏览器移除' } })} />
+          : game.isLoading && <DetailEmptyState loading title="正在读取游戏目录…" />}
       </TabsContent>
 
       <TabsContent value="mods" className="flex min-w-0 flex-col gap-3">

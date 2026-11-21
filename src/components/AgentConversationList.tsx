@@ -1,8 +1,8 @@
-import { useId, useRef, useState } from "react";
+import { memo, useId, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { ArchiveIcon, EllipsisIcon, PencilIcon, PinIcon, PinOffIcon, Trash2Icon } from "lucide-react";
+import { ArchiveIcon, CircleCheckIcon, CircleHelpIcon, EllipsisIcon, LoaderCircleIcon, SquarePenIcon, PencilIcon, PinIcon, PinOffIcon, ShieldIcon, Trash2Icon } from "lucide-react";
 import { api } from "@/lib/api";
-import { activeTurn, useAgent } from "@/lib/agent-store";
+import { type AgentConversationStatus, useAgentConversationStatuses } from "@/lib/agent-conversation-status";
 import { useUI } from "@/lib/store";
 import type { Conversation } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -18,6 +18,7 @@ import {
 } from "./ui/dropdown-menu";
 import { Field, FieldLabel } from "./ui/field";
 import { Input } from "./ui/input";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
 
 interface Props {
   conversations: Conversation[];
@@ -34,10 +35,26 @@ const successMessages = {
   delete: "对话已删除",
 };
 
-export function AgentConversationList({ conversations, selectedId, disabled, onSelect }: Props) {
+const statusIndicators = {
+  running: { text: "进行中", Icon: LoaderCircleIcon, color: "text-agent-running" },
+  completed: { text: "已完成", Icon: CircleCheckIcon, color: "text-success" },
+  "waiting-answer": { text: "等待回答", Icon: CircleHelpIcon, color: "text-agent-question" },
+  "waiting-input": { text: "等待输入", Icon: SquarePenIcon, color: "text-muted-foreground" },
+  "waiting-approval": { text: "等待授权", Icon: ShieldIcon, color: "text-warning" },
+} satisfies Record<AgentConversationStatus, { text: string; Icon: typeof CircleCheckIcon; color: string }>;
+
+function ConversationStatus({ id, status }: { id: string; status: AgentConversationStatus }) {
+  const { text, Icon, color } = statusIndicators[status];
+  return <span id={id} role="img" aria-label={text} className={cn("relative ms-auto inline-flex size-4 shrink-0 items-center justify-center", color)}>
+    {status === "running" && <span aria-hidden="true" className="absolute size-3 rounded-full border-[1.5px] border-current opacity-25" />}
+    <Icon aria-hidden="true" className={cn("size-3.5", status === "running" && "motion-safe:animate-spin")} />
+  </span>;
+}
+
+export const AgentConversationList = memo(function AgentConversationList({ conversations, selectedId, disabled, onSelect }: Props) {
   const client = useQueryClient();
   const notify = useUI((state) => state.notify);
-  const streams = useAgent((state) => state.streams);
+  const statuses = useAgentConversationStatuses(conversations);
   const titleId = useId();
   const [dialog, setDialog] = useState<{ action: "rename" | "delete"; conversation: Conversation } | null>(null);
   const [title, setTitle] = useState("");
@@ -105,16 +122,23 @@ export function AgentConversationList({ conversations, selectedId, disabled, onS
       <ul aria-label={label} className="flex gap-1 overflow-x-auto md:flex-col md:overflow-visible">
         {rows.map((conversation) => {
           const current = conversation.id === selectedId;
-          const running = !!activeTurn(streams[conversation.id] ?? []);
+          const state = statuses[conversation.id];
+          const statusId = `${titleId}-status-${conversation.id}`;
           const PinActionIcon = conversation.pinned ? PinOffIcon : PinIcon;
           return <li key={conversation.id}
             className={cn("flex max-w-full min-w-0 shrink-0 items-center rounded-md pr-1 md:w-full", current && "bg-secondary")}>
-            <Button type="button" variant="ghost" size="sm" disabled={disabled || pending} aria-current={current || undefined}
-              title={conversation.title} onClick={() => onSelect(conversation.id)}
-              className="min-w-0 flex-1 justify-start text-left">
-              {conversation.pinned && <PinIcon aria-hidden="true" className="text-muted-foreground" />}
-              <span className="min-w-0 truncate">{conversation.title}</span>
-            </Button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button type="button" variant="ghost" size="sm" disabled={disabled || pending} aria-current={current || undefined}
+                  aria-label={conversation.title} aria-describedby={state ? statusId : undefined} onClick={() => onSelect(conversation.id)}
+                  className="min-w-0 flex-1 justify-start text-left">
+                  {conversation.pinned && <PinIcon aria-hidden="true" className="text-muted-foreground" />}
+                  <span className="min-w-0 truncate" title={conversation.title}>{conversation.title}</span>
+                  {state && <ConversationStatus id={statusId} status={state.status} />}
+                </Button>
+              </TooltipTrigger>
+              {state && <TooltipContent side="top" align="end" sideOffset={4}>{statusIndicators[state.status].text}</TooltipContent>}
+            </Tooltip>
             <DropdownMenu modal={false}>
               <DropdownMenuTrigger asChild>
                 <Button type="button" size="icon-xs" variant="ghost" className="shrink-0 text-muted-foreground"
@@ -132,10 +156,10 @@ export function AgentConversationList({ conversations, selectedId, disabled, onS
                   <DropdownMenuItem onSelect={() => void apply("pin", conversation)}>
                     <PinActionIcon />{conversation.pinned ? "取消置顶" : "置顶"}
                   </DropdownMenuItem>
-                  <DropdownMenuItem disabled={running} onSelect={() => void apply("archive", conversation)}><ArchiveIcon />归档</DropdownMenuItem>
+                  <DropdownMenuItem disabled={state?.active} onSelect={() => void apply("archive", conversation)}><ArchiveIcon />归档</DropdownMenuItem>
                 </DropdownMenuGroup>
                 <DropdownMenuSeparator />
-                <DropdownMenuItem variant="destructive" disabled={running} onSelect={() => launch("delete", conversation)}><Trash2Icon />删除</DropdownMenuItem>
+                <DropdownMenuItem variant="destructive" disabled={state?.active} onSelect={() => launch("delete", conversation)}><Trash2Icon />删除</DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </li>;
@@ -190,4 +214,4 @@ export function AgentConversationList({ conversations, selectedId, disabled, onS
       </AlertDialogContent>
     </AlertDialog>
   </div>;
-}
+});

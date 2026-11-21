@@ -4,6 +4,8 @@ pub mod diagnostic_tools;
 pub mod events;
 pub mod identity_tools;
 pub mod install_tools;
+#[cfg(test)]
+mod local_file_access_tests;
 pub(crate) mod model_catalog;
 pub mod plugin_tools;
 pub mod policy;

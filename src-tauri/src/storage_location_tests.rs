@@ -91,7 +91,10 @@ fn restart_migrates_data_and_keeps_transactions_usable() {
     assert!(old_file.is_file());
     assert!(migrated
         .paths
-        .guard(&source.join("private/test-secret"), &[source.clone()])
+        .guard(
+            &source.join("private/test-secret"),
+            std::slice::from_ref(&source)
+        )
         .is_err());
     assert_eq!(
         fs::read(source.join("private/test-secret")).unwrap(),

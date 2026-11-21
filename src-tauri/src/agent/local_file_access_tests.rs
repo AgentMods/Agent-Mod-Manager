@@ -1,0 +1,301 @@
+use crate::{
+    agent::{
+        install_tools,
+        policy::{Effect, PermissionMode},
+        tools::{ToolContext, ToolRegistry},
+    },
+    db::Db,
+    error::AppResult,
+    sources::resolutions::ResolutionScope,
+    transaction::{self, FileEngine},
+};
+use serde_json::{json, Value};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
+use tokio_util::sync::CancellationToken;
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    engine: FileEngine,
+    registry: ToolRegistry,
+    game: PathBuf,
+    external: PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        let (dir, engine, game) = transaction::tests::setup();
+        let external = dir.path().join("files");
+        fs::create_dir(&external).unwrap();
+        let registry = ToolRegistry::builtin().unwrap();
+        install_tools::register(&registry).unwrap();
+        Self {
+            _dir: dir,
+            engine,
+            registry,
+            game,
+            external,
+        }
+    }
+    fn context(&self, resolution_scope: ResolutionScope) -> ToolContext {
+        ToolContext {
+            engine: self.engine.clone(),
+            cancel: CancellationToken::new(),
+            progress: None,
+            resolution_scope,
+        }
+    }
+    fn agent(&self) -> ToolContext {
+        self.context(ResolutionScope::Agent("local-chat".into()))
+    }
+    fn restricted(&self) -> [ToolContext; 2] {
+        [
+            self.context(ResolutionScope::Desktop),
+            self.context(ResolutionScope::Mcp("remote-session".into())),
+        ]
+    }
+    async fn call(&self, ctx: &ToolContext, name: &str, args: Value) -> AppResult<Value> {
+        let tool = self.registry.get(name)?;
+        let prepared = tool.prepare(ctx, &args).await?;
+        tool.execute(ctx, args, prepared).await
+    }
+    async fn plan(&self, ctx: &ToolContext, ops: Value) -> AppResult<String> {
+        let result = self
+            .call(
+                ctx,
+                "plan_file_ops",
+                json!({"operations":ops,"summary":"fixture"}),
+            )
+            .await?;
+        Ok(result["id"].as_str().unwrap().into())
+    }
+    async fn apply_after_review(&self, id: &str, effect: Effect) {
+        let ctx = self.agent();
+        let tool = self.registry.get("apply_file_ops").unwrap();
+        let args = json!({"plan_id":id});
+        let prepared = tool.prepare(&ctx, &args).await.unwrap();
+        assert_eq!(prepared.effect, effect);
+        assert!(PermissionMode::AutoApprove.needs_approval(effect));
+        assert!(!PermissionMode::FullTrust.needs_approval(effect));
+        assert_eq!(tool.execute(&ctx, args, prepared).await.unwrap()["id"], id);
+    }
+    fn reopen(&self) -> FileEngine {
+        let paths = self.engine.paths.as_ref().clone();
+        FileEngine::new(Db::open(&paths.db_file()).unwrap(), paths)
+    }
+    fn status(&self, id: &str) -> String {
+        self.engine
+            .db
+            .conn()
+            .query_row(
+                "SELECT status FROM file_transactions WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+}
+fn write(dst: &Path, content: &str) -> Value {
+    json!({"op":"write_text","dst":dst,"content":content})
+}
+
+#[tokio::test]
+async fn agent_can_inspect_game_parent_and_sibling_files_without_registering_them() {
+    let f = Fixture::new();
+    let parent = f.game.parent().unwrap();
+    let note = parent.join("appmanifest_123.acf");
+    fs::write(&note, "Steam fixture").unwrap();
+    let archive = f.external.join("mod.zip");
+    let mut zip = zip::ZipWriter::new(fs::File::create(&archive).unwrap());
+    zip.start_file("entry.txt", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(b"fixture").unwrap();
+    zip.finish().unwrap();
+    let agent = f.agent();
+    let list = f
+        .call(&agent, "read_dir", json!({"path":parent}))
+        .await
+        .unwrap();
+    assert!(list
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["name"] == "appmanifest_123.acf"));
+    let text = f
+        .call(&agent, "read_file", json!({"path":note}))
+        .await
+        .unwrap();
+    assert_eq!(text["lines"][0]["text"], "Steam fixture");
+    let listing = f
+        .call(&agent, "extract_preview", json!({"path":archive}))
+        .await
+        .unwrap();
+    assert_eq!(listing["entries"][0]["path"], "entry.txt");
+    for ctx in f.restricted() {
+        for (name, path) in [
+            ("read_dir", parent),
+            ("read_file", note.as_path()),
+            ("extract_preview", archive.as_path()),
+        ] {
+            assert!(f.call(&ctx, name, json!({"path":path})).await.is_err());
+        }
+    }
+}
+
+#[tokio::test]
+async fn mixed_external_plan_is_reviewed_and_cannot_be_claimed_by_mcp() {
+    let f = Fixture::new();
+    let src = f.external.join("source.txt");
+    let moved = f.external.join("move.txt");
+    fs::write(&src, "copy").unwrap();
+    fs::write(&moved, "move").unwrap();
+    let copy_dst = f.external.join("new/nested/copy.txt");
+    let move_dst = f.game.join("move.txt");
+    let dir = f.external.join("new/empty");
+    let ops = json!([{"op":"copy","src":src,"dst":copy_dst},{"op":"move","src":moved,"dst":move_dst},{"op":"mkdir","dst":dir}]);
+    let id = f.plan(&f.agent(), ops.clone()).await.unwrap();
+    for ctx in f.restricted() {
+        assert!(f.plan(&ctx, ops.clone()).await.is_err());
+        assert!(f
+            .call(&ctx, "apply_file_ops", json!({"plan_id":id}))
+            .await
+            .is_err());
+        assert_eq!(f.status(&id), "planned");
+    }
+    assert!(!copy_dst.exists() && !move_dst.exists() && !dir.exists() && moved.exists());
+    f.apply_after_review(&id, Effect::ExternalWrite).await;
+    assert_eq!(fs::read_to_string(copy_dst).unwrap(), "copy");
+    assert_eq!(fs::read_to_string(move_dst).unwrap(), "move");
+    assert!(dir.is_dir() && !moved.exists());
+}
+
+#[tokio::test]
+async fn external_utf8_create_and_overwrite_only_write_after_approval_and_can_roll_back() {
+    let f = Fixture::new();
+    let path = f.external.join("notes.txt");
+    let before = "初始文本\n🛠";
+    let after = "更新文本\n🌱";
+    let id = f
+        .plan(&f.agent(), json!([write(&path, before)]))
+        .await
+        .unwrap();
+    assert!(!path.exists());
+    f.apply_after_review(&id, Effect::ExternalWrite).await;
+    let id = f
+        .plan(&f.agent(), json!([write(&path, after)]))
+        .await
+        .unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), before);
+    f.apply_after_review(&id, Effect::ExternalWrite).await;
+    let restarted = f.reopen();
+    assert!(restarted.rollback_transaction(&id).is_err());
+    for ctx in f.restricted() {
+        assert!(f
+            .call(&ctx, "rollback_transaction", json!({"transaction_id":id}))
+            .await
+            .is_err());
+    }
+    assert_eq!(f.status(&id), "committed");
+    assert_eq!(fs::read_to_string(&path).unwrap(), after);
+    restarted
+        .for_local_agent()
+        .rollback_transaction(&id)
+        .unwrap();
+    assert_eq!(fs::read_to_string(path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn startup_recovers_external_overwrite_from_its_journal() {
+    let f = Fixture::new();
+    let dst = f.external.join("existing.txt");
+    fs::write(&dst, "original").unwrap();
+    let id = f
+        .plan(&f.agent(), json!([write(&dst, "replacement")]))
+        .await
+        .unwrap();
+    f.apply_after_review(&id, Effect::ExternalWrite).await;
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "replacement");
+    // Simulate process loss after all filesystem mutations but before the final status update.
+    f.engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE file_transactions SET status='applying' WHERE id=?1",
+            [&id],
+        )
+        .unwrap();
+    assert_eq!(
+        f.reopen().recover_interrupted().unwrap().as_slice(),
+        std::slice::from_ref(&id)
+    );
+    assert_eq!(f.status(&id), "rolled_back");
+    assert_eq!(fs::read_to_string(dst).unwrap(), "original");
+}
+
+#[tokio::test]
+async fn write_text_is_desktop_agent_only_even_in_game_and_capped_in_aggregate() {
+    let f = Fixture::new();
+    let dst = f.game.join("settings.txt");
+    let ops = json!([write(&dst, "fixture")]);
+    for ctx in f.restricted() {
+        assert!(f.plan(&ctx, ops.clone()).await.is_err());
+    }
+    assert!(f
+        .engine
+        .plan_file_ops(
+            serde_json::from_value(ops.clone()).unwrap(),
+            "restricted".into()
+        )
+        .is_err());
+    let id = f.plan(&f.agent(), ops).await.unwrap();
+    assert!(!dst.exists());
+    f.apply_after_review(&id, Effect::ManagerWrite).await;
+    assert_eq!(fs::read_to_string(&dst).unwrap(), "fixture");
+    let large = "x".repeat(1024 * 512 + 1);
+    assert!(f
+        .plan(
+            &f.agent(),
+            json!([
+                write(&dst, &large),
+                write(&f.game.join("other.txt"), &large)
+            ])
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn local_file_access_still_protects_env_and_manager_credentials() {
+    let f = Fixture::new();
+    let private = f.engine.paths.root.join("private");
+    fs::create_dir_all(&private).unwrap();
+    let agent = f.agent();
+    assert!(f
+        .call(&agent, "read_dir", json!({"path":private}))
+        .await
+        .is_err());
+    for path in [
+        private.join("credentials.json"),
+        f.external.join(".env.local"),
+    ] {
+        fs::write(&path, "fixture secret").unwrap();
+        assert!(f
+            .call(&agent, "read_file", json!({"path":path}))
+            .await
+            .is_err());
+        assert!(f
+            .plan(&agent, json!([write(&path, "overwrite")]))
+            .await
+            .is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "fixture secret");
+    }
+    assert!(f
+        .plan(
+            &agent,
+            json!([{"op":"move","src":f.external,"dst":f.game.join("newdir")}])
+        )
+        .await
+        .is_err());
+}

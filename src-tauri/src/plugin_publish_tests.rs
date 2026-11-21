@@ -673,3 +673,94 @@ fn inconsistent_persisted_state_is_not_reported_as_success() {
         .unwrap();
     assert!(get_publication(&f.engine, &r.id).is_err());
 }
+
+#[test]
+fn deleted_draft_blocks_new_steps_but_preserves_completed_history_and_installed_publication() {
+    let f = Fixture::new();
+    let engine = &f.engine;
+    let (draft, mut completed) = f.approved();
+    for action in [
+        PublicationStep::CreateUpload,
+        PublicationStep::StartUpload,
+        PublicationStep::PutPart,
+        PublicationStep::CompleteUpload,
+        PublicationStep::PublishWork,
+    ] {
+        completed = step(&f, &completed, action);
+    }
+    let mut changed = metadata();
+    changed.title.push_str(" updated");
+    let (preview, _) = prepare_package(engine, &draft.draft.id, changed).unwrap();
+    let open = create_publication(engine, &preview).unwrap();
+    approve_publication(engine, &open.id, &preview.digest).unwrap();
+    let pending = begin_step(
+        engine,
+        &open.id,
+        &preview.digest,
+        PublicationStep::CreateUpload,
+    )
+    .unwrap();
+    let install = plugin_workflow::plan_install_plugin(engine, &draft.draft.id).unwrap();
+    engine.approve_plan(&install.plan.id).unwrap();
+    engine.apply_file_ops(&install.plan.id).unwrap();
+    plugin_workflow::reconcile_deployments(engine).unwrap();
+    let (from_install, _) = prepare_installed_package(engine, SLUG, metadata()).unwrap();
+
+    plugin_workflow::delete_confirmed_draft(engine, &draft.draft.id).unwrap();
+    let reopened = f.reopen();
+    assert_eq!(list_publications(&reopened).unwrap().len(), 2);
+    assert_eq!(
+        get_publication(&reopened, &completed.id).unwrap(),
+        completed
+    );
+    assert_eq!(get_publication(&reopened, &pending.id).unwrap(), pending);
+    assert_eq!(
+        prepare_installed_package(&reopened, SLUG, metadata())
+            .unwrap()
+            .0,
+        from_install
+    );
+    assert!(create_publication(&reopened, &preview).is_err());
+    assert!(approve_publication(&reopened, &open.id, &preview.digest).is_err());
+
+    // A request already authorized and durably pending is not canceled by
+    // local deletion. Its outcome can still be recorded, but no new side
+    // effect from that draft is authorized until it is restored.
+    let observed = finish_step(
+        &reopened,
+        &open.id,
+        PublicationStep::CreateUpload,
+        Some(43),
+        None,
+    )
+    .unwrap();
+    assert_eq!(observed.phase, PublicationPhase::UploadCreated);
+    assert!(matches!(
+        begin_step(
+            &reopened,
+            &open.id,
+            &preview.digest,
+            PublicationStep::StartUpload
+        ),
+        Err(AppError::Conflict(_))
+    ));
+    assert_eq!(get_publication(&reopened, &open.id).unwrap(), observed);
+
+    let item = crate::trash::list_trash(&reopened.db, false)
+        .unwrap()
+        .remove(0);
+    let restore = crate::trash::plan_restore(&reopened, &[item.id], false).unwrap();
+    reopened.approve_plan(&restore.id).unwrap();
+    reopened.apply_file_ops(&restore.id).unwrap();
+    assert_eq!(
+        begin_step(
+            &reopened,
+            &open.id,
+            &preview.digest,
+            PublicationStep::StartUpload
+        )
+        .unwrap()
+        .phase,
+        PublicationPhase::StartUploadPending
+    );
+}

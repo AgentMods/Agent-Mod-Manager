@@ -5,10 +5,11 @@ use crate::{
     error::{AppError, AppResult},
     paths,
     plugins::{self, GamePackage},
-    transaction::{FileEngine, FileOp, FilePlan},
+    transaction::{self, FileEngine, FileOp, FilePlan, PlannedEntry},
+    trash::{self, TrashRequest},
     util,
 };
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -223,7 +224,7 @@ fn install_path(engine: &FileEngine, slug: &str) -> AppResult<PathBuf> {
     plugins::validate_slug(slug)?;
     checked_path(engine, &engine.paths.plugins().join("games").join(slug))
 }
-fn draft_path(engine: &FileEngine, id: &str, slug: &str) -> AppResult<PathBuf> {
+fn validate_draft_id(id: &str) -> AppResult<()> {
     if !id.strip_prefix("draft_").is_some_and(|s| {
         s.len() == 32
             && s.bytes()
@@ -231,6 +232,10 @@ fn draft_path(engine: &FileEngine, id: &str, slug: &str) -> AppResult<PathBuf> {
     }) {
         return Err(invalid("草稿 ID 格式无效"));
     }
+    Ok(())
+}
+fn draft_path(engine: &FileEngine, id: &str, slug: &str) -> AppResult<PathBuf> {
+    validate_draft_id(id)?;
     plugins::validate_slug(slug)?;
     checked_path(
         engine,
@@ -405,12 +410,146 @@ fn transaction_status(engine: &FileEngine, id: &str) -> AppResult<String> {
         .ok_or_else(|| AppError::NotFound(format!("文件事务: {id}")))
 }
 
+fn draft_unavailable() -> AppError {
+    AppError::Conflict("插件草稿已删除或正在恢复；如果仍在回收站，请先恢复草稿".into())
+}
+
+// Use for live authoring/deployment/publication only. Historical provenance
+// intentionally uses the unfiltered draft row even when its files are gone.
+pub(crate) fn ensure_draft_not_deleted(conn: &Connection, id: &str) -> AppResult<()> {
+    let unavailable: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM unavailable_plugin_drafts WHERE draft_id=?1)",
+        [id],
+        |r| r.get(0),
+    )?;
+    if unavailable {
+        return Err(draft_unavailable());
+    }
+    Ok(())
+}
+
+/// Only the confirmed desktop IPC may authorize this move. Preserve the
+/// original draft/write transaction as evidence for already installed packages.
+pub(crate) fn delete_confirmed_draft(engine: &FileEngine, id: &str) -> AppResult<()> {
+    validate_draft_id(id)?;
+    let _workflow = lock();
+    let files = transaction::write_lock();
+    let draft = get_draft(engine, id)?;
+    ensure_draft_not_deleted(&engine.db.conn(), id)?;
+    if transaction_status(engine, &draft.write_transaction_id)? != "committed" {
+        return Err(AppError::Conflict("只能删除已提交的插件草稿".into()));
+    }
+    let expected = draft_path(engine, id, &draft.slug)?;
+    if expected != draft.path {
+        return Err(AppError::Denied("草稿路径与登记 ID/slug 不一致".into()));
+    }
+    package_copy_entries(
+        &engine.get_plan(&draft.write_transaction_id)?,
+        &draft.write_transaction_id,
+        &scratch_path(engine, id)?,
+        &expected,
+        true,
+    )?;
+    match fs::symlink_metadata(&expected) {
+        Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+        Ok(_) => return Err(AppError::Denied("草稿路径不是普通目录".into())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(AppError::NotFound(
+                "插件草稿目录不存在，无法移入回收站".into(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+    engine.paths.stable_directory(&engine.paths.trash())?;
+    let trash = trash::prepare_trash(
+        engine,
+        &TrashRequest {
+            paths: vec![expected.to_string_lossy().into_owned()],
+            game_id: None,
+            reason: format!("删除插件草稿 {id}"),
+        },
+    )?;
+    let [item] = trash.as_slice() else {
+        return Err(invalid("插件草稿删除必须对应唯一的回收站项"));
+    };
+    let plan = engine.build_locked_plan(
+        &files,
+        vec![item.operation.clone()],
+        format!("移入回收站：插件草稿 {} ({id})", draft.slug),
+        true,
+    )?;
+    let [entry] = plan.entries.as_slice() else {
+        return Err(invalid("插件草稿删除必须对应唯一的移动操作"));
+    };
+    if !matches!(&entry.operation, FileOp::Move { src, dst }
+        if src == &expected && dst == item.operation.dst())
+        || !plan.requires_review
+        || entry.before.is_some()
+        || !entry.source.as_ref().is_some_and(|fp| fp.kind == "dir")
+    {
+        return Err(AppError::Conflict(
+            "草稿或回收站路径已改变，不能移动草稿".into(),
+        ));
+    }
+    let trash_id = item.id().to_owned();
+    {
+        // The plan, recycle-bin item and tombstone are durable before any
+        // payload moves. Visibility follows the engine's transaction status.
+        let mut conn = engine.db.conn();
+        let tx = conn.transaction()?;
+        FileEngine::persist_plan(&tx, &plan, true)?;
+        trash::record_prepared(engine, &tx, &plan.id, trash)?;
+        tx.execute(
+            "INSERT INTO plugin_draft_deletions(draft_id,transaction_id,trash_item_id) VALUES (?1,?2,?3)",
+            params![id, plan.id, trash_id],
+        )?;
+        tx.commit()?;
+    }
+    engine.approve_plan(&plan.id)?;
+    engine.apply_locked(&files, &plan.id)?;
+    Ok(())
+}
+
+/// An already reviewed deployment preview must not use a deleted draft even
+/// if identical bytes are put back out of band. Installed packages are not
+/// subject to this check during reconciliation or publication.
+pub(crate) fn validate_deployment_source(engine: &FileEngine, plan: &FilePlan) -> AppResult<()> {
+    let Some(FileOp::Copy { src, .. }) = plan.entries.first().map(|e| &e.operation) else {
+        return Ok(());
+    };
+    let Some(directory) = src.parent() else {
+        return Ok(());
+    };
+    if !directory.starts_with(engine.paths.staging().join("plugin-drafts")) {
+        return Ok(());
+    }
+    let deleted: bool = engine.db.conn().query_row(
+        "SELECT EXISTS(SELECT 1 FROM plugin_deployments p
+         JOIN plugin_drafts d ON d.slug=p.slug AND d.path=?2
+         JOIN unavailable_plugin_drafts u ON u.draft_id=d.id
+         WHERE p.transaction_id=?1)",
+        params![plan.id, directory.to_string_lossy()],
+        |r| r.get(0),
+    )?;
+    if deleted {
+        return Err(draft_unavailable());
+    }
+    Ok(())
+}
+
 /// A committed draft remains discoverable after process restart. Validation is
 /// separate, so an invalid saved draft can still be found and explained.
 pub fn list_drafts(engine: &FileEngine) -> AppResult<Vec<DraftInfo>> {
     let _lock = lock();
+    let _files = transaction::write_lock();
     let conn = engine.db.conn();
-    let mut stmt = conn.prepare("SELECT d.id,d.slug,d.path,d.write_transaction_id,d.created_at FROM plugin_drafts d JOIN file_transactions f ON f.id=d.write_transaction_id WHERE f.status='committed' ORDER BY d.created_at DESC,d.rowid DESC")?;
+    let mut stmt = conn.prepare(
+        "SELECT d.id,d.slug,d.path,d.write_transaction_id,d.created_at
+        FROM plugin_drafts d JOIN file_transactions f ON f.id=d.write_transaction_id
+        WHERE f.status='committed' AND NOT EXISTS (
+            SELECT 1 FROM unavailable_plugin_drafts u WHERE u.draft_id=d.id
+        ) ORDER BY d.created_at DESC,d.rowid DESC",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok(DraftInfo {
             id: r.get(0)?,
@@ -431,6 +570,27 @@ pub fn list_drafts(engine: &FileEngine) -> AppResult<Vec<DraftInfo>> {
     Ok(drafts)
 }
 
+fn package_copy_entries<'a>(
+    plan: &'a FilePlan,
+    id: &str,
+    source: &Path,
+    destination: &Path,
+    new_only: bool,
+) -> AppResult<[&'a PlannedEntry; 2]> {
+    if plan.id != id || !plan.requires_review || plan.entries.len() != 2 {
+        return Err(invalid("持久计划不是已要求审查的双文件包事务"));
+    }
+    let find = |name: &str| -> AppResult<&PlannedEntry> {
+        let entry = plan.entries.iter().find(|e| matches!(&e.operation, FileOp::Copy { src, dst } if *src == source.join(name) && *dst == destination.join(name)))
+            .ok_or_else(|| invalid("持久计划包含不匹配的源或目标"))?;
+        if new_only && entry.before.is_some() {
+            return Err(invalid("新草稿不能覆盖既存文件"));
+        }
+        Ok(entry)
+    };
+    Ok([find("adapter.json")?, find("SKILL.md")?])
+}
+
 fn verify_copy_plan(
     plan: &FilePlan,
     id: &str,
@@ -439,26 +599,11 @@ fn verify_copy_plan(
     content: &Content,
     new_only: bool,
 ) -> AppResult<()> {
-    if plan.id != id || !plan.requires_review || plan.entries.len() != 2 {
-        return Err(invalid("持久计划不是已要求审查的双文件包事务"));
-    }
-    for (name, hash, size) in [
-        (
-            "adapter.json",
-            &content.hashes.adapter_sha256,
-            content.adapter_json.len(),
-        ),
-        (
-            "SKILL.md",
-            &content.hashes.skill_sha256,
-            content.skill_markdown.len(),
-        ),
-    ] {
-        let entry = plan.entries.iter().find(|e| matches!(&e.operation, FileOp::Copy { src, dst } if *src == source.join(name) && *dst == destination.join(name)))
-            .ok_or_else(|| invalid("持久计划包含不匹配的源或目标"))?;
-        if new_only && entry.before.is_some() {
-            return Err(invalid("新草稿不能覆盖既存文件"));
-        }
+    let entries = package_copy_entries(plan, id, source, destination, new_only)?;
+    for (entry, (hash, size)) in entries.into_iter().zip([
+        (&content.hashes.adapter_sha256, content.adapter_json.len()),
+        (&content.hashes.skill_sha256, content.skill_markdown.len()),
+    ]) {
         if !entry
             .source
             .as_ref()
@@ -472,6 +617,7 @@ fn verify_copy_plan(
 
 fn validate_inner(engine: &FileEngine, id: &str) -> AppResult<DraftValidation> {
     let draft = get_draft(engine, id)?;
+    ensure_draft_not_deleted(&engine.db.conn(), id)?;
     let status = transaction_status(engine, &draft.write_transaction_id)?;
     let mut report = DraftValidation { draft, transaction_status:status, valid:false, package:None, hashes:None, issues:vec![],
         warnings:vec!["仅验证声明结构与事务完整性，不证明游戏路径资料、兼容性或 Skill 指令可信；必须人工审查。".into()] };

@@ -6,7 +6,8 @@ type AskUserPreviewFixture = {title?: string; questions: AskUserQuestionFixture[
 // Test-only IPC transport. It is never imported by the shipped application.
 export async function installMockTauri(page: Page, {
   fomodSelection = "requires_user", onboarding = false, onboardingStarted = false, failRegistration = false,
-  gameWithoutAdapter = false,
+  gameWithoutAdapter = false, holdAgentTurn = false,
+  duplicatePluginDraftSlug = false, failPluginDraftDeletion = false, seedPublishedPluginRecord = false,
   providerModels = ["fixture-thinking", "fixture-standard"],
   askUser,
   storage,
@@ -16,11 +17,15 @@ export async function installMockTauri(page: Page, {
   onboardingStarted?: boolean;
   failRegistration?: boolean;
   gameWithoutAdapter?: boolean;
+  holdAgentTurn?: boolean;
+  duplicatePluginDraftSlug?: boolean;
+  failPluginDraftDeletion?: boolean;
+  seedPublishedPluginRecord?: boolean;
   providerModels?: string[];
-  askUser?: {preview: AskUserPreviewFixture; approvalId?: string; toolCallId?: string};
+  askUser?: {preview: AskUserPreviewFixture; approvalId?: string; toolCallId?: string; deferResult?: boolean};
   storage?: {dataRoot: string; parent: string; previousError?: string; rejectFirstMigration?: boolean};
 } = {}) {
-  await page.addInitScript(({fomodSelection, onboarding, onboardingStarted, failRegistration, gameWithoutAdapter, providerModels, askUser, storage}) => {
+  await page.addInitScript(({fomodSelection, onboarding, onboardingStarted, failRegistration, gameWithoutAdapter, holdAgentTurn, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, askUser, storage}) => {
     type Args = Record<string, any>;
     const now = "2026-11-18T00:00:00Z";
     const callbacks = new Map<number, (value: any) => void>();
@@ -29,7 +34,10 @@ export async function installMockTauri(page: Page, {
     let seq = 0;
     let migrationAttempts = 0;
     const calls: Array<{ command: string; args: Args }> = [];
-    const events: any[] = [];
+    const savedQuestionnaire = askUser ? JSON.parse(sessionStorage.getItem("amm.test.questionnaire") ?? "null") : null;
+    const events: any[] = savedQuestionnaire?.events ?? [];
+    seq = events.at(-1)?.seq ?? seq;
+    const replayedEvents: any[] = [];
     const initialGame: Args = {
       id: "game-fixture", name: "Minecraft Java Edition", slug: "minecraft-java",
       rootPath: "/sandbox/minecraft", platform: "windows", adapterSlug: "minecraft-java",
@@ -43,17 +51,21 @@ export async function installMockTauri(page: Page, {
       {rootPath: "/sandbox/steam/Fixture", name: "Fixture Game", confidence: 0.92, status: "identified", suggestedAdapterSlug: "minecraft-java", registeredGameId: null, platform: "windows", warnings: ["这是一个测试扫描候选，请确认目录后再添加"]},
       {rootPath: "/sandbox/steam/Broken", name: "Broken Fixture", confidence: 0.61, status: "ambiguous", suggestedAdapterSlug: null, registeredGameId: null, platform: "unknown", warnings: []},
     ];
-    const conversations = [{
+    const libraryCandidates = onboardingCandidates.map((item, i) => ({...item,
+      rootPath: item.rootPath.replace("/sandbox/steam", "/sandbox/new-game"),
+      ...(i === 0 ? {confidence: 1, status: "high_confidence"} : {status: "candidate"}),
+    }));
+    const conversations: Args[] = savedQuestionnaire?.conversations ?? [{
       id: "conversation-fixture", title: "检查 Minecraft 模组", game_id: "game-fixture",
       task_summary: null, archived: false, pinned: false, message_count: 0,
       created_at: now, updated_at: now, permission_mode: null,
     }];
-    const messages = new Map<string, any[]>();
-    messages.set("conversation-fixture", []);
+    const messages = new Map<string, any[]>(savedQuestionnaire?.messages ?? [["conversation-fixture", []]]);
     const approvalId = askUser?.approvalId ?? "approval-fixture";
     const toolCallId = askUser?.toolCallId ?? "tool-fixture";
     let activeConversation = "conversation-fixture";
     let pending = false;
+    let deferredQuestionResult: (() => void) | undefined;
     let restored = false;
     let purged = false;
     let pluginEnabled = true;
@@ -68,8 +80,16 @@ export async function installMockTauri(page: Page, {
     let publicationOutcome = 'completed';
     let publicationReconcileOutcome: 'verified' | 'unconfirmed' = 'verified';
     const unknownCandidate = {rootPath: '/sandbox/unknown-game', name: 'unknown-game', confidence: 0, status: 'unidentified', suggestedAdapterSlug: null, registeredGameId: null, platform: 'unknown', warnings: [], matches: [], sources: [], requiresConfirmation: true};
-    const publications: Args[] = [];
+    const publications: Args[] = seedPublishedPluginRecord ? [{
+      id: 'publish-fixture-retained', state: 'completed', phase: 'completed', fileId: 42, workId: 99,
+      createdAt: now, updatedAt: now,
+      preview: {package: {title: '已发布 fixture-game', slug: 'fixture-game', version: '1.0.0'}},
+    }] : [];
     const draft = {id: 'draft-fixture', slug: 'fixture-game', path: '/sandbox/data/staging/plugin-drafts/fixture', writeTransactionId: 'txn-draft-fixture', createdAt: now};
+    const pluginDrafts: Args[] = [draft, ...(duplicatePluginDraftSlug ? [{
+      ...draft, id: 'draft-fixture-duplicate', path: '/sandbox/data/staging/plugin-drafts/fixture-duplicate',
+      writeTransactionId: 'txn-draft-fixture-duplicate',
+    }] : [])];
     let settings: Args = { base_url: "https://example.com/v1", model: onboarding ? "" : "mock-model", context_budget: 32768, permission_mode: "request_approval", api_key_ref: "model.api_key", onboarding_completed: !onboarding };
     let composerPreferences: Args = {model: null, reasoning_effort: null, permission_mode: null};
     let onboardingCompleted = !onboarding;
@@ -117,12 +137,20 @@ export async function installMockTauri(page: Page, {
       },
       markdown: "---\nname: minecraft-java\ndescription: Minecraft 模组安装指引\n---\n\n# Minecraft Java Edition 适配指导\n\n核对加载器版本和模组依赖。",
     });
-    const emit = (kind: string, payload: any, conversationId = activeConversation, messageId: string | null = "assistant-fixture") => {
+    const persistOnly = (kind: string, payload: any, conversationId = activeConversation, messageId: string | null = "assistant-fixture") => {
       const value = { seq: ++seq, turnId: "turn-fixture", conversationId, messageId, kind, payload, createdAt: now };
       events.push(value);
+      if (kind === "done") pending = false;
+      return value;
+    };
+    const emitEvent = (event: string, payload: unknown) => {
       for (const [id, listener] of listeners) {
-        if (listener.event === `agent://${kind}`) callbacks.get(listener.handler)?.({ event: listener.event, id, payload: value });
+        if (listener.event === event) callbacks.get(listener.handler)?.({ event, id, payload });
       }
+    };
+    const emit = (kind: string, payload: any, conversationId = activeConversation, messageId: string | null = "assistant-fixture") => {
+      const value = persistOnly(kind, payload, conversationId, messageId);
+      emitEvent(`agent://${kind}`, value);
       return value;
     };
     const delta = (text: string) => {
@@ -130,15 +158,25 @@ export async function installMockTauri(page: Page, {
       if (message) message.content += text;
       emit("delta", { content: text, reasoning: "" });
     };
-    const finish = (approved: boolean) => {
+    const finish = ({approved, answer}: {approved: boolean; answer?: string | null}) => {
       pending = false;
       emit("approval-resolved", { approvalId, status: approved ? "approved" : "rejected" });
-      emit("tool-result", { toolCallId, status: approved ? "done" : "denied", result: { status: approved ? "committed" : "denied" } });
-      delta(askUser
-        ? approved ? "\n回答已提交。" : "\n回答已跳过。"
-        : approved ? "\n检查完成，文件计划已执行。" : "\n未执行文件操作。");
-      emit("usage", { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 });
-      emit("done", { status: "done" }, activeConversation, null);
+      const publishResult = () => {
+        if (askUser) {
+          const submitted = approved ? "questions" in askUser.preview ? JSON.parse(answer!) : answer : null;
+          emit("tool-result", {toolCallId, status: "done", result: {answer: submitted}});
+        } else {
+          emit("tool-result", {toolCallId, status: approved ? "done" : "denied", result: {status: approved ? "committed" : "denied"}});
+        }
+        delta(askUser
+          ? approved ? "\n回答已提交。" : "\n回答已跳过。"
+          : approved ? "\n检查完成，文件计划已执行。" : "\n未执行文件操作。");
+        emit("usage", { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 });
+        emit("done", { status: "done" }, activeConversation, null);
+        if (askUser) sessionStorage.setItem("amm.test.questionnaire", JSON.stringify({events, conversations, messages: [...messages]}));
+      };
+      if (askUser?.deferResult) deferredQuestionResult = publishResult;
+      else publishResult();
     };
     const invoke = async (command: string, args: Args = {}) => {
       calls.push({command, args: command === "list_agent_models" ? {baseUrl: args.baseUrl, authenticated: !!args.apiKey} : args});
@@ -207,7 +245,11 @@ export async function installMockTauri(page: Page, {
           return null;
         }
         case "set_conversation_permission": return null;
-        case "replay_agent_events": return events.filter((event) => event.conversationId === args.conversationId && event.seq > args.after).slice(0, args.limit || 2000);
+        case "replay_agent_events": {
+          const replayed = events.filter((event) => event.conversationId === args.conversationId && event.seq > args.after).slice(0, args.limit || 2000);
+          replayedEvents.push(...replayed);
+          return replayed;
+        }
         case "start_turn": {
           activeConversation = args.request.conversationId;
           const history = messages.get(activeConversation) ?? [];
@@ -219,14 +261,14 @@ export async function installMockTauri(page: Page, {
           emit("turn-start", {}, activeConversation, null);
           delta("正在检查模组文件。");
           pending = true;
-          setTimeout(() => {
+          if (!holdAgentTurn) setTimeout(() => {
             if (!pending) return;
             emit("tool-start", { toolCallId, providerCallId: "provider-fixture", name: askUser ? "ask_user" : "apply_file_ops", arguments: askUser?.preview ?? { plan_id: plan.id } });
             emit("approval-request", { approvalId, toolCallId, title: askUser ? "ask_user" : "apply_file_ops", preview: askUser?.preview ?? plan });
           }, 120);
           return "turn-fixture";
         }
-        case "respond_approval": if (pending) finish(!!args.response.approved); return null;
+        case "respond_approval": if (pending) finish(args.response); return null;
         case "cancel_turn": pending = false; emit("done", { status: "cancelled" }, activeConversation, null); return null;
         case "list_trash": return purged || (restored && !args.includeRestored) ? [] : [{ id: "trash_fixture", original_path: "/sandbox/minecraft/mods/Example.jar", trash_path: "/sandbox/data/trash/trash_fixture/payload", transaction_id: "txn-trash", size: 1024, is_dir: false, game_id: "game-fixture", label: "Example.jar", reason: "停用测试模组", created_at: now, restored_at: restored ? now : null, exists: !restored }];
         case "purge_trash": if (args.confirmation !== "PURGE_TRASH") throw new Error("confirmation missing"); purged = true; return 1024;
@@ -304,8 +346,9 @@ export async function installMockTauri(page: Page, {
           if (!archiveImported || args.request.artifactPath !== "/sandbox/data/staging/imports/fixture/Fixture.jar") throw new Error("archive not imported"); return {plan: installPlan, warnings: []};
         }
         case "mcp_list": return [];
+        case "mcp_startup_requests": return [];
         case "mcp_connections": return [];
-        case "mcp_server_status": return {running: false, stopping: false, endpoint: null, tokenRef: "mcp.local_server.token", activeCalls: 0};
+        case "mcp_server_status": return {startupRequested: false, running: false, stopping: false, endpoint: null, tokenRef: "mcp.local_server.token", activeCalls: 0};
         case "list_skills": return [
           ...systemSkills.map(({skill}) => ({...skill})),
           minecraftSkill().skill,
@@ -334,7 +377,14 @@ export async function installMockTauri(page: Page, {
           return skill();
         }
         case "plan_uninstall_skill": if (args.name !== "my-game-notes" || skillRemoved) throw new Error("unknown Skill"); return {plan: skillPlan};
-        case "list_plugin_drafts": return [draft];
+        case "list_plugin_drafts": return structuredClone(pluginDrafts);
+        case "delete_plugin_draft": {
+          const index = pluginDrafts.findIndex(item => item.id === args.draftId);
+          if (index < 0) throw new Error('unknown draft');
+          if (failPluginDraftDeletion) throw new Error('模拟删除草稿失败');
+          pluginDrafts.splice(index, 1);
+          return null;
+        }
         case "list_plugin_publications": return structuredClone(publications);
         case "prepare_plugin_publication": {
           if (args.draftId !== draft.id) throw new Error('unknown draft');
@@ -371,13 +421,12 @@ export async function installMockTauri(page: Page, {
         }
         case "set_plugin_enabled": if (args.slug !== "minecraft-java") throw new Error("unknown plugin"); pluginEnabled = args.enabled; return {slug: "minecraft-java", enabled: pluginEnabled};
         case "list_plugins": return [{...minecraftPlugin, enabled: pluginEnabled}];
-        case "list_mod_sources": return [{ source_id: "modrinth", state: "available", message: "" }, { source_id: "curseforge", state: "missing_key", message: "需要配置 API Key" }];
         case "search_mods": return { mods: [{ source_id: "modrinth", project_id: "example", game_id: "minecraft", name: "Example Performance Mod", summary: "测试来源响应", author: "Fixture Author", homepage_url: "https://example.com/mod", icon_url: null, downloads: 1024 }], sources: [{ source_id: "modrinth", state: "available", message: "" }] };
         case "read_dir": return [{ name: "mods", path: "/sandbox/minecraft/mods", is_dir: true, size: 0, modified: now }, ...fileTrashed ? [] : [{ name: "options.txt", path: "/sandbox/minecraft/options.txt", is_dir: false, size: 128, modified: now }]];
         case "read_file": if (fileTrashed && args.path === "/sandbox/minecraft/options.txt") throw new Error("file moved to trash"); return { lines: [{ line: 1, text: "fixture log" }], truncated: false };
         case "trash_paths": if (JSON.stringify(args.request.paths) !== JSON.stringify(["/sandbox/minecraft/options.txt"])) throw new Error("unknown file"); return filePlan;
         case "register_game": {
-          const candidate = onboardingCandidates.find((item) => item.rootPath === args.directory);
+          const candidate = [...onboardingCandidates, ...libraryCandidates].find((item) => item.rootPath === args.directory);
           if (!candidate) throw new Error("unknown candidate");
           if (failRegistration && candidate.name === "Broken Fixture") throw new Error("目录已变化，请重新扫描");
           const id = `game-${candidate.name.toLowerCase().replaceAll(" ", "-")}`;
@@ -386,7 +435,10 @@ export async function installMockTauri(page: Page, {
           candidate.registeredGameId = game.id;
           return game;
         }
-        case "scan_games": return { candidates: onboarding ? structuredClone(onboardingCandidates) : [], warnings: [], directoriesChecked: 3, entriesChecked: 18, truncated: false };
+        case "scan_games": {
+          const candidates = args.options?.userRoots?.includes("/sandbox/new-game") ? libraryCandidates : onboarding ? onboardingCandidates : [];
+          return { candidates: structuredClone(candidates), warnings: [], directoriesChecked: 3, entriesChecked: 18, truncated: false };
+        }
         // Game-card actions. The native commands resolve every path from the game id, so the mock never accepts a path from the UI.
         case "launch_game": {
           const game = games.find((item) => item.id === args.id);
@@ -441,7 +493,11 @@ export async function installMockTauri(page: Page, {
     };
     target.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: (_event: string, id: number) => listeners.delete(id) };
     target.__AMM_TEST__ = {
-      calls, emit, events, conversations,
+      calls, emit, emitEvent, persistOnly, replayedEvents, events, conversations,
+      publishQuestionResult() {
+        deferredQuestionResult?.();
+        deferredQuestionResult = undefined;
+      },
       get pending() { return pending; },
       get modsFolderMissing() { return modsFolderMissing; },
       set modsFolderMissing(value: boolean) { modsFolderMissing = value; },
@@ -454,5 +510,5 @@ export async function installMockTauri(page: Page, {
         seq = Math.max(seq, ...values.map((event) => event.seq).filter(Number.isSafeInteger));
       },
     };
-  }, {fomodSelection, onboarding, onboardingStarted, failRegistration, gameWithoutAdapter, providerModels, askUser, storage});
+  }, {fomodSelection, onboarding, onboardingStarted, failRegistration, gameWithoutAdapter, holdAgentTurn, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, askUser, storage});
 }

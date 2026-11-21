@@ -60,6 +60,9 @@ jobs:
         with:
           node-version: 24
           cache: yarn
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt,clippy
@@ -73,7 +76,9 @@ jobs:
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
       - name: Build Unsigned Installers
         id: bundle
-        run: yarn tauri -- build --ci --bundles ${{ matrix.bundles }} -- --locked
+        run: node node_modules/@tauri-apps/cli/tauri.js build --ci --bundles "${{ matrix.bundles }}" -- --locked
+      - name: Verify Native MCP Runtime Offline
+        run: python scripts/verify-mcp-runtime.py src-tauri/resources
       - name: Install Linux WebDriver Bridge
         if: runner.os == 'Linux'
         id: webdriver
@@ -86,7 +91,18 @@ jobs:
           packages=(src-tauri/target/release/bundle/deb/*.deb)
           test "${#packages[@]}" -eq 1
           sudo dpkg --install "${packages[0]}"
+          python scripts/verify-mcp-runtime.py '/usr/lib/Agent Mod Manager'
           bash scripts/run-linux-package-smoke.sh /usr/bin/agent-mod-manager output/linux-package-smoke/deb
+      - name: Verify Packaged AppImage MCP Runtime
+        if: runner.os == 'Linux'
+        timeout-minutes: 5
+        run: |
+          shopt -s nullglob
+          packages=("$PWD"/src-tauri/target/release/bundle/appimage/*.AppImage)
+          test "${#packages[@]}" -eq 1
+          work=$(mktemp -d)
+          (cd "$work" && "${packages[0]}" --appimage-extract 'usr/lib/Agent Mod Manager/mcp-runtime/runtime.zip')
+          python scripts/verify-mcp-runtime.py "$work/squashfs-root/usr/lib/Agent Mod Manager"
       - name: Smoke Test AppImage In Extraction Mode
         if: ${{ !cancelled() && runner.os == 'Linux' && steps.webdriver.outcome == 'success' }}
         timeout-minutes: 4
@@ -102,6 +118,7 @@ jobs:
           shopt -s nullglob
           applications=(src-tauri/target/release/bundle/macos/*.app)
           test "${#applications[@]}" -eq 1
+          python scripts/verify-mcp-runtime.py "${applications[0]}/Contents/Resources"
           node scripts/run-macos-package-smoke.mjs "$PWD/${applications[0]}" "$PWD/output/macos-package-smoke"
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() && runner.os == 'Linux' && steps.bundle.outcome == 'success' }}
@@ -146,6 +163,9 @@ jobs:
         with:
           node-version: 24
           cache: yarn
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - run: yarn install --frozen-lockfile
       - uses: actions/download-artifact@v4
         with:
@@ -161,6 +181,11 @@ jobs:
           if ($packages.Count -ne 1) { throw "Expected one $env:PACKAGE_KIND installer; found $($packages.Count)" }
           ./scripts/run-windows-package-smoke.ps1 -Kind $env:PACKAGE_KIND -Installer $packages[0].FullName `
             -EvidenceDir 'output/windows-package-smoke/evidence' -DisposableMachine
+          # The smoke runner creates a fresh installation directory and records it in its evidence.
+          $target = @(Select-String -LiteralPath 'output/windows-package-smoke/evidence/run.log' -Pattern '^Install target: (.+); Node: ')
+          if ($target.Count -ne 1) { throw 'Expected one fresh install target in the smoke evidence.' }
+          python scripts/verify-mcp-runtime.py $target[0].Matches[0].Groups[1].Value
+          if ($LASTEXITCODE -ne 0) { throw 'Installed MCP runtime verification failed.' }
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:

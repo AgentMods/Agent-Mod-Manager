@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useRef, useState, type Ref } from "react";
 import { ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, PlusIcon, ShieldAlertIcon, ShieldIcon, SquareIcon } from "lucide-react";
 import { DropdownMenu as Menu, Popover, Slider } from "radix-ui";
 import { Button } from "@/components/ui/button";
@@ -24,6 +24,8 @@ const permissionLabels: Record<PermissionMode | "", string> = {
 
 interface AgentComposerProps {
   input: string;
+  inputRef?: Ref<HTMLTextAreaElement>;
+  onCancelEdit?: () => void;
   onInputChange: (value: string) => void;
   onSend: () => void;
   onCancel?: () => void;
@@ -40,7 +42,7 @@ interface AgentComposerProps {
 }
 
 export function AgentComposer({
-  input, onInputChange, onSend, onCancel, disabled, busy, permission, inheritedPermission,
+  input, inputRef, onCancelEdit, onInputChange, onSend, onCancel, disabled, busy, permission, inheritedPermission,
   onPermissionChange, model, models, onModelChange, reasoningEffort, onReasoningChange,
 }: AgentComposerProps) {
   const [picker, setPicker] = useState<"model" | "reasoning" | null>(null);
@@ -58,8 +60,13 @@ export function AgentComposer({
     if (canSend) onSend();
   }}>
     <div className="mx-auto w-full max-w-5xl">
+      {onCancelEdit && <div className="mb-1 flex items-center justify-between gap-2 px-2 text-xs text-muted-foreground">
+        <span>正在编辑消息 · 发送后开启新分支</span>
+        <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={onCancelEdit}>取消编辑</Button>
+      </div>}
       <InputGroup className="rounded-[22px] border-border shadow-sm bg-muted/55 dark:bg-secondary">
         <InputGroupTextarea
+          ref={inputRef}
           aria-label="告诉 Agent 你想做什么"
           placeholder="和 Agent 一起工作"
           value={input}

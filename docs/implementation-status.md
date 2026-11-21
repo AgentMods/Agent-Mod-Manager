@@ -1,7 +1,37 @@
 # Agent Mod Manager implementation status
 
-Updated: 2026-11-19. The full project goal remains active. This is an
+Updated: 2026-11-20. The full project goal remains active. This is an
 implementation and verification snapshot, not a release-completion claim.
+
+**Desktop Agent filesystem access (2026-11-21, Windows).** Six local file-tool
+regression tests passed, including listing a registered game's parent, creating
+and overwriting external UTF-8 files, approval, credential exclusions, rollback,
+and restart recovery. The loopback MCP test confirmed that the managed-only
+planner does not advertise `write_text`. Formatting and strict Clippy passed.
+With TEMP/TMP outside AppData the full Rust suite had 664 passed, 4 failed and
+6 ignored. The remaining failures covered two diagnostics path cases, the game
+card's unregistered Mod directory, and portable import filename validation.
+
+**Agent window responsiveness (2026-11-20, Windows).** Turn start, retry,
+event replay, cancellation and approval IPC no longer wait for database or
+runtime locks on the window thread. Startup repairs interrupted tool calls from
+protocol metadata only; the background task builds the prompt once. Retrying a
+long conversation copies prior completed events without rescanning them for
+each delta. On a synthetic in-memory SQLite fixture with 8,001 events the copy
+query took about 9 s before and 6 ms after; this is not model response time.
+Live text batches within 32 ms, terminal/approval events flush immediately,
+and unchanged Markdown and completed reasoning traces stay stable.
+
+The locked-database Tauri dispatch regression, stalled-model cancellation,
+interrupted-stream retries and all 30 focused browser cases passed. The frontend
+production build and Rust all-target check passed. The broader Windows runs
+reported 632 Rust tests passed, 5 failed and 5 ignored (temp outside AppData),
+and 261 browser tests passed with 9 failures in history navigation and the game
+file-tab workflows. An isolated Windows/WebView2 build also sent a real HTTP
+request to a loopback SSE fixture that withheld the first token. Its native
+window answered all 20 `WM_NULL` probes (maximum 9 ms); switching to the game
+library, returning to chat, and stopping generation closed the stalled request.
+No external provider, user credentials or existing conversations were used.
 
 After removal of Mod Discovery, all 171 remaining Playwright cases passed on
 Windows across the three configured viewports. `yarn typecheck` and the Vite
@@ -104,15 +134,29 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   draft, validation and installation transactions. Local updates keep the slug.
   Built-in packages can be copied under a new slug. The desktop library applies
   a selected installed package to a registered game after checking its markers.
+  A standalone, unapproved file preview (such as creating a Mod directory)
+  does not block binding or run as a side effect. Pending reviews, approved
+  operations on the game, game-linked plans and recovery still block binding;
+  removing the registration still checks all unfinished previews.
+- In the package center, deleting a draft moves only the selected draft ID's
+  directory to the manager's Trash after confirmation. Restoring it makes the
+  same draft available again. Installed packages and publication history are kept.
 - Settings shows three embedded system Skills for adapter authoring, web search
   and Mod downloads, plus manually installed Skills in their own section.
   Game Skills are available from their package details. The Agent can read the
   active system Skills and the selected game's package Skill.
+- Desktop Settings uses MCP and Skills as the entry points for Mod provider
+  workflows. Brave credentials for built-in web search and game identification
+  are configured in the web search Skill details.
 - Game discovery: bounded shallow scans, marker confidence with ambiguous
   candidates, structured Steam ACF and libraryfolders parsing, secondary Steam
   libraries, Epic/Legendary metadata, explicit canonical root registration,
   idempotent game state persistence and list/get commands. Discovery does not
-  grant write access or execute launcher metadata.
+  grant write access or execute launcher metadata. In the game library, picking
+  a folder scans it immediately; a typed path scans on Enter or “扫描此目录”.
+  This scoped scan excludes common launcher locations, can surface unadapted
+  installation candidates, and still requires explicit registration. A unique
+  full adapter match is labeled “已适配” with a green check.
 - First-run onboarding: desktop-only bootstrap detection with persisted
   `onboarding_completed`, explicit scan-candidate registration, Agent settings
   setup with encrypted API-key storage, and a three-stage feature tour. The
@@ -140,19 +184,60 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   the selected model's context budget. Selecting a
   model in the composer leaves the saved default intact. Legacy single-level
   settings load as one enabled option.
+- The composer remembers the last model, reasoning level and permission policy
+  used to send a turn. They are stored in the SQLite `settings` table under
+  `composer_preferences` (separate from `AppSettings`, so saving Settings never
+  overwrites them) and restored on the next launch. A removed model or a level
+  the model no longer enables falls back to the saved default. SQLite lives in
+  the app data directory (or the relocated storage root), so the choice survives
+  restarts and an uninstall that keeps user data. A reinstall that wipes the data
+  directory resets it, like every other setting. Covered by
+  `settings::tests::composer_preferences_*` and `tests/ui/composer-memory.spec.ts`.
+- The left navigation rail remembers a manual expand/collapse in WebView
+  `localStorage` (`amm.sidebar`, same mechanism as the theme). Without a saved
+  choice it still follows the window width; an invalid value is ignored. Covered
+  by `tests/ui/sidebar-memory.spec.ts`.
+- Agent messages expose copy, edit, and retry in the message footer. Edit
+  restores the original text in the composer. Sending an edit or retrying a
+  reply opens a new conversation with the context preceding that turn. The
+  original conversation remains available in the conversation list.
 - Agent `ask_user` requests appear inline as a questionnaire: one step per
   question, with single-choice options, free text, back/next, and skip. The
   existing approval transport waits for the response and preserves skipped
   steps as `null`. Legacy single questions render as a one-step text card.
-  Replay shows resolved/cancelled status; file-operation approval is unchanged.
+  Completed questionnaires collapse to a question count. Expanding the trace
+  reveals the original questions and submitted answers in order, including
+  skipped steps and cancelled requests. Conversation replay restores the
+  answers from persisted tool results. Cancelled, expired or entirely skipped
+  questionnaires in an unarchived chat offer **重新回答**. Submitting opens a new
+  turn in the same chat with the original questions and the user's answers; it
+  does not revive the old approval, rewrite its record, or clear a composer draft.
+- Conversation rows show just a color-coded status icon at the right, with its
+  label available on hover, keyboard focus, and to assistive technology. **进行中** marks
+  an active turn; an outstanding questionnaire shows **等待回答** and an operation
+  approval shows **等待授权**. A successful turn shows **已完成**; an empty chat or
+  a cancelled, failed or interrupted turn shows **等待输入**. The list starts from
+  a persisted checkpoint and applies newer events even for unselected chats.
 - Explicit user-data root registrations, bound to game and adapter root ID.
-  Stable canonical root checks reject replaced symlinks, including replacement
-  with a different already-authorized game or manager directory.
+  Operations that require registered roots still reject symlink-replaced roots,
+  including replacement with a different authorized game or manager directory.
+  The desktop Agent's `read_dir`, `read_file`, `extract_preview`,
+  `plan_file_ops`, and `apply_file_ops` can use paths outside those roots
+  under the app process's OS permissions. Credential/`.env` protections and
+  path safety checks still apply. `extract_preview` is a read-only archive
+  listing, not extraction or installation. Inbound MCP keeps its existing scope.
+- The desktop Agent's native `plan_file_ops` accepts `write_text` (`dst` and
+  full UTF-8 `content`) to create or overwrite a file through `apply_file_ops`.
+  Planning fingerprints the inline text without writing the destination. The
+  combined `content` byte length across the plan is limited to 1 MiB. A plan
+  with `write_text` requires review under `auto_approve`, even for registered
+  game paths. Inbound MCP and other generic planners reject this operation.
 - Adapter-driven install previews and installed-file manifests. JAR/ZIP payloads
   declared single-file stay intact; SMAPI directories retain their manifests;
   declared Data prefixes are stripped only after inspection. FOMOD archives now
-  have a bounded read-only `ModuleConfig.xml` preview in the desktop
-  local-archive install flow and the Agent. Folder directives expand descendants from the
+  have a bounded `ModuleConfig.xml` preview in the desktop local-archive
+  install flow and the Agent. `preview_fomod` still accepts only archives in
+  managed downloads or staging. Folder directives expand descendants from the
   verified archive inventory into exact per-file mappings, including wrapped
   installers and empty destinations relative to the install root. The desktop
   flow preselects deterministic
@@ -189,6 +274,16 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   and tool-call assembly, complete-stream gate before tool execution, bounded
   completion/frame sizes, tool loop, single active turn per conversation,
   cancellation during HTTP streaming and approvals, usage and progress events.
+  The desktop Rust task owns each turn; the app shell follows active conversations
+  across navigation and replays missing events through the final sequence number.
+  A truncated SSE response retries the current completion once in streaming mode.
+  If both streams end early (including transport errors), the third and final
+  request uses `stream: false` with the same messages, tools and reasoning effort.
+  The JSON fallback must finish downloading within the 16 MiB size limit and pass
+  validation before replacing the visible draft or dispatching any tool. Failed
+  recovery leaves the last draft visible; it never replays earlier tool rounds.
+  Windows loopback tests cover truncated HTTP bodies, missing SSE terminators,
+  successful JSON recovery and failure without draft loss. No live gateway was used.
 - Durable turn/event log with sequence-based replay, persisted assistant deltas,
   tool results and approval requests. Startup marks in-memory turns interrupted;
   subsequent turns complete interrupted tool-result groups before a model call.
@@ -197,7 +292,12 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   capped at 64 KiB and redact the configured API key before persistence.
 - Explicit permission matrix: request_approval/auto_approve/full_trust, global,
   conversation and turn overrides; interactive approval responses verify their
-  conversation. Read tools and game-target file plans have separate effects.
+  conversation. Reads and file writes have separate effects; a write outside
+  the app data root and registered game roots is not a game write and still
+  needs review under `auto_approve`. Plans remain fingerprinted and writes use
+  the same durable journal, backups, rollback, and recovery. The desktop
+  transaction-history command and local Agent can roll back external file
+  transactions in their recorded scope; inbound MCP cannot, even with an ID.
 - Context compression summarizes old turns without removing original messages.
   The current task's complete tool groups stay intact. Budget accounting now
   includes serialized messages, the complete registered tool schema, chat/tool
@@ -322,7 +422,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   and distinguishes install record matches from unrecorded and ambiguous files.
   It never extracts or executes a JAR. See [diagnostic limits](diagnostics.md).
 - Brave Web Search is registered as a read-only Agent tool. It uses the fixed
-  HTTPS endpoint and the `sources.brave` Settings secret, limits queries to
+  HTTPS endpoint and the `sources.brave` secret, limits queries to
   1..512 characters/75 words and counts to 1..10, rejects local/private paths
   and credential-bearing URLs, bounds result fields, and marks excerpts
   untrusted. It validates result URLs as public HTTP(S) and never fetches them.
@@ -343,19 +443,32 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   namespaced tools, bounded results/cancellation, stale-config revocation and
   atomic registry registration. All external tool annotations remain untrusted.
   Playwright MCP and MarkItDown MCP join the Mod 客栈 and 3DM presets as
-  opt-in configurations; they do not contribute credentials or bundle runtimes.
-  A macOS stdio smoke test exercised Playwright initialization, tool discovery,
-  and navigation. MarkItDown resolved its dependencies, but cold-cache wheel
-  downloads timed out before its handshake. Neither preset has been verified
-  through the native settings UI on Windows.
+  opt-in configurations. Desktop bundles carry Node.js/npm/npx and uv/uvx. A confirmed
+  bare launcher uses the packaged runtime with a child-only npm or PyPI mirror
+  (npmmirror or Tsinghua). Explicit executable paths retain their own configuration.
+  The Windows Playwright preset selects installed Edge, and MarkItDown retains its
+  explicit index argument. Schema v4 clears prior auto-start consent for bare aliases.
+  `uvx` has a ten-minute startup deadline for dependency installation; other
+  stdio processes still have two minutes and HTTP still has twenty seconds.
+  On Windows the old PyPI command timed out downloading `pdfminer-six` before
+  initialization. The opt-in native Rust smoke with the mirror completed
+  initialization and found `convert_to_markdown` in 245 s, then in 11 s on a
+  warm-cache repeat. It used a disposable database and did not convert a file.
+  A macOS stdio smoke separately exercised Playwright initialization, tool
+  discovery and navigation; these are not native settings UI tests.
   Stdio is an explicitly acknowledged unsandboxed OS-user process, not contained
   by FileEngine; stronger cross-platform sandboxing remains required.
 - External MCP connections use a compact list with a per-service credentials
   dialog for Bearer and stdio environment secrets. Each row shows 未启动,
   启动中, 运行中 (tool count) or 启动失败 with the reason, and has one start/stop
   button. Starting saves `enabled` itself, so the editor has no enable switch.
-  HTTP starts in one click; stdio asks once, showing the command line, because
-  the backend still requires the unsandboxed-process acknowledgement.
+  On desktop launch, previously started connections restore in the background.
+  Only a successful manual handshake and tool registration save consent to that
+  exact configuration (stdio requires acknowledgement of OS-user privileges).
+  Merely enabled or legacy configurations have no consent. Stop, edit or remove
+  revokes it; a transient restore failure permits retry on the next launch or
+  cancellation from Settings even when disconnected. The local server remembers
+  its opt-in separately and recreates its loopback endpoint and token.
   Playwright covers both transports, masked inputs, keyboard dismissal and
   start/stop/failure states at 390, 1280, and 1440 px.
 - An optional desktop-owned MCP server binds numeric loopback on a random port,

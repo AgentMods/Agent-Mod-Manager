@@ -190,8 +190,12 @@ impl AgentTool for InstallTool {
         if context.cancel.is_cancelled() {
             return Err(AppError::Cancelled);
         }
-        let engine = context.engine.clone();
         let name = self.name.clone();
+        let engine = if name == "rollback_transaction" {
+            context.file_engine()
+        } else {
+            context.engine.clone()
+        };
         let args = args.clone();
         tokio::task::spawn_blocking(move || {
             let (preview,plan) = match name.as_str() {
@@ -219,7 +223,11 @@ impl AgentTool for InstallTool {
             return Err(AppError::Cancelled);
         }
         let name = self.name.clone();
-        let engine = context.engine.clone();
+        let engine = if name == "rollback_transaction" {
+            context.file_engine()
+        } else {
+            context.engine.clone()
+        };
         tokio::task::spawn_blocking(move || {
             if let Some(plan) = prepared.plan {
                 engine.approve_plan(&plan.id)?;

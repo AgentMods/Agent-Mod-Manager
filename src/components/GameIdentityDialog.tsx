@@ -95,7 +95,7 @@ export function GameIdentityDialog({ directory, writable, onClose, onConfirmed }
       {result && <section className="flex flex-col gap-4" aria-label="联网识别候选">
         <Separator/>
         <div className="flex items-center justify-between gap-2"><h3 className="flex items-center gap-2 font-medium"><GlobeIcon className="size-4"/>网络候选</h3><Badge tone="warning">未验证</Badge></div>
-        {result.status === 'needs_configuration' ? <Alert variant="warning" role="status"><AlertDescription>请先在设置中配置 Brave Search API Key，未执行网络搜索。</AlertDescription></Alert> : result.status === 'unavailable' ? <Alert variant="warning" role="status"><AlertDescription>联网搜索暂不可用，未确认任何游戏身份。</AlertDescription></Alert> : <>
+        {result.status === 'needs_configuration' ? <Alert variant="warning" role="status"><AlertDescription>请在「设置 → Skills → 联网搜索」中配置 Brave Search API Key。</AlertDescription></Alert> : result.status === 'unavailable' ? <Alert variant="warning" role="status"><AlertDescription>联网搜索暂不可用，未确认任何游戏身份。</AlertDescription></Alert> : <>
           {result.candidates.length ? <RadioGroup aria-label="选择游戏候选" value={selected === null ? '' : String(selected)} disabled={busy} onValueChange={value => { const index = Number(value); setSelected(index); setName(result.candidates[index].name); setRegistrationConsent(false); }}>
             <ItemGroup className="gap-2">{result.candidates.map((candidate, index) => <Item asChild variant="outline" key={`${index}:${candidate.url}`}>
               <label className="cursor-pointer items-start">

@@ -1,5 +1,7 @@
 import * as React from "react"
 import { cn } from "@/lib/utils"
+import { Button } from "@/components/ui/button"
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 
 function MessageGroup({ className, ...props }: React.ComponentProps<"div">) {
   return (
@@ -81,7 +83,21 @@ function MessageFooter({ className, ...props }: React.ComponentProps<"div">) {
   )
 }
 
+function MessageAction({ label, children, ...props }: React.ComponentProps<typeof Button> & { label: string }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button type="button" variant="ghost" size="icon-sm" aria-label={label} {...props}>
+          {children}
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent>{label}</TooltipContent>
+    </Tooltip>
+  )
+}
+
 export {
+  MessageAction,
   MessageGroup,
   Message,
   MessageAvatar,

@@ -269,7 +269,7 @@ async fn search_inner(
         Ok(Some(key)) if !key.trim().is_empty() && key.len() <= 4096 => SearchSecret(key),
         Ok(_) => return Ok(WebSearchResult::empty(
             WebSearchStatus::NeedsConfiguration,
-            "Configure a Brave Search API key in Settings (sources.brave); no search was performed",
+            "Configure a Brave Search API key in Settings → Skills → 联网搜索; no search was performed",
         )),
         Err(_) => {
             return Ok(WebSearchResult::empty(

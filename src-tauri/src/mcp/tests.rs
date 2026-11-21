@@ -52,6 +52,25 @@ fn fixture() -> (tempfile::TempDir, McpServers, Settings, ToolContext) {
     (dir, servers, settings, context)
 }
 
+fn playwright_v2_args() -> Vec<String> {
+    [
+        "--yes",
+        "@playwright/mcp@0.0.85",
+        "--headless",
+        "--isolated",
+        "--no-webmcp",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn assert_playwright_windows_args(args: &[String]) {
+    let mut expected = playwright_v2_args();
+    expected.push("--browser=msedge".into());
+    assert_eq!(args, expected);
+}
+
 #[test]
 fn sqlite_crud_presets_and_secret_references() {
     let (_dir, servers, settings, _) = fixture();
@@ -123,16 +142,11 @@ fn microsoft_mcp_presets_are_credential_free_and_preserve_existing_config() {
         playwright.command.as_deref(),
         Some(if cfg!(windows) { "npx.cmd" } else { "npx" })
     );
-    assert_eq!(
-        playwright.args,
-        [
-            "--yes",
-            "@playwright/mcp@0.0.85",
-            "--headless",
-            "--isolated",
-            "--no-webmcp"
-        ]
-    );
+    if cfg!(windows) {
+        assert_playwright_windows_args(&playwright.args);
+    } else {
+        assert_eq!(playwright.args, playwright_v2_args());
+    }
     assert!(playwright.env_secret_refs.is_empty() && playwright.bearer_secret_ref.is_none());
     assert!(!playwright.enabled && playwright.builtin);
     assert!(ConnectionConsent::after_user_confirmation(&playwright, false).is_err());
@@ -148,6 +162,8 @@ fn microsoft_mcp_presets_are_credential_free_and_preserve_existing_config() {
     assert_eq!(
         markitdown.args,
         [
+            "--default-index",
+            "https://pypi.tuna.tsinghua.edu.cn/simple",
             "--with",
             "azure-ai-contentunderstanding==1.2.0b3",
             "markitdown-mcp==0.0.1a8"
@@ -156,6 +172,141 @@ fn microsoft_mcp_presets_are_credential_free_and_preserve_existing_config() {
     assert!(markitdown.env_secret_refs.is_empty() && markitdown.bearer_secret_ref.is_none());
     assert!(!markitdown.enabled && markitdown.builtin);
     assert!(ConnectionConsent::after_user_confirmation(&markitdown, false).is_err());
+}
+
+#[test]
+fn markitdown_mirror_upgrade_is_one_time_and_requires_new_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.sqlite");
+    let old_args = vec![
+        "--with".to_string(),
+        "azure-ai-contentunderstanding==1.2.0b3".into(),
+        "markitdown-mcp==0.0.1a8".into(),
+    ];
+    let servers = McpServers::new(Db::open(&path).unwrap());
+    servers.seed_presets().unwrap();
+    let mut old = servers.get("markitdown").unwrap();
+    old.args.clone_from(&old_args);
+    old.enabled = true;
+    servers.update(&old).unwrap();
+    servers.remember_start(&old).unwrap();
+    servers
+        .db
+        .conn()
+        .pragma_update(None, "user_version", 1)
+        .unwrap();
+    drop(servers);
+
+    let servers = McpServers::new(Db::open(&path).unwrap());
+    let migrated = servers.get("markitdown").unwrap();
+    assert_eq!(
+        &migrated.args[..2],
+        &[
+            "--default-index",
+            "https://pypi.tuna.tsinghua.edu.cn/simple"
+        ]
+    );
+    assert_eq!(&migrated.args[2..], old_args.as_slice());
+    assert!(migrated.enabled && migrated.builtin);
+    assert!(servers.startup_requests().unwrap().is_empty());
+    servers.update(&old).unwrap(); // Explicit opt-out must survive another launch.
+    drop(servers);
+    let servers = McpServers::new(Db::open(&path).unwrap());
+    servers.seed_presets().unwrap();
+    assert_eq!(servers.get("markitdown").unwrap(), old);
+
+    // A v1 install with its own launcher must not be touched or lose its consent.
+    old.command = Some("my-uv-wrapper".into());
+    servers.update(&old).unwrap();
+    servers.remember_start(&old).unwrap();
+    servers
+        .db
+        .conn()
+        .pragma_update(None, "user_version", 1)
+        .unwrap();
+    drop(servers);
+    let servers = McpServers::new(Db::open(&path).unwrap());
+    assert_eq!(servers.get("markitdown").unwrap(), old);
+    assert_eq!(servers.startup_requests().unwrap(), ["markitdown"]);
+}
+
+#[test]
+fn playwright_v2_to_v3_migration_is_windows_only_invalidates_consent_and_runs_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("playwright-v2.sqlite");
+    let servers = McpServers::new(Db::open(&path).unwrap());
+    servers.seed_presets().unwrap();
+    let mut legacy = servers.get("playwright").unwrap();
+    legacy.args = playwright_v2_args();
+    legacy.enabled = true;
+    servers.update(&legacy).unwrap();
+    servers.remember_start(&legacy).unwrap();
+    servers
+        .db
+        .conn()
+        .pragma_update(None, "user_version", 2)
+        .unwrap();
+    drop(servers);
+
+    let servers = McpServers::new(Db::open(&path).unwrap());
+    let reopened = servers.get("playwright").unwrap();
+    if cfg!(windows) {
+        assert_playwright_windows_args(&reopened.args);
+        assert!(reopened.enabled && reopened.builtin);
+        assert!(servers.startup_requests().unwrap().is_empty());
+        assert!(ConnectionConsent::from_remembered(&servers, &reopened).is_err());
+
+        // After the one-time migration, an explicit return to the old arguments is respected.
+        let mut opted_out = reopened;
+        opted_out.args = playwright_v2_args();
+        servers.update(&opted_out).unwrap();
+        servers.remember_start(&opted_out).unwrap();
+        drop(servers);
+
+        let servers = McpServers::new(Db::open(&path).unwrap());
+        servers.seed_presets().unwrap();
+        assert_eq!(servers.get("playwright").unwrap(), opted_out);
+        assert_eq!(servers.startup_requests().unwrap(), ["playwright"]);
+        assert!(ConnectionConsent::from_remembered(&servers, &opted_out).is_ok());
+    } else {
+        assert_eq!(reopened, legacy);
+        assert!(servers.startup_requests().unwrap().is_empty()); // v4 changes the bare launcher.
+        assert!(ConnectionConsent::from_remembered(&servers, &reopened).is_err());
+    }
+}
+
+#[test]
+fn playwright_upgrades_preserve_edits_but_only_custom_launchers_retain_consent() {
+    let dir = tempfile::tempdir().unwrap();
+    for customization in ["name", "command", "args"] {
+        let path = dir.path().join(format!("{customization}.sqlite"));
+        let servers = McpServers::new(Db::open(&path).unwrap());
+        servers.seed_presets().unwrap();
+        let mut customized = servers.get("playwright").unwrap();
+        customized.args = playwright_v2_args();
+        match customization {
+            "name" => customized.name = "My Playwright".into(),
+            "command" => customized.command = Some("custom-npx.cmd".into()),
+            "args" => customized.args.push("--browser=firefox".into()),
+            _ => unreachable!(),
+        }
+        customized.enabled = true;
+        servers.update(&customized).unwrap();
+        servers.remember_start(&customized).unwrap();
+        servers
+            .db
+            .conn()
+            .pragma_update(None, "user_version", 2)
+            .unwrap();
+        drop(servers);
+
+        let servers = McpServers::new(Db::open(&path).unwrap());
+        assert_eq!(servers.get("playwright").unwrap(), customized);
+        assert_eq!(
+            ConnectionConsent::from_remembered(&servers, &customized).is_ok(),
+            customization == "command"
+        );
+    }
 }
 
 #[test]
@@ -348,6 +499,7 @@ async fn connect_http(servers: &McpServers, settings: &Settings, url: &str, id: 
         settings,
         id,
         consent,
+        &McpRuntime::default(),
         &CancellationToken::new(),
     )
     .await
@@ -518,9 +670,16 @@ async fn redaction_expansion_cannot_bypass_result_size_limit() {
         .unwrap();
     servers.create(&config).unwrap();
     let consent = ConnectionConsent::after_user_confirmation(&config, false).unwrap();
-    let client = McpClient::connect(servers, &settings, &config.id, consent, &context.cancel)
-        .await
-        .unwrap();
+    let client = McpClient::connect(
+        servers,
+        &settings,
+        &config.id,
+        consent,
+        &McpRuntime::default(),
+        &context.cancel,
+    )
+    .await
+    .unwrap();
     let error = client
         .call_tool("echo", json!({}), &context.cancel)
         .await
@@ -551,11 +710,19 @@ async fn credential_backend_errors_do_not_expose_provider_details() {
     config.bearer_secret_ref = Some("mcp.failed.key".into());
     servers.create(&config).unwrap();
     let consent = ConnectionConsent::after_user_confirmation(&config, false).unwrap();
-    let error =
-        match McpClient::connect(servers, &settings, &config.id, consent, &context.cancel).await {
-            Err(error) => error,
-            Ok(_) => panic!("failed credential provider must prevent connection"),
-        };
+    let error = match McpClient::connect(
+        servers,
+        &settings,
+        &config.id,
+        consent,
+        &McpRuntime::default(),
+        &context.cancel,
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("failed credential provider must prevent connection"),
+    };
     assert!(!error.to_string().contains("mock-secret-value"));
     assert!(!format!("{error:?}").contains("mock-secret-value"));
     assert!(!serde_json::to_string(&error)
@@ -604,6 +771,7 @@ async fn disabled_and_stale_confirmations_cannot_connect() {
         &settings,
         &config.id,
         consent,
+        &McpRuntime::default(),
         &context.cancel
     )
     .await
@@ -612,7 +780,15 @@ async fn disabled_and_stale_confirmations_cannot_connect() {
     config.enabled = true;
     servers.update(&config).unwrap();
     assert!(matches!(
-        McpClient::connect(servers, &settings, &config.id, consent, &context.cancel).await,
+        McpClient::connect(
+            servers,
+            &settings,
+            &config.id,
+            consent,
+            &McpRuntime::default(),
+            &context.cancel
+        )
+        .await,
         Err(AppError::Conflict(_))
     ));
 }
@@ -655,6 +831,37 @@ async fn batch_registration_capacity_failure_leaves_no_mcp_namespace() {
     }
     client.disconnect_and_wait().await.unwrap();
     stop.cancel();
+}
+
+/// Opt-in native stdio smoke for the exact preset. Uses a disposable DB, does
+/// not read application credentials, and never invokes the conversion tool.
+#[tokio::test]
+#[ignore = "requires the prepared MCP runtime and MarkItDown dependencies (or network access)"]
+async fn live_markitdown_preset_initializes_and_lists_conversion_tool() {
+    let (dir, servers, settings, context) = fixture();
+    servers.seed_presets().unwrap();
+    servers.set_enabled("markitdown", true).unwrap();
+    let config = servers.get("markitdown").unwrap();
+    let consent = ConnectionConsent::after_user_confirmation(&config, true).unwrap();
+    let client = McpClient::connect(
+        servers,
+        &settings,
+        &config.id,
+        consent,
+        &McpRuntime::bundled(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/mcp-runtime/runtime.zip"),
+            dir.path().canonicalize().unwrap().join("runtime-cache"),
+        ),
+        &context.cancel,
+    )
+    .await
+    .unwrap();
+    let tools = client.list_tools(&context.cancel).await;
+    client.disconnect_and_wait().await.unwrap();
+    assert!(tools
+        .unwrap()
+        .iter()
+        .any(|tool| tool.remote_name == "convert_to_markdown"));
 }
 
 #[cfg(unix)]
@@ -701,6 +908,7 @@ async fn confirmed_stdio_mock_receives_keychain_secret_without_ambient_credentia
         &settings,
         &config.id,
         consent,
+        &McpRuntime::default(),
         &context.cancel,
     )
     .await
@@ -733,4 +941,196 @@ async fn confirmed_stdio_mock_receives_keychain_secret_without_ambient_credentia
         .status()
         .unwrap()
         .success());
+}
+
+#[tokio::test]
+async fn desktop_startup_restores_only_successful_connections_and_remembers_stop() {
+    use crate::mcp_connections::McpConnections;
+    let (_dir, servers, settings, ctx) = fixture();
+    let (url, stop, _) = mock_http("echo").await;
+    let (invalid_url, stop_invalid, _) = mock_http("duplicate").await;
+    let registry = ToolRegistry::default();
+    let connections = McpConnections::default();
+    for (id, url) in [
+        ("good", &url),
+        ("requires_key", &url),
+        ("never_started", &url),
+        ("bad_tools", &invalid_url),
+    ] {
+        let mut config = ServerConfig::http(id, id, url);
+        config.enabled = true;
+        if id == "requires_key" {
+            config.bearer_secret_ref = Some("mcp.test.key".into());
+            servers
+                .write_secret(&settings, "mcp.test.key", "secret")
+                .unwrap();
+        }
+        servers.create(&config).unwrap();
+        if id != "never_started" {
+            assert_eq!(
+                connections
+                    .connect(settings.clone(), &registry, config, false)
+                    .await
+                    .is_ok(),
+                id != "bad_tools"
+            );
+        }
+    }
+    drop((connections, registry, servers, settings));
+    let db = Db::open(&ctx.engine.paths.db_file()).unwrap();
+    let servers = McpServers::new(db.clone());
+    // Simulate a new desktop session, this time without the external key available.
+    let settings = Settings::with_secret_store(db, Arc::new(MockSecrets::default()));
+    let connections = McpConnections::default();
+    let registry = ToolRegistry::default();
+    assert_eq!(
+        servers.startup_requests().unwrap(),
+        ["good", "requires_key"]
+    );
+    connections
+        .restore_requested(&settings, &registry, || {})
+        .await;
+    let list = connections.list().await;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].server_id, "good");
+    assert_eq!(list[0].tools.len(), 1);
+    assert!(registry.get(&list[0].tools[0]).is_ok());
+    // A transient failure does not lose intent, and stopping it even while offline works.
+    assert_eq!(
+        servers.startup_requests().unwrap(),
+        ["good", "requires_key"]
+    );
+    for id in ["good", "requires_key"] {
+        connections
+            .disconnect(&registry, &servers, id)
+            .await
+            .unwrap();
+    }
+    assert!(servers.startup_requests().unwrap().is_empty());
+    assert!(registry.get(&list[0].tools[0]).is_err());
+    connections
+        .restore_requested(&settings, &registry, || {})
+        .await;
+    assert!(connections.list().await.is_empty());
+    stop.cancel();
+    stop_invalid.cancel();
+}
+
+#[tokio::test]
+async fn startup_stdio_requires_unchanged_acknowledged_configuration() {
+    use crate::mcp_connections::McpConnections;
+    let (_dir, servers, settings, _) = fixture();
+    let fixture_script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/mock_stdio.py");
+    let python = if cfg!(windows) { "py" } else { "python3" };
+    let mut config = ServerConfig::stdio(
+        "local_tool",
+        "mock",
+        python,
+        vec![fixture_script.to_string_lossy().into_owned()],
+    );
+    config.enabled = true;
+    servers.create(&config).unwrap();
+    assert!(matches!(
+        McpConnections::default()
+            .connect(
+                settings.clone(),
+                &ToolRegistry::default(),
+                config.clone(),
+                false
+            )
+            .await,
+        Err(AppError::Denied(_))
+    ));
+    assert!(servers.startup_requests().unwrap().is_empty());
+    assert!(ConnectionConsent::from_remembered(&servers, &config).is_err());
+    // Only the bundled, offline fixture is launched. A fresh manager must register its tool again.
+    let first = McpConnections::default();
+    let registry = ToolRegistry::default();
+    first
+        .connect(settings.clone(), &registry, config.clone(), true)
+        .await
+        .unwrap();
+    drop((first, registry));
+    let restored = McpConnections::default();
+    let registry = ToolRegistry::default();
+    restored
+        .restore_requested(&settings, &registry, || {})
+        .await;
+    assert_eq!(restored.list().await.len(), 1);
+    assert_eq!(registry.definitions().len(), 1);
+    drop((restored, registry));
+    assert!(ConnectionConsent::from_remembered(&servers, &config).is_ok());
+    // Even bypassing the normal desktop edit path cannot transfer consent to different arguments.
+    servers
+        .db
+        .conn()
+        .execute(
+            "UPDATE mcp_servers SET args_json='[]' WHERE id=?1",
+            [&config.id],
+        )
+        .unwrap();
+    assert!(
+        ConnectionConsent::from_remembered(&servers, &servers.get(&config.id).unwrap()).is_err()
+    );
+    servers.update(&config).unwrap();
+    assert!(servers.startup_requests().unwrap().is_empty());
+    servers.remember_start(&config).unwrap();
+    servers.set_enabled(&config.id, false).unwrap();
+    servers.set_enabled(&config.id, true).unwrap();
+    assert!(servers.startup_requests().unwrap().is_empty());
+    servers.remember_start(&config).unwrap();
+    servers.remove(&config.id).unwrap();
+    servers.create(&config).unwrap();
+    assert!(servers.startup_requests().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn stopping_during_startup_cancels_without_registering_or_remembering_again() {
+    use crate::mcp_connections::McpConnections;
+    let (_dir, servers, settings, _) = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut config = ServerConfig::http(
+        "slow",
+        "slow",
+        &format!("http://{}/mcp", listener.local_addr().unwrap()),
+    );
+    config.enabled = true;
+    servers.create(&config).unwrap();
+    servers.remember_start(&config).unwrap();
+    let connections = McpConnections::default();
+    let registry = ToolRegistry::default();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            connections.restore_requested(&settings, &registry, || {}),
+            async {
+                let (_socket, _) = listener.accept().await.unwrap();
+                connections
+                    .disconnect(&registry, &servers, "slow")
+                    .await
+                    .unwrap();
+            }
+        );
+    })
+    .await
+    .unwrap();
+    assert!(servers.startup_requests().unwrap().is_empty());
+    assert!(connections.list().await.is_empty());
+    assert!(registry.definitions().is_empty());
+}
+
+#[test]
+fn migrating_enabled_legacy_server_does_not_grant_startup_consent() {
+    let (_dir, servers, _, ctx) = fixture();
+    let mut config = ServerConfig::stdio("legacy", "legacy", "unused", vec![]);
+    config.enabled = true;
+    servers.create(&config).unwrap();
+    servers
+        .db
+        .conn()
+        .execute("ALTER TABLE mcp_servers DROP COLUMN startup_digest", [])
+        .unwrap();
+    let reopened = McpServers::new(Db::open(&ctx.engine.paths.db_file()).unwrap());
+    assert_eq!(reopened.get("legacy").unwrap(), config);
+    assert!(reopened.startup_requests().unwrap().is_empty());
 }

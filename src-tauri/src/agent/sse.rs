@@ -4,7 +4,8 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 const MAX_FRAME: usize = 2 * 1024 * 1024;
-const MAX_COMPLETION: usize = 16 * 1024 * 1024;
+pub(super) const MAX_COMPLETION: usize = 16 * 1024 * 1024;
+const MAX_TOOL_CALLS: usize = 64;
 
 #[derive(Default)]
 pub struct SseDecoder {
@@ -73,9 +74,88 @@ pub struct Completion {
 pub struct Delta {
     pub content: String,
     pub reasoning: String,
-    pub usage: Option<Value>,
 }
 impl Completion {
+    pub(super) fn from_json(body: &[u8]) -> AppResult<Self> {
+        #[derive(Deserialize)]
+        struct Response {
+            choices: Option<[Choice; 1]>, // We request a single completion (n = 1).
+            usage: Option<Value>,
+            error: Option<Value>,
+        }
+        #[derive(Deserialize)]
+        struct Choice {
+            #[serde(default)]
+            index: usize,
+            finish_reason: String,
+            message: Message,
+        }
+        #[derive(Deserialize)]
+        struct Message {
+            role: String,
+            content: Option<String>,
+            reasoning_content: Option<String>,
+            reasoning: Option<String>,
+            tool_calls: Option<Vec<Call>>,
+        }
+        #[derive(Deserialize)]
+        struct Call {
+            id: String,
+            #[serde(rename = "type")]
+            kind: String,
+            function: Function,
+        }
+        #[derive(Deserialize)]
+        struct Function {
+            name: String,
+            arguments: String,
+        }
+        let response: Response = serde_json::from_slice(body)?;
+        if let Some(error) = response.error {
+            return Err(AppError::Other(format!("模型服务返回错误\n{error:#}")));
+        }
+        let [choice] = response
+            .choices
+            .ok_or_else(|| AppError::Invalid("模型回复缺少 choices".into()))?;
+        let message = choice.message;
+        if choice.index != 0 || message.role != "assistant" {
+            return Err(AppError::Invalid("模型回复不是预期的助手消息".into()));
+        }
+        let mut completion = Self {
+            content: message.content.unwrap_or_default(),
+            reasoning: message
+                .reasoning_content
+                .or(message.reasoning)
+                .unwrap_or_default(),
+            usage: response.usage,
+            finish_reason: Some(choice.finish_reason),
+            done: true,
+            ..Self::default()
+        };
+        let calls = message.tool_calls.unwrap_or_default();
+        if calls.len() > MAX_TOOL_CALLS {
+            return Err(AppError::Invalid("工具调用数量超过限制".into()));
+        }
+        for (index, call) in calls.into_iter().enumerate() {
+            if call.kind != "function" {
+                return Err(AppError::Invalid("不支持的工具调用类型".into()));
+            }
+            completion.calls.insert(
+                index as u64,
+                ToolCall {
+                    id: call.id,
+                    name: call.function.name,
+                    arguments: call.function.arguments,
+                },
+            );
+        }
+        completion.validate()?;
+        if completion.calls.is_empty() && completion.content.is_empty() {
+            return Err(AppError::Invalid("模型未返回回复正文或工具调用".into()));
+        }
+        Ok(completion)
+    }
+
     pub fn accept(&mut self, data: &str) -> AppResult<Delta> {
         if self.done {
             return Err(AppError::Invalid("SSE 在结束后继续发送数据".into()));
@@ -95,7 +175,6 @@ impl Completion {
         let mut delta = Delta::default();
         if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
             self.usage = Some(usage.clone());
-            delta.usage = Some(usage.clone());
         }
         for choice in value["choices"].as_array().into_iter().flatten() {
             if choice["index"].as_u64().unwrap_or(0) != 0 {
@@ -116,7 +195,7 @@ impl Completion {
             for call in d["tool_calls"].as_array().into_iter().flatten() {
                 let index = call["index"]
                     .as_u64()
-                    .filter(|i| *i < 64)
+                    .filter(|i| *i < MAX_TOOL_CALLS as u64)
                     .ok_or_else(|| AppError::Invalid("tool_calls index 无效".into()))?;
                 let partial = self.calls.entry(index).or_insert_with(|| ToolCall {
                     id: String::new(),
@@ -146,18 +225,19 @@ impl Completion {
         }
         Ok(delta)
     }
-    pub fn calls(&self) -> AppResult<Vec<ToolCall>> {
+    pub(super) fn validate(&self) -> AppResult<()> {
         if !self.done {
             return Err(AppError::Invalid("模型流意外断开，工具不会执行".into()));
         }
-        if !matches!(self.finish_reason.as_deref(), Some("stop" | "tool_calls")) {
-            let reason = self.finish_reason.as_deref().unwrap_or("缺失");
-            return Err(AppError::Invalid(format!(
-                "模型回复未完整结束，工具不会执行 (finish_reason = {reason})"
-            )));
-        }
-        if !self.calls.is_empty() && self.finish_reason.as_deref() != Some("tool_calls") {
-            return Err(AppError::Invalid("工具调用未完整结束".into()));
+        match self.finish_reason.as_deref().unwrap_or("缺失") {
+            "stop" if self.calls.is_empty() => (),
+            "tool_calls" if !self.calls.is_empty() => (),
+            "stop" | "tool_calls" => return Err(AppError::Invalid("工具调用未完整结束".into())),
+            reason => {
+                return Err(AppError::Invalid(format!(
+                    "模型回复未完整结束，工具不会执行 (finish_reason = {reason})"
+                )))
+            }
         }
         let mut ids = std::collections::HashSet::new();
         for c in self.calls.values() {
@@ -173,6 +253,10 @@ impl Completion {
                 return Err(AppError::Invalid("工具参数必须为 JSON 对象".into()));
             }
         }
+        Ok(())
+    }
+    pub fn calls(&self) -> AppResult<Vec<ToolCall>> {
+        self.validate()?;
         Ok(self.calls.values().cloned().collect())
     }
 }
@@ -180,6 +264,22 @@ impl Completion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn buffered_completion_requires_matching_finish_reason_and_valid_calls() {
+        use serde_json::json;
+        let call =
+            json!({"type":"function","id":"one","function":{"name":"read_file","arguments":"{}"}});
+        for (finish, calls) in [
+            ("stop", vec![call.clone()]),
+            ("tool_calls", vec![]),
+            ("length", vec![call.clone()]),
+            ("tool_calls", vec![call.clone(), call.clone()]),
+            ("tool_calls", vec![call; MAX_TOOL_CALLS + 1]),
+        ] {
+            let body = json!({"choices":[{"finish_reason":finish,"message":{"role":"assistant","content":"text","tool_calls":calls}}]});
+            assert!(Completion::from_json(body.to_string().as_bytes()).is_err());
+        }
+    }
     #[test]
     fn splits_utf8_crlf_comments_and_multiline_frames() {
         let input = ": heartbeat\r\ndata: 你好\r\ndata: again\r\n\r\ndata: [DONE]\n\n";

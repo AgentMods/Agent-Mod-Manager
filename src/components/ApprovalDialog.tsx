@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { CheckIcon, ShieldCheckIcon, XIcon } from "lucide-react";
 import { api } from "../lib/api";
-import { isQuestionRequest, pendingApprovals, replayConversation, useAgent } from "../lib/agent-store";
+import { pendingApproval, replayConversation, useAgent } from "../lib/agent-store";
 import type { AgentEvent, FilePlan } from "../lib/types";
 import { PlanPreview } from "./PlanDialog";
 import { ErrorState, Modal } from "./ui";
@@ -15,8 +15,8 @@ function findPlan(value: unknown): FilePlan | null {
 }
 
 export function ApprovalDialog() {
-  const streams = useAgent((s) => s.streams);
-  const pending = pendingApprovals(streams).find((event) => !isQuestionRequest(event));
+  const milestones = useAgent((s) => s.milestones);
+  const pending = useMemo(() => pendingApproval(milestones), [milestones]);
   return pending ? <Approval key={String(pending.payload.approvalId)} event={pending}/> : null;
 }
 function Approval({event}: {event: AgentEvent}) {

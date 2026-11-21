@@ -2,13 +2,13 @@ use crate::games;
 use crate::sources::{
     resolutions::{resolution_id as parse_resolution_id, ResolutionResult, ResolutionScope},
     DependencyGraph, DependencyGraphRequest, ResolveRequest, SearchQuery, SearchResult, SourceKeys,
-    SourceStatus, Sources, VersionListRequest, VersionListResult,
+    Sources, VersionListRequest, VersionListResult,
 };
 use crate::{
     app::AppServices,
     error::{AppError, AppResult},
     plugins, snapshot,
-    transaction::{FileEngine, FileOp, FilePlan},
+    transaction::{FileOp, FilePlan},
     trash,
 };
 use tauri::{AppHandle, State};
@@ -98,6 +98,7 @@ pub async fn mcp_create(
     state: State<'_, AppServices>,
     config: crate::mcp::ServerConfig,
 ) -> AppResult<()> {
+    crate::mcp_connections::require_external(&config.id)?;
     blocking(state.engine.clone(), move |e| {
         crate::mcp::McpServers::new(e.db).create(&config)
     })
@@ -109,14 +110,12 @@ pub async fn mcp_update(
     agent: State<'_, AgentRuntime>,
     config: crate::mcp::ServerConfig,
 ) -> AppResult<()> {
+    crate::mcp_connections::require_external(&config.id)?;
+    let servers = crate::mcp::McpServers::new(state.engine.db.clone());
     state
         .mcp_connections
-        .disconnect(&agent.registry, &config.id)
-        .await?;
-    blocking(state.engine.clone(), move |e| {
-        crate::mcp::McpServers::new(e.db).update(&config)
-    })
-    .await
+        .revoke(&agent.registry, &config.id, || servers.update(&config))
+        .await
 }
 #[tauri::command]
 pub async fn mcp_remove(
@@ -124,14 +123,12 @@ pub async fn mcp_remove(
     agent: State<'_, AgentRuntime>,
     id: String,
 ) -> AppResult<()> {
+    crate::mcp_connections::require_external(&id)?;
+    let servers = crate::mcp::McpServers::new(state.engine.db.clone());
     state
         .mcp_connections
-        .disconnect(&agent.registry, &id)
-        .await?;
-    blocking(state.engine.clone(), move |e| {
-        crate::mcp::McpServers::new(e.db).remove(&id)
-    })
-    .await
+        .revoke(&agent.registry, &id, || servers.remove(&id))
+        .await
 }
 #[tauri::command]
 pub async fn mcp_connect(
@@ -156,7 +153,18 @@ pub async fn mcp_disconnect(
     agent: State<'_, AgentRuntime>,
     id: String,
 ) -> AppResult<()> {
-    state.mcp_connections.disconnect(&agent.registry, &id).await
+    let servers = crate::mcp::McpServers::new(state.engine.db.clone());
+    state
+        .mcp_connections
+        .disconnect(&agent.registry, &servers, &id)
+        .await
+}
+#[tauri::command]
+pub async fn mcp_startup_requests(state: State<'_, AppServices>) -> AppResult<Vec<String>> {
+    blocking(state.engine.clone(), |e| {
+        crate::mcp::McpServers::new(e.db).startup_requests()
+    })
+    .await
 }
 #[tauri::command]
 pub async fn mcp_connections(
@@ -176,19 +184,21 @@ pub async fn mcp_server_status(
 #[tauri::command]
 pub async fn mcp_server_start(
     server: State<'_, crate::mcp_server::LocalMcpServer>,
+    state: State<'_, AppServices>,
     confirmation: String,
 ) -> AppResult<crate::mcp_server::McpServerStatus> {
     if confirmation != "START_LOCAL_MCP" {
         return Err(AppError::Denied("需在桌面确认开启本地 MCP 服务".into()));
     }
-    server.start().await
+    server.start_desktop(&state.mcp_connections).await
 }
 
 #[tauri::command]
 pub async fn mcp_server_stop(
     server: State<'_, crate::mcp_server::LocalMcpServer>,
+    state: State<'_, AppServices>,
 ) -> AppResult<()> {
-    server.stop().await
+    server.stop_desktop(&state.mcp_connections).await
 }
 
 #[tauri::command]
@@ -248,10 +258,6 @@ pub async fn resolve_modrinth_dependency_graph(
         .modrinth_dependency_graph(&request)
         .await
 }
-#[tauri::command]
-pub fn list_mod_sources(agent: State<'_, AgentRuntime>) -> AppResult<Vec<SourceStatus>> {
-    Ok(crate::agent::source_tools::sources(&agent.settings)?.statuses())
-}
 use crate::{
     agent::{
         approval::ApprovalResponse,
@@ -263,34 +269,58 @@ use crate::{
 };
 
 #[tauri::command]
-pub fn start_turn(state: State<'_, AgentRuntime>, request: TurnRequest) -> AppResult<String> {
-    state.start_turn(request)
+pub async fn start_turn(state: State<'_, AgentRuntime>, request: TurnRequest) -> AppResult<String> {
+    blocking(state.inner().clone(), move |agent| {
+        agent.start_turn(request)
+    })
+    .await
 }
 #[tauri::command]
-pub fn cancel_turn(
+pub async fn restart_turn(
+    state: State<'_, AgentRuntime>,
+    request: TurnRequest,
+    message_id: String,
+    edit: bool,
+) -> AppResult<String> {
+    blocking(state.inner().clone(), move |agent| {
+        agent.restart_turn(request, &message_id, edit)
+    })
+    .await
+}
+#[tauri::command]
+pub async fn cancel_turn(
     state: State<'_, AgentRuntime>,
     conversation_id: String,
     turn_id: String,
 ) -> AppResult<()> {
-    state.cancel_turn(&conversation_id, &turn_id)
+    blocking(state.inner().clone(), move |agent| {
+        agent.cancel_turn(&conversation_id, &turn_id)
+    })
+    .await
 }
 #[tauri::command]
-pub fn respond_approval(
+pub async fn respond_approval(
     state: State<'_, AgentRuntime>,
     conversation_id: String,
     approval_id: String,
     response: ApprovalResponse,
 ) -> AppResult<()> {
-    state.respond_approval(&conversation_id, &approval_id, response)
+    blocking(state.inner().clone(), move |agent| {
+        agent.respond_approval(&conversation_id, &approval_id, response)
+    })
+    .await
 }
 #[tauri::command]
-pub fn replay_agent_events(
+pub async fn replay_agent_events(
     state: State<'_, AgentRuntime>,
     conversation_id: String,
     after: i64,
     limit: usize,
 ) -> AppResult<Vec<AgentEvent>> {
-    state.events.replay(&conversation_id, after, limit)
+    blocking(state.events.clone(), move |events| {
+        events.replay(&conversation_id, after, limit)
+    })
+    .await
 }
 #[tauri::command]
 pub async fn create_conversation(
@@ -358,10 +388,10 @@ pub async fn set_conversation_pinned(
 }
 #[tauri::command]
 pub async fn delete_conversation(state: State<'_, AgentRuntime>, id: String) -> AppResult<()> {
-    let runtime = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || runtime.delete_conversation(&id))
-        .await
-        .map_err(|e| AppError::Other(e.to_string()))?
+    blocking(state.inner().clone(), move |agent| {
+        agent.delete_conversation(&id)
+    })
+    .await
 }
 #[tauri::command]
 pub async fn set_conversation_permission(
@@ -632,18 +662,18 @@ pub async fn launch_game(
     .await
 }
 
-async fn blocking<T: Send + 'static>(
-    engine: FileEngine,
-    work: impl FnOnce(FileEngine) -> AppResult<T> + Send + 'static,
+async fn blocking<S: Send + 'static, T: Send + 'static>(
+    state: S,
+    work: impl FnOnce(S) -> AppResult<T> + Send + 'static,
 ) -> AppResult<T> {
-    tauri::async_runtime::spawn_blocking(move || work(engine))
+    tauri::async_runtime::spawn_blocking(move || work(state))
         .await
         .map_err(|e| AppError::Other(e.to_string()))?
 }
 
 #[cfg(not(test))]
 #[tauri::command]
-pub(crate) fn get_bootstrap_state(
+pub(crate) async fn get_bootstrap_state(
     state: State<'_, AppServices>,
     agent: State<'_, AgentRuntime>,
     storage: State<'_, crate::storage_location::StorageLocation>,
@@ -741,6 +771,15 @@ pub async fn list_plugin_drafts(
 ) -> AppResult<Vec<crate::plugin_workflow::DraftInfo>> {
     blocking(state.engine.clone(), |e| {
         crate::plugin_workflow::list_drafts(&e)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_plugin_draft(state: State<'_, AppServices>, draft_id: String) -> AppResult<()> {
+    // Desktop invokes this only after the user confirms this exact draft ID.
+    blocking(state.engine.clone(), move |engine| {
+        crate::plugin_workflow::delete_confirmed_draft(&engine, &draft_id)
     })
     .await
 }
@@ -925,14 +964,17 @@ pub async fn plan_file_ops(
 
 #[tauri::command]
 pub async fn get_file_plan(state: State<'_, AppServices>, plan_id: String) -> AppResult<FilePlan> {
-    blocking(state.engine.clone(), move |e| e.get_plan(&plan_id)).await
+    blocking(state.engine.for_local_agent(), move |e| {
+        e.get_plan(&plan_id)
+    })
+    .await
 }
 
 /// Desktop confirmation endpoint. Agent tools must use the separate approval
 /// coordinator and may not invoke this IPC endpoint.
 #[tauri::command]
 pub async fn apply_plan(state: State<'_, AppServices>, plan_id: String) -> AppResult<FilePlan> {
-    blocking(state.engine.clone(), move |e| {
+    blocking(state.engine.for_local_agent(), move |e| {
         e.approve_plan(&plan_id)?;
         let result = e.apply_file_ops(&plan_id)?;
         crate::install::reconcile(&e.db)?;
@@ -1012,7 +1054,7 @@ pub async fn rollback_transaction(
     state: State<'_, AppServices>,
     transaction_id: String,
 ) -> AppResult<()> {
-    blocking(state.engine.clone(), move |e| {
+    blocking(state.engine.for_local_agent(), move |e| {
         e.rollback_transaction(&transaction_id)?;
         crate::install::reconcile(&e.db)?;
         crate::plugin_workflow::reconcile_deployments(&e)?;

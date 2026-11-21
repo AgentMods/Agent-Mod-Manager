@@ -1,5 +1,6 @@
 use super::config::{McpServers, McpTransport, ServerConfig};
 use super::redaction::ConnectionSecrets;
+use super::McpRuntime;
 use crate::{
     error::{AppError, AppResult},
     settings::Settings,
@@ -23,7 +24,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio_util::sync::CancellationToken;
 
 pub const MAX_TOOLS: usize = 128;
@@ -33,17 +34,78 @@ pub const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 pub const MAX_RESULT_BYTES: usize = 1024 * 1024;
 pub const MAX_ARGUMENT_BYTES: usize = 256 * 1024;
 pub const MAX_WIRE_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// For stdio, the initialize deadline also covers anything the launcher must
+/// install before an MCP server exists. This never extends tool call timeouts.
+#[derive(Clone, Copy)]
+struct StartupBudget {
+    timeout: Duration,
+    hint: &'static str,
+    launcher_env: &'static [(&'static str, &'static str)],
+}
+
+impl StartupBudget {
+    const HTTP: Self = Self {
+        timeout: Duration::from_secs(20),
+        hint: "请检查服务地址和网络连接。",
+        launcher_env: &[],
+    };
+
+    fn stdio(command: &str) -> Self {
+        let executable = std::path::Path::new(command)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if ["uvx", "uvx.exe"]
+            .iter()
+            .any(|s| executable.eq_ignore_ascii_case(s))
+        {
+            return Self {
+                timeout: Duration::from_secs(600),
+                // Fixed non-secret tuning, not inherited UV_* (indexes may contain credentials).
+                launcher_env: &[("UV_HTTP_TIMEOUT", "120"), ("UV_CONCURRENT_DOWNLOADS", "4")],
+                hint: "uvx 首次启动可能需要下载 Python 和依赖包，请检查网络和 uv 缓存。",
+            };
+        }
+        let is_npx = ["npx", "npx.cmd", "npx.exe"]
+            .iter()
+            .any(|s| executable.eq_ignore_ascii_case(s));
+        Self {
+            timeout: Duration::from_secs(120),
+            launcher_env: &[],
+            hint: if is_npx {
+                "npx 首次启动可能需要下载 npm 包，请检查网络和 npm 缓存。"
+            } else {
+                "请确认命令和参数正确，且服务使用 stdio 传输。"
+            },
+        }
+    }
+}
+
 /// A single-use, non-serializable confirmation of this exact configuration.
-/// Create only in trusted UI/IPC code after displaying its complete contents.
+/// Created by trusted desktop code after confirmation, or by matching its saved digest.
 /// Never expose this constructor as an Agent tool or infer it from enabled=true.
 pub struct ConnectionConsent {
     config: ServerConfig,
 }
 
 impl ConnectionConsent {
+    pub(crate) fn from_remembered(servers: &McpServers, config: &ServerConfig) -> AppResult<Self> {
+        config.validate()?;
+        if !config.enabled
+            || servers.startup_digest(&config.id)?.as_deref()
+                != Some(&config.confirmation_digest()?[..])
+        {
+            return Err(AppError::Denied(
+                "此 MCP 配置没有自动启动授权，请重新确认".into(),
+            ));
+        }
+        Ok(Self {
+            config: config.clone(),
+        })
+    }
+
     pub fn after_user_confirmation(
         config: &ServerConfig,
         accepts_unsandboxed_stdio: bool,
@@ -109,6 +171,7 @@ impl McpClient {
         settings: &Settings,
         id: &str,
         consent: ConnectionConsent,
+        runtime: &McpRuntime,
         cancel: &CancellationToken,
     ) -> AppResult<Self> {
         let config = servers.get(id)?;
@@ -152,14 +215,17 @@ impl McpClient {
                     .build()
                     .map_err(|_| AppError::Other("Cannot initialize MCP HTTP client".into()))?;
                 let transport = StreamableHttpClientTransport::with_client(http, transport_config);
-                let service = bounded(cancel, CONNECT_TIMEOUT, ().serve(transport)).await?;
+                let service =
+                    bounded_startup(cancel, StartupBudget::HTTP, ().serve(transport)).await?;
                 (service, None, secrets)
             }
             McpTransport::Stdio => {
-                let mut command = Command::new(config.command.as_ref().unwrap());
+                let executable = config.command.as_deref().unwrap();
+                let budget = StartupBudget::stdio(executable);
+                let mut command = runtime.command(executable, cancel).await?;
                 command
                     .args(&config.args)
-                    .env_clear()
+                    .envs(budget.launcher_env.iter().copied())
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     // Never forward credential-bearing stderr into application logs.
@@ -167,7 +233,6 @@ impl McpClient {
                     .kill_on_drop(true);
                 // No ambient API keys, shell startup configuration or loader hooks.
                 for key in [
-                    "PATH",
                     "HOME",
                     "USERPROFILE",
                     "SYSTEMROOT",
@@ -186,9 +251,13 @@ impl McpClient {
                     resolved_secrets.push(value);
                 }
                 let secrets = ConnectionSecrets::new(resolved_secrets)?;
-                let mut child = command
-                    .spawn()
-                    .map_err(|_| AppError::Other("Cannot start confirmed MCP process".into()))?;
+                if cancel.is_cancelled() {
+                    return Err(AppError::Cancelled);
+                }
+                let mut child = command.spawn().map_err(|err| AppError::Other(match err.kind() {
+                    std::io::ErrorKind::NotFound => "找不到 MCP 启动程序。请确认已安装，并在应用的 PATH 中，或将命令设置为绝对路径。",
+                    _ => "无法启动 MCP 进程，请检查启动程序及其执行权限。",
+                }.into()))?;
                 let stdout = child
                     .stdout
                     .take()
@@ -199,7 +268,7 @@ impl McpClient {
                     .ok_or_else(|| AppError::Other("Missing MCP stdin".into()))?;
                 let transport = AsyncRwTransport::<RoleClient, _, _>::new(stdout, stdin)
                     .with_max_line_length(MAX_WIRE_MESSAGE_BYTES);
-                let service = bounded(cancel, CONNECT_TIMEOUT, ().serve(transport)).await?;
+                let service = bounded_startup(cancel, budget, ().serve(transport)).await?;
                 (service, Some(child), secrets)
             }
         };
@@ -441,6 +510,21 @@ async fn bounded<T, E>(
     }
 }
 
+async fn bounded_startup<T, E>(
+    cancel: &CancellationToken,
+    budget: StartupBudget,
+    operation: impl Future<Output = Result<T, E>>,
+) -> AppResult<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(AppError::Cancelled),
+        result = tokio::time::timeout(budget.timeout, operation) => match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_)) => Err(AppError::Other(format!("MCP 启动握手失败。{}未调用任何工具。", budget.hint))),
+            Err(_) => Err(AppError::Other(format!("MCP 启动超时（{} 秒）。{}未调用任何工具。", budget.timeout.as_secs(), budget.hint))),
+        }
+    }
+}
 pub fn namespaced_tool_name(server: &str, tool: &str) -> String {
     fn readable(s: &str) -> String {
         s.bytes()
@@ -468,6 +552,62 @@ pub fn namespaced_tool_name(server: &str, tool: &str) -> String {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    #[test]
+    fn cold_start_budget_only_extends_uvx_launches() {
+        for command in ["uvx", "uvx.exe", "/tools/UVX.EXE"] {
+            let budget = StartupBudget::stdio(command);
+            assert_eq!(budget.timeout, Duration::from_secs(600));
+            assert_eq!(
+                budget.launcher_env,
+                &[("UV_HTTP_TIMEOUT", "120"), ("UV_CONCURRENT_DOWNLOADS", "4")]
+            );
+            assert!(budget.hint.contains("uvx"));
+            assert!(!budget.hint.contains("npx"));
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            StartupBudget::stdio(r"C:\Program Files\uv\uvx.exe").timeout,
+            Duration::from_secs(600)
+        );
+        for command in ["npx", "npx.cmd", "my-uvx", "/uvx/python"] {
+            let budget = StartupBudget::stdio(command);
+            assert_eq!(budget.timeout, Duration::from_secs(120));
+            assert!(budget.launcher_env.is_empty());
+            assert_eq!(budget.hint.contains("npx"), command.starts_with("npx"));
+        }
+        assert_eq!(StartupBudget::HTTP.timeout, Duration::from_secs(20));
+    }
+
+    #[tokio::test]
+    async fn startup_reports_timeout_separately_from_failure_and_cancellation() {
+        let cancel = CancellationToken::new();
+        let budget = StartupBudget {
+            timeout: Duration::from_millis(2),
+            ..StartupBudget::stdio("uvx")
+        };
+        let hung = std::future::pending::<Result<(), &str>>();
+        let timeout = bounded_startup(&cancel, budget, hung)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(timeout.contains("超时") && timeout.contains("uvx") && !timeout.contains("npx"));
+        let failed = async { Err::<(), _>("private-token") };
+        let error = bounded_startup(&cancel, budget, failed)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("握手失败")
+                && !error.contains("超时")
+                && !error.contains("private-token")
+        );
+        cancel.cancel();
+        assert!(matches!(
+            bounded_startup(&cancel, budget, async { Ok::<_, ()>(()) }).await,
+            Err(AppError::Cancelled)
+        ));
+    }
 
     #[tokio::test]
     async fn timeout_and_preexisting_cancellation_are_bounded_without_remote_error_leaks() {

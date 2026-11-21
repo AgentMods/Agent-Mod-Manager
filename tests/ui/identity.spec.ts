@@ -6,7 +6,7 @@ async function openIdentity(page: Page) {
   await page.goto('/');
   await page.getByRole('button', {name: '游戏库', exact: true}).click();
   await page.getByLabel('游戏目录', {exact: true}).fill('/sandbox/unknown-game');
-  await page.getByRole('button', {name: '检查目录', exact: true}).click();
+  await page.getByRole('button', {name: '检查单个游戏', exact: true}).click();
   await page.getByRole('button', {name: '联网识别', exact: true}).click();
   const modal = page.getByRole('dialog', {name: '联网识别游戏', exact: true});
   await expect(modal.getByLabel('公开搜索词', {exact: true})).toHaveValue('FixtureGame.exe game');

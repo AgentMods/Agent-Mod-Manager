@@ -1,8 +1,7 @@
 use crate::error::{AppError, AppResult};
 use std::path::{Path, PathBuf};
 
-/// Root of every path the manager owns. Nothing outside this (or a registered
-/// game root) may ever be written by the file engine.
+/// Manager-owned paths and the protected locations shared by filesystem callers.
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub root: PathBuf,
@@ -80,16 +79,24 @@ impl AppPaths {
         self.backups().join("snapshots").join(game).join(id)
     }
 
-    /// Roots that the file engine is allowed to write into. Game roots are
-    /// appended by the caller from the `games` table.
+    /// Managed roots for scoped callers and for classifying Agent transactions.
     pub fn managed_roots(&self, game_roots: &[PathBuf]) -> Vec<PathBuf> {
         let mut roots = vec![self.root.clone()];
         roots.extend(game_roots.iter().cloned());
         roots
     }
 
-    /// Resolve a user/agent supplied path and assert it lands in a managed root.
+    /// The default path policy, including for inbound MCP, remains managed-only.
     pub fn guard(&self, target: &Path, game_roots: &[PathBuf]) -> AppResult<PathBuf> {
+        self.guard_file_path(target, game_roots, false)
+    }
+
+    pub(crate) fn guard_file_path(
+        &self,
+        target: &Path,
+        game_roots: &[PathBuf],
+        local_agent: bool,
+    ) -> AppResult<PathBuf> {
         self.stable_directory(&self.root)?;
         let mut roots = vec![self.root.clone()];
         for root in game_roots {
@@ -102,22 +109,30 @@ impl AppPaths {
                 )));
             }
         }
-        let resolved = crate::paths::ensure_within(target, &roots)?;
+        let resolved = if local_agent {
+            crate::paths::canonicalize_lenient(target)?
+        } else {
+            crate::paths::ensure_within(target, &roots)?
+        };
         if self
             .control_root
             .as_ref()
-            .is_some_and(|root| crate::paths::overlaps(&resolved, root))
-            || resolved.starts_with(self.root.join("private"))
-            || resolved
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n == ".env" || n.starts_with(".env."))
+            .is_some_and(|root| crate::paths::contains_path(root, &resolved))
+            || crate::paths::contains_path(&self.root.join("private"), &resolved)
+            || resolved.components().any(|c| Self::env_name(c.as_os_str()))
         {
             return Err(AppError::Denied(
                 "凭据目录和 .env 不可通过文件或 Agent 工具访问".into(),
             ));
         }
         Ok(resolved)
+    }
+
+    pub(crate) fn env_name(name: &std::ffi::OsStr) -> bool {
+        name.to_str().is_some_and(|name| {
+            let name = name.to_ascii_lowercase();
+            name == ".env" || name.starts_with(".env.")
+        })
     }
 
     pub fn stable_directory(&self, directory: &Path) -> AppResult<()> {

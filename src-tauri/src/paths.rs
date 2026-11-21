@@ -36,7 +36,8 @@ pub fn canonicalize_lenient(p: &Path) -> AppResult<PathBuf> {
         Err(e) => return Err(e.into()),
     }
     let mut resolved = PathBuf::new();
-    for component in absolute.components() {
+    let mut components = absolute.components().peekable();
+    while let Some(component) = components.next() {
         match component {
             Component::Prefix(_) | Component::RootDir => resolved.push(component.as_os_str()),
             Component::CurDir => {}
@@ -60,7 +61,18 @@ pub fn canonicalize_lenient(p: &Path) -> AppResult<PathBuf> {
                 match std::fs::symlink_metadata(&resolved) {
                     // canonicalize must succeed for an existing link, including
                     // links whose targets have missing components.
-                    Ok(_) => resolved = resolved.canonicalize()?,
+                    Ok(_) => {
+                        resolved = resolved.canonicalize()?;
+                        // Windows may report a child of a regular file as NotFound,
+                        // which would otherwise be mistaken for a creatable tail.
+                        if components.peek().is_some() && !std::fs::metadata(&resolved)?.is_dir() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::NotADirectory,
+                                format!("{} 不是目录", resolved.display()),
+                            )
+                            .into());
+                        }
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
                 }
@@ -76,22 +88,23 @@ pub fn is_within(child: &Path, root: &Path) -> bool {
 }
 
 /// Compare canonical directory paths, including absent destinations under an existing parent.
-pub(crate) fn overlaps(left: &Path, right: &Path) -> bool {
-    fn contains(child: &Path, parent: &Path) -> bool {
-        if !cfg!(windows) {
-            return child.starts_with(parent);
-        }
-        let mut parts = child.components();
-        parent.components().all(|expected| {
-            parts.next().is_some_and(|actual| {
-                actual
-                    .as_os_str()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy())
-            })
-        })
+pub(crate) fn contains_path(parent: &Path, child: &Path) -> bool {
+    if !cfg!(windows) {
+        return child.starts_with(parent);
     }
-    contains(left, right) || contains(right, left)
+    let mut parts = child.components();
+    parent.components().all(|expected| {
+        parts.next().is_some_and(|actual| {
+            actual
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&expected.as_os_str().to_string_lossy())
+        })
+    })
+}
+
+pub(crate) fn overlaps(left: &Path, right: &Path) -> bool {
+    contains_path(right, left) || contains_path(left, right)
 }
 
 /// Validate that a target path stays inside one of the allowed roots.

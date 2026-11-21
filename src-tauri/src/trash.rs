@@ -44,6 +44,12 @@ pub(crate) struct TrashDraft {
     manifest: TrashItem,
 }
 
+impl TrashDraft {
+    pub(crate) fn id(&self) -> &str {
+        &self.manifest.id
+    }
+}
+
 /// Build trash moves and metadata without recording a plan or acquiring the write lock.
 /// Call before taking the DB connection; path validation reads through the engine.
 pub(crate) fn prepare_trash(engine: &FileEngine, req: &TrashRequest) -> AppResult<Vec<TrashDraft>> {

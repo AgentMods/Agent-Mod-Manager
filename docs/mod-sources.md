@@ -220,9 +220,10 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked --lib \
 
 ## 3DM API v3
 
-Configure the **3DM API Key** in Settings (`sources.3dm`). The direct adapter uses
-only `https://mod.3dmgame.com/api/v3/mods` and `/mods/<id>`, with the raw key in
-the sensitive `Authorization` header, not in a URL or `Bearer` prefix. Redirects
+Configure new 3DM connections under **MCP 服务** in Settings. The direct adapter
+can still read an existing `sources.3dm` credential. It uses only
+`https://mod.3dmgame.com/api/v3/mods` and `/mods/<id>`, with the raw key in the
+sensitive `Authorization` header, not in a URL or `Bearer` prefix. Redirects
 are disabled for API requests. The shared HTTP cache isolates credential scopes
 and applies the existing rate limit and response-size limits.
 

@@ -23,9 +23,12 @@ const structured = {
   ],
 };
 
-test("questionnaire walks steps, keeps draft answers, and submits ordered choices and skips", async ({page}) => {
-  await installMockTauri(page, {askUser: {preview: structured}});
+test("questionnaire walks steps, keeps draft answers, and submits ordered choices and skips", async ({page}, testInfo) => {
+  const theme = testInfo.project.name === "desktop-1280" ? "light" : "dark";
+  await page.emulateMedia({colorScheme: theme});
+  await installMockTauri(page, {askUser: {preview: structured, deferResult: true}});
   await askAgent(page);
+  await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
   const card = page.getByRole("region", {name: title});
   await expect(card).toBeVisible();
   await expect(page.getByRole("dialog", {name: "Agent 等待你的回答"})).toHaveCount(0);
@@ -49,17 +52,32 @@ test("questionnaire walks steps, keeps draft answers, and submits ordered choice
   await expect(input).toBeVisible();
   expect(await responses(page)).toEqual([]);
   await card.getByRole("button", {name: "跳过", exact: true}).click();
-  await expect(card.getByRole("status")).toHaveText("已提交回答");
   await expect.poll(() => responses(page)).toEqual([expect.objectContaining({args: expect.objectContaining({
     response: {approved: true, answer: JSON.stringify(["Windows PC", "已验证 Game.exe", null])},
   })})]);
 
+  const trace = page.getByRole("button", {name: "已询问 3 个问题", exact: true});
+  const details = page.locator("dl").filter({hasText: structured.questions[0].question});
+  await expect(trace).toHaveAttribute("aria-expanded", "false");
+  await expect(details).not.toBeVisible();
+  await trace.focus();
+  await trace.press("Enter");
+  await expect(trace).toHaveAttribute("aria-expanded", "true");
+  await expect(details.locator("dt")).toHaveText(structured.questions.map(({question}) => question));
+  await expect(details.locator("dd")).toHaveText(["Windows PC", "已验证 Game.exe", "已跳过"]);
+
+  await page.evaluate(() => (window as any).__AMM_TEST__.publishQuestionResult());
+  await expect(page.getByText("回答已提交。")).toBeVisible();
+  await expect(trace).toHaveAttribute("aria-expanded", "true");
+  await page.reload();
   const conversation = page.getByRole("button", {name: /^(新对话|帮我确认游戏适配信息)$/});
-  await page.getByRole("button", {name: "新建对话", exact: true}).click();
-  await expect(card).toHaveCount(0);
   await conversation.click();
-  await expect(card.getByRole("status")).toHaveText("已提交回答");
-  await expect(card.getByRole("radio")).toHaveCount(0);
+  await expect(trace).toHaveAttribute("aria-expanded", "false");
+  await trace.click();
+  await expect(details.locator("dt")).toHaveText(structured.questions.map(({question}) => question));
+  await expect(details.locator("dd")).toHaveText(["Windows PC", "已验证 Game.exe", "已跳过"]);
+  await expect(card).toHaveCount(0);
+  await expect(details).toBeInViewport({ratio: 0.95});
 });
 
 test("legacy question uses a single inline text step and submits a plain answer", async ({page}) => {
@@ -70,7 +88,11 @@ test("legacy question uses a single inline text step and submits a plain answer"
   await expect(card.getByRole("radio")).toHaveCount(0);
   await card.getByRole("textbox", {name: "填写回答"}).fill("D:/Games/Test");
   await card.getByRole("button", {name: "提交回答"}).click();
-  await expect(card.getByRole("status")).toHaveText("已提交回答");
+  const trace = page.getByRole("button", {name: "已询问 1 个问题", exact: true});
+  await expect(trace).toHaveAttribute("aria-expanded", "false");
+  await trace.click();
+  await expect(page.locator("dt")).toHaveText("请输入安装目录。");
+  await expect(page.locator("dd")).toHaveText("D:/Games/Test");
   await expect.poll(() => responses(page)).toEqual([expect.objectContaining({args: expect.objectContaining({
     response: {approved: true, answer: "D:/Games/Test"},
   })})]);
@@ -82,7 +104,10 @@ test("cancelling a turn disables its unfinished questionnaire", async ({page}) =
   const card = page.getByRole("region", {name: title});
   await expect(card.getByRole("button", {name: "跳过"})).toBeVisible();
   await page.getByRole("button", {name: "停止生成"}).click();
-  await expect(card.getByRole("status")).toHaveText(/已结束|已取消/);
-  await expect(card.getByRole("button", {name: "跳过"})).toHaveCount(0);
+  const trace = page.getByRole("button", {name: /已询问 3 个问题.*已取消/});
+  await expect(trace).toHaveAttribute("aria-expanded", "false");
+  await trace.click();
+  await expect(page.locator("dd")).toHaveText(["未回答", "未回答", "未回答"]);
+  await expect(card).toHaveCount(0);
   expect(await responses(page)).toEqual([]);
 });

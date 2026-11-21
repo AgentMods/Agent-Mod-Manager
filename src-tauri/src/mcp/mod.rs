@@ -4,10 +4,12 @@ pub mod bridge;
 pub mod client;
 pub mod config;
 mod redaction;
+mod runtime;
 
 pub use bridge::McpAgentTool;
 pub use client::{ConnectionConsent, McpClient, McpTool};
 pub use config::{McpServers, McpTransport, ServerConfig};
+pub use runtime::McpRuntime;
 
 #[cfg(test)]
 mod tests;

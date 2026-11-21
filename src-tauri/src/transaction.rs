@@ -15,6 +15,9 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
+// Stored only by the native desktop Agent planner, never taken from tool input.
+const LOCAL_AGENT_FILES: &str = "local_agent_files";
+
 static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 pub(crate) fn write_lock() -> MutexGuard<'static, ()> {
     lock()
@@ -33,15 +36,19 @@ pub enum FileOp {
     Copy { src: PathBuf, dst: PathBuf },
     Move { src: PathBuf, dst: PathBuf },
     Mkdir { dst: PathBuf },
+    WriteText { dst: PathBuf, content: String },
 }
 
 impl FileOp {
     pub fn dst(&self) -> &Path {
         match self {
-            Self::Copy { dst, .. } | Self::Move { dst, .. } | Self::Mkdir { dst } => dst,
+            Self::Copy { dst, .. }
+            | Self::Move { dst, .. }
+            | Self::Mkdir { dst }
+            | Self::WriteText { dst, .. } => dst,
         }
     }
-    fn src(&self) -> Option<&Path> {
+    pub(crate) fn src(&self) -> Option<&Path> {
         match self {
             Self::Copy { src, .. } | Self::Move { src, .. } => Some(src),
             _ => None,
@@ -52,6 +59,7 @@ impl FileOp {
             Self::Copy { .. } => "copy",
             Self::Move { .. } => "move",
             Self::Mkdir { .. } => "mkdir",
+            Self::WriteText { .. } => "write_text",
         }
     }
 }
@@ -64,6 +72,10 @@ pub struct Fingerprint {
 }
 
 pub(crate) fn fingerprint(path: &Path) -> AppResult<Option<Fingerprint>> {
+    fingerprint_checked(path, false)
+}
+
+fn fingerprint_checked(path: &Path, protect_descendants: bool) -> AppResult<Option<Fingerprint>> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -95,6 +107,14 @@ pub(crate) fn fingerprint(path: &Path) -> AppResult<Option<Fingerprint>> {
             .path()
             .strip_prefix(path)
             .map_err(|e| AppError::Invalid(e.to_string()))?;
+        if protect_descendants
+            && (AppPaths::env_name(entry.file_name())
+                || entry.file_name().eq_ignore_ascii_case(".amm-retained"))
+        {
+            return Err(AppError::Denied(
+                "目录含受保护的 .env 文件或事务保留目录".into(),
+            ));
+        }
         let fp = fingerprint_leaf(entry.path())?;
         digest.update(serde_json::to_vec(&(rel, &fp))?);
         size += fp.size;
@@ -233,6 +253,7 @@ type RenameHook = Box<dyn Fn(&JournalRename) + Send + Sync>;
 pub struct FileEngine {
     pub db: Db,
     pub paths: Arc<AppPaths>,
+    local_agent_files: bool,
     #[cfg(test)]
     fail_before: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -246,6 +267,7 @@ impl FileEngine {
         Self {
             db,
             paths: Arc::new(paths),
+            local_agent_files: false,
             #[cfg(test)]
             fail_before: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             #[cfg(test)]
@@ -253,6 +275,32 @@ impl FileEngine {
             #[cfg(test)]
             before_rename: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn for_local_agent(&self) -> Self {
+        Self {
+            local_agent_files: true,
+            ..self.clone()
+        }
+    }
+
+    /// Apply and undo use the recorded scope, never broader authority just because
+    /// today's caller is the desktop Agent. Old/managed plans stay managed.
+    fn for_transaction(&self, kind: &str) -> AppResult<Self> {
+        if kind == LOCAL_AGENT_FILES && !self.local_agent_files {
+            return Err(AppError::Denied(
+                "此文件事务只能由桌面 Agent 或本地用户操作".into(),
+            ));
+        }
+        Ok(Self {
+            local_agent_files: kind == LOCAL_AGENT_FILES,
+            ..self.clone()
+        })
+    }
+
+    pub(crate) fn resolve_file_path(&self, path: &Path) -> AppResult<PathBuf> {
+        self.paths
+            .guard_file_path(path, &self.roots()?, self.local_agent_files)
     }
 
     #[cfg(test)]
@@ -267,6 +315,15 @@ impl FileEngine {
             conn.prepare("SELECT root_path FROM games UNION SELECT path FROM game_user_roots")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0).map(PathBuf::from))?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub(crate) fn has_external_paths(&self, plan: &FilePlan) -> AppResult<bool> {
+        let roots = self.paths.managed_roots(&self.roots()?);
+        Ok(plan.entries.iter().any(|entry| {
+            std::iter::once(entry.operation.dst())
+                .chain(entry.operation.src())
+                .any(|path| !roots.iter().any(|root| path.starts_with(root)))
+        }))
     }
 
     pub fn retained_paths(&self) -> AppResult<Vec<PathBuf>> {
@@ -292,17 +349,36 @@ impl FileEngine {
         let root = roots
             .iter()
             .filter(|r| path.starts_with(r))
-            .max_by_key(|r| r.components().count())
-            .ok_or_else(|| AppError::PathEscape(path.display().to_string()))?;
-        if root == &self.paths.root {
-            Ok(self.paths.backup_dir(id).join(name))
-        } else {
-            Ok(root.join(".amm-retained").join(id).join(name))
+            .max_by_key(|r| r.components().count());
+        match root {
+            Some(r) if r == &self.paths.root => Ok(self.paths.backup_dir(id).join(name)),
+            Some(r) => Ok(r.join(".amm-retained").join(id).join(name)),
+            // Place staging/undo on the target volume, not at a drive root (which
+            // need not be writable) or inside a directory the plan will create.
+            None if self.local_agent_files => path
+                .ancestors()
+                .skip(1)
+                .find(|p| p.is_dir())
+                .map(|p| p.join(".amm-retained").join(id).join(name))
+                .ok_or_else(|| AppError::Invalid("外部路径没有可用的父目录".into())),
+            None => Err(AppError::PathEscape(path.display().to_string())),
         }
     }
 
     fn guard(&self, path: &Path, internal: bool) -> AppResult<PathBuf> {
-        let target = self.paths.guard(path, &self.roots()?)?;
+        let roots = self.roots()?;
+        let target = self
+            .paths
+            .guard_file_path(path, &roots, self.local_agent_files)?;
+        if !internal
+            && self.local_agent_files
+            && !target.starts_with(&self.paths.root)
+            && self.paths.overlaps_storage(&target)
+        {
+            return Err(AppError::Denied(
+                "不能移动或覆盖管理器存储目录及其上级目录".into(),
+            ));
+        }
         if !internal
             && (target.starts_with(self.paths.downloads())
                 || target.starts_with(self.paths.staging()))
@@ -319,10 +395,9 @@ impl FileEngine {
             ));
         }
         if !internal
-            && self
-                .roots()?
-                .iter()
-                .any(|r| target.starts_with(r.join(".amm-retained")))
+            && target
+                .components()
+                .any(|c| c.as_os_str().eq_ignore_ascii_case(".amm-retained"))
         {
             return Err(AppError::Denied("不能修改事务保留目录".into()));
         }
@@ -344,8 +419,7 @@ impl FileEngine {
             }
         }
         if !internal
-            && self
-                .roots()?
+            && roots
                 .iter()
                 .filter_map(|r| paths::canonicalize_lenient(r).ok())
                 .any(|root| root.starts_with(&target))
@@ -381,8 +455,20 @@ impl FileEngine {
         internal: bool,
     ) -> AppResult<FilePlan> {
         let guard = lock();
-        let plan = self.build_locked_plan(&guard, ops, summary, internal)?;
-        Self::persist_plan(&self.db.conn(), &plan, internal)?;
+        let mut plan = self.build_locked_plan(&guard, ops, summary, internal)?;
+        if self.local_agent_files
+            && !internal
+            && (plan
+                .entries
+                .iter()
+                .any(|e| matches!(e.operation, FileOp::WriteText { .. }))
+                || self.has_external_paths(&plan)?)
+        {
+            plan.requires_review = true;
+            Self::persist_plan_kind(&self.db.conn(), &plan, LOCAL_AGENT_FILES)?;
+        } else {
+            Self::persist_plan(&self.db.conn(), &plan, internal)?;
+        }
         Ok(plan)
     }
 
@@ -405,16 +491,41 @@ impl FileEngine {
             ));
         }
         let mut entries = Vec::new();
+        // Inline text is part of the immutable plan and journal, so bound the total,
+        // not just each entry. No staging file is written while planning.
+        let mut text_bytes = 0usize;
         let mut total_bytes = 0;
         let mut touched: Vec<PathBuf> = Vec::new();
         for op in ops {
+            let inline_source = if let FileOp::WriteText { content, .. } = &op {
+                if !self.local_agent_files || internal {
+                    return Err(AppError::Denied(
+                        "只有桌面 Agent 的通用文件计划支持 write_text".into(),
+                    ));
+                }
+                text_bytes = text_bytes.saturating_add(content.len());
+                if text_bytes > 1024 * 1024 {
+                    return Err(AppError::Invalid("单个计划的文本内容不能超过 1 MiB".into()));
+                }
+                Some(Fingerprint {
+                    kind: "file".into(),
+                    size: content.len() as u64,
+                    sha256: util::sha256_reader(&mut content.as_bytes())?,
+                })
+            } else {
+                None
+            };
             let dst = self.guard(op.dst(), internal)?;
             let src = op.src().map(|p| self.guard(p, internal)).transpose()?;
             let before = fingerprint(&dst)?;
             let source = src
                 .as_ref()
-                .map(|s| fingerprint(s)?.ok_or_else(|| AppError::NotFound(s.display().to_string())))
-                .transpose()?;
+                .map(|s| {
+                    fingerprint_checked(s, self.local_agent_files && !internal)?
+                        .ok_or_else(|| AppError::NotFound(s.display().to_string()))
+                })
+                .transpose()?
+                .or(inline_source);
             if let Some(src) = &src {
                 if dst.starts_with(src) || src.starts_with(&dst) {
                     return Err(AppError::Conflict("源路径与目标路径不能互相包含".into()));
@@ -458,6 +569,7 @@ impl FileEngine {
                     dst,
                 },
                 FileOp::Mkdir { .. } => FileOp::Mkdir { dst },
+                FileOp::WriteText { content, .. } => FileOp::WriteText { dst, content },
             };
             total_bytes += source.as_ref().map_or(0, |s| s.size);
             let impact = if before.is_some() {
@@ -505,9 +617,17 @@ impl FileEngine {
         plan: &FilePlan,
         internal: bool,
     ) -> AppResult<()> {
+        Self::persist_plan_kind(conn, plan, if internal { "internal" } else { "files" })
+    }
+
+    fn persist_plan_kind(
+        conn: &rusqlite::Connection,
+        plan: &FilePlan,
+        kind: &str,
+    ) -> AppResult<()> {
         conn.execute(
             "INSERT INTO file_transactions (id,kind,status,summary,plan_json,created_at) VALUES (?1,?2,'planned',?3,?4,?5)",
-            params![plan.id, if internal { "internal" } else { "files" }, plan.summary, serde_json::to_string(plan)?, plan.created_at],
+            params![plan.id, kind, plan.summary, serde_json::to_string(plan)?, plan.created_at],
         )?;
         Ok(())
     }
@@ -533,8 +653,8 @@ impl FileEngine {
             .db
             .conn()
             .query_row(
-                "SELECT plan_json FROM file_transactions WHERE id=?1",
-                [id],
+                "SELECT plan_json FROM file_transactions WHERE id=?1 AND (kind != ?2 OR ?3)",
+                params![id, LOCAL_AGENT_FILES, self.local_agent_files],
                 |r| r.get(0),
             )
             .optional()?
@@ -545,8 +665,8 @@ impl FileEngine {
     /// Called only by the trusted approval coordinator, never registered as a tool.
     pub fn approve_plan(&self, id: &str) -> AppResult<()> {
         let changed = self.db.conn().execute(
-            "UPDATE file_transactions SET status='approved' WHERE id=?1 AND status='planned'",
-            [id],
+            "UPDATE file_transactions SET status='approved' WHERE id=?1 AND status='planned' AND (kind != ?2 OR ?3)",
+            params![id, LOCAL_AGENT_FILES, self.local_agent_files],
         )?;
         if changed != 1 {
             return Err(AppError::Conflict("计划不存在或不再等待审批".into()));
@@ -555,7 +675,14 @@ impl FileEngine {
     }
 
     pub fn apply_file_ops(&self, id: &str) -> AppResult<FilePlan> {
-        let _guard = lock();
+        self.apply_locked(&lock(), id)
+    }
+
+    pub(crate) fn apply_locked(
+        &self,
+        _guard: &MutexGuard<'static, ()>,
+        id: &str,
+    ) -> AppResult<FilePlan> {
         let interrupted:i64=self.db.conn().query_row("SELECT count(*) FROM file_transactions WHERE status IN ('applying','rolling_back','recovery_failed')",[],|r|r.get(0))?;
         if interrupted > 0 {
             return Err(AppError::Denied(
@@ -570,11 +697,17 @@ impl FileEngine {
         if status != "approved" {
             return Err(AppError::Denied("计划尚未批准，或已执行".into()));
         }
+        self.for_transaction(&kind)?
+            .apply_approved(id, kind == "internal")
+    }
+
+    fn apply_approved(&self, id: &str, internal: bool) -> AppResult<FilePlan> {
         let plan = self.get_plan(id)?;
         crate::install::validate_apply(self, &plan)?;
+        crate::plugin_workflow::validate_deployment_source(self, &plan)?;
         let mut evidence = Vec::with_capacity(plan.entries.len());
         for e in &plan.entries {
-            self.stable_path(e.operation.dst(), kind == "internal")?;
+            self.stable_path(e.operation.dst(), internal)?;
             let original = e
                 .before
                 .as_ref()
@@ -587,7 +720,7 @@ impl FileEngine {
             }
             let mut source = None;
             if let Some(src) = e.operation.src() {
-                self.stable_path(src, kind == "internal")?;
+                self.stable_path(src, internal)?;
                 if matches!(e.operation, FileOp::Move { .. }) {
                     source = Some(require_identity(src)?);
                 }
@@ -754,12 +887,18 @@ impl FileEngine {
             FileOp::Move { src, .. } if src.is_dir() => util::copy_dir(src, &staged)?,
             FileOp::Move { src, .. } => util::atomic_copy(src, &staged)?,
             FileOp::Mkdir { .. } => safe_fs::create_dir(&staged)?,
+            FileOp::WriteText { content, .. } => {
+                use std::io::Write;
+                let mut output = safe_fs::create_new(&staged)?;
+                output.write_all(content.as_bytes())?;
+                output.sync_all()?;
+            }
         }
         let mut step =
             JournalRename::move_to(staged.clone(), op.dst().into(), require_identity(&staged)?);
         if !matches!(op, FileOp::Mkdir { .. }) {
             check_fingerprint(&staged, &journal.entry.source)?;
-            if matches!(op, FileOp::Move { .. }) {
+            if matches!(op, FileOp::Move { .. } | FileOp::WriteText { .. }) {
                 step.expected_content.clone_from(&journal.entry.source);
             }
         } else {
@@ -890,11 +1029,12 @@ impl FileEngine {
                 "此事务包含用户已确认永久清空的回收站项，不能回滚".into(),
             ));
         }
-        let (status, json): (String, String) = self.db.conn().query_row(
-            "SELECT status,journal_json FROM file_transactions WHERE id=?1",
+        let (status, kind, json): (String, String, String) = self.db.conn().query_row(
+            "SELECT status,kind,journal_json FROM file_transactions WHERE id=?1",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
+        let engine = self.for_transaction(&kind)?;
         if status == "rolled_back" {
             return Ok(());
         }
@@ -906,12 +1046,12 @@ impl FileEngine {
         }
         let mut journal: Vec<JournalEntry> = serde_json::from_str(&json)?;
         if status == "committed" {
-            if crate::install::validate_rollback(self, id)? {
-                self.validate_replacement_rollback_payloads(&journal)?;
+            if crate::install::validate_rollback(&engine, id)? {
+                engine.validate_replacement_rollback_payloads(&journal)?;
             }
-            self.validate_committed_rollback(&journal)?;
+            engine.validate_committed_rollback(&journal)?;
         }
-        self.rollback_locked(id, &mut journal)
+        engine.rollback_locked(id, &mut journal)
     }
 
     fn validate_committed_rollback(&self, journal: &[JournalEntry]) -> AppResult<()> {
@@ -1058,7 +1198,7 @@ impl FileEngine {
         };
         let mut recovered = Vec::new();
         for id in ids {
-            self.rollback_transaction(&id)?;
+            self.for_local_agent().rollback_transaction(&id)?;
             recovered.push(id);
         }
         Ok(recovered)

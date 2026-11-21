@@ -26,7 +26,7 @@ async function open(page: Page, remembered: Record<string, unknown> | null) {
     };
   }, {settings, remembered});
   await page.goto("/");
-  await page.getByRole("button", {name: "Agent 对话", exact: true}).click();
+  await page.getByRole("button", {name: "Agent", exact: true}).click();
 }
 
 const calls = (page: Page, command: string) =>
@@ -73,3 +73,4 @@ test("已删除的模型或思考等级不会被恢复", async ({page}) => {
   expect(request.model ?? null).toBe(null);
   expect(request.reasoningEffort).toBe(null);
 });
+

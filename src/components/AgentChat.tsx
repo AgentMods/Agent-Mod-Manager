@@ -1,21 +1,25 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import Markdown from "react-markdown";
+import Markdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { toast } from "sonner";
 import {
   BotIcon,
   CheckIcon,
   CircleCheckIcon,
   CircleDotIcon,
+  CopyIcon,
   FolderIcon,
   LoaderCircleIcon,
   MessageSquarePlusIcon,
+  PencilIcon,
+  RefreshCcwIcon,
   Settings2Icon,
   TriangleAlertIcon,
 } from "lucide-react";
 import { api, backendAvailable, useBackendQuery } from "@/lib/api";
-import { activeTurn, ensureAgentListeners, isQuestionRequest, replayConversation, useAgent } from "../lib/agent-store";
+import { activeTurn, isQuestionRequest, replayConversation, trackAgentTurn, useAgent } from "../lib/agent-store";
 import { useUI } from "../lib/store";
 import type { AgentEvent, AppSettings, ComposerPreferences, Conversation, Game, Message as ChatMessage, PermissionMode, ReasoningEffort } from "../lib/types";
 import { Badge, ErrorState } from "./ui";
@@ -23,7 +27,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Button } from "@/components/ui/button";
 import { CodeBlock, CodeBlockContent } from "@/components/ui/code-block";
-import { Message, MessageContent } from "@/components/ui/message";
+import { Message, MessageAction, MessageContent, MessageFooter } from "@/components/ui/message";
 import {
   Trace,
   TraceCollapsible,
@@ -37,9 +41,21 @@ import {
 import { cn } from "@/lib/utils";
 import { AgentComposer } from "./AgentComposer";
 import { AgentConversationList } from "./AgentConversationList";
-import { AgentQuestionnaire, questionStatus } from "./AgentQuestionnaire";
+import { AgentQuestionnaire, questionOutcome } from "./AgentQuestionnaire";
 
 const EMPTY_EVENTS: AgentEvent[] = [];
+const EMPTY_CONVERSATIONS: Conversation[] = [];
+
+function groupByMessage<T>(items: T[], messageId: (item: T) => string | null) {
+  const groups = new Map<string | null, T[]>();
+  for (const item of items) {
+    const id = messageId(item);
+    const group = groups.get(id);
+    if (group) group.push(item);
+    else groups.set(id, [item]);
+  }
+  return groups;
+}
 
 export function AgentChat() {
   const conversationId = useUI((s) => s.conversationId);
@@ -50,12 +66,16 @@ export function AgentChat() {
   const client = useQueryClient();
   const [composer, setComposer] = useState({ seed: adapterChat, text: adapterChat?.prompt ?? "" });
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const composerInput = useRef<HTMLTextAreaElement>(null);
+  const [edit, setEdit] = useState<{ conversationId: string; messageId: string; text: string } | null>(null);
   const [error, setError] = useState<unknown>(null);
   const [permission, setPermission] = useState<PermissionMode | "">("");
   const [effortSelection, setEffortSelection] = useState<{ model: string; level: ReasoningEffort } | null>(null);
   const [modelSelection, setModelSelection] = useState("");
   const stream = useAgent((s) => conversationId ? s.streams[conversationId] || EMPTY_EVENTS : EMPTY_EVENTS);
-  const turn = activeTurn(stream);
+  const milestones = useAgent((s) => conversationId ? s.milestones[conversationId] || EMPTY_EVENTS : EMPTY_EVENTS);
+  const turn = activeTurn(milestones);
   const conversations = useBackendQuery<Conversation[]>(["conversations", false], "list_conversations", { archived: false });
   const detail = useBackendQuery<{ conversation: Conversation; messages: ChatMessage[] }>(["conversation", conversationId], "get_conversation", { id: conversationId }, !!conversationId);
   const games = useBackendQuery<Game[]>(["games"], "list_games");
@@ -66,13 +86,14 @@ export function AgentChat() {
   const selectedModel = models.some((entry) => entry.id === modelSelection) ? modelSelection : model;
   const levels = models.find((entry) => entry.id === selectedModel)?.reasoning_levels ?? [];
   const selectedModelLabel = models.find((entry) => entry.id === selectedModel)?.display_name || selectedModel;
-  const latestUsage = [...stream].reverse().find((event) => event.kind === "usage")?.payload;
+  const latestUsage = useMemo(() => [...milestones].reverse().find((event) => event.kind === "usage")?.payload, [milestones]);
   const totalTokens = typeof latestUsage?.total_tokens === "number" ? latestUsage.total_tokens : undefined;
   const reasoningEffort = effortSelection && effortSelection.model === selectedModel && levels.includes(effortSelection.level)
     ? effortSelection.level : null;
   const end = useRef<HTMLDivElement>(null);
   const busy = submitting || !!turn;
-  const input = composer.text;
+  const activeEdit = edit?.conversationId === conversationId ? edit : null;
+  const input = activeEdit?.text ?? composer.text;
   const restoredPreferences = useRef(false);
 
   // Restore the last-used model, reasoning level and permission policy once per
@@ -94,39 +115,21 @@ export function AgentChat() {
   }, [adapterChat]);
 
   useEffect(() => {
-    if (!conversationId || !backendAvailable) return;
-    let disposed = false;
-    const refresh = () => replayConversation(conversationId).catch((failure) => { if (!disposed) setError(failure); });
-    void refresh();
-    const timer = setInterval(() => { void refresh(); }, 2000);
-    return () => { disposed = true; clearInterval(timer); };
-  }, [conversationId]);
-
-  useEffect(() => {
-    if (!turn && conversationId && stream.length) {
-      void client.invalidateQueries({ queryKey: ["conversation", conversationId] });
-      void client.invalidateQueries({ queryKey: ["conversations"] });
-      const authoring = stream.some((event) => event.kind === "tool-start" &&
-        ["write_plugin_draft", "install_plugin"].includes(String(event.payload.name)));
-      if (authoring) {
-        for (const key of ["plugin-drafts", "plugins", "game-adapter", "skills"]) {
-          void client.invalidateQueries({ queryKey: [key] });
-        }
-      }
-    }
-  }, [turn, conversationId, stream, client]);
-
-  useEffect(() => {
     end.current?.scrollIntoView({ block: "end", behavior: "auto" });
   }, [stream.length]);
 
-  const { messages, errors, unlinkedErrors } = useMemo(() => {
+  const { messages, visibleIds, errors, unlinkedErrors, streamingReplyId } = useMemo(() => {
     const all = (detail.data?.messages || []).map((message) => ({ ...message }));
     const byId = new Map(all.map((message) => [message.id, message]));
     const text = new Map<string, { content: string; reasoning: string }>();
     const lastReplyByTurn = new Map<string, string>();
     for (const event of stream) {
-      if (event.kind !== "delta" || !event.messageId) continue;
+      if (!event.messageId) continue;
+      if (event.kind === "reply-reset") {
+        text.set(event.messageId, { content: "", reasoning: "" });
+        continue;
+      }
+      if (event.kind !== "delta") continue;
       lastReplyByTurn.set(event.turnId, event.messageId);
       const accumulated = text.get(event.messageId) || { content: "", reasoning: "" };
       accumulated.content += typeof event.payload.content === "string" ? event.payload.content : "";
@@ -137,54 +140,87 @@ export function AgentChat() {
         all.push(message); byId.set(message.id, message);
       }
     }
-    for (const [id, value] of text) Object.assign(byId.get(id)!, value);
+    for (const [id, value] of text) {
+      const message = byId.get(id);
+      if (message) Object.assign(message, value);
+    }
     const messages = all.filter((message) => message.role === "user" || message.role === "assistant");
     const visibleIds = new Set(messages.map((message) => message.id));
     const errors = new Map<string, string>();
     const unlinkedErrors: { seq: number; message: string }[] = [];
-    for (const event of stream) {
+    for (const event of milestones) {
       if (event.kind !== "error" || typeof event.payload.message !== "string") continue;
       const id = event.messageId ?? lastReplyByTurn.get(event.turnId);
       if (id && visibleIds.has(id)) errors.set(id, event.payload.message);
       else unlinkedErrors.push({ seq: event.seq, message: event.payload.message });
     }
-    return { messages, errors, unlinkedErrors };
-  }, [detail.data, stream]);
+    return { messages, visibleIds, errors, unlinkedErrors, streamingReplyId: turn ? lastReplyByTurn.get(turn) : undefined };
+  }, [detail.data, stream, milestones, turn]);
 
-  function selectConversation(id: string | null) {
+  const selectConversation = useCallback((id: string | null) => {
     setConversation(id);
+    setEdit(null);
     setComposer({ seed: null, text: "" });
     setError(null);
+  }, [setConversation]);
+
+  function editMessage(message: ChatMessage) {
+    if (!conversationId || busy) return;
+    setEdit({ conversationId, messageId: message.id, text: message.content });
+    composerInput.current?.focus();
   }
 
-  async function send() {
-    if (!input.trim() || busy) return;
-    const content = input.trim();
+  async function send(content: string, options: { restart?: { messageId: string; edit: boolean }; questionnaire?: boolean } = {}) {
+    const { restart, questionnaire } = options;
+    if (busy || submittingRef.current || (!restart && !content) || archivedConversation) return false;
+    submittingRef.current = true;
     setSubmitting(true); setError(null);
+    // The native request may finish starting after the user opens a different chat.
+    let selectedAtSubmit = conversationId;
+    let started = false;
+    const stillSelected = () => useUI.getState().conversationId === selectedAtSubmit &&
+      useUI.getState().adapterChat === adapterChat;
     try {
-      await ensureAgentListeners();
       let id = conversationId;
       if (!id) {
         const conversation = await api<Conversation>("create_conversation", { title: "", gameId });
         id = conversation.id;
-        setConversation(id, true);
+        if (stillSelected()) {
+          setConversation(id, true);
+          selectedAtSubmit = id;
+        }
         void client.invalidateQueries({ queryKey: ["conversations"] });
       }
-      await replayConversation(id);
-      await api<string>("start_turn", { request: { conversationId: id, content, permissionMode: permission || null, model: selectedModel && selectedModel !== model ? selectedModel : null, reasoningEffort } });
+      const request = { conversationId: id, content, permissionMode: permission || null, model: selectedModel && selectedModel !== model ? selectedModel : null, reasoningEffort };
+      if (restart) {
+        id = await api<string>("restart_turn", { request, ...restart });
+        trackAgentTurn(id);
+      } else {
+        const turnId = await api<string>("start_turn", { request });
+        trackAgentTurn(id, turnId);
+      }
+      started = true;
       const remembered: ComposerPreferences = {
         model: selectedModel || null, reasoning_effort: reasoningEffort, permission_mode: permission || null,
       };
       client.setQueryData(["composer-preferences"], remembered);
       // Remembering the choice must never fail an already-started turn.
       api("set_composer_preferences", { preferences: remembered }).catch(() => undefined);
-      setConversation(id);
-      setComposer({ seed: adapterChat, text: "" });
+      if (stillSelected() && !questionnaire) {
+        setConversation(id);
+        setEdit(null);
+        if (!restart || restart.edit) setComposer({ seed: adapterChat, text: "" });
+      }
       await replayConversation(id);
       await client.invalidateQueries({ queryKey: ["conversation", id] });
       await client.invalidateQueries({ queryKey: ["conversations"] });
-    } catch (failure) { setError(failure); }
-    finally { setSubmitting(false); }
+    } catch (failure) {
+      if (questionnaire && !started) throw failure; // Keep the form and its answers available for retry.
+      if (useUI.getState().view === "agent" && stillSelected()) setError(failure);
+      else useUI.getState().notify(String(failure));
+    }
+    finally { submittingRef.current = false; setSubmitting(false); }
+    return started; // A failed refresh cannot undo a successfully started turn.
   }
 
   async function cancel() {
@@ -193,18 +229,27 @@ export function AgentChat() {
     catch (failure) { setError(failure); }
   }
 
-  const questions = stream.filter(isQuestionRequest).map((request) => ({
-    request, status: questionStatus(request, stream),
-  }));
-  const questionTools = new Set(questions.map(({ request }) => request.payload.toolCallId));
-  const answering = questions.some(({ status }) => !status);
-  const tools = stream.filter((event) => event.kind === "tool-start" && !questionTools.has(event.payload.toolCallId));
-  const renderQuestion = ({ request, status }: (typeof questions)[number]) => <AgentQuestionnaire
-    key={String(request.payload.approvalId)} request={request} status={status ?? (archivedConversation ? "对话已归档" : null)} />;
+  const archivedConversation = !!detail.data?.conversation.archived;
+  const { questions, answering, tools, toolsByMessage, questionsByMessage } = useMemo(() => {
+    const questions = milestones.filter(isQuestionRequest).map((request) => ({
+      request,
+      outcome: questionOutcome(request, milestones) ?? (archivedConversation ? { kind: "closed" as const, label: "对话已归档" } : null),
+    }));
+    const questionTools = new Set(questions.map(({ request }) => request.payload.toolCallId));
+    const tools = milestones.filter((event) => event.kind === "tool-start" && !questionTools.has(event.payload.toolCallId));
+    return {
+      questions, tools, answering: questions.some(({ outcome }) => !outcome),
+      toolsByMessage: groupByMessage(tools, (event) => event.messageId),
+      questionsByMessage: groupByMessage(questions, ({ request }) => request.messageId),
+    };
+  }, [milestones, archivedConversation]);
+  const renderQuestion = ({ request, outcome }: (typeof questions)[number]) => <AgentQuestionnaire
+    key={String(request.payload.approvalId)} request={request} outcome={outcome} turnBusy={busy}
+    onReanswer={backendAvailable && detail.data?.conversation.id === request.conversationId && !archivedConversation
+      ? (content) => send(content, { questionnaire: true }) : undefined} />;
   const title = detail.data?.conversation.title || "Agent 对话";
   const conversationGame = detail.data ? detail.data.conversation.game_id : gameId;
   const gameName = adapterChat?.label ?? (games.data?.find((game) => game.id === conversationGame)?.name || "全部游戏");
-  const archivedConversation = !!detail.data?.conversation.archived;
   const hasMessages = messages.length > 0 || unlinkedErrors.length > 0 || questions.length > 0;
 
   return <div className="agent-chat-shell flex h-full min-h-0 flex-col overflow-hidden bg-background md:flex-row">
@@ -223,7 +268,7 @@ export function AgentChat() {
           <MessageSquarePlusIcon data-icon="inline-start" />
           新建对话
         </Button>
-        <AgentConversationList conversations={conversations.data ?? []} selectedId={conversationId}
+        <AgentConversationList conversations={conversations.data ?? EMPTY_CONVERSATIONS} selectedId={conversationId}
           disabled={submitting} onSelect={selectConversation} />
         <div className="mt-auto hidden flex-col gap-2 border-t pt-3 md:flex">
           <div className="flex items-center gap-2 px-2 text-xs font-medium text-muted-foreground"><FolderIcon className="size-3.5" />工作区</div>
@@ -266,22 +311,32 @@ export function AgentChat() {
           {messages.map((message) => {
             const failure = errors.get(message.id);
             const isAssistant = message.role === "assistant";
-            const messageTools = tools.filter((event) => event.messageId === message.id);
+            const hasContent = Boolean(message.content.trim());
+            const canAct = backendAvailable && !!conversationId && !busy && !archivedConversation;
             return <Fragment key={message.id}>
               <article className={cn("chat-message", message.role)}>
                 <Message align={isAssistant ? "start" : "end"}>
                   <MessageContent className={cn(isAssistant ? "max-w-3xl" : "max-w-[min(80%,36rem)]")}>
-                    {message.reasoning && <ReasoningTrace reasoning={message.reasoning} streaming={busy && isAssistant} />}
+                    {message.reasoning && <ReasoningTrace reasoning={message.reasoning} streaming={message.id === streamingReplyId} />}
                     <Bubble variant={isAssistant ? "ghost" : "default"} align={isAssistant ? "start" : "end"} className={isAssistant ? "max-w-full" : undefined}>
                       <BubbleContent className={cn("markdown min-w-0 break-words", !isAssistant && "rounded-2xl px-4 py-2.5")}>
                         <div data-message-id={message.id} className="flex flex-col gap-3 [&_a]:text-primary [&_a]:underline [&_a]:underline-offset-4 [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:font-mono [&_code]:text-xs [&_ol]:list-decimal [&_ol]:pl-5 [&_p]:leading-relaxed [&_pre]:max-w-full [&_pre]:overflow-auto [&_pre]:rounded-md [&_pre]:border [&_pre]:bg-muted [&_pre]:p-3 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_table]:w-full [&_table]:border-collapse [&_td]:border [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:px-2 [&_th]:py-1 [&_th]:text-left [&_ul]:list-disc [&_ul]:pl-5">
-                          <Markdown remarkPlugins={[remarkGfm]} components={{ img: ({ alt }) => <span>{alt || "远程图片"}</span>, a: ({ children, href }) => href && /^https?:\/\//i.test(href) ? <a href={href} target="_blank" rel="noreferrer" onClick={(event) => { if (backendAvailable) { event.preventDefault(); void openUrl(href).catch(setError); } }}>{children}</a> : <span>{children}</span> }}>{message.content}</Markdown>
+                          <MessageMarkdown content={message.content} onError={setError} />
                         </div>
                       </BubbleContent>
                     </Bubble>
-                    {messageTools.map((event) => <ToolTrace key={event.seq} event={event} events={stream} />)}
-                    {questions.filter(({ request }) => request.messageId === message.id).map(renderQuestion)}
+                    {toolsByMessage.get(message.id)?.map((event) => <ToolTrace key={event.seq} event={event} events={milestones} />)}
+                    {questionsByMessage.get(message.id)?.map(renderQuestion)}
                     {isAssistant && <TurnError message={failure} />}
+                    {(hasContent || failure) && <MessageFooter className="mt-1" role="group" aria-label="消息操作">
+                      {hasContent && <CopyMessage content={message.content} />}
+                      {!isAssistant && hasContent && <MessageAction label="编辑消息" disabled={!canAct} onClick={() => editMessage(message)}>
+                        <PencilIcon aria-hidden="true" />
+                      </MessageAction>}
+                      {(isAssistant || failure) && <MessageAction label="重试" disabled={!canAct} onClick={() => void send("", { restart: { messageId: message.id, edit: false } })}>
+                        <RefreshCcwIcon aria-hidden="true" />
+                      </MessageAction>}
+                    </MessageFooter>}
                   </MessageContent>
                 </Message>
               </article>
@@ -289,8 +344,8 @@ export function AgentChat() {
             </Fragment>;
           })}
 
-          {tools.filter((event) => !messages.some((message) => message.id === event.messageId)).map((event) => <ToolTrace key={event.seq} event={event} events={stream} />)}
-          {questions.filter(({ request }) => !messages.some((message) => message.id === request.messageId)).map(renderQuestion)}
+          {tools.filter((event) => !event.messageId || !visibleIds.has(event.messageId)).map((event) => <ToolTrace key={event.seq} event={event} events={milestones} />)}
+          {questions.filter(({ request }) => !request.messageId || !visibleIds.has(request.messageId)).map(renderQuestion)}
           {unlinkedErrors.map(({ seq, message }) => <div className="chat-message" key={seq}><TurnError message={message} /></div>)}
           {busy && !answering && <Trace className="max-w-3xl"><TraceLine status="running"><TraceIcon><LoaderCircleIcon className="animate-spin" /></TraceIcon><TraceTitle>正在处理请求</TraceTitle></TraceLine></Trace>}
           <ErrorState error={error || detail.error} />
@@ -300,8 +355,16 @@ export function AgentChat() {
 
       <AgentComposer
         input={input}
-        onInputChange={(text) => setComposer({ seed: adapterChat, text })}
-        onSend={() => { void send(); }}
+        inputRef={composerInput}
+        onCancelEdit={activeEdit ? () => setEdit(null) : undefined}
+        onInputChange={(text) => {
+          if (activeEdit) setEdit({ ...activeEdit, text });
+          else setComposer({ seed: adapterChat, text });
+        }}
+        onSend={() => {
+          const text = input.trim();
+          if (text) void send(text, activeEdit ? { restart: { messageId: activeEdit.messageId, edit: true } } : undefined);
+        }}
         onCancel={turn ? () => { void cancel(); } : undefined}
         disabled={!backendAvailable || archivedConversation}
         busy={busy}
@@ -319,6 +382,41 @@ export function AgentChat() {
       />
     </section>
   </div>;
+}
+
+// React Markdown parses synchronously; skip unchanged history when the turn or draft changes.
+const MessageMarkdown = memo(function MessageMarkdown({ content, onError }: { content: string; onError: (error: unknown) => void }) {
+  const components = useMemo<Components>(() => ({
+    img: ({ alt }) => <span>{alt || "远程图片"}</span>,
+    a: ({ children, href }) => href && /^https?:\/\//i.test(href) ? <a href={href} target="_blank" rel="noreferrer" onClick={(event) => {
+      if (backendAvailable) {
+        event.preventDefault();
+        void openUrl(href).catch(onError);
+      }
+    }}>{children}</a> : <span>{children}</span>,
+  }), [onError]);
+  return <Markdown remarkPlugins={[remarkGfm]} components={components}>{content}</Markdown>;
+});
+
+function CopyMessage({ content }: { content: string }) {
+  const [copied, setCopied] = useState(false);
+  const reset = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => () => clearTimeout(reset.current), []);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      clearTimeout(reset.current);
+      reset.current = setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error("复制失败，请重试");
+    }
+  }
+
+  return <MessageAction label={copied ? "已复制" : "复制消息"} onClick={() => void copy()}>
+    {copied ? <CheckIcon aria-hidden="true" /> : <CopyIcon aria-hidden="true" />}
+  </MessageAction>;
 }
 
 function ReasoningTrace({ reasoning, streaming }: { reasoning: string; streaming: boolean }) {
@@ -353,7 +451,7 @@ function TurnError({ message }: { message?: string }) {
   </Alert>;
 }
 
-function ToolTrace({ event, events }: { event: AgentEvent; events: AgentEvent[] }) {
+const ToolTrace = memo(function ToolTrace({ event, events }: { event: AgentEvent; events: AgentEvent[] }) {
   const result = events.find((item) => item.kind === "tool-result" && item.payload.toolCallId === event.payload.toolCallId);
   const approval = events.find((item) => item.kind === "approval-request" && item.payload.toolCallId === event.payload.toolCallId);
   const resolved = approval && events.find((item) => item.kind === "approval-resolved" && item.payload.approvalId === approval.payload.approvalId);
@@ -364,7 +462,7 @@ function ToolTrace({ event, events }: { event: AgentEvent; events: AgentEvent[] 
   const pending = !!approval && !resolved && !result;
   const status = failed ? "error" : pending ? "pending" : !result && !denied ? "running" : undefined;
   const label = failed ? "执行失败" : denied ? "已拒绝" : pending ? "等待审批" : result ? "已执行" : "正在执行";
-  const payload = JSON.stringify({ arguments: event.payload.arguments, ...(result ? { result: result.payload.result } : {}) }, null, 2);
+  const payload = useMemo(() => JSON.stringify({ arguments: event.payload.arguments, ...(result ? { result: result.payload.result } : {}) }, null, 2), [event, result]);
   return <Trace>
     <TraceCollapsible defaultOpen={pending || failed}>
       <TraceCollapsibleTrigger>
@@ -381,6 +479,6 @@ function ToolTrace({ event, events }: { event: AgentEvent; events: AgentEvent[] 
       </TraceCollapsibleContent>
     </TraceCollapsible>
   </Trace>;
-}
+});
 
 export default AgentChat;

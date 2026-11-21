@@ -1,7 +1,8 @@
 import { lazy, Suspense, useEffect, useState } from "react";
 import { Gamepad2Icon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { backendAvailable, useBackendQuery } from "./lib/api";
-import { ensureAgentListeners } from "./lib/agent-store";
+import { syncAgentEvents } from "./lib/agent-store";
 import { useUI } from "./lib/store";
 import { t } from "./lib/i18n";
 import type { BootstrapState, PageName } from "./lib/types";
@@ -48,6 +49,17 @@ function useWideWindow() {
   return wide;
 }
 
+/** `null` means the user never chose, so the rail follows the window width. */
+const RAIL_KEY = "amm.sidebar";
+function storedRail(): boolean | null {
+  try { const stored = localStorage.getItem(RAIL_KEY); if (stored === "open" || stored === "closed") return stored === "open"; }
+  catch { /* Storage may be unavailable in a restricted webview. */ }
+  return null;
+}
+function storeRail(open: boolean) {
+  try { localStorage.setItem(RAIL_KEY, open ? "open" : "closed"); } catch { /* Keep the in-memory choice. */ }
+}
+
 function Loading({ children }: { children: string }) {
   return <div role="status" className="flex min-h-40 items-center justify-center gap-2 p-8 text-sm text-muted-foreground"><Spinner />{children}</div>;
 }
@@ -58,12 +70,24 @@ export default function App() {
   const theme = useUI((state) => state.theme);
   const toggleTheme = useUI((state) => state.toggleTheme);
   const notify = useUI((state) => state.notify);
+  const visibleConversation = useUI((state) => state.view === "agent" ? state.conversationId : null);
+  const client = useQueryClient();
   const bootstrap = useBackendQuery<BootstrapState>(["bootstrap"], "get_bootstrap_state");
   useEffect(() => { document.documentElement.dataset.theme = theme; document.documentElement.style.colorScheme = theme; }, [theme]);
-  useEffect(() => { void ensureAgentListeners().catch((error) => notify(String(error))); }, [notify]);
+  useEffect(() => syncAgentEvents(visibleConversation, (id, events) => {
+    void client.invalidateQueries({ queryKey: ["conversation", id] });
+    void client.invalidateQueries({ queryKey: ["conversations"] });
+    if (events.some((event) => event.kind === "tool-start" &&
+      ["write_plugin_draft", "install_plugin"].includes(String(event.payload.name)))) {
+      for (const key of ["plugin-drafts", "plugins", "game-adapter", "skills"]) {
+        void client.invalidateQueries({ queryKey: [key] });
+      }
+    }
+  }, (error) => notify(String(error))), [client, visibleConversation, notify]);
   const appName = t("app.name");
   const wide = useWideWindow();
-  const [railOpen, setRailOpen] = useState<boolean | null>(null);
+  const [railOpen, setRailOpen] = useState<boolean | null>(storedRail);
+  const changeRail = (open: boolean) => { setRailOpen(open); storeRail(open); };
 
   if (backendAvailable && bootstrap.isLoading && !bootstrap.data) return <div className="flex min-h-dvh items-center justify-center bg-background"><Loading>正在准备桌面服务…</Loading></div>;
   const automaticOnboarding = !!(bootstrap.data?.isFirstRun || bootstrap.data?.resumeOnboarding);
@@ -76,12 +100,12 @@ export default function App() {
   const Page = pages[view];
   const current = view === "detail" ? "游戏详情" : [...navigation, settingsItem].find((item) => item.id === view)?.label;
   const macos = backendAvailable && navigator.platform.startsWith("Mac");
-  return <SidebarProvider open={railOpen ?? wide} onOpenChange={setRailOpen} className="h-dvh min-h-0 overflow-hidden" style={{ "--sidebar-width": "13.5rem" } as React.CSSProperties}>
+  return <SidebarProvider open={railOpen ?? wide} onOpenChange={changeRail} className="h-dvh min-h-0 overflow-hidden" style={{ "--sidebar-width": "13.5rem" } as React.CSSProperties}>
     <Sidebar collapsible="icon" className="[&_[data-slot=sidebar-inner]]:bg-sidebar">
       <SidebarHeader className={cn("gap-0 p-3", macos && "pt-10")}>
         <SidebarMenu>
           <SidebarMenuItem>
-            <SidebarMenuButton size="lg" tooltip={appName} aria-label={appName} onClick={() => navigate("library")}>
+            <SidebarMenuButton size="lg" tooltip={appName} aria-label={appName} onClick={() => navigate("agent")}>
               <img src="/favicon.png" width={32} height={32} alt="" className="size-8 rounded-lg" />
               <span className="truncate text-sm font-semibold">{appName}</span>
             </SidebarMenuButton>

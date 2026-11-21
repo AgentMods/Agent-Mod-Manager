@@ -5,6 +5,7 @@ import { api, errorText } from "@/lib/api";
 import { useUI } from "@/lib/store";
 import type { BootstrapState, GameCandidate, ScanReport } from "@/lib/types";
 import { AgentConfiguration } from "@/components/AgentConfiguration";
+import { GameMatchBadge } from "@/components/GameMatchBadge";
 import { PathText } from "@/components/ui";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -28,7 +29,7 @@ const features = [
   {id: "plugins", title: "插件中心", details: "查看游戏适配包、版本和验证状态，按需启用或安装。适配包为受支持的游戏提供目录识别和 Mod 安装规则。"},
   {id: "trash", title: "回收站", details: "选择条目并审阅恢复计划，可将文件还原到原路径。永久删除需要单独确认，该操作无法撤回。"},
   {id: "history", title: "历史对话", details: "打开过去的 Agent 会话查看消息和任务进度。可以归档会话，也可以从归档中恢复。"},
-  {id: "settings", title: "设置", details: "在「AI 与模型」配置服务和权限，在「Mod 来源」管理来源凭据，在「MCP 服务」管理连接，在「Skills」管理指引，在「外观与存储」切换主题并查看数据目录。外部 stdio MCP 进程拥有当前用户的系统权限，运行在本地文件事务沙盒之外。"},
+  {id: "settings", title: "设置", details: "在「AI 与模型」配置服务和权限，在「MCP 服务」管理连接，在「Skills」管理指引，在「外观与存储」切换主题并查看数据目录。外部 stdio MCP 进程拥有当前用户的系统权限，运行在本地文件事务沙盒之外。"},
 ];
 
 export default function OnboardingPage({automatic = false, recoveryError = null}: {automatic?: boolean; recoveryError?: string | null}) {
@@ -214,7 +215,7 @@ function CandidateRow({candidate, selected, disabled, error, onSelect, onRegiste
         {error && <p className="text-xs text-destructive" role="alert">添加失败：{error}</p>}
       </ItemContent>
       <ItemActions className="flex-wrap">
-        <Badge variant="outline">{Math.round(candidate.confidence * 100)}% 匹配</Badge>
+        <GameMatchBadge candidate={candidate} variant="outline" />
         {registered ? <Badge variant="success">管理中</Badge> : <Button variant="outline" size="sm" disabled={disabled || !selected} onClick={onRegister}>添加</Button>}
       </ItemActions>
     </li>

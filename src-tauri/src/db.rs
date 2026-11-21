@@ -26,7 +26,7 @@ impl Db {
     }
 
     fn migrate(&self) -> AppResult<()> {
-        let c = self.conn();
+        let mut c = self.conn();
         c.execute_batch(SCHEMA)?;
         let has_auto_title: bool = c.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='auto_title_pending')",
@@ -36,10 +36,36 @@ impl Db {
         if !has_auto_title {
             c.execute("ALTER TABLE conversations ADD COLUMN auto_title_pending INTEGER NOT NULL DEFAULT 0", [])?;
         }
+        // NULL on upgrade: enabled configurations predate persistent launch consent.
+        let has_mcp_consent: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mcp_servers') WHERE name='startup_digest')",
+            [], |row| row.get(0),
+        )?;
+        if !has_mcp_consent {
+            c.execute("ALTER TABLE mcp_servers ADD COLUMN startup_digest BLOB", [])?;
+        }
         // lightweight forward migrations
         let version: i64 = c.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < SCHEMA_VERSION {
-            c.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            let tx = c.transaction()?;
+            if version < 2 {
+                crate::mcp::config::migrate_markitdown_index(&tx)?;
+            }
+            #[cfg(windows)]
+            if version < 3 {
+                crate::mcp::config::migrate_playwright_browser(&tx)?;
+            }
+            if version < 4 {
+                // Bare aliases now use a different executable and package source. Explicit
+                // paths, other commands and HTTP keep their previous startup consent.
+                tx.execute(
+                    "UPDATE mcp_servers SET startup_digest=NULL WHERE transport='stdio'
+                    AND lower(command) IN ('npx','npx.cmd','npx.exe','uvx','uvx.exe')",
+                    [],
+                )?;
+            }
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
         }
         drop(c);
         crate::skills::migrate(self)?;
@@ -49,7 +75,7 @@ impl Db {
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS games (
@@ -254,6 +280,23 @@ CREATE TABLE IF NOT EXISTS plugin_drafts (
   write_transaction_id TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS plugin_draft_deletions (
+  draft_id TEXT NOT NULL REFERENCES plugin_drafts(id),
+  transaction_id TEXT PRIMARY KEY REFERENCES file_transactions(id),
+  trash_item_id TEXT NOT NULL UNIQUE REFERENCES trash_items(id)
+);
+CREATE INDEX IF NOT EXISTS idx_plugin_draft_deletions_draft ON plugin_draft_deletions(draft_id);
+-- A failed plan does not delete the draft. A committed restore, or rollback of
+-- the deletion itself, makes the original ID available again.
+CREATE VIEW IF NOT EXISTS unavailable_plugin_drafts AS
+  SELECT d.draft_id FROM plugin_draft_deletions d
+  JOIN file_transactions f ON f.id=d.transaction_id
+  WHERE f.status IN ('committed','applying','rolling_back','recovery_failed')
+    AND NOT EXISTS (
+      SELECT 1 FROM trash_restore_links l
+      JOIN file_transactions r ON r.id=l.transaction_id
+      WHERE l.item_id=d.trash_item_id AND r.status='committed'
+    );
 CREATE TABLE IF NOT EXISTS plugin_deployments (
   transaction_id TEXT PRIMARY KEY,
   slug TEXT NOT NULL,
@@ -273,6 +316,7 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
   secret_ref TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
   builtin INTEGER NOT NULL DEFAULT 0,
+  startup_digest BLOB,
   created_at TEXT NOT NULL
 );
 

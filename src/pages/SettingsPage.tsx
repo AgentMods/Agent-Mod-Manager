@@ -1,9 +1,10 @@
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useQueryClient } from "@tanstack/react-query";
 import { open } from "@tauri-apps/plugin-dialog";
 import { join } from "@tauri-apps/api/path";
 import { FolderOpenIcon } from "lucide-react";
-import { BoxIcon, CheckIcon, DownloadIcon, FileTextIcon, KeyRoundIcon, LinkIcon, MoonIcon, PencilIcon, PlayIcon, PlusIcon, RotateCcwIcon, SaveIcon, SearchIcon, ServerIcon, SquareIcon, SunIcon, Trash2Icon } from "lucide-react";
+import { BoxIcon, DownloadIcon, FileTextIcon, KeyRoundIcon, MoonIcon, PencilIcon, PlayIcon, PlusIcon, RotateCcwIcon, SaveIcon, SearchIcon, ServerIcon, SquareIcon, SunIcon, Trash2Icon } from "lucide-react";
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { useUI } from "@/lib/store";
 import type { FilePlan } from "@/lib/types";
@@ -16,10 +17,8 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group";
-import { Item, ItemActions, ItemContent, ItemDescription, ItemGroup, ItemMedia, ItemSeparator, ItemTitle } from "@/components/ui/item";
-import { Label } from "@/components/ui/label";
+import { Item, ItemActions, ItemContent, ItemGroup, ItemMedia, ItemSeparator, ItemTitle } from "@/components/ui/item";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
-import { Separator } from "@/components/ui/separator";
 import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -27,21 +26,20 @@ import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 
 type McpConfig = { id: string; name: string; transport: "stdio" | "streamable_http"; command: string | null; args: string[]; url: string | null; env_secret_refs: Record<string, string>; bearer_secret_ref: string | null; enabled: boolean; builtin: boolean };
-type LocalStatus = { running: boolean; stopping: boolean; endpoint: string | null; tokenRef: string; activeCalls: number };
+type LocalStatus = { startupRequested: boolean; running: boolean; stopping: boolean; endpoint: string | null; tokenRef: string; activeCalls: number };
 type Connection = { serverId: string; tools: string[] };
 
-const sections = [["model", "AI 与模型"], ["sources", "Mod 来源"], ["mcp", "MCP 服务"], ["skills", "Skills"], ["appearance", "外观与存储"]] as const;
+const sections = [["model", "AI 与模型"], ["mcp", "MCP 服务"], ["skills", "Skills"], ["appearance", "外观与存储"]] as const;
 
 export default function SettingsPage() {
   const [tab, setTab] = useState("model");
   return <Page>
-    <PageHeader title="设置" subtitle="模型、Mod 来源、MCP 与外观" />
+    <PageHeader title="设置" subtitle="模型、MCP、Skills 与外观" />
     <Tabs value={tab} onValueChange={setTab} className="gap-6">
       <TabsList aria-label="设置分类" className="max-w-full flex-wrap justify-start group-data-[orientation=horizontal]/tabs:h-auto">
         {sections.map(([id, name]) => <TabsTrigger key={id} value={id} className="h-7.5 flex-none">{name}</TabsTrigger>)}
       </TabsList>
       <TabsContent value="model"><ModelSettings /></TabsContent>
-      <TabsContent value="sources"><SourceSettings /></TabsContent>
       <TabsContent value="mcp"><McpSettings /></TabsContent>
       <TabsContent value="skills"><SkillsSettings /></TabsContent>
       <TabsContent value="appearance"><AppearanceSettings /></TabsContent>
@@ -56,16 +54,15 @@ function ModelSettings() {
   </Card>;
 }
 
-function SecretField({ label, reference, showSaveLabel = false }: { label: string; reference: string; showSaveLabel?: boolean }) {
+function SecretField({ label, reference }: { label: string; reference: string }) {
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const notify = useUI((s) => s.notify);
-  const client = useQueryClient();
   return <form className="flex flex-col gap-2" onSubmit={async (event) => {
     event.preventDefault(); if (!value.trim()) return;
     setBusy(true); setError(null);
-    try { await api("set_secret", { key: reference, value }); setValue(""); await client.invalidateQueries({ queryKey: ["sources"] }); notify(`${label}已保存`); }
+    try { await api("set_secret", { key: reference, value }); setValue(""); notify(`${label}已保存`); }
     catch (failure) { setError(failure); } finally { setBusy(false); }
   }}>
     <Field>
@@ -73,38 +70,14 @@ function SecretField({ label, reference, showSaveLabel = false }: { label: strin
       <InputGroup>
         <InputGroupInput id={`secret-${reference}`} type="password" autoComplete="new-password" aria-label={label} value={value} onChange={(event) => setValue(event.target.value)} disabled={!backendAvailable || busy} placeholder={reference} />
         <InputGroupAddon align="inline-end">
-          <InputGroupButton type="submit" size={showSaveLabel ? "xs" : "icon-xs"} aria-label={`保存${label}`} title={`保存${label}`} disabled={!backendAvailable || busy || !value.trim()}>
-            {busy ? <Spinner /> : !showSaveLabel && <KeyRoundIcon />}
-            {showSaveLabel && "保存"}
+          <InputGroupButton type="submit" size="xs" aria-label={`保存${label}`} title={`保存${label}`} disabled={!backendAvailable || busy || !value.trim()}>
+            {busy && <Spinner />}保存
           </InputGroupButton>
         </InputGroupAddon>
       </InputGroup>
     </Field>
     <ErrorState error={error} />
   </form>;
-}
-
-function SourceSettings() {
-  const sources = useBackendQuery<Array<{ source_id: string; state: string; message: string }>>(["sources"], "list_mod_sources");
-  return <Card>
-    <CardHeader><CardTitle>来源凭据</CardTitle><CardDescription>Agent 的通用网页搜索使用 Brave Search。未配置时会提示配置，Mod 来源搜索仍可使用。</CardDescription></CardHeader>
-    <CardContent className="flex flex-col gap-6">
-      <ErrorState error={sources.error} />
-      {!!sources.data?.length && <ItemGroup className="gap-2">
-        {sources.data.map((source) => <Item key={source.source_id} variant="outline" size="sm">
-          <ItemContent><ItemTitle>{source.source_id}</ItemTitle>{source.message && <ItemDescription className="line-clamp-none break-words">{source.message}</ItemDescription>}</ItemContent>
-          <ItemActions><Badge tone={source.state === "available" ? "success" : "warning"}>{source.state}</Badge></ItemActions>
-        </Item>)}
-      </ItemGroup>}
-      <Separator />
-      <FieldGroup>
-        <SecretField label="CurseForge API Key" reference="sources.curseforge" />
-        <SecretField label="Nexus API Key" reference="sources.nexus" />
-        <SecretField label="3DM API Key" reference="sources.3dm" />
-        <SecretField label="Brave Search API Key" reference="sources.brave" />
-      </FieldGroup>
-    </CardContent>
-  </Card>;
 }
 
 function mcpCredentialFields(config: McpConfig) {
@@ -122,6 +95,8 @@ function mcpCredentialFields(config: McpConfig) {
 
 function McpSettings() {
   const configs = useBackendQuery<McpConfig[]>(["mcp", "configs"], "mcp_list");
+  const externalConfigs = configs.data?.filter((config) => config.id !== "amm_local") ?? [];
+  const startup = useBackendQuery<string[]>(["mcp", "startup"], "mcp_startup_requests");
   const connections = useBackendQuery<Connection[]>(["mcp", "connections"], "mcp_connections");
   const local = useBackendQuery<LocalStatus>(["mcp", "local"], "mcp_server_status");
   const [edit, setEdit] = useState<McpConfig | null>(null);
@@ -136,6 +111,23 @@ function McpSettings() {
   const [error, setError] = useState<unknown>(null);
   const notify = useUI((s) => s.notify);
   const client = useQueryClient();
+  useEffect(() => {
+    if (!backendAvailable) return;
+    let mounted = true;
+    let unlisten: (() => void) | undefined;
+    const sync = async () => {
+      if (!mounted) return;
+      // A first fetch may still reflect pre-restore state when an event arrives.
+      await client.cancelQueries({ queryKey: ["mcp"] });
+      if (mounted) await client.invalidateQueries({ queryKey: ["mcp"] });
+    };
+    void listen("mcp://restore-progress", () => { void sync(); }).then((stop) => {
+      if (!mounted) { stop(); return; }
+      unlisten = stop;
+      void sync(); // Catch restores that finished before subscription.
+    }).catch((cause) => { if (mounted) setError(cause); });
+    return () => { mounted = false; unlisten?.(); };
+  }, [client]);
   const busy = pending !== null;
   const forget = (id: string) => setFailures(({ [id]: _removed, ...rest }) => rest);
   const refresh = () => client.invalidateQueries({ queryKey: ["mcp"] });
@@ -161,14 +153,14 @@ function McpSettings() {
     <Card className="gap-4 py-4">
       <CardHeader className="px-3 sm:px-5">
         <CardTitle>外部 MCP 连接</CardTitle>
-        <CardDescription>连接第三方 MCP 服务，扩展 Agent 可用的工具。</CardDescription>
+        <CardDescription>已启动的连接会在下次打开应用时自动重连。停止或编辑连接会取消自动启动。</CardDescription>
         <CardAction><Button size="sm" variant="outline" disabled={!backendAvailable} onClick={() => { setFresh(true); setEdit({ id: `custom_${Date.now()}`, name: "自定义 MCP", transport: "streamable_http", command: null, args: [], url: "https://", env_secret_refs: {}, bearer_secret_ref: null, enabled: false, builtin: false }); }}><PlusIcon data-icon="inline-start" />添加连接</Button></CardAction>
       </CardHeader>
       <CardContent className="flex flex-col gap-3 px-3 sm:px-5">
-        <ErrorState error={configs.error || connections.error || local.error || error} />
-        {!configs.data?.length && !configs.isLoading && !configs.error && <EmptyState icon={<ServerIcon />} title="尚未配置外部 MCP 连接" />}
-        {!!configs.data?.length && <ItemGroup className="rounded-md border" aria-label="外部 MCP 连接">
-          {configs.data.map((config, index) => {
+        <ErrorState error={configs.error || startup.error || connections.error || local.error || error} />
+        {!externalConfigs.length && !configs.isLoading && !configs.error && <EmptyState icon={<ServerIcon />} title="尚未配置外部 MCP 连接" />}
+        {!!externalConfigs.length && <ItemGroup className="rounded-md border" aria-label="外部 MCP 连接">
+          {externalConfigs.map((config, index) => {
             const active = connections.data?.find((connection) => connection.serverId === config.id);
             const starting = pending === config.id && !active;
             const failure = failures[config.id];
@@ -181,6 +173,7 @@ function McpSettings() {
                 <ItemContent className="min-w-0 gap-0.5">
                   <ItemTitle className="max-w-full"><span className="truncate" title={config.name}>{config.name}</span></ItemTitle>
                   <PathText className="block truncate" title={endpoint}>{endpoint}</PathText>
+                  {!active && startup.data?.includes(config.id) && <Button variant="link" size="sm" className="h-auto self-start p-0 text-xs" disabled={busy} aria-label={`取消 ${config.name} 自动启动`} onClick={() => { void run(config.id, () => api("mcp_disconnect", { id: config.id }), "已取消自动启动"); }}>取消自动启动</Button>}
                   {failure && !active && <p className="truncate text-xs text-destructive" title={failure}>{failure}</p>}
                 </ItemContent>
                 <ItemActions className="grid shrink-0 grid-cols-[auto_repeat(3,1.75rem)] gap-0.5 [&_button]:size-7 sm:grid-cols-[auto_repeat(3,2rem)] sm:[&_button]:size-8">
@@ -203,15 +196,15 @@ function McpSettings() {
     <Card>
       <CardHeader>
         <CardTitle>本地 MCP 服务</CardTitle>
-        <CardDescription>让外部 Agent 通过受控工具使用本机的 Agent Mod Manager。</CardDescription>
+        <CardDescription>让外部 Agent 通过受控工具使用本机的 Agent Mod Manager。开启后会随应用启动，手动停止即可取消。</CardDescription>
         <CardAction><Badge tone={local.data?.running ? "success" : "neutral"}>{local.data?.stopping ? "正在等待事务完成" : local.data?.running ? "运行中" : "未开启"}</Badge></CardAction>
       </CardHeader>
       <CardContent className="flex flex-col items-start gap-3">
+        {local.data?.startupRequested && !local.data.running && <Button variant="link" size="sm" disabled={busy} onClick={() => { void run("local", () => api("mcp_server_stop"), "已取消本地 MCP 自动启动"); }}>取消本地 MCP 自动启动</Button>}
         {local.data?.endpoint && <PathText>{local.data.endpoint}</PathText>}
         {local.data?.running
           ? <Button variant="outline" disabled={busy} onClick={() => { void run("local", () => api("mcp_server_stop"), "本地 MCP 服务已停止"); }}><SquareIcon data-icon="inline-start" />停止服务</Button>
           : <Button variant="outline" disabled={!backendAvailable || busy || local.data?.stopping} onClick={() => setConfirm("local")}><PlayIcon data-icon="inline-start" />开启服务</Button>}
-        {local.data?.running && <p className="text-sm text-muted-foreground">加密令牌引用：{local.data.tokenRef}。活动调用 {local.data.activeCalls}。</p>}
       </CardContent>
     </Card>
 
@@ -221,7 +214,7 @@ function McpSettings() {
       actions={<Button variant="outline" onClick={() => setCredentials(null)}>返回列表</Button>}>
       <p className="text-sm text-muted-foreground">凭据仅在本机加密保存。输入新值可替换已保存的凭据。</p>
       <FieldGroup className="gap-4">
-        {mcpCredentialFields(credentials.config).map(({ reference, label }) => <SecretField key={reference} label={label} reference={reference} showSaveLabel />)}
+        {mcpCredentialFields(credentials.config).map(({ reference, label }) => <SecretField key={reference} label={label} reference={reference} />)}
       </FieldGroup>
     </Modal>}
     {edit && <McpEditor config={edit} fresh={fresh} onClose={() => setEdit(null)} onSaved={async () => { forget(edit.id); setEdit(null); await refresh(); }} />}
@@ -232,12 +225,18 @@ function McpSettings() {
       </Button>
     </>}>
       {confirm === "local" ? <>
-        <p className="text-sm">允许持有本机令牌的外部 Agent 调用受控工具。文件写入沿用桌面权限策略，审批只能在桌面完成。</p>
+        <p className="text-sm">允许持有本机令牌的外部 Agent 调用受控工具。文件写入沿用桌面权限策略，审批只能在桌面完成。开启成功且未手动停止时，下次启动应用会自动尝试开启。</p>
         <ErrorState error={error} />
       </> : <>
         <PathText className="rounded-md border bg-muted p-3">{[confirm.command, ...confirm.args].join(" ")}</PathText>
         {Object.keys(confirm.env_secret_refs).length > 0 && <p className="text-xs text-muted-foreground">环境变量：{Object.keys(confirm.env_secret_refs).join("、")}</p>}
-        <p className="text-sm">该进程会以当前用户的系统权限运行，不受本地路径与“不删除”规则保护。</p>
+        <p className="text-sm">该进程会以当前用户的系统权限运行。确认后，相同配置会在下次打开应用时自动启动，直到你手动停止或编辑连接。</p>
+        {/^(uvx|uvx\.exe)$/i.test(confirm.command ?? "") && <p className="text-sm text-muted-foreground">
+          使用应用内置的 uvx，默认从清华 PyPI 镜像安装包。首次准备 Python 或下载依赖可能需要数分钟。可在启动参数中用 <code>--default-index</code> 指定其他源，不会更改系统设置。
+        </p>}
+        {/^(npx|npx\.cmd|npx\.exe)$/i.test(confirm.command ?? "") && <p className="text-sm text-muted-foreground">
+          使用应用内置的 Node.js 和 npx，默认从 npmmirror 安装包。可在包名前用 <code>--registry=地址</code> 指定其他源，不会更改系统设置。
+        </p>}
         <ErrorState error={failures[confirm.id]} />
       </>}
     </Modal>}
@@ -492,7 +491,10 @@ function SkillsSettings() {
       {selected.skill.kind === "standalone" && <IconButton title={`预览卸载 Skill ${selected.skill.name}`} className="mr-auto" disabled={!backendAvailable || busy || !selected.skill.valid} onClick={() => { void uninstall(selected.skill); }}><Trash2Icon /></IconButton>}
       <Button variant="outline" disabled={busy} onClick={() => setSelected(null)}>关闭</Button>
     </>}>
-      <pre className="max-h-96 overflow-auto rounded-md border bg-muted p-3 font-mono text-xs break-words whitespace-pre-wrap">{selected.markdown}</pre><ErrorState error={error} />
+      <pre className="max-h-96 overflow-auto rounded-md border bg-muted p-3 font-mono text-xs break-words whitespace-pre-wrap">{selected.markdown}</pre>
+      {selected.skill.kind === "system" && selected.skill.name === "system-web-search" &&
+        <SecretField label="Brave Search API Key" reference="sources.brave" />}
+      <ErrorState error={error} />
     </Modal>}
     {importing && <Modal title="导入声明式 Skill" onClose={() => { if (!busy) setImporting(false); }} actions={<>
       <Button variant="outline" disabled={busy} onClick={() => setImporting(false)}>取消</Button>

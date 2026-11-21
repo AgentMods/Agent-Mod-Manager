@@ -19,8 +19,11 @@ application's reqwest 0.12 dependency.
 
 ## Integration
 
-The parent agent owns `lib.rs`, commands and runtime integration. Add
-`pub mod mcp;` there. No schema migration is required.
+Desktop setup restores the local service from its own saved opt-in, then starts
+previously connected external servers in the background. SQLite stores a nullable
+`startup_digest` of the exact confirmed external configuration, not resolved
+credentials. Existing rows migrate without consent. The following low-level client
+example connects once; only the desktop lifecycle records startup intent.
 
 ```rust,ignore
 let servers = mcp::McpServers::new(db.clone());
@@ -33,7 +36,8 @@ let config = servers.get("glossmod_http")?;
 // to confirm this connection. For stdio also require acknowledgement of the
 // unsandboxed OS-user process boundary; pass true only after acknowledgement.
 let consent = mcp::ConnectionConsent::after_user_confirmation(&config, false)?;
-let client = mcp::McpClient::connect(servers, &settings, &config.id, consent, &cancel).await?;
+let runtime = mcp::McpRuntime::default(); // HTTP does not need a bundled launcher.
+let client = mcp::McpClient::connect(servers, &settings, &config.id, consent, &runtime, &cancel).await?;
 let registered = client.register_tools(&agent_registry, &cancel).await?;
 // Keep the client. On disabling/removing/editing settings or application shutdown:
 client.disconnect();
@@ -55,26 +59,37 @@ Presets configure third-party services; they do not bundle the runtimes:
 - 3DM: `uvx glossmod-mcp`, environment `GLOSSMOD_API_KEY` resolved from reference
   `mcp.glossmod_3dm.api_key` at launch.
 - [Playwright MCP](https://github.com/microsoft/playwright-mcp):
-  `npx --yes @playwright/mcp@0.0.85 --headless --isolated --no-webmcp`
-  (`npx.cmd` on Windows). Requires Node.js 20+, npm, and a supported browser
-  such as Chrome for navigation. Uses a separate temporary browser profile;
+  on Windows the preset uses the installed Microsoft Edge:
+  `npx.cmd --yes @playwright/mcp@0.0.85 --headless --isolated --no-webmcp --browser=msedge`.
+  macOS and Linux keep `npx --yes @playwright/mcp@0.0.85 --headless --isolated --no-webmcp`
+  (Chrome by default). Node.js and npm are bundled. The selected browser must be available separately.
+  To select a different browser, edit the arguments in Settings → MCP 服务.
+  Uses a separate temporary browser profile;
   it does not attach to an existing signed-in browser. No API key is needed.
 - [MarkItDown MCP](https://github.com/microsoft/markitdown/tree/main/packages/markitdown-mcp):
-  `uvx --with azure-ai-contentunderstanding==1.2.0b3 markitdown-mcp==0.0.1a8`,
-  with uv and Python 3.10+. The explicit dependency pin lets uv resolve the
+  `uvx --default-index https://pypi.tuna.tsinghua.edu.cn/simple --with azure-ai-contentunderstanding==1.2.0b3 markitdown-mcp==0.0.1a8`,
+  with bundled uv and a compatible Python (uv may download it). The explicit dependency pin lets uv resolve the
   prerelease required by MarkItDown without allowing all prerelease packages.
   Converts documents to Markdown via stdio, without an API key. Its `file:`
   URIs can read files available to the OS user, outside the manager's game roots.
 
 Enable and connect from Settings. For stdio, verify the displayed command and
-acknowledge its OS permissions before connecting. The launcher must be on the
-desktop application's `PATH`; edit the command to an absolute path when needed.
-The first connection may download packages and exceed the 20-second handshake
-timeout. MarkItDown can also download Python and document conversion dependencies.
-To warm a cold cache, run the trusted launcher command with `--help` appended
-in a terminal as the same user, then retry the connection. These package versions
-are fixed in new preset entries; existing entries stay editable and are not
-auto-updated.
+acknowledge its OS permissions before connecting. Bare `npx`, `npx.cmd`, `npx.exe`, `uvx` and `uvx.exe` (case-insensitive) use
+application-owned launchers. Their child environments select npmmirror
+(`npm_config_registry`) or the Tsinghua PyPI mirror (`UV_DEFAULT_INDEX`).
+Explicit CLI registry options take precedence. MarkItDown retains its explicit index.
+Other commands, including absolute paths, keep their own executable and package configuration.
+MCP packages, Python interpreter downloads and browsers are separate from the launchers.
+Schema v4 revokes old auto-start consent for affected bare aliases, including custom connections,
+while preserving commands, arguments and credentials.
+
+Schema v3 switches only an unmodified built-in Windows Playwright preset to Edge.
+If it was set to start automatically, start it manually once to confirm the new
+command. Custom browser arguments and other edited configurations are preserved.
+
+For a first `uvx` launch the app allows up to ten minutes for dependencies and
+MCP initialization, with up to four concurrent downloads and a 120-second uv
+HTTP timeout in the child environment. A failed start can be retried from Settings. The app does not log child stderr.
 
 ## Trust Boundary
 
@@ -85,7 +100,11 @@ auto-updated.
 - `ConnectionConsent` is single-use, bound to exact config, non-serializable and
   intended for trusted UI/IPC code only. Do not expose it, configuration mutation,
   process startup or `write_secret` as model-callable tools. Enabling alone never
-  authorizes spawning. Agent registry registration never starts a process.
+  authorizes spawning. Desktop startup may issue fresh single-use consent when
+  the current config matches a receipt saved after successful manual connection
+  and registration. Stop, edit, disable or remove revokes the receipt. A failed
+  restore leaves it available for the next launch, until explicitly cancelled.
+  Agent registry registration never starts a process.
 - **stdio is NOT sandboxed.** Its command and descendants have the user's OS
   filesystem/network permissions. User acknowledgement is mandatory. A malicious
   server can directly delete or alter local files outside FileEngine; per-tool
@@ -132,7 +151,8 @@ auto-updated.
 
 ## Bounds And Cancellation
 
-Connection handshake: 20 seconds. Listing/call: 30 seconds including pagination.
+Connection initialization: HTTP 20 seconds, direct `uvx` launchers 600 seconds,
+other stdio launchers 120 seconds. Listing/call: 30 seconds including pagination.
 Cancellation disconnects failed requests, sends best-effort SDK cancellation,
 and kills the direct stdio child. Timeout/cancellation cannot guarantee that an
 external side effect did not happen; never blindly retry it.
@@ -154,7 +174,10 @@ direct stdio child exit/reaping after disconnect, atomic registration failure,
 HTTP/stdio credential echo filtering (including quoted environment values),
 key rotation, `isError`/RPC errors, filtered history/tool-call persistence,
 provider errors and post-redaction expansion limits.
-No production endpoint credentials or actual uvx invocation are used.
+Default tests use no production endpoint credentials or actual uvx invocation.
+Opt-in native smoke: `cargo test --lib live_markitdown_preset_initializes_and_lists_conversion_tool -- --ignored`
+(from `src-tauri`). It prepares the preset, initializes it and lists tools, but
+never converts a document or sends one to the server.
 
 Verification after parent integration on 2026-11-17:
 

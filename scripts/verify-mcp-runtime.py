@@ -1,0 +1,95 @@
+"""Exercise a packaged MCP runtime offline, without npm or uv on the system PATH."""
+import argparse
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import tempfile
+import zipfile
+
+LOCK = Path(__file__).with_name('mcp-runtime.lock.json')
+
+
+def python_fixture(directory):
+    wheel = directory / 'amm_fixture-1.0-py3-none-any.whl'
+    info = 'amm_fixture-1.0.dist-info'
+    files = {
+        'amm_fixture.py': 'def main():\n    print("python-fixture-ok")\n',
+        f'{info}/METADATA': 'Metadata-Version: 2.1\nName: amm-fixture\nVersion: 1.0\n',
+        f'{info}/WHEEL': 'Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n',
+        f'{info}/entry_points.txt': '[console_scripts]\namm-fixture = amm_fixture:main\n',
+    }
+    record = f'{info}/RECORD'
+    files[record] = ''.join(f'{name},,\n' for name in [*files, record])
+    with zipfile.ZipFile(wheel, 'w') as archive:
+        for name, text in files.items():
+            archive.writestr(name, text)
+    return wheel
+
+
+def verify(archive_path, work):
+    runtime = work / 'installed runtime'
+    # No links or traversal: extract files exactly as the production runtime does.
+    with zipfile.ZipFile(archive_path) as archive:
+        for entry in archive.infolist():
+            dest = (runtime / entry.filename).resolve()
+            if not dest.is_relative_to(runtime) or stat.S_ISLNK(entry.external_attr >> 16):
+                raise ValueError(f'Unsafe runtime entry {entry.filename!r}')
+            archive.extract(entry, runtime)
+            if not entry.is_dir() and (entry.filename.startswith('bin/') or (entry.external_attr >> 16) & 0o111):
+                dest.chmod(0o700)
+
+    bin_dir = runtime / 'bin'
+    exe = '.exe' if os.name == 'nt' else ''
+    node = bin_dir / f'node{exe}'
+    uvx = bin_dir / f'uvx{exe}'
+    npx = runtime / 'npm/bin/npx-cli.js'
+    home = work / 'home'
+    home.mkdir()
+    env = {k: os.environ[k] for k in ('SYSTEMROOT', 'WINDIR') if k in os.environ}
+    # The only other PATH entries contain system shell tools used by package bin wrappers.
+    os_bins = [str(Path(env['SYSTEMROOT']) / 'System32')] if os.name == 'nt' else ['/bin', '/usr/bin']
+    env.update(PATH=os.pathsep.join([str(bin_dir), *os_bins]), HOME=str(home), USERPROFILE=str(home),
+               TEMP=str(work), TMP=str(work), TMPDIR=str(work), npm_config_cache=str(work / 'npm-cache'),
+               UV_CACHE_DIR=str(work / 'uv-cache'), UV_PYTHON_DOWNLOADS='never',
+               UV_OFFLINE='true', npm_config_offline='true')
+    def run(args, expected):
+        result = subprocess.run(args, cwd=work, env=env, text=True, capture_output=True, timeout=90)
+        if result.returncode or expected not in result.stdout.splitlines():
+            raise RuntimeError(f'{args[0]} {args[1:]} failed: {result.returncode}\n{result.stdout}\n{result.stderr}')
+        print(result.stdout.strip())
+
+    lock = json.loads(LOCK.read_text(encoding='utf-8'))
+    run([node, '--version'], 'v' + lock['node']['version'])
+    run([node, npx, '--version'], lock['node']['npmVersion'])
+    # uvx's version may also display its upstream build commit and date.
+    version = subprocess.check_output([uvx, '--version'], cwd=work, env=env, text=True, timeout=15).strip()
+    if version.split()[:2] != ['uvx', lock['uv']['version']]:
+        raise RuntimeError(f'Unexpected uvx version: {version}')
+    print(version)
+    package = work / 'npm-fixture'
+    package.mkdir()
+    (package / 'package.json').write_text(json.dumps({'name': 'amm-fixture', 'version': '1.0.0',
+                                                      'bin': {'amm-fixture': 'cli.js'}}), encoding='utf-8')
+    cli = package / 'cli.js'
+    cli.write_text('#!/usr/bin/env node\nconsole.log(require("node:fs").realpathSync(process.execPath));\n', encoding='utf-8', newline='\n')
+    cli.chmod(0o755)
+    run([node, npx, '--yes', '--offline', '--package=file:./npm-fixture', '--', 'amm-fixture'], str(node.resolve()))
+    wheel = python_fixture(work)
+    run([uvx, '--offline', '--python', sys.executable, '--from', str(wheel), 'amm-fixture'], 'python-fixture-ok')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('resource', type=Path, help='mcp-runtime/runtime.zip or the installed resource directory')
+    resource = parser.parse_args().resource.resolve()
+    if resource.is_dir():
+        resource = resource / 'mcp-runtime/runtime.zip'
+    with tempfile.TemporaryDirectory(prefix='amm runtime smoke ') as temp:
+        verify(resource, Path(temp).resolve())
+
+
+if __name__ == '__main__':
+    main()

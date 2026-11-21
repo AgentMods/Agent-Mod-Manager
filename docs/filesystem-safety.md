@@ -1,12 +1,29 @@
 # Filesystem operation safety
 
-The transaction engine still authorizes canonical paths against registered
-roots, checks the approved plan's fingerprints, and persists intent before
-doing filesystem work. These checks are not interchangeable with safe path
-resolution: an outside process can change a name between the check and the
-operation. `src-tauri/src/safe_fs.rs` is used by transaction copy/move/mkdir,
-backup and rollback, manager metadata creation, transaction hashing, and text
-opens for file tools and diagnosis.
+Root-restricted operations still check canonical paths against the manager data
+root or registered game roots, as applicable. The desktop Agent's native
+`read_dir`, `read_file`, `extract_preview`, `plan_file_ops`, and
+`apply_file_ops` can work outside those roots with the desktop process's OS
+permissions. Inbound MCP retains its existing scope. Credential directories
+and `.env` files remain protected, and AutoApprove still requires review for
+external writes.
+
+Only the desktop Agent's native `plan_file_ops` accepts `write_text`. Its `dst`
+and `content` fields specify a new file or the complete replacement contents,
+not an append or patch. The plan fingerprints the UTF-8 bytes and permits at
+most 1 MiB of combined text content per plan. It does not write the destination
+until `apply_file_ops` runs under the approval policy. AutoApprove still
+requires review for a plan containing `write_text`, including on registered
+paths. Inbound MCP and other generic planners reject it. Apply stages and
+verifies the payload and uses the same journal, overwrite backups, and rollback
+checks as other file writes.
+
+The transaction engine still checks the approved plan's fingerprints and
+persists intent before doing filesystem work. These checks are not interchangeable
+with safe path resolution: an outside process can change a name between the
+check and the operation. `src-tauri/src/safe_fs.rs` is used by transaction
+copy/move/mkdir, backup and rollback, manager metadata creation, transaction
+hashing, and text opens for file tools and diagnosis.
 
 - macOS and Linux open each canonical directory component using its parent's
   descriptor, with `DIRECTORY` and `NOFOLLOW`. New payloads use exclusive
@@ -48,7 +65,10 @@ where it appeared. If it prevents restoration, the transaction stays pending and
 blocks new plans until the conflict is resolved. A populated implicit directory
 stays in place. A requested rollback of a committed transaction checks ownership
 before making any change, so a stale or out-of-order request does not itself
-block later writes.
+block later writes. The desktop transaction-history command and the local Agent
+can request rollback of an external file transaction. Rollback uses the scope
+recorded with the transaction; inbound MCP cannot roll it back even if it
+knows the transaction ID.
 
 The forced-process-exit regression runs an actual worker against a temporary
 WAL database. The worker has already created an additional payload and its
@@ -68,10 +88,14 @@ original object and will not pass automatic rollback validation.
 
 ## Archive staging
 
-Archive listing opens a regular file once. Verified installation uses the
-same open archive for a read-only preflight and the extraction pass, checks its
-SHA-256 through that handle before and after parsing, and compares the entry
-lists. It cannot open a different archive because a filename changed between
+`extract_preview` opens a regular archive for read-only listing; it does not
+extract payloads or install them. Desktop Agent archive listing can use paths
+outside managed roots. `preview_fomod` still requires an archive in managed
+downloads or staging and does not write to the game.
+
+Verified installation uses the same open archive for a read-only preflight and
+the extraction pass. It checks SHA-256 through that handle before and after
+parsing and compares the entry lists. It cannot open a different archive because a filename changed between
 passes. Entries still undergo the path, type, byte-limit, and ratio checks.
 
 On macOS and Linux, extraction creates a private, exclusive staging directory

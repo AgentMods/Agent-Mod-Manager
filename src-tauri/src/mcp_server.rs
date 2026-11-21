@@ -9,6 +9,7 @@ use crate::{
     },
     error::{AppError, AppResult},
     history::{FunctionCall, History, ToolCall, ToolCallUpdate},
+    mcp_connections::McpConnections,
     util,
 };
 use axum::{
@@ -35,12 +36,13 @@ use rmcp::{
     },
     ErrorData as McpError, RoleServer, ServerHandler,
 };
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
+    future::Future,
     sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
@@ -54,6 +56,7 @@ use tokio::{
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 pub const TOKEN_REF: &str = "mcp.local_server.token";
+const STARTUP_REQUEST_KEY: &str = "mcp.local_server.startup_requested";
 const MAX_BODY: usize = 512 * 1024;
 const MAX_ARGS: usize = 256 * 1024;
 const MAX_RESULT: usize = 1024 * 1024;
@@ -98,6 +101,7 @@ const NATIVE_TOOLS: &[&str] = &[
 pub struct McpServerStatus {
     pub running: bool,
     pub stopping: bool,
+    pub startup_requested: bool,
     pub endpoint: Option<String>,
     pub token_ref: &'static str,
     pub active_calls: usize,
@@ -185,6 +189,7 @@ enum ServerState {
 
 struct Owner {
     runtime: AgentRuntime,
+    lifecycle: Mutex<()>,
     state: Mutex<ServerState>,
 }
 
@@ -198,8 +203,8 @@ impl Drop for Owner {
     }
 }
 
-/// Construct once in AppServices with the desktop's existing Runtime clone.
-/// Construction is disabled/stopped; only explicit trusted UI code calls start.
+/// The desktop owns the server and shares its existing Agent runtime with it.
+/// Construction does not start anything; startup requires remembered desktop consent.
 #[derive(Clone)]
 pub struct LocalMcpServer {
     owner: Arc<Owner>,
@@ -210,12 +215,169 @@ impl LocalMcpServer {
         Self {
             owner: Arc::new(Owner {
                 runtime,
+                lifecycle: Mutex::new(()),
                 state: Mutex::new(ServerState::Stopped),
             }),
         }
     }
 
-    pub async fn start(&self) -> AppResult<McpServerStatus> {
+    /// Read only the durable opt-in; it remains set if restoration failed.
+    pub fn startup_requested(&self) -> AppResult<bool> {
+        let encoded: Option<String> = self
+            .owner
+            .runtime
+            .settings
+            .db
+            .conn()
+            .query_row(
+                "SELECT value FROM settings WHERE key=?1",
+                [STARTUP_REQUEST_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match encoded {
+            None => Ok(false),
+            Some(value) => serde_json::from_str(&value)
+                .map_err(|_| AppError::Invalid("本地 MCP 启动偏好必须为布尔值".into())),
+        }
+    }
+
+    /// Called only after explicit desktop confirmation. Remember the request
+    /// after both the listener and the Agent connection are ready.
+    pub async fn start_desktop(&self, connections: &McpConnections) -> AppResult<McpServerStatus> {
+        self.desktop_lifecycle(connections, |server, connections| async move {
+            server.start_with_agent(&connections, true).await?;
+            Ok(server.status().await)
+        })
+        .await
+    }
+
+    /// Explicitly turn off auto-start, even if the listener never came up.
+    pub async fn stop_desktop(&self, connections: &McpConnections) -> AppResult<()> {
+        self.desktop_lifecycle(connections, |server, connections| async move {
+            let forgotten = server.forget_startup_request();
+            // Attempt to turn off the running service even if the DB write failed.
+            let stopped = server.stop_with_agent(&connections).await;
+            if let (Err(_), Err(err)) = (&forgotten, &stopped) {
+                tracing::warn!(%err, "关闭本地 MCP 时未能完成清理");
+            }
+            forgotten.and(stopped)
+        })
+        .await
+    }
+
+    /// At desktop startup, remove a runtime-only entry left by the previous
+    /// process, then restore only when explicitly requested. Report failures to
+    /// the caller without erasing the intent so the user can retry or turn it off.
+    pub async fn restore_if_requested(&self, connections: &McpConnections) -> AppResult<()> {
+        self.desktop_lifecycle(connections, |server, connections| async move {
+            if !matches!(*server.owner.state.lock().await, ServerState::Stopped) {
+                // A desktop start already won the race; don't detach its connection.
+                return Ok(());
+            }
+            server.disconnect_agent(&connections).await?;
+            if server.startup_requested()? {
+                server.start_with_agent(&connections, false).await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn desktop_lifecycle<T, Op, Fut>(
+        &self,
+        connections: &McpConnections,
+        operation: Op,
+    ) -> AppResult<T>
+    where
+        T: Send + 'static,
+        Op: FnOnce(Self, McpConnections) -> Fut + Send + 'static,
+        Fut: Future<Output = AppResult<T>> + Send,
+    {
+        let server = self.clone();
+        let connections = connections.clone();
+        // Serialize preferences, Agent attachment and the listener as one desktop
+        // operation. A dropped IPC future must not interrupt rollback or cleanup.
+        tokio::spawn(async move {
+            let _guard = server.owner.lifecycle.lock().await;
+            operation(server.clone(), connections).await
+        })
+        .await
+        .map_err(|_| AppError::Other("本地 MCP 生命周期任务未完成".into()))?
+    }
+
+    fn remember_startup_request(&self) -> AppResult<()> {
+        self.owner
+            .runtime
+            .settings
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO settings(key,value) VALUES(?1,'true')
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                [STARTUP_REQUEST_KEY],
+            )
+            .map_err(|err| AppError::Other(format!("无法保存本地 MCP 启动偏好（{err}）")))?;
+        Ok(())
+    }
+
+    fn forget_startup_request(&self) -> AppResult<()> {
+        self.owner
+            .runtime
+            .settings
+            .db
+            .conn()
+            .execute("DELETE FROM settings WHERE key=?1", [STARTUP_REQUEST_KEY])
+            .map_err(|err| AppError::Other(format!("无法清除本地 MCP 启动偏好（{err}）")))?;
+        Ok(())
+    }
+
+    async fn start_with_agent(
+        &self,
+        connections: &McpConnections,
+        remember: bool,
+    ) -> AppResult<()> {
+        let runtime = &self.owner.runtime;
+        let endpoint = self.start().await?;
+        let result = async {
+            connections
+                .connect_local(runtime.settings.clone(), &runtime.registry, &endpoint)
+                .await
+                .map_err(|err| {
+                    AppError::Other(format!("无法将本地 MCP 服务连接到 Agent（{err}）"))
+                })?;
+            if remember {
+                self.remember_startup_request()?;
+            }
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            if let Err(err) = self.stop_with_agent(connections).await {
+                tracing::warn!(%err, "回滚本地 MCP 启动时未能完成清理");
+            }
+        }
+        result
+    }
+
+    async fn disconnect_agent(&self, connections: &McpConnections) -> AppResult<()> {
+        let runtime = &self.owner.runtime;
+        connections
+            .disconnect_local(&runtime.registry, &runtime.settings)
+            .await
+            .map_err(|err| AppError::Other(format!("无法清理本地 MCP 的 Agent 连接（{err}）")))
+    }
+
+    async fn stop_with_agent(&self, connections: &McpConnections) -> AppResult<()> {
+        // Stop admission without waiting behind another Agent connection's startup.
+        let (stopped, detached) = tokio::join!(self.stop(), self.disconnect_agent(connections));
+        if let (Err(_), Err(err)) = (&detached, &stopped) {
+            tracing::warn!(%err, "本地 MCP 监听器关闭失败");
+        }
+        detached.and(stopped)
+    }
+
+    async fn start(&self) -> AppResult<String> {
         let mut state = self.owner.state.lock().await;
         if !matches!(*state, ServerState::Stopped) {
             return Err(AppError::Conflict(
@@ -276,21 +438,27 @@ impl LocalMcpServer {
                 .with_graceful_shutdown(shutdown.cancelled_owned())
                 .await
         });
+        let endpoint = format!("http://{address}/mcp");
         *state = ServerState::Running(Running {
-            endpoint: format!("http://{address}/mcp"),
+            endpoint: endpoint.clone(),
             shared,
             http,
         });
-        Ok(status_of(&state))
+        Ok(endpoint)
     }
 
     pub async fn status(&self) -> McpServerStatus {
-        status_of(&*self.owner.state.lock().await)
+        let state = self.owner.state.lock().await;
+        let startup_requested = self.startup_requested().unwrap_or_else(|err| {
+            tracing::warn!(%err, "无法读取本地 MCP 启动偏好");
+            false
+        });
+        status_of(&state, startup_requested)
     }
 
     /// Cancels admission/approvals, then drains tracked operations. Never abort
     /// an executing tool's future: a spawn_blocking file commit must be joined.
-    pub async fn stop(&self) -> AppResult<()> {
+    async fn stop(&self) -> AppResult<()> {
         let mut state = self.owner.state.lock().await;
         let running = match std::mem::replace(&mut *state, ServerState::Stopped) {
             ServerState::Stopped => return Ok(()),
@@ -332,7 +500,7 @@ impl LocalMcpServer {
     }
 }
 
-fn status_of(state: &ServerState) -> McpServerStatus {
+fn status_of(state: &ServerState, startup_requested: bool) -> McpServerStatus {
     let (running, stopping, endpoint, active_calls) = match state {
         ServerState::Stopped => (false, false, None, 0),
         ServerState::Running(r) => (
@@ -348,6 +516,7 @@ fn status_of(state: &ServerState) -> McpServerStatus {
     McpServerStatus {
         running,
         stopping,
+        startup_requested,
         endpoint,
         token_ref: TOKEN_REF,
         active_calls,
@@ -421,7 +590,7 @@ impl DesktopSession {
             Tool::new("amm_session", "Create or read this connection's persistent conversation", json!({"type":"object","properties":{"title":{"type":"string"}},"additionalProperties":false}).as_object().unwrap().clone()),
             Tool::new("amm_events", "Read this connection's desktop Agent events; cannot approve requests", json!({"type":"object","properties":{"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":200}},"additionalProperties":false}).as_object().unwrap().clone()),
         ];
-        for definition in self.shared.runtime.registry.definitions() {
+        for definition in self.shared.runtime.registry.inbound_definitions() {
             let function = &definition["function"];
             let name = function["name"].as_str().unwrap_or_default();
             if !exported(name) {

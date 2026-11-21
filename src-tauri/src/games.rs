@@ -989,6 +989,38 @@ struct Scanner<'a> {
     options: &'a ScanOptions,
     report: ScanReport,
     probes: BTreeMap<PathBuf, Vec<DiscoverySource>>,
+    user_install_hints: BTreeSet<PathBuf>,
+}
+
+// Filename evidence for an unadapted installation, not an adapter match or a launch target.
+fn install_hint(root: &Path, entry: &fs::DirEntry, kind: fs::FileType) -> bool {
+    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+    if kind.is_dir() {
+        return name == ".egstore"
+            || (name == "contents"
+                && root
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("app")));
+    }
+    kind.is_file()
+        && (matches!(
+            name.as_str(),
+            "unityplayer.dll" | "unityplayer.so" | "project.godot" | "steam_appid.txt"
+        ) || (name.starts_with("goggame-") && name.ends_with(".info"))
+            || name.ends_with(".x86_64")
+            || (name.ends_with(".exe")
+                && ![
+                    "setup",
+                    "install",
+                    "unins",
+                    "vc_redist",
+                    "dxsetup",
+                    "crashpad",
+                    "crashreport",
+                    "unitycrash",
+                ]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))))
 }
 impl Scanner<'_> {
     fn warn(&mut self, path: &Path, message: impl ToString) {
@@ -1057,7 +1089,12 @@ impl Scanner<'_> {
     fn tree(&mut self, path: &Path, kind: DiscoveryKind, depth: u8) {
         let base = match canonical_directory(path) {
             Ok(base) => base,
-            Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                if kind == DiscoveryKind::User {
+                    self.warn(path, "所选扫描目录不存在");
+                }
+                return;
+            }
             Err(e) => {
                 self.warn(path, e);
                 return;
@@ -1075,7 +1112,10 @@ impl Scanner<'_> {
                 break;
             }
             self.probe(&path, DiscoverySource::simple(kind.clone()));
-            if level >= depth {
+            // Only treat launch files at a chosen root or its immediate children as hints;
+            // nested tool, installer and engine directories are not separate games.
+            let check_hints = kind == DiscoveryKind::User && level <= 1;
+            if level >= depth && !check_hints {
                 continue;
             }
             if self.probes.len() >= self.options.max_directories {
@@ -1085,10 +1125,13 @@ impl Scanner<'_> {
             for entry in self.entries(&path) {
                 // No recursive following of symlinks/reparse points. A root
                 // directly chosen by the user may itself be canonicalized.
-                if entry
-                    .file_type()
-                    .is_ok_and(|ft| ft.is_dir() && !ft.is_symlink())
-                {
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+                if check_hints && install_hint(&path, &entry, file_type) {
+                    self.user_install_hints.insert(path.clone());
+                }
+                if level < depth && file_type.is_dir() && !file_type.is_symlink() {
                     let name = entry.file_name();
                     if matches!(
                         name.to_str(),
@@ -1385,6 +1428,7 @@ pub fn scan_games(db: &Db, options: &ScanOptions) -> AppResult<ScanReport> {
         options,
         report: ScanReport::default(),
         probes: BTreeMap::new(),
+        user_install_hints: BTreeSet::new(),
     };
     scanner.steam(
         &options
@@ -1422,10 +1466,18 @@ pub fn scan_games(db: &Db, options: &ScanOptions) -> AppResult<ScanReport> {
     scanner.report.directories_checked = scanner.probes.len();
     for (root, sources) in &scanner.probes {
         let mut candidate = identify_at(root, scanner.adapters, sources.clone())?;
-        if candidate.matches.is_empty() && !sources.iter().any(|s| s.metadata_path.is_some()) {
-            continue;
-        }
         candidate.registered_game_id = existing.get(&candidate.root_path).cloned();
+        if candidate.matches.is_empty() && !sources.iter().any(|s| s.metadata_path.is_some()) {
+            if scanner.user_install_hints.contains(root) {
+                candidate
+                    .warnings
+                    .push("检测到可能的游戏文件，未匹配适配包，请核对后再添加。".into());
+            } else if candidate.registered_game_id.is_none()
+                || !sources.iter().any(|s| s.kind == DiscoveryKind::User)
+            {
+                continue;
+            }
+        }
         scanner.report.candidates.push(candidate);
     }
     scanner.report.candidates.sort_by(|a, b| {
@@ -1831,6 +1883,34 @@ mod tests {
         assert_eq!(result.candidates[0].status, IdentificationStatus::Candidate);
         assert!(result.candidates[0].confidence <= 0.6);
         assert_eq!(result.warnings.len(), 1);
+        assert!(list_games(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn chosen_library_lists_adapted_and_unadapted_installs_without_registering() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db(&temp);
+        let root = temp.path().join("Games");
+        skyrim(&root.join("Skyrim"));
+        make_file(&root, "Portable/StartGame.EXE");
+        make_file(&root, "Portable/tools/Helper.exe");
+        make_file(&root, "Downloads/setup.exe");
+        make_file(&root, "Notes/readme.txt");
+        let report = scan_games(
+            &db,
+            &ScanOptions {
+                user_roots: vec![root.clone(), root.join("missing")],
+                ..scan_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.candidates.len(), 2);
+        assert!(report.candidates[0].suggested_adapter_slug.is_some());
+        let portable = &report.candidates[1];
+        assert_eq!(portable.name, "Portable");
+        assert_eq!(portable.status, IdentificationStatus::Unidentified);
+        assert!(portable.suggested_adapter_slug.is_none());
+        assert!(report.warnings.iter().any(|w| w.message.contains("不存在")));
         assert!(list_games(&db).unwrap().is_empty());
     }
 

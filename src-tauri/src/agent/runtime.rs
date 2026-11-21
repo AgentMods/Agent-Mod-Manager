@@ -19,7 +19,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex},
 };
 use tokio_util::sync::CancellationToken;
@@ -227,6 +227,33 @@ impl AgentRuntime {
         });
         Ok(id)
     }
+    pub fn restart_turn(
+        &self,
+        mut request: TurnRequest,
+        message_id: &str,
+        edit: bool,
+    ) -> AppResult<String> {
+        let history = History::new(self.engine.db.clone());
+        let (branch, content) = {
+            let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            if active.contains_key(&request.conversation_id) {
+                return Err(AppError::Conflict("此会话已有正在运行的任务".into()));
+            }
+            history.fork_before_message(
+                &request.conversation_id,
+                message_id,
+                edit.then(|| std::mem::take(&mut request.content)),
+            )?
+        };
+        request.conversation_id = branch.clone();
+        request.content = content;
+        if let Err(error) = self.start_turn(request) {
+            let _ = history.delete_conversation(&branch);
+            return Err(error);
+        }
+        Ok(branch)
+    }
+
     pub fn delete_conversation(&self, id: &str) -> AppResult<()> {
         let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         if active.contains_key(id) {
@@ -288,7 +315,15 @@ impl AgentRuntime {
             stored.unwrap_or(json!(config.permission_mode)),
         )?);
         let client = ModelClient::new()?;
-        let mut messages = self.context(conv)?;
+        // Skill verification can wait on the filesystem writer, and loading a
+        // long transcript takes the shared SQLite connection. Neither belongs
+        // on the executor that drives model I/O and cancellation.
+        let runtime = self.clone();
+        let conversation = conv.clone();
+        let mut messages =
+            tauri::async_runtime::spawn_blocking(move || runtime.context(&conversation))
+                .await
+                .map_err(|error| AppError::Other(error.to_string()))??;
         // Tool schemas are part of the provider's input context even though
         // they are not represented as chat messages. Keep one immutable
         // snapshot for the whole turn so compression and the actual request
@@ -324,30 +359,29 @@ impl AgentRuntime {
             let message = append_message(&self.engine.db, conv, "assistant", "", None, None)?;
             error_message_id.clone_from(&message);
             let stream_result = client
-                .stream(&model, &messages, &tools, cancel, |delta, full| {
-                    if !delta.content.is_empty() || !delta.reasoning.is_empty() {
-                        self.engine.db.conn().execute(
-                            "UPDATE messages SET content=?1,reasoning=?2 WHERE id=?3",
-                            params![full.content, full.reasoning, message],
-                        )?;
-                        self.events.emit(
-                            turn,
-                            conv,
-                            Some(&message),
-                            "delta",
-                            json!({"content":delta.content,"reasoning":delta.reasoning}),
-                        )?;
-                    }
-                    if let Some(usage) = &delta.usage {
-                        self.engine.db.conn().execute(
-                            "UPDATE messages SET token_count=?1 WHERE id=?2",
-                            params![usage["completion_tokens"].as_i64().unwrap_or(0), message],
-                        )?;
-                        self.events
-                            .emit(turn, conv, Some(&message), "usage", usage.clone())?;
-                    }
-                    Ok(())
-                })
+                .stream(
+                    &model,
+                    &messages,
+                    &tools,
+                    cancel,
+                    |delta, full| {
+                        if !delta.content.is_empty() || !delta.reasoning.is_empty() {
+                            self.engine.db.conn().execute(
+                                "UPDATE messages SET content=?1,reasoning=?2 WHERE id=?3",
+                                params![full.content, full.reasoning, message],
+                            )?;
+                            self.events.emit(
+                                turn,
+                                conv,
+                                Some(&message),
+                                "delta",
+                                json!({"content":delta.content,"reasoning":delta.reasoning}),
+                            )?;
+                        }
+                        Ok(())
+                    },
+                    || self.events.reset_reply(turn, conv, &message),
+                )
                 .await;
             let completion = match stream_result {
                 Ok(value) => value,
@@ -369,6 +403,14 @@ impl AgentRuntime {
                 Err(error) => return Err(error),
             };
             let mut calls = completion.calls()?;
+            if let Some(usage) = &completion.usage {
+                self.engine.db.conn().execute(
+                    "UPDATE messages SET token_count=?1 WHERE id=?2",
+                    params![usage["completion_tokens"].as_i64().unwrap_or(0), message],
+                )?;
+                self.events
+                    .emit(turn, conv, Some(&message), "usage", usage.clone())?;
+            }
             for call in &mut calls {
                 match call.name.as_str() {
                     "download_mod" => call.arguments = history_arguments(&call.arguments),
@@ -543,24 +585,39 @@ impl AgentRuntime {
             }
             messages.push(msg);
         }
+        drop(stmt);
+        drop(conn);
         scrub_model_history(&mut messages);
         Ok(messages)
     }
     fn repair_incomplete_tool_groups(&self, conv: &str) -> AppResult<()> {
-        let messages = self.context(conv)?;
-        let mut unanswered = HashMap::new();
-        for msg in &messages {
-            for c in msg["tool_calls"].as_array().into_iter().flatten() {
-                if let Some(id) = c["id"].as_str() {
-                    unanswered.insert(id.to_string(), ());
+        // Only protocol metadata is needed before appending the next user
+        // message. Don't rebuild the prompt, verify skills or load tool output
+        // twice, especially while start_turn holds the active-turn lock.
+        let mut unanswered = BTreeSet::new();
+        {
+            let conn = self.engine.db.conn();
+            let mut stmt = conn.prepare(
+                "SELECT tool_calls_json, tool_call_id FROM messages WHERE conversation_id=?1
+                 AND (tool_calls_json IS NOT NULL OR tool_call_id IS NOT NULL) ORDER BY rowid",
+            )?;
+            let mut rows = stmt.query([conv])?;
+            while let Some(row) = rows.next()? {
+                if let Some(encoded) = row.get::<_, Option<String>>(0)? {
+                    let calls: Value = serde_json::from_str(&encoded)?;
+                    for call in calls.as_array().into_iter().flatten() {
+                        if let Some(id) = call["id"].as_str() {
+                            unanswered.insert(id.to_owned());
+                        }
+                    }
                 }
-            }
-            if let Some(id) = msg["tool_call_id"].as_str() {
-                unanswered.remove(id);
+                if let Some(id) = row.get::<_, Option<String>>(1)? {
+                    unanswered.remove(&id);
+                }
             }
         }
         // Finish the prior interrupted group before submitting a new model request.
-        for id in unanswered.keys() {
+        for id in &unanswered {
             append_message(
                 &self.engine.db,
                 conv,
@@ -601,7 +658,14 @@ impl AgentRuntime {
             json!({"role":"user","content":older}),
         ];
         let summary = client
-            .stream(budget.model, &request, &[], cancel, |_, _| Ok(()))
+            .stream(
+                budget.model,
+                &request,
+                &[],
+                cancel,
+                |_, _| Ok(()),
+                || Ok(()),
+            )
             .await?
             .content;
         self.engine.db.conn().execute(

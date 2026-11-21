@@ -704,3 +704,178 @@ fn toggle_cannot_validate_registry_version_or_unrecoverable_deployment() {
     assert!(set_enabled(&f.engine, SLUG, true).is_err());
     assert!(!f.flags().1 && !f.flags().2);
 }
+
+#[test]
+fn deletion_moves_only_the_selected_draft_and_restore_revives_its_original_id() {
+    let f = Fixture::new();
+    let engine = &f.engine;
+    let chosen = f.draft("1.0.0").draft;
+    let sibling = f.draft("2.0.0").draft;
+    let deployment = plan_install_plugin(engine, &chosen.id).unwrap();
+    apply(engine, &deployment.plan);
+    reconcile_deployments(engine).unwrap();
+    set_enabled(engine, SLUG, false).unwrap();
+    let installed = f.flags();
+    let read_adapter = |directory: &Path| fs::read(directory.join("adapter.json")).unwrap();
+    let chosen_bytes = read_adapter(&chosen.path);
+    let sibling_bytes = read_adapter(&sibling.path);
+
+    delete_confirmed_draft(engine, &chosen.id).unwrap();
+    let reopened = f.reopened();
+    assert_eq!(list_drafts(&reopened).unwrap()[0].id, sibling.id);
+    assert_eq!(list_drafts(&reopened).unwrap().len(), 1);
+    assert!(!chosen.path.exists());
+    assert_eq!(read_adapter(&sibling.path), sibling_bytes);
+    assert_eq!(read_adapter(&deployment.install_path), chosen_bytes);
+    assert!(reconcile_deployments(&reopened).unwrap().issues.is_empty());
+    assert_eq!(f.flags(), installed);
+    assert_eq!(
+        get_draft(engine, &chosen.id).unwrap().write_transaction_id,
+        chosen.write_transaction_id
+    );
+    assert_eq!(
+        transaction_status(engine, &chosen.write_transaction_id).unwrap(),
+        "committed"
+    );
+    assert!(validate_draft(engine, &chosen.id).is_err());
+    assert!(plan_install_plugin(engine, &chosen.id).is_err());
+    assert!(delete_confirmed_draft(engine, &chosen.id).is_err());
+
+    let items = trash::list_trash(&engine.db, false).unwrap();
+    let [item] = items.as_slice() else {
+        panic!("expected one trash item")
+    };
+    assert_eq!(Path::new(&item.original_path), chosen.path);
+    assert_eq!(read_adapter(Path::new(&item.trash_path)), chosen_bytes);
+    let move_plan = engine.get_plan(&item.transaction_id).unwrap();
+    assert!(move_plan.requires_review && move_plan.entries.len() == 1);
+    assert!(
+        matches!(&move_plan.entries[0].operation, FileOp::Move { src, .. } if *src == chosen.path)
+    );
+
+    let restore = trash::plan_restore(&reopened, std::slice::from_ref(&item.id), false).unwrap();
+    apply(&reopened, &restore);
+    let validation = validate_draft(engine, &chosen.id).unwrap();
+    assert!(validation.valid);
+    assert_eq!(
+        validation.draft.write_transaction_id,
+        chosen.write_transaction_id
+    );
+    assert!(trash::list_trash(&engine.db, false).unwrap().is_empty());
+    assert_eq!(list_drafts(engine).unwrap().len(), 2);
+
+    // Undoing a restore puts the same payload back in the bin, and undoing the
+    // original delete in History revives it too (without rewriting provenance).
+    engine.rollback_transaction(&restore.id).unwrap();
+    assert!(validate_draft(engine, &chosen.id).is_err());
+    engine.rollback_transaction(&move_plan.id).unwrap();
+    assert!(validate_draft(engine, &chosen.id).unwrap().valid);
+}
+
+#[test]
+fn deletion_rejects_uncommitted_bad_ids_and_mismatched_source_provenance() {
+    let f = Fixture::new();
+    let engine = &f.engine;
+    let (adapter, skill) = content(SLUG, "1.0.0");
+    let planned = plan_write_draft(engine, SLUG, &adapter, &skill)
+        .unwrap()
+        .draft;
+    let chosen = f.draft("1.0.0").draft;
+    let other = f.draft("1.0.0").draft;
+    assert!(matches!(
+        delete_confirmed_draft(engine, "../other"),
+        Err(AppError::Invalid(_))
+    ));
+    assert!(matches!(
+        delete_confirmed_draft(engine, &util::new_id("draft")),
+        Err(AppError::NotFound(_))
+    ));
+    assert!(matches!(
+        delete_confirmed_draft(engine, &planned.id),
+        Err(AppError::Conflict(_))
+    ));
+    engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE plugin_drafts SET path=?2 WHERE id=?1",
+            params![chosen.id, other.path.to_string_lossy()],
+        )
+        .unwrap();
+    assert!(matches!(
+        delete_confirmed_draft(engine, &chosen.id),
+        Err(AppError::Denied(_))
+    ));
+    engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE plugin_drafts SET path=?2,write_transaction_id=?3 WHERE id=?1",
+            params![
+                chosen.id,
+                chosen.path.to_string_lossy(),
+                other.write_transaction_id
+            ],
+        )
+        .unwrap();
+    assert!(matches!(
+        delete_confirmed_draft(engine, &chosen.id),
+        Err(AppError::Invalid(_))
+    ));
+    assert_eq!(f.count("plugin_draft_deletions"), 0);
+    assert!(chosen.path.exists() && other.path.exists());
+    assert!(trash::list_trash(&engine.db, false).unwrap().is_empty());
+}
+
+#[test]
+fn failed_draft_deletion_keeps_draft_live_and_only_committed_moves_appear_in_trash() {
+    let f = Fixture::new();
+    let engine = &f.engine;
+    let draft = f.draft("1.0.0").draft;
+    engine
+        .db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER fail_tombstone BEFORE INSERT ON plugin_draft_deletions
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+    assert!(matches!(
+        delete_confirmed_draft(engine, &draft.id),
+        Err(AppError::Db(_))
+    ));
+    assert_eq!(f.count("file_transactions"), 1);
+    assert_eq!(f.count("trash_items"), 0);
+    engine
+        .db
+        .conn()
+        .execute_batch("DROP TRIGGER fail_tombstone")
+        .unwrap();
+    engine.inject_failure_before(0);
+    assert!(delete_confirmed_draft(engine, &draft.id).is_err());
+    let reopened = f.reopened();
+    assert!(validate_draft(&reopened, &draft.id).unwrap().valid);
+    assert_eq!(list_drafts(&reopened).unwrap()[0].id, draft.id);
+    assert!(trash::list_trash(&reopened.db, false).unwrap().is_empty());
+    delete_confirmed_draft(&reopened, &draft.id).unwrap();
+    assert!(list_drafts(&reopened).unwrap().is_empty());
+    assert_eq!(trash::list_trash(&reopened.db, false).unwrap().len(), 1);
+}
+
+#[test]
+fn reviewed_install_cannot_use_out_of_band_recreated_files_of_a_deleted_draft() {
+    let f = Fixture::new();
+    let engine = &f.engine;
+    let draft = f.draft("1.0.0").draft;
+    let deployment = plan_install_plugin(engine, &draft.id).unwrap();
+    engine.approve_plan(&deployment.plan.id).unwrap();
+    delete_confirmed_draft(engine, &draft.id).unwrap();
+    let (adapter, skill) = content(SLUG, "1.0.0");
+    write(&draft.path.join("adapter.json"), adapter);
+    write(&draft.path.join("SKILL.md"), skill);
+    assert!(matches!(
+        engine.apply_file_ops(&deployment.plan.id),
+        Err(AppError::Conflict(_))
+    ));
+    assert!(!deployment.install_path.exists());
+}

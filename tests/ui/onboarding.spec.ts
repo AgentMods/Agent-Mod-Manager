@@ -112,6 +112,7 @@ test.describe("首次启动引导", () => {
       };
     }, configuredSettings);
     await page.goto("/");
+    await page.getByRole("button", {name: "游戏库", exact: true}).click();
     await expect(page.getByTestId("library-page")).toBeVisible();
     await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
 
@@ -248,6 +249,7 @@ test.describe("首次启动引导", () => {
   test("已完成引导的用户可以从设置重新查看引导", async ({page}) => {
     await installMockTauri(page);
     await page.goto("/");
+    await page.getByRole("button", {name: "游戏库", exact: true}).click();
     await expect(page.getByTestId("library-page")).toBeVisible();
     await page.getByRole("button", {name: "设置", exact: true}).click();
     await page.getByRole("tab", {name: "外观与存储"}).click();

@@ -119,7 +119,6 @@ test.describe("游戏卡片操作", () => {
     // The onboarding fixture registers "Fixture Game" with zero installed Mods.
     await installMockTauri(page, {onboarding: true});
     await page.goto("/");
-    await page.getByRole("button", {name: "游戏库", exact: true}).click();
     await page.getByRole("button", {name: "扫描已安装游戏"}).click();
     const fixture = page.getByRole("listitem").filter({hasText: "Fixture Game"});
     await fixture.getByRole("checkbox", {name: "选择 Fixture Game"}).check();

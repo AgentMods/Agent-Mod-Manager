@@ -3,7 +3,7 @@ use crate::{
     error::{AppError, AppResult},
     util,
 };
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -34,26 +34,59 @@ impl Events {
         kind: &str,
         payload: Value,
     ) -> AppResult<AgentEvent> {
-        let created_at = util::now();
-        let seq = {
-            let conn = self.db.conn();
-            let changed = conn.execute("INSERT INTO agent_events (turn_id,conversation_id,message_id,kind,payload_json,created_at) SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS (SELECT 1 FROM conversations WHERE id=?2)",params![turn,conv,message,kind,serde_json::to_string(&payload)?,created_at])?;
+        let event = Self::record(&self.db.conn(), turn, conv, message, kind, payload)?;
+        (self.sink)(&event);
+        Ok(event)
+    }
+
+    pub fn reset_reply(&self, turn: &str, conv: &str, message: &str) -> AppResult<()> {
+        let event = {
+            let mut conn = self.db.conn();
+            let tx = conn.transaction()?;
+            let changed = tx.execute(
+                "UPDATE messages SET content='', reasoning=NULL, token_count=0 WHERE id=?1 AND conversation_id=?2 AND role='assistant'",
+                params![message, conv],
+            )?;
             if changed == 0 {
-                return Err(AppError::NotFound("会话".into()));
+                return Err(AppError::NotFound("助理消息".into()));
             }
-            conn.last_insert_rowid()
+            let event = Self::record(
+                &tx,
+                turn,
+                conv,
+                Some(message),
+                "reply-reset",
+                serde_json::json!({}),
+            )?;
+            tx.commit()?;
+            event
         };
-        let event = AgentEvent {
-            seq,
+        (self.sink)(&event);
+        Ok(())
+    }
+
+    fn record(
+        conn: &Connection,
+        turn: &str,
+        conv: &str,
+        message: Option<&str>,
+        kind: &str,
+        payload: Value,
+    ) -> AppResult<AgentEvent> {
+        let created_at = util::now();
+        let changed = conn.execute("INSERT INTO agent_events (turn_id,conversation_id,message_id,kind,payload_json,created_at) SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS (SELECT 1 FROM conversations WHERE id=?2)",params![turn,conv,message,kind,serde_json::to_string(&payload)?,created_at])?;
+        if changed == 0 {
+            return Err(AppError::NotFound("会话".into()));
+        }
+        Ok(AgentEvent {
+            seq: conn.last_insert_rowid(),
             turn_id: turn.into(),
             conversation_id: conv.into(),
             message_id: message.map(String::from),
             kind: kind.into(),
             payload,
             created_at,
-        };
-        (self.sink)(&event);
-        Ok(event)
+        })
     }
     pub fn replay(&self, conv: &str, after: i64, limit: usize) -> AppResult<Vec<AgentEvent>> {
         if after < 0 || limit == 0 || limit > 2000 {

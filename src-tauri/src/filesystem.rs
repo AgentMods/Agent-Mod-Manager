@@ -19,11 +19,11 @@ pub struct TextFile {
 }
 
 pub fn read_dir(engine: &FileEngine, path: &Path) -> AppResult<Vec<util::DirEntryInfo>> {
-    let path = engine.paths.guard(path, &engine.roots()?)?;
+    let path = engine.resolve_file_path(path)?;
     util::list_dir_shallow(&path, 2000)
 }
 pub fn read_file(engine: &FileEngine, path: &Path) -> AppResult<TextFile> {
-    let path = engine.paths.guard(path, &engine.roots()?)?;
+    let path = engine.resolve_file_path(path)?;
     let mut bytes = Vec::new();
     safe_fs::open_regular(&path)?
         .take(256 * 1024 + 1)

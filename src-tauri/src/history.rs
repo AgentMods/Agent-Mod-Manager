@@ -69,6 +69,23 @@ pub struct Conversation {
     pub updated_at: String,
     /// None inherits the global setting. This value lives in settings, not schema.
     pub permission_mode: Option<String>,
+    /// List-only checkpoint; the frontend layers more recent live events over it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_status: Option<ConversationAgentStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConversationAgentStatus {
+    turn_id: Option<String>,
+    turn_status: Option<String>,
+    event_seq: i64,
+    pending: Option<PendingAgentInteraction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PendingAgentInteraction {
+    approval_id: String,
+    status: String,
 }
 
 /// Persistence/UI DTO. Use `to_openai` to omit local metadata from a request.
@@ -190,14 +207,57 @@ impl History {
     pub fn list_conversations(&self, archived: bool) -> AppResult<Vec<Conversation>> {
         let conn = self.db.conn();
         let mut stmt = conn.prepare(
-            "SELECT id,title,game_id,task_summary,archived,pinned,message_count,created_at,updated_at
-             FROM conversations WHERE archived=?1 ORDER BY pinned DESC,updated_at DESC,rowid DESC",
+            "WITH latest_turns AS (
+                SELECT conversation_id, MAX(rowid) turn_row FROM agent_turns GROUP BY conversation_id
+             )
+             SELECT c.id,c.title,c.game_id,c.task_summary,c.archived,c.pinned,c.message_count,c.created_at,c.updated_at,
+                    t.id AS turn_id,t.status AS turn_status,
+                    COALESCE((SELECT MAX(seq) FROM agent_events WHERE conversation_id=c.id),0) AS event_seq
+             FROM conversations c
+             LEFT JOIN latest_turns lt ON lt.conversation_id=c.id
+             LEFT JOIN agent_turns t ON t.rowid=lt.turn_row
+             WHERE c.archived=?1 ORDER BY c.pinned DESC,c.updated_at DESC,c.rowid DESC",
         )?;
-        let conversations = stmt.query_map([archived], conversation_from_row)?;
+        let conversations = stmt.query_map([archived], |row| {
+            let mut conversation = conversation_from_row(row)?;
+            conversation.agent_status = Some(ConversationAgentStatus {
+                turn_id: row.get(9)?,
+                turn_status: row.get(10)?,
+                event_seq: row.get(11)?,
+                pending: None,
+            });
+            Ok(conversation)
+        })?;
         let mut result = Vec::new();
         for item in conversations {
             let mut conversation = item?;
             conversation.permission_mode = read_permission_mode(&conn, &conversation.id)?;
+            if let Some(status) = conversation
+                .agent_status
+                .as_mut()
+                .filter(|s| s.turn_status.as_deref() == Some("running"))
+            {
+                // The runtime waits for one interaction at a time. Require both a
+                // published request for this turn and a still-pending approval row.
+                status.pending = conn
+                    .query_row(
+                        "SELECT a.id, CASE
+                            WHEN a.title='ask_user' THEN 'waiting-answer'
+                            ELSE 'waiting-approval' END
+                         FROM agent_events e JOIN approvals a ON a.id=json_extract(e.payload_json,'$.approvalId')
+                         WHERE e.conversation_id=?1 AND e.turn_id=?2 AND e.kind='approval-request'
+                           AND a.conversation_id=?1 AND a.status='pending'
+                         ORDER BY e.seq DESC LIMIT 1",
+                        params![conversation.id, status.turn_id],
+                        |row| {
+                            Ok(PendingAgentInteraction {
+                                approval_id: row.get(0)?,
+                                status: row.get(1)?,
+                            })
+                        },
+                    )
+                    .optional()?;
+            }
             result.push(conversation);
         }
         Ok(result)
@@ -213,6 +273,90 @@ impl History {
             conversation,
             messages,
         })
+    }
+
+    /// Snapshot the context before the selected user turn. A retry targets an
+    /// assistant message and uses the nearest preceding user message as input.
+    pub(crate) fn fork_before_message(
+        &self,
+        source: &str,
+        message_id: &str,
+        edited_content: Option<String>,
+    ) -> AppResult<(String, String)> {
+        let mut conn = self.db.conn();
+        let tx = conn.transaction()?;
+        let conversation = read_conversation(&tx, source)?;
+        if conversation.archived {
+            return Err(AppError::Denied("请先恢复归档会话".into()));
+        }
+        let (target_row, role, original): (i64, String, String) = tx
+            .query_row(
+                "SELECT rowid,role,content FROM messages WHERE conversation_id=?1 AND id=?2",
+                params![source, message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| AppError::NotFound("消息".into()))?;
+        let (cutoff, content) = match (role.as_str(), edited_content) {
+            ("user", Some(content)) => (target_row, content),
+            ("user", None) => (target_row, original),
+            ("assistant", None) => tx
+                .query_row(
+                    "SELECT rowid,content FROM messages
+                     WHERE conversation_id=?1 AND role='user' AND rowid<?2 ORDER BY rowid DESC LIMIT 1",
+                    params![source, target_row],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| AppError::NotFound("原始提问".into()))?,
+            _ => return Err(AppError::Invalid("只能编辑用户消息".into())),
+        };
+        let branch = new_id("conv");
+        let timestamp = now();
+        tx.execute(
+            "INSERT INTO conversations(id,title,game_id,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)",
+            params![branch, first_message_title(&content), conversation.game_id, timestamp],
+        )?;
+        let copied = tx.execute(
+            "INSERT INTO messages(id,conversation_id,role,content,reasoning,tool_calls_json,tool_call_id,name,token_count,created_at)
+             SELECT ?1 || ':' || id,?1,role,content,reasoning,tool_calls_json,tool_call_id,name,token_count,created_at
+             FROM messages WHERE conversation_id=?2 AND rowid<?3 ORDER BY rowid",
+            params![branch, source, cutoff],
+        )?;
+        tx.execute(
+            "UPDATE conversations SET message_count=?2 WHERE id=?1",
+            params![branch, copied],
+        )?;
+        tx.execute(
+            "INSERT INTO settings(key,value) SELECT ?1,value FROM settings WHERE key=?2",
+            params![
+                conversation_permission_key(&branch),
+                conversation_permission_key(source)
+            ],
+        )?;
+        // Compute membership once per conversation. A correlated lookup for
+        // the terminal event would rescan thousands of deltas per copied row
+        // while holding the app's single database connection.
+        tx.execute(
+            "WITH prior_turns AS (
+                 SELECT e.turn_id FROM agent_events e JOIN messages m ON m.id=e.message_id
+                 WHERE e.conversation_id=?2 AND m.conversation_id=?2 AND m.rowid<?3
+             ), finished AS (
+                 SELECT turn_id FROM agent_events WHERE conversation_id=?2 AND kind='done'
+             ), answers AS (
+                 SELECT turn_id, json_extract(payload_json,'$.approvalId') FROM agent_events
+                 WHERE conversation_id=?2 AND kind='approval-resolved'
+             )
+             INSERT INTO agent_events(turn_id,conversation_id,message_id,kind,payload_json,created_at)
+             SELECT ?1 || ':' || e.turn_id,?1,?1 || ':' || e.message_id,e.kind,e.payload_json,e.created_at
+             FROM agent_events e WHERE e.conversation_id=?2
+               AND e.turn_id IN prior_turns AND e.turn_id IN finished
+               AND (e.kind<>'approval-request' OR (e.turn_id, json_extract(e.payload_json,'$.approvalId')) IN answers)
+             ORDER BY e.seq",
+            params![branch, source, cutoff],
+        )?;
+        tx.commit()?;
+        Ok((branch, content))
     }
 
     pub fn archive_conversation(&self, id: &str, archived: bool) -> AppResult<()> {
@@ -542,6 +686,7 @@ fn conversation_from_row(row: &Row<'_>) -> rusqlite::Result<Conversation> {
         created_at: row.get(7)?,
         updated_at: row.get(8)?,
         permission_mode: None,
+        agent_status: None,
     })
 }
 
@@ -728,6 +873,365 @@ mod tests {
                 arguments: "{}".into(),
             },
         }
+    }
+
+    fn checkpoint(history: &History, id: &str) -> ConversationAgentStatus {
+        history
+            .list_conversations(false)
+            .unwrap()
+            .into_iter()
+            .find(|conversation| conversation.id == id)
+            .unwrap()
+            .agent_status
+            .unwrap()
+    }
+
+    fn checkpoint_events(history: &History) -> crate::agent::events::Events {
+        crate::agent::events::Events {
+            db: history.db.clone(),
+            sink: std::sync::Arc::new(|_| {}),
+        }
+    }
+
+    #[test]
+    fn conversation_list_checkpoint_preserves_latest_turn_outcome() {
+        let (_dir, history) = fixture();
+        let conv = history.create_conversation("Task", None).unwrap().id;
+        let empty = checkpoint(&history, &conv);
+        assert_eq!(empty.turn_id, None);
+        assert_eq!(empty.turn_status, None);
+        assert_eq!(empty.event_seq, 0);
+        assert_eq!(empty.pending, None);
+
+        let events = checkpoint_events(&history);
+        for (turn, status) in [
+            ("success", "done"),
+            ("cancel", "cancelled"),
+            ("failure", "error"),
+        ] {
+            // Use the same timestamp for each row; only insertion order is reliable.
+            history.db.conn().execute(
+                "INSERT INTO agent_turns (id,conversation_id,status,created_at) VALUES (?1,?2,?3,'now')",
+                params![turn, conv, status],
+            ).unwrap();
+            let started = events
+                .emit(turn, &conv, None, "turn-start", json!({}))
+                .unwrap();
+            // The terminal DB outcome remains available even without a done event.
+            let current = checkpoint(&history, &conv);
+            assert_eq!(current.turn_id.as_deref(), Some(turn));
+            assert_eq!(current.turn_status.as_deref(), Some(status));
+            assert_eq!(current.event_seq, started.seq);
+            assert_eq!(current.pending, None);
+        }
+    }
+
+    #[test]
+    fn conversation_list_checkpoint_only_exposes_current_published_pending_requests() {
+        let (_dir, history) = fixture();
+        let conv = history.create_conversation("Task", None).unwrap().id;
+        history
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO agent_turns (id,conversation_id,status,created_at)
+             VALUES ('old',?1,'done','now'),('current',?1,'running','now')",
+                [&conv],
+            )
+            .unwrap();
+        let events = checkpoint_events(&history);
+        let requests = [
+            (
+                "old",
+                "old-approval",
+                "apply_file_ops",
+                json!({}),
+                "waiting-approval",
+            ),
+            (
+                "current",
+                "legacy",
+                "ask_user",
+                json!({"question":"Input?"}),
+                "waiting-answer",
+            ),
+            (
+                "current",
+                "structured",
+                "ask_user",
+                json!({"questions":[{"question":"Input?"}]}),
+                "waiting-answer",
+            ),
+            (
+                "current",
+                "permission",
+                "apply_file_ops",
+                json!({}),
+                "waiting-approval",
+            ),
+        ];
+        for (turn, approval, title, preview, expected) in requests {
+            history.db.conn().execute(
+                "INSERT INTO approvals (id,conversation_id,kind,title,payload_json,status,created_at)
+                 VALUES (?1,?2,'tool',?3,?4,'pending','now')",
+                params![approval, conv, title, preview.to_string()],
+            ).unwrap();
+            assert_eq!(
+                checkpoint(&history, &conv).pending,
+                None,
+                "not published yet"
+            );
+
+            let request = events
+                .emit(
+                    turn,
+                    &conv,
+                    None,
+                    "approval-request",
+                    json!({
+                        "approvalId": approval, "title": title, "preview": preview,
+                    }),
+                )
+                .unwrap();
+            let current = checkpoint(&history, &conv);
+            assert_eq!(current.turn_id.as_deref(), Some("current"));
+            assert_eq!(current.turn_status.as_deref(), Some("running"));
+            assert_eq!(current.event_seq, request.seq);
+            if turn == "old" {
+                // A stray pending row from a previous turn cannot become actionable.
+                assert_eq!(current.pending, None);
+                continue;
+            }
+            assert_eq!(
+                current.pending,
+                Some(PendingAgentInteraction {
+                    approval_id: approval.into(),
+                    status: expected.into(),
+                })
+            );
+
+            history
+                .db
+                .conn()
+                .execute(
+                    "UPDATE approvals SET status='approved',resolved_at='now' WHERE id=?1",
+                    [approval],
+                )
+                .unwrap();
+            // The persisted resolution is authoritative before its event is emitted.
+            assert_eq!(checkpoint(&history, &conv).pending, None);
+        }
+    }
+
+    #[test]
+    fn conversation_list_checkpoint_clears_pending_after_runtime_restart() {
+        use crate::{
+            agent::runtime::AgentRuntime,
+            settings::{SecretStore, Settings},
+            storage::AppPaths,
+            transaction::FileEngine,
+        };
+        use std::sync::Arc;
+
+        struct NoSecrets;
+        impl SecretStore for NoSecrets {
+            fn read(&self, _: &str) -> AppResult<Option<String>> {
+                Ok(None)
+            }
+            fn write(&self, _: &str, _: &str) -> AppResult<()> {
+                Ok(())
+            }
+        }
+
+        let (dir, history) = fixture();
+        let conv = history.create_conversation("Restart", None).unwrap().id;
+        history.db.conn().execute(
+            "INSERT INTO agent_turns (id,conversation_id,status,created_at) VALUES ('turn',?1,'running','now')",
+            [&conv],
+        ).unwrap();
+        history
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO approvals (id,conversation_id,kind,title,status,created_at)
+             VALUES ('approval',?1,'tool','apply_file_ops','pending','now')",
+                [&conv],
+            )
+            .unwrap();
+        let request = checkpoint_events(&history)
+            .emit(
+                "turn",
+                &conv,
+                None,
+                "approval-request",
+                json!({
+                    "approvalId": "approval", "title": "apply_file_ops"
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            checkpoint(&history, &conv).pending.unwrap().status,
+            "waiting-approval"
+        );
+        drop(history);
+
+        let db = Db::open(&dir.path().join("history.sqlite")).unwrap();
+        let paths = AppPaths::new(dir.path().join("data")).unwrap();
+        let settings = Settings::with_secret_store(db.clone(), Arc::new(NoSecrets));
+        let runtime = AgentRuntime::new(
+            FileEngine::new(db.clone(), paths),
+            settings,
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        let after = checkpoint(&History::new(db.clone()), &conv);
+        assert_eq!(after.turn_id.as_deref(), Some("turn"));
+        assert_eq!(after.turn_status.as_deref(), Some("interrupted"));
+        assert_eq!(after.pending, None);
+
+        let replay = runtime.events.replay(&conv, request.seq, 10).unwrap();
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].kind, "approval-resolved");
+        assert_eq!(
+            replay[0].payload,
+            json!({"approvalId": "approval", "status": "cancelled"})
+        );
+        assert_eq!(replay[1].kind, "done");
+        assert_eq!(replay[1].payload["status"], "interrupted");
+        assert_eq!(after.event_seq, replay[1].seq);
+        let status: String = db
+            .conn()
+            .query_row(
+                "SELECT status FROM approvals WHERE id='approval'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "cancelled");
+    }
+
+    #[test]
+    fn message_branches_keep_only_the_context_before_the_question() {
+        let (_dir, history) = fixture();
+        let source = history
+            .create_conversation("Source", Some("game_1"))
+            .unwrap();
+        history
+            .set_permission_mode(&source.id, Some("auto_approve"))
+            .unwrap();
+        let append = |role, text| {
+            history
+                .append_message(&source.id, role, text, None, None)
+                .unwrap()
+        };
+        append("user", "Earlier question");
+        let earlier = append("assistant", "Earlier answer");
+        let question = append("user", "Original question");
+        let answer = append("assistant", "Original answer");
+        append("user", "Later question");
+        let events = crate::agent::events::Events {
+            db: history.db.clone(),
+            sink: std::sync::Arc::new(|_| {}),
+        };
+        events
+            .emit(
+                "earlier",
+                &source.id,
+                Some(&earlier.id),
+                "delta",
+                json!({"content": "Earlier answer"}),
+            )
+            .unwrap();
+        events
+            .emit(
+                "earlier",
+                &source.id,
+                Some(&earlier.id),
+                "approval-request",
+                json!({"approvalId":"unresolved"}),
+            )
+            .unwrap();
+        for kind in ["approval-request", "approval-resolved"] {
+            events
+                .emit(
+                    "earlier",
+                    &source.id,
+                    Some(&earlier.id),
+                    kind,
+                    json!({"approvalId":"answered"}),
+                )
+                .unwrap();
+        }
+        events
+            .emit(
+                "unfinished",
+                &source.id,
+                Some(&earlier.id),
+                "delta",
+                json!({"content": "incomplete"}),
+            )
+            .unwrap();
+        events
+            .emit(
+                "earlier",
+                &source.id,
+                None,
+                "done",
+                json!({"status": "done"}),
+            )
+            .unwrap();
+        events
+            .emit(
+                "target",
+                &source.id,
+                Some(&answer.id),
+                "delta",
+                json!({"content": "Original answer"}),
+            )
+            .unwrap();
+        events
+            .emit(
+                "target",
+                &source.id,
+                None,
+                "done",
+                json!({"status": "done"}),
+            )
+            .unwrap();
+
+        let (retry, prompt) = history
+            .fork_before_message(&source.id, &answer.id, None)
+            .unwrap();
+        assert_eq!(prompt, "Original question");
+        let (edit, prompt) = history
+            .fork_before_message(&source.id, &question.id, Some("Edited question".into()))
+            .unwrap();
+        assert_eq!(prompt, "Edited question");
+        for branch_id in [retry, edit] {
+            let branch = history.get_conversation(&branch_id).unwrap();
+            assert_eq!(branch.conversation.game_id, source.game_id);
+            assert_eq!(
+                branch.conversation.permission_mode.as_deref(),
+                Some("auto_approve")
+            );
+            assert_eq!(branch.conversation.message_count, 2);
+            assert_eq!(branch.messages[0].content, "Earlier question");
+            assert_eq!(branch.messages[1].content, "Earlier answer");
+            let replay = events.replay(&branch_id, 0, 10).unwrap();
+            assert_eq!(
+                replay.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+                ["delta", "approval-request", "approval-resolved", "done"]
+            );
+            assert_eq!(replay[1].payload["approvalId"], "answered");
+            assert_eq!(
+                replay[0].message_id.as_deref(),
+                Some(branch.messages[1].id.as_str())
+            );
+        }
+        assert_eq!(
+            history.get_conversation(&source.id).unwrap().messages.len(),
+            5
+        );
     }
 
     #[test]

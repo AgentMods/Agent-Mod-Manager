@@ -6,7 +6,7 @@ use crate::{
     install::INSTALL_STATE,
     plugins::{GameAdapter, Platform, RootKind},
     storage::AppPaths,
-    transaction::{self, FileEngine, FileOp, FilePlan},
+    transaction::{self, FileEngine, FilePlan},
     util,
 };
 use rusqlite::{params, Connection, OptionalExtension};
@@ -80,7 +80,7 @@ pub(crate) fn set_game_adapter(engine: &FileEngine, id: &str, slug: &str) -> App
     if recovery_pending {
         return Err(AppError::Conflict("请先处理待恢复的文件事务".into()));
     }
-    if has_pending_review(&conn, id, root)? {
+    if has_pending_review(&conn, id, root, GameChange::SelectAdapter)? {
         return Err(AppError::Conflict(
             "该游戏仍有待审批或待执行的计划，请处理后再选择适配包".into(),
         ));
@@ -126,7 +126,7 @@ pub(crate) fn remove_game(engine: &FileEngine, id: &str) -> AppResult<()> {
             "存在待恢复的文件事务，请先恢复后再移除游戏".into(),
         ));
     }
-    if has_pending_review(&tx, id, PathBuf::from(root_path))? {
+    if has_pending_review(&tx, id, PathBuf::from(root_path), GameChange::Remove)? {
         return Err(AppError::Conflict(
             "该游戏仍有待审批或待执行的计划，请先处理后再移除".into(),
         ));
@@ -144,7 +144,17 @@ pub(crate) fn remove_game(engine: &FileEngine, id: &str) -> AppResult<()> {
     Ok(())
 }
 
-fn has_pending_review(conn: &Connection, id: &str, root: PathBuf) -> AppResult<bool> {
+enum GameChange {
+    SelectAdapter,
+    Remove,
+}
+
+fn has_pending_review(
+    conn: &Connection,
+    id: &str,
+    root: PathBuf,
+    change: GameChange,
+) -> AppResult<bool> {
     let explicit: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM file_transactions f
            WHERE f.status IN ('planned','approved') AND (
@@ -179,25 +189,28 @@ fn has_pending_review(conn: &Connection, id: &str, root: PathBuf) -> AppResult<b
             .iter()
             .any(|root| path.starts_with(root) || root.starts_with(path))
     };
+    // Selecting an adapter does not revoke any root. A standalone file preview
+    // uses fixed paths, not adapter rules, and cannot run without approval.
+    // Removal *does* revoke roots, so even those previews must block it.
+    let include_file_previews = matches!(change, GameChange::Remove);
     let mut stmt = conn.prepare(
         "SELECT plan_json FROM file_transactions
            WHERE game_id IS NULL AND status IN ('planned','approved')
+             AND (?1 OR status='approved' OR kind NOT IN ('files','local_agent_files'))
          UNION ALL
          SELECT f.plan_json FROM approvals a JOIN file_transactions f
-           ON f.id=CASE WHEN json_valid(a.payload_json)
-                        THEN json_extract(a.payload_json,'$.originalPlan.id') END
+           ON f.id=CASE WHEN json_valid(a.payload_json) THEN coalesce(
+               json_extract(a.payload_json,'$.originalPlan.id'),
+               json_extract(a.payload_json,'$.plan.id'),
+               json_extract(a.payload_json,'$.id')) END
            WHERE a.status='pending'",
     )?;
-    for json in stmt.query_map([], |row| row.get::<_, String>(0))? {
+    for json in stmt.query_map([include_file_previews], |row| row.get::<_, String>(0))? {
         let plan: FilePlan = serde_json::from_str(&json?).map_err(|_| {
             AppError::Conflict("存在无法核对归属的未完成文件计划，请先处理该计划".into())
         })?;
         if plan.entries.iter().any(|entry| {
-            overlaps_root(entry.operation.dst())
-                || match &entry.operation {
-                    FileOp::Copy { src, .. } | FileOp::Move { src, .. } => overlaps_root(src),
-                    FileOp::Mkdir { .. } => false,
-                }
+            overlaps_root(entry.operation.dst()) || entry.operation.src().is_some_and(overlaps_root)
         }) {
             return Ok(true);
         }

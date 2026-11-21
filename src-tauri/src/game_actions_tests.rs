@@ -1,5 +1,8 @@
 use super::*;
-use crate::db::Db;
+use crate::{
+    db::Db,
+    transaction::{FileOp, FilePlan},
+};
 use serde_json::json;
 
 struct Fixture {
@@ -603,4 +606,77 @@ fn selecting_a_package_checks_markers_and_keeps_the_game_registration() {
     );
     assert_eq!(updated.metadata["keep"], json!({"value":1}));
     assert_eq!(games::list_games(&f.engine.db).unwrap().len(), 1);
+}
+
+fn make_minecraft_selectable(f: &Fixture) {
+    crate::plugins::seed_builtins(&f.engine.db, &f.engine.paths).unwrap();
+    let adapter = minecraft_adapter();
+    let marker = adapter
+        .markers
+        .iter()
+        .find(|marker| matches!(marker.kind, crate::plugins::MarkerKind::Directory))
+        .unwrap();
+    make_dir(&f.root.join(&marker.path));
+}
+
+fn unbound_mods_directory_preview(f: &Fixture) -> FilePlan {
+    f.engine
+        .plan_file_ops(
+            vec![FileOp::Mkdir {
+                dst: f.root.join("~mods"),
+            }],
+            "PBZ 安装预览".into(),
+        )
+        .unwrap()
+}
+
+#[test]
+fn selecting_package_checks_approval_and_transaction_state_for_mods_preview() {
+    let f = Fixture::new();
+    make_minecraft_selectable(&f);
+    let plan = unbound_mods_directory_preview(&f);
+    // A stale, unapproved standalone preview must not block adapter selection.
+    let updated = set_game_adapter(&f.engine, "g", "minecraft-java").unwrap();
+    assert_eq!(updated.adapter_slug.as_deref(), Some("minecraft-java"));
+    assert!(!f.root.join("~mods").exists());
+    // A pending approval linked by its direct FilePlan payload still blocks it.
+    f.engine.db.conn().execute(
+        "INSERT INTO approvals(id,kind,title,payload_json,created_at)
+         VALUES ('approval-pbz','tool','安装 PBZ',?1,'now')",
+        [serde_json::to_string(&plan).unwrap()],
+    ).unwrap();
+    assert!(set_game_adapter(&f.engine, "g", "minecraft-java").is_err());
+
+    f.engine.db.conn().execute(
+        "UPDATE approvals SET status='rejected' WHERE id='approval-pbz'",
+        [],
+    ).unwrap();
+    let rebound = set_game_adapter(&f.engine, "g", "minecraft-java").unwrap();
+    assert_eq!(rebound.adapter_slug.as_deref(), Some("minecraft-java"));
+    let status: String = f.engine.db.conn().query_row(
+        "SELECT status FROM file_transactions WHERE id=?1",
+        [&plan.id],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(status, "planned");
+    assert!(!f.root.join("~mods").exists());
+    assert!(remove_game(&f.engine, "g")
+        .unwrap_err()
+        .to_string()
+        .contains("待审批或待执行"));
+    assert_eq!(f.game().adapter_slug.as_deref(), Some("minecraft-java"));
+    f.engine.approve_plan(&plan.id).unwrap();
+    assert!(set_game_adapter(&f.engine, "g", "minecraft-java").is_err());
+
+    f.engine.db.conn().execute(
+        "UPDATE file_transactions SET status='recovery_failed' WHERE id=?1",
+        [&plan.id],
+    ).unwrap();
+    assert!(set_game_adapter(&f.engine, "g", "minecraft-java").is_err());
+
+    f.engine.db.conn().execute(
+        "UPDATE file_transactions SET status='planned',game_id='g' WHERE id=?1",
+        [&plan.id],
+    ).unwrap();
+    assert!(set_game_adapter(&f.engine, "g", "minecraft-java").is_err());
 }

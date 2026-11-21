@@ -147,11 +147,29 @@ loopback SSE fixture; no credentials or internet access are needed.
 
 ## File Safety
 
-Game roots must be explicitly registered. Scan results never grant write
-permission. A file change is planned and fingerprinted before approval, then
-committed with a durable journal and overwrite backups. Conflicting files are
-not silently replaced during restoration. Failed or interrupted transactions
-are recovered before new changes are allowed.
+In desktop Agent Chat, `read_dir`, `read_file`, `extract_preview`,
+`plan_file_ops`, and `apply_file_ops` can work outside registered game roots
+and the manager data root, subject to the desktop process's OS permissions
+and the app's file safety checks. `extract_preview` only lists archive entries;
+it does not extract or install anything. `preview_fomod` still requires an
+archive in managed downloads or staging. Credential storage and `.env` files
+remain protected, and game discovery still does not grant write authorization.
+Inbound MCP clients keep their existing filesystem restrictions.
+
+The desktop Agent's native `plan_file_ops` accepts `write_text` with a `dst`
+path and the full UTF-8 `content` for a new file or a complete overwrite. The
+combined text content in one plan may not exceed 1 MiB. Planning does not
+write the file; applying the plan follows the normal approval policy and still
+requires review in AutoApprove mode, even for registered game directories.
+Inbound MCP and other generic file planners cannot use `write_text`.
+
+File changes are planned and fingerprinted before approval, then committed with
+a durable journal and overwrite backups. Writes to external directories are not
+game writes and still require review in AutoApprove mode. Conflicting files are
+not silently replaced during restoration. Rollback of an external transaction
+is supported by the desktop transaction-history command and the local Agent,
+not by inbound MCP. Failed or interrupted transactions are recovered before
+new changes are allowed.
 
 Agent removal tools move content into manager trash. Only a separate,
 explicitly confirmed desktop action can permanently purge selected trash
@@ -163,12 +181,28 @@ trust acknowledgement. Do not enable an untrusted process. Descriptor-level
 defenses against concurrent filesystem path replacement and stronger stdio
 containment remain acceptance requirements.
 
+Desktop installers include Node.js with npm/npx and Astral uv/uvx. MCP connections using
+a bare `npx` or `uvx` command can install packages without system Node or uv.
+By default, npx uses `https://registry.npmmirror.com`, and uvx uses
+`https://pypi.tuna.tsinghua.edu.cn/simple`. To override a mirror, put `--registry=<url>`
+before the npm package name or `--default-index <url>` before the Python tool name.
+These defaults apply only to the child process. Explicit executable paths keep their own
+configuration. A first start can still need network access for packages and Python.
+The Playwright connection also requires its selected browser. Upgrading users must
+confirm previously started bare launchers once to use the packaged runtime.
+
+Settings remembers each MCP connection after its first successful start. On the
+next app launch, it reconnects in the background without opening Settings.
+Stop or edit a connection to cancel auto-start. After upgrading from a version
+without this feature, start each desired connection once to opt in.
+
 ## Local MCP Server
 
 The local server is opt-in from Settings, binds a random port on numeric
 loopback, and requires a fresh random Bearer token. The token is held in the
 encrypted Tauri Store under reference `mcp.local_server.token`.
-Starting a new server rotates it. Desktop status
+The server starts again on subsequent launches until you stop it in Settings.
+Each start rotates the token and binds a new endpoint. Desktop status
 returns the endpoint and reference, not the token.
 
 External clients share the desktop's tool registry, journal, permission policy

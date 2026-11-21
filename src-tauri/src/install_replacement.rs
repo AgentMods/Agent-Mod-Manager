@@ -240,7 +240,9 @@ impl Replacement {
                         )));
                     }
                 }
-                FileOp::Mkdir { .. } => return Err(conflict("版本替换含未知变更")),
+                FileOp::Mkdir { .. } | FileOp::WriteText { .. } => {
+                    return Err(conflict("版本替换含未知变更"))
+                }
             }
         }
         if !original.is_empty() {
@@ -346,7 +348,9 @@ pub(crate) fn validate_rollback(engine: &FileEngine, transaction_id: &str) -> Ap
                 }
                 touched.insert(path_key(src));
             }
-            FileOp::Mkdir { .. } => return Err(conflict("替换事务含未知变更")),
+            FileOp::Mkdir { .. } | FileOp::WriteText { .. } => {
+                return Err(conflict("替换事务含未知变更"))
+            }
         }
     }
     verify_ownership(

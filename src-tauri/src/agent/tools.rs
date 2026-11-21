@@ -32,6 +32,21 @@ pub struct ToolContext {
     pub progress: Option<Arc<dyn Fn(Value) + Send + Sync>>,
     pub(crate) resolution_scope: crate::sources::resolutions::ResolutionScope,
 }
+impl ToolContext {
+    /// Select host file access only for native file operations in a desktop chat.
+    /// Inbound MCP uses the same registry, but cannot select this scope via tool arguments.
+    pub(super) fn file_engine(&self) -> FileEngine {
+        if matches!(
+            self.resolution_scope,
+            crate::sources::resolutions::ResolutionScope::Agent(_)
+        ) {
+            self.engine.for_local_agent()
+        } else {
+            self.engine.clone()
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedTool {
     pub preview: Value,
@@ -42,6 +57,9 @@ pub struct PreparedTool {
 #[async_trait::async_trait]
 pub trait AgentTool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
+    fn inbound_definition(&self) -> ToolDefinition {
+        self.definition()
+    }
     async fn prepare(&self, _context: &ToolContext, args: &Value) -> AppResult<PreparedTool> {
         Ok(PreparedTool {
             preview: args.clone(),
@@ -105,11 +123,24 @@ impl ToolRegistry {
             .ok_or_else(|| AppError::NotFound(format!("工具未注册: {name}")))
     }
     pub fn definitions(&self) -> Vec<Value> {
+        self.definitions_for(false)
+    }
+    pub(crate) fn inbound_definitions(&self) -> Vec<Value> {
+        self.definitions_for(true)
+    }
+    fn definitions_for(&self, inbound: bool) -> Vec<Value> {
         self.tools
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .map(|t| t.definition().as_json())
+            .map(|t| {
+                if inbound {
+                    t.inbound_definition()
+                } else {
+                    t.definition()
+                }
+                .as_json()
+            })
             .collect()
     }
     pub fn builtin() -> AppResult<Self> {
@@ -136,6 +167,16 @@ impl ToolRegistry {
 struct Builtin {
     name: String,
 }
+impl Builtin {
+    fn engine_for(&self, context: &ToolContext) -> FileEngine {
+        match self.name.as_str() {
+            "read_dir" | "read_file" | "extract_preview" | "plan_file_ops" | "apply_file_ops" => {
+                context.file_engine()
+            }
+            _ => context.engine.clone(),
+        }
+    }
+}
 fn text<'a>(args: &'a Value, key: &str) -> AppResult<&'a str> {
     args[key]
         .as_str()
@@ -144,9 +185,8 @@ fn text<'a>(args: &'a Value, key: &str) -> AppResult<&'a str> {
 fn schema(properties: Value, required: &[&str]) -> Value {
     json!({"type":"object","properties":properties,"required":required,"additionalProperties":false})
 }
-#[async_trait::async_trait]
-impl AgentTool for Builtin {
-    fn definition(&self) -> ToolDefinition {
+impl Builtin {
+    fn tool_definition(&self, local: bool) -> ToolDefinition {
         let string = json!({"type":"string"});
         let (description, parameters, effect) = match self.name.as_str() {
             "scan_games" => (
@@ -155,12 +195,12 @@ impl AgentTool for Builtin {
                 Effect::Read,
             ),
             "read_dir" => (
-                "读取已登记游戏或管理器目录的直接子项",
+                if local { "列出指定目录的直接子项；无需先登记游戏目录" } else { "列出受管理目录的直接子项" },
                 schema(json!({"path":string}), &["path"]),
                 Effect::Read,
             ),
             "read_file" => (
-                "读取受管理文本文件，返回行号，最多2000行/256KiB",
+                if local { "按路径读取文本文件，最多2000行/256KiB；无需先登记游戏目录" } else { "读取受管理文本文件，返回行号，最多2000行/256KiB" },
                 schema(json!({"path":string}), &["path"]),
                 Effect::Read,
             ),
@@ -174,10 +214,21 @@ impl AgentTool for Builtin {
                 schema(json!({"path":string}), &["path"]),
                 Effect::Read,
             ),
+            "plan_file_ops" if !local => (
+                "生成受管理路径的复制/移动/建目录影响计划，不能永久删除文件",
+                schema(json!({"operations":{"type":"array","items":{"type":"object","properties":{
+                    "op":{"type":"string","enum":["copy","move","mkdir"]},"dst":string,"src":string
+                },"required":["op","dst"]}},"summary":string}), &["operations", "summary"]),
+                Effect::Read,
+            ),
             "plan_file_ops" => (
-                "生成复制/移动/建目录影响计划，不能删除文件",
+                "生成文件变更预览，不立即写入。桌面 Agent 可使用未登记的源或目标，或以 write_text 在指定路径新建/完整覆盖 UTF-8 文本（每个计划最多 1 MiB）。不能永久删除文件",
                 schema(
-                    json!({"operations":{"type":"array","items":{"type":"object"}},"summary":string}),
+                    json!({"operations":{"type":"array","items":{"type":"object","properties":{
+                        "op":{"type":"string","enum":["copy","move","mkdir","write_text"]},
+                        "dst":string,"src":{"type":"string","description":"copy / move 的源路径"},
+                        "content":{"type":"string","description":"write_text 的完整新文本（仅桌面 Agent）"}
+                    },"required":["op","dst"]}},"summary":string}),
                     &["operations", "summary"],
                 ),
                 Effect::Read,
@@ -229,6 +280,15 @@ impl AgentTool for Builtin {
             effect,
         }
     }
+}
+#[async_trait::async_trait]
+impl AgentTool for Builtin {
+    fn definition(&self) -> ToolDefinition {
+        self.tool_definition(true)
+    }
+    fn inbound_definition(&self) -> ToolDefinition {
+        self.tool_definition(false)
+    }
     async fn prepare(&self, context: &ToolContext, args: &Value) -> AppResult<PreparedTool> {
         if self.name == "ask_user" {
             return Ok(PreparedTool {
@@ -237,7 +297,7 @@ impl AgentTool for Builtin {
                 plan: None,
             });
         }
-        let engine = context.engine.clone();
+        let engine = self.engine_for(context);
         let args = args.clone();
         let name = self.name.clone();
         tokio::task::spawn_blocking(move || {
@@ -260,7 +320,9 @@ impl AgentTool for Builtin {
             };
             let effect = if let Some(p) = &plan {
                 let roots = engine.roots()?;
-                if !p.requires_review
+                if engine.has_external_paths(p)? {
+                    Effect::ExternalWrite
+                } else if !p.requires_review
                     && p.entries.iter().all(|e| {
                         roots.iter().any(|r| e.operation.dst().starts_with(r))
                             && match &e.operation {
@@ -300,7 +362,7 @@ impl AgentTool for Builtin {
         if context.cancel.is_cancelled() {
             return Err(AppError::Cancelled);
         }
-        let engine = context.engine.clone();
+        let engine = self.engine_for(context);
         let name = self.name.clone();
         tokio::task::spawn_blocking(move || {
             if let Some(p) = prepared.plan {
@@ -325,9 +387,7 @@ impl AgentTool for Builtin {
                     &PathBuf::from(text(&args, "path")?)
                 )?)),
                 "extract_preview" => {
-                    let path = engine
-                        .paths
-                        .guard(&PathBuf::from(text(&args, "path")?), &engine.roots()?)?;
+                    let path = engine.resolve_file_path(&PathBuf::from(text(&args, "path")?))?;
                     Ok(json!(crate::archive::list_archive(&path)?))
                 }
                 "preview_fomod" => Ok(json!(crate::fomod::preview(

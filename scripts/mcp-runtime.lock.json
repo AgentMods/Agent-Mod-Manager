@@ -1,0 +1,41 @@
+{
+  "node": {
+    "version": "24.22.3",
+    "npmVersion": "11.19.1",
+    "checksums": "https://nodejs.org/dist/v24.22.3/SHASUMS256.txt",
+    "sha256": {
+      "darwin-arm64": "1d64136c8a43d648d1b3bad10797a4c995b1ca032d2bde8799de43b37f058fe5",
+      "darwin-x64": "4daeec962855c1a6e66cda398a25037319dc1bbd4a0939188b3547afbbfb6490",
+      "linux-arm64": "6e51a2ada00f0011cc266f65d98922b403d7ad88f809ca2aa615a5fe1ce6e86c",
+      "linux-x64": "4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb",
+      "win-arm64": "b3cc74a295b39d4f273271e96f58c06dd2b35757ca12abec64c7d0598b434f14",
+      "win-x64": "e612af99f626ab415ea225af6bce5c971feb448cb5cae250bb1c3fa50c5f7d9f"
+    }
+  },
+  "uv": {
+    "version": "0.13.9",
+    "commit": "6b2d39dcc390293d51c9c0d2bbcd650f4bcbfdce",
+    "checksums": "https://github.com/astral-sh/uv/releases/download/0.13.9/sha256.sum",
+    "sha256": {
+      "aarch64-apple-darwin": "5aeca67f2283f75235de40d0bd9c0a5bbc5fce23b6d48b3bf9fa1b2db08382ca",
+      "x86_64-apple-darwin": "617a3211261b0fc739562f0071aa34e9739797c510208ede8e2977c30903d041",
+      "aarch64-unknown-linux-gnu": "0797542018e541a9288855df555c8077eed06f7a47d206362030480e8ecc9f3d",
+      "x86_64-unknown-linux-gnu": "a7fbaff2b9a271d85c1bdb540941090fd1ce011797b4abeb48e4dcd39c2471d5",
+      "aarch64-pc-windows-msvc": "72eed595983a4d7d22d79f21065b0f4479cc7e5c7a89104bb410c8f47559a878",
+      "x86_64-pc-windows-msvc": "edd61f7f5728a56cc62455386661860bdfc7bab65872f39b0c25bdcc1d8e1beb"
+    },
+    "licenses": {
+      "LICENSE-APACHE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "LICENSE-MIT": "860e3d7a86b84e6a7012c7a635fc64df475cebc6cce34dfeb73a5982ec58176c",
+      "crates/uv-build-frontend/src/pipreqs/LICENSE": "b40930bbcf80744c86c46a12bc9da056641d722716c378f5659b9e555ef833e1",
+      "crates/uv-extract/src/vendor/LICENSE": "b1cf7d681f2b87b1f8b34bb672407d408f4c53a22c7145e7b126dc13816b0231",
+      "crates/uv-netrc/LICENSE": "cd34bce7d85e332b01956deffe29ee74bfb2c02eccf0ee67ff48aaaafb507df1",
+      "crates/uv-pep440/License-Apache": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9",
+      "crates/uv-pep440/License-BSD": "349881bddbe385d3febd5ab50e36ea781aefee73bda4b0610918fe73fda29322",
+      "crates/uv-pep508/License-Apache": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9",
+      "crates/uv-pep508/License-BSD": "349881bddbe385d3febd5ab50e36ea781aefee73bda4b0610918fe73fda29322",
+      "crates/uv-python-interpreter/python/packaging/LICENSE.APACHE": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+      "crates/uv-python-interpreter/python/packaging/LICENSE.BSD": "b70e7e9b742f1cc6f948b34c16aa39ffece94196364bc88ff0d2180f0028fac5"
+    }
+  }
+}

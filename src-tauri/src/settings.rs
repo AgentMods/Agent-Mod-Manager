@@ -223,7 +223,10 @@ impl Settings {
         self.db.conn().execute(
             "INSERT INTO settings(key,value) VALUES(?1,?2)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![COMPOSER_PREFERENCES_KEY, serde_json::to_string(preferences)?],
+            params![
+                COMPOSER_PREFERENCES_KEY,
+                serde_json::to_string(preferences)?
+            ],
         )?;
         Ok(())
     }

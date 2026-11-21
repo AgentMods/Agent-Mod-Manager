@@ -282,6 +282,9 @@ test("Settings separates system and standalone Skills from game Skills", async (
   await page.getByRole("tab", {name: "Skills", exact: true}).click();
 
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect(page.getByRole("tablist", {name: "设置分类"}).getByRole("tab")).toHaveText([
+    "AI 与模型", "MCP 服务", "Skills", "外观与存储",
+  ]);
   const panel = page.getByRole("tabpanel", {name: "Skills", exact: true});
   const system = panel.getByRole("region", {name: "系统 Skills", exact: true});
   await expect(system.getByRole("row")).toHaveCount(4);
@@ -306,6 +309,13 @@ test("Settings separates system and standalone Skills from game Skills", async (
   await system.getByRole("button", {name: "联网搜索", exact: true}).click();
   const details = page.getByRole("dialog", {name: "联网搜索", exact: true});
   await expect(details).toContainText("仅发送公开的搜索关键词。");
+  const braveKey = details.getByLabel("Brave Search API Key", {exact: true});
+  await expect(braveKey).toHaveAttribute("type", "password");
+  await braveKey.fill("brave-fixture-key");
+  await details.getByRole("button", {name: "保存Brave Search API Key", exact: true}).click();
+  await expect(braveKey).toHaveValue("");
+  const secret = await page.evaluate(() => (window as any).__AMM_TEST__.calls.find((call: any) => call.command === "set_secret"));
+  expect(secret?.args).toEqual({key: "sources.brave", value: "brave-fixture-key"});
   await expect(details.getByRole("button", {name: /卸载 Skill/})).toHaveCount(0);
   await page.keyboard.press("Escape");
 
@@ -357,7 +367,8 @@ test("file details discard cached content after a reviewed trash commit", async 
   await page.goto("/");
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
   await page.getByRole("button").filter({hasText: "Minecraft Java Edition"}).click();
-  await page.getByRole("cell", {name: "options.txt", exact: true}).click();
+  await page.getByRole("tab", {name: "文件", exact: true}).click();
+  await page.getByRole("button", {name: "options.txt", exact: true}).click();
   await expect(page.locator(".file-viewer")).toContainText("fixture log");
   await page.getByRole("button", {name: "移入回收站", exact: true}).click();
   const dialog = page.getByRole("dialog", {name: "确认文件变更", exact: true});
@@ -368,11 +379,11 @@ test("file details discard cached content after a reviewed trash commit", async 
   await expect(dialog).toBeHidden();
   await expect(page.getByText("未选择文件", {exact: true})).toBeVisible();
   await expect(page.locator(".file-viewer")).toHaveCount(0);
-  await expect(page.getByRole("cell", {name: "options.txt", exact: true})).toHaveCount(0);
+  await expect(page.getByRole("button", {name: "options.txt", exact: true})).toHaveCount(0);
   await expect(page.locator("main [role=alert]")).toHaveCount(0);
 });
 
-test("directory picker fills the path without granting root access", async ({page}) => {
+test("directory picker scans only the chosen library without registering games", async ({page}) => {
   await installMockTauri(page);
   await page.goto("/");
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
@@ -380,11 +391,25 @@ test("directory picker fills the path without granting root access", async ({pag
   await directory.fill("/sandbox/original");
   await page.getByRole("button", {name: "选择游戏目录", exact: true}).click();
   await expect(directory).toHaveValue("/sandbox/new-game");
+  const adapted = page.getByText("已适配", {exact: true});
+  await expect(adapted).toHaveAttribute("data-variant", "success");
+  await expect(adapted.locator("svg")).toBeVisible();
+  await expect(page.getByText("Fixture Game", {exact: true})).toBeVisible();
+  await expect(page.getByText("61% 匹配", {exact: true})).toBeVisible();
   await page.getByRole("button", {name: "选择游戏目录", exact: true}).click();
   await expect(directory).toHaveValue("/sandbox/new-game");
+  await expect(adapted).toBeVisible();
   const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
   expect(calls.filter((call: any) => ["register_game", "identify_game", "register_user_root"].includes(call.command))).toHaveLength(0);
   expect(calls.filter((call: any) => call.command === "plugin:dialog|open")).toHaveLength(2);
+  expect(calls.filter((call: any) => call.command === "scan_games").map((call: any) => call.args.options)).toEqual([{userRoots: ["/sandbox/new-game"], includeCommonRoots: false}]);
+
+  await directory.fill("  /sandbox/empty  ");
+  await directory.press("Enter");
+  await expect(page.getByText(/未发现候选游戏/)).toBeVisible();
+  await expect(adapted).toHaveCount(0);
+  const lastScan = await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "scan_games").at(-1));
+  expect(lastScan.args.options).toEqual({userRoots: ["/sandbox/empty"], includeCommonRoots: false});
 });
 
 test("local archive import and game installation have separate approvals", async ({page}) => {
