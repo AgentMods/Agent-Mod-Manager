@@ -32,7 +32,7 @@ enum Slot {
     Starting {
         config: Box<ServerConfig>,
         requires_saved_consent: bool,
-        cancel: CancellationToken,
+        cancel: Arc<CancellationToken>,
         finished: CancellationToken,
     },
     Running {
@@ -62,15 +62,15 @@ impl Slot {
 }
 
 #[derive(Clone, Copy)]
-enum Start {
+enum Start<'a> {
     Confirmed(bool),
     Remembered,
-    Attachment,
+    Attachment(&'a CancellationToken),
     ManagedLocal,
 }
-impl Start {
+impl Start<'_> {
     fn requires_saved_consent(self) -> bool {
-        matches!(self, Self::Remembered | Self::Attachment)
+        matches!(self, Self::Remembered | Self::Attachment(_))
     }
 }
 
@@ -168,6 +168,7 @@ impl McpConnections {
         &self,
         settings: &Settings,
         registry: &ToolRegistry,
+        cancel: &CancellationToken,
     ) -> AppResult<McpClient> {
         use crate::mcp::{
             client::{namespaced_tool_name, MARKDOWN_TOOL},
@@ -187,11 +188,31 @@ impl McpConnections {
                     .into(),
             ));
         }
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        // A cancelled in-flight conversion stops the direct stdio child. Clear
+        // only that stopped slot; keep the exact saved launch authorization.
+        let stopped = {
+            let mut slots = self.lock_slots();
+            if matches!(slots.get(MARKITDOWN_ID), Some(Slot::Running { client, .. }) if client.is_closed())
+            {
+                slots
+                    .remove(MARKITDOWN_ID)
+                    .and_then(|slot| slot.revoke(registry))
+            } else {
+                None
+            }
+        };
+        if let Some(stopped) = stopped {
+            stopped.disconnect_and_wait().await?;
+        }
         let (info, client) = self
-            .start(settings.clone(), registry, config, Start::Attachment)
+            .start(settings.clone(), registry, config, Start::Attachment(cancel))
             .await
             .map_err(|err| match err {
                 AppError::Denied(_) => AppError::Denied("此 MarkItDown MCP 配置需要启动授权。请确认 stdio 进程使用当前用户的系统权限，或前往「设置 → 工具」启动它。".into()),
+                AppError::Cancelled => AppError::Cancelled,
                 other => AppError::Other(format!("无法使用 MarkItDown MCP。请在「设置 → 工具」中检查连接后重试。{other}")),
             })?;
         if !info
@@ -208,10 +229,16 @@ impl McpConnections {
         settings: Settings,
         registry: &ToolRegistry,
         expected: ServerConfig,
-        start: Start,
+        start: Start<'_>,
     ) -> AppResult<(ConnectionInfo, McpClient)> {
         let servers = McpServers::new(settings.db.clone());
-        let cancel = CancellationToken::new();
+        let cancel = Arc::new(match start {
+            Start::Attachment(caller) => caller.child_token(),
+            _ => CancellationToken::new(),
+        });
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
         let finished = CancellationToken::new();
         let _notify_waiters = finished.clone().drop_guard();
         let reservation = {
@@ -223,7 +250,7 @@ impl McpConnections {
                 .map(|_| crate::transaction::write_lock());
             let mut slots = self.lock_slots();
             match slots.get(&expected.id) {
-                Some(_) if !matches!(start, Start::Attachment) => {
+                Some(_) if !matches!(start, Start::Attachment(_)) => {
                     return Err(AppError::Conflict("MCP 正在启动或已连接".into()));
                 }
                 Some(Slot::Starting {
@@ -248,7 +275,7 @@ impl McpConnections {
                         Start::Confirmed(accepted) => {
                             ConnectionConsent::after_user_confirmation(&expected, accepted)?
                         }
-                        Start::Remembered | Start::Attachment => {
+                        Start::Remembered | Start::Attachment(_) => {
                             ConnectionConsent::from_remembered(&servers, &expected)?
                         }
                         Start::ManagedLocal => {
@@ -274,12 +301,13 @@ impl McpConnections {
         };
         let consent = match reservation {
             Ok(consent) => consent,
-            Err((finished, cancel)) => {
+            Err((finished, shared_cancel)) => {
                 // Concurrent uploads and desktop restore share one handshake. A waiter never
                 // retries a failed or revoked launch and cannot hold up an explicit stop.
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => return Err(AppError::Cancelled),
+                    _ = shared_cancel.cancelled() => return Err(AppError::Cancelled),
                     _ = finished.cancelled() => (),
                 }
                 return Self::attached(self.lock_slots().get(&expected.id), &expected);
@@ -289,7 +317,7 @@ impl McpConnections {
             .await
             .map_err(|err| match err {
                 // Authorization succeeded. Filesystem/transport denials must never reopen the consent dialog.
-                AppError::Denied(reason) if matches!(start, Start::Attachment) => {
+                AppError::Denied(reason) if matches!(start, Start::Attachment(_)) => {
                     AppError::Other(reason)
                 }
                 other => other,
@@ -323,8 +351,8 @@ impl McpConnections {
         settings: Settings,
         registry: &ToolRegistry,
         expected: ServerConfig,
-        start: Start,
-        cancel: CancellationToken,
+        start: Start<'_>,
+        cancel: Arc<CancellationToken>,
         consent: ConnectionConsent,
     ) -> AppResult<(ConnectionInfo, McpClient)> {
         let servers = McpServers::new(settings.db.clone());
@@ -356,7 +384,12 @@ impl McpConnections {
                 .map(|_| crate::transaction::write_lock());
             let mut slots = self.lock_slots();
             if cancel.is_cancelled() {
-                // Stop/edit removed our reservation. A newer start may already own the ID.
+                // An attachment may cancel its own launch. Stop/edit may have
+                // removed the slot and allowed a newer start to claim the ID.
+                if matches!(slots.get(&expected.id), Some(Slot::Starting { cancel: owner, .. }) if Arc::ptr_eq(owner, &cancel))
+                {
+                    slots.remove(&expected.id);
+                }
                 client_to_close = prepared.ok().map(|(client, _)| client);
                 return Err(AppError::Cancelled);
             }

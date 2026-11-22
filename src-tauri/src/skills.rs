@@ -14,15 +14,12 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read, Write},
+    io::Write,
     path::{Component, Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
 
-const SKILL_LIMIT: usize = 128 * 1024;
-const ADAPTER_LIMIT: usize = 256 * 1024;
-const RECORD_LIMIT: usize = 1024 * 1024;
-const MANIFEST_LIMIT: usize = 64 * 1024;
+const MANIFEST_LIMIT: u64 = 64 * 1024;
 const SOURCE: &str = "external";
 const SYSTEM_SOURCE: &str = "system";
 
@@ -46,6 +43,8 @@ const SYSTEM_SKILLS: &[SystemSkill] = &[
     system_skill!("system-adapter-authoring"),
     system_skill!("system-web-search"),
     system_skill!("system-mod-download"),
+    system_skill!("system-mod-install"),
+    system_skill!("system-mod-uninstall"),
 ];
 
 fn system_skill(name: &str) -> Option<&'static SystemSkill> {
@@ -195,9 +194,7 @@ impl Content {
         })
     }
     fn validate(&self, name: &str) -> AppResult<plugins::SkillMetadata> {
-        if self.markdown.len() > SKILL_LIMIT
-            || hex::encode(Sha256::digest(self.markdown.as_bytes())) != self.sha256
-        {
+        if hex::encode(Sha256::digest(self.markdown.as_bytes())) != self.sha256 {
             return Err(invalid("Skill 记录大小或 SHA-256 无效"));
         }
         plugins::parse_skill(&self.markdown, name)
@@ -294,11 +291,11 @@ fn scratch_path(engine: &FileEngine, id: &str, name: &str) -> AppResult<PathBuf>
             .join("SKILL.md"),
     )
 }
-fn read_text(engine: &FileEngine, path: &Path, limit: usize) -> AppResult<String> {
+fn read_text(engine: &FileEngine, path: &Path, limit: Option<u64>) -> AppResult<String> {
     checked_path(engine, path)?;
     let meta = fs::symlink_metadata(path)?;
-    if !meta.is_file() || meta.len() > limit as u64 {
-        return Err(invalid("Skill/适配文件须为大小受限的普通文件"));
+    if !meta.is_file() {
+        return Err(invalid("Skill/适配文件须为普通文件"));
     }
     #[cfg(unix)]
     {
@@ -307,14 +304,9 @@ fn read_text(engine: &FileEngine, path: &Path, limit: usize) -> AppResult<String
             return Err(AppError::Denied("不接受带执行权限的 Skill 资产".into()));
         }
     }
-    let file = fs::File::open(path)?;
+    let text = plugins::read_local_text(path, limit)?;
     checked_path(engine, path)?;
-    let mut bytes = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        return Err(invalid("Skill 读取超过上限"));
-    }
-    String::from_utf8(bytes).map_err(|_| invalid("Skill 必须是 UTF-8 文本"))
+    Ok(text)
 }
 fn exact_entries(engine: &FileEngine, directory: &Path, names: &[&str]) -> AppResult<()> {
     checked_path(engine, directory)?;
@@ -338,7 +330,7 @@ fn exact_entries(engine: &FileEngine, directory: &Path, names: &[&str]) -> AppRe
 fn read_standalone(engine: &FileEngine, name: &str) -> AppResult<Content> {
     let target = location(engine, name)?;
     exact_entries(engine, target.parent().unwrap(), &["SKILL.md"])?;
-    Content::new(name, &read_text(engine, &target, SKILL_LIMIT)?)
+    Content::new(name, &read_text(engine, &target, None)?)
 }
 fn absent(engine: &FileEngine, target: &Path) -> AppResult<bool> {
     checked_path(engine, target)?;
@@ -471,7 +463,11 @@ fn trash_binding(
             "Skill 回收站项目不匹配原文件/目标/大小".into(),
         ));
     }
-    let manifest = read_text(engine, &directory.join("manifest.json"), MANIFEST_LIMIT)?;
+    let manifest = read_text(
+        engine,
+        &directory.join("manifest.json"),
+        Some(MANIFEST_LIMIT),
+    )?;
     let decoded: trash::TrashItem = serde_json::from_str(&manifest)?;
     if serde_json::to_value(&decoded)? != serde_json::to_value(item)? {
         return Err(AppError::Conflict(
@@ -568,8 +564,10 @@ fn verify_plan(
     if let Some(previous) = &record.previous {
         previous.content.validate(&row.name)?;
         let previous_json: String = engine.db.conn().query_row(
-            "SELECT CASE WHEN length(CAST(record_json AS BLOB))<=?3 THEN record_json ELSE '' END FROM skills_deployments WHERE transaction_id=?1 AND name=?2",
-            params![previous.deployment_id,row.name,RECORD_LIMIT], |r|r.get(0))?;
+            "SELECT record_json FROM skills_deployments WHERE transaction_id=?1 AND name=?2",
+            params![previous.deployment_id, row.name],
+            |r| r.get(0),
+        )?;
         let prior: DeploymentRecord = serde_json::from_str(&previous_json)?;
         if prior.action != SkillAction::Install
             || prior.content.sha256 != previous.content.sha256
@@ -583,8 +581,10 @@ fn verify_plan(
 }
 fn record_for(engine: &FileEngine, row: &DeploymentRow) -> AppResult<DeploymentRecord> {
     let json: String = engine.db.conn().query_row(
-        "SELECT CASE WHEN length(CAST(record_json AS BLOB))<=?2 THEN record_json ELSE '' END FROM skills_deployments WHERE transaction_id=?1",
-        params![row.transaction_id,RECORD_LIMIT], |r|r.get(0))?;
+        "SELECT record_json FROM skills_deployments WHERE transaction_id=?1",
+        [&row.transaction_id],
+        |r| r.get(0),
+    )?;
     let record: DeploymentRecord = serde_json::from_str(&json)?;
     verify_plan(engine, row, &record, &engine.get_plan(&row.transaction_id)?)?;
     Ok(record)
@@ -634,7 +634,7 @@ fn reconcile_locked(engine: &FileEngine) -> AppResult<ReconcileReport> {
                     };
                     if record.action == SkillAction::Uninstall {
                         let parked = trash_payload(engine, row, &record)?;
-                        let text = read_text(engine, &parked, SKILL_LIMIT)?;
+                        let text = read_text(engine, &parked, None)?;
                         if Content::new(&name, &text)?.sha256 == record.content.sha256 {
                             return Ok(false);
                         }
@@ -725,9 +725,6 @@ fn persist_plan(
         }
     };
     let json = serde_json::to_string(&record)?;
-    if json.len() > RECORD_LIMIT {
-        return Err(invalid("Skill 部署记录超过上限"));
-    }
     let plan = engine.require_review(&plan.id)?;
     let row = DeploymentRow {
         transaction_id: plan.id.clone(),
@@ -877,8 +874,8 @@ fn inspect(engine: &FileEngine, mut info: SkillInfo) -> (SkillInfo, Option<Strin
                 return Err(AppError::Denied("关联插件未通过完整性校验".into()));
             }
             plugin_workflow::validate_package_directory(engine, &expected)?;
-            let markdown = read_text(engine, &info.location, SKILL_LIMIT)?;
-            let adapter = read_text(engine, &expected.join("adapter.json"), ADAPTER_LIMIT)?;
+            let markdown = read_text(engine, &info.location, None)?;
+            let adapter = read_text(engine, &expected.join("adapter.json"), None)?;
             let package = plugins::parse_package(&info.name, &adapter, &markdown)?;
             if !plugins::matches_registered_adapter(&adapter_json, &package.adapter)? {
                 return Err(AppError::Conflict(

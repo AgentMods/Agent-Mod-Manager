@@ -180,6 +180,40 @@ test("取消历史问卷重新回答会恢复普通输入区和原草稿", async
   expect(starts).toHaveLength(1);
 });
 
+test("历史多选问卷重新回答会按选项顺序逐项写入新消息", async ({page}) => {
+  const multiPreview = {
+    title,
+    questions: [{question: "需要参考哪些安装来源？", options: ["游戏目录", "模组目录", "配置文件"], multiSelect: true}],
+  };
+  await installMockTauri(page, {askUser: {preview: multiPreview}});
+  await page.goto("/");
+  await page.getByRole("button", {name: "游戏库", exact: true}).click();
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
+  await page.getByRole("textbox", {name: "告诉 Agent 你想做什么"}).fill("帮我确认游戏适配信息");
+  await page.getByRole("button", {name: "发送消息", exact: true}).click();
+  const form = page.getByRole("region", {name: title});
+  await expect(form).toBeVisible();
+  await page.getByRole("button", {name: "停止生成", exact: true}).click();
+
+  const summary = page.getByRole("button", {name: /已询问 1 个问题/});
+  await expect(summary).toBeVisible();
+  await page.getByRole("button", {name: "重新回答", exact: true}).click();
+  await expect(form).toBeVisible();
+  await stubReanswerStart(page, false);
+  await form.getByRole("checkbox", {name: "游戏目录", exact: true}).check();
+  await form.getByRole("checkbox", {name: "模组目录", exact: true}).check();
+  await expect(form.getByText("可多选 · 已选 2 项", {exact: true})).toBeVisible();
+  await form.getByRole("button", {name: "提交回答", exact: true}).click();
+
+  await expect(form).toHaveCount(0);
+  const turns = await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "start_turn"));
+  expect(turns).toHaveLength(2);
+  const content = turns[1].args.request.content as string;
+  expect(content).toContain("需要参考哪些安装来源？");
+  expect(content.split("\n").filter((line) => line.startsWith("- "))).toEqual(["- 游戏目录", "- 模组目录"]);
+  expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "respond_approval"))).toEqual([]);
+});
+
 test("已回答问卷作为历史记录只读，归档会话不能重新回答或发送消息", async ({ page }) => {
   await installMockTauri(page, { askUser: { preview } });
   await page.goto("/");

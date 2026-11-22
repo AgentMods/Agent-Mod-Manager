@@ -1,6 +1,7 @@
 use super::*;
 use crate::{db::Db, storage::AppPaths};
 use serde_json::json;
+use std::io::Read;
 
 const SLUG: &str = "publish-test";
 struct Fixture {
@@ -19,9 +20,15 @@ impl Fixture {
         }
     }
     fn draft(&self) -> plugin_workflow::DraftPreview {
+        self.draft_with_origin(false)
+    }
+    fn draft_with_origin(&self, agent: bool) -> plugin_workflow::DraftPreview {
         let (adapter, skill) = content();
         let draft =
             plugin_workflow::plan_write_draft(&self.engine, SLUG, &adapter, &skill).unwrap();
+        if agent {
+            plugin_workflow::mark_agent_draft(&self.engine, &draft.draft.id).unwrap();
+        }
         self.engine.approve_plan(&draft.plan.id).unwrap();
         self.engine.apply_file_ops(&draft.plan.id).unwrap();
         draft
@@ -119,7 +126,6 @@ fn deterministic_zip_has_exact_entries_raw_text_hashes_and_no_preview_side_effec
     assert_eq!(preview.package.work_status, "published");
     assert_eq!(preview.package.archive_size, bytes.len() as u64);
     assert_eq!(preview.package.archive_sha256, sha256(bytes.as_slice()));
-    assert!(bytes.len() <= MAX_ARCHIVE_BYTES);
     let mut zip = zip::ZipArchive::new(Cursor::new(bytes.as_slice())).unwrap();
     assert_eq!(zip.len(), 2);
     for (i, expected) in ["adapter.json", "SKILL.md"].iter().enumerate() {
@@ -582,7 +588,7 @@ fn former_adapter_slug_publishes_only_the_reviewed_external_package() {
 }
 
 #[test]
-fn history_listing_is_bounded_and_does_not_delete_old_records() {
+fn history_listing_pages_through_all_records() {
     let f = Fixture::new();
     let (_, preview, _) = f.preview();
     // Fixtures use the real preview construction but one transaction avoids
@@ -603,12 +609,19 @@ fn history_listing_is_bounded_and_does_not_delete_old_records() {
     }
     tx.commit().unwrap();
     drop(conn);
-    assert_eq!(list_publications(&f.engine).unwrap().len(), 100);
+    let first = list_publications(&f.engine, None).unwrap();
+    assert_eq!(first.len(), 100);
+    let next = list_publications(&f.engine, Some(&first.last().unwrap().id)).unwrap();
+    assert_eq!(next.len(), 5);
+    assert!(next.iter().all(|p| first.iter().all(|row| row.id != p.id)));
+    assert!(list_publications(&f.engine, Some(&next.last().unwrap().id))
+        .unwrap()
+        .is_empty());
     assert_eq!(f.count("plugin_publications"), 105);
 }
 
 #[test]
-fn archive_builder_rejects_paths_duplicates_sizes_hashes_and_oversized_files() {
+fn archive_builder_rejects_paths_duplicates_sizes_and_hashes() {
     let f = Fixture::new();
     let (_, preview, _) = f.preview();
     for name in [
@@ -627,11 +640,46 @@ fn archive_builder_rejects_paths_duplicates_sizes_hashes_and_oversized_files() {
     let mut files = preview.package.files.clone();
     files[0].sha256 = "0".repeat(64);
     assert!(archive(&files).is_err());
-    let mut files = preview.package.files.clone();
-    files[0].text = "x".repeat(ADAPTER_LIMIT + 1);
-    files[0].size = files[0].text.len() as u64;
-    files[0].sha256 = sha256(files[0].text.as_bytes());
-    assert!(archive(&files).is_err());
+}
+
+#[test]
+fn large_publication_retains_exact_zip_and_approval_across_reopen() {
+    let f = Fixture::new();
+    let (adapter, skill) = content();
+    let mut adapter: serde_json::Value = serde_json::from_str(&adapter).unwrap();
+    adapter["uninstallNotes"] = json!(["注销说明".repeat(32 * 1024)]);
+    let adapter = adapter.to_string();
+    let skill = format!("{skill}{}", "发布说明\n".repeat(96 * 1024));
+    let draft = plugin_workflow::plan_write_draft(&f.engine, SLUG, &adapter, &skill).unwrap();
+    f.engine.approve_plan(&draft.plan.id).unwrap();
+    f.engine.apply_file_ops(&draft.plan.id).unwrap();
+    let (preview, bytes) = prepare_package(&f.engine, &draft.draft.id, metadata()).unwrap();
+    assert!(bytes.len() > 1024 * 1024);
+    let record = create_publication(&f.engine, &preview).unwrap();
+    assert!(verified_upload_artifact(&f.engine, &record.id, &preview.digest).is_err());
+    approve_publication(&f.engine, &record.id, &preview.digest).unwrap();
+    let engine = f.reopen();
+    let (saved, rebuilt) = verified_upload_artifact(&engine, &record.id, &preview.digest).unwrap();
+    assert_eq!(saved.preview, preview);
+    assert_eq!(rebuilt.as_slice(), bytes.as_slice());
+    let install = plugin_workflow::plan_install_plugin(&engine, &draft.draft.id).unwrap();
+    engine.approve_plan(&install.plan.id).unwrap();
+    engine.apply_file_ops(&install.plan.id).unwrap();
+    plugin_workflow::reconcile_deployments(&engine).unwrap();
+    let (installed, installed_bytes) =
+        prepare_installed_package(&engine, SLUG, metadata()).unwrap();
+    assert!(matches!(
+        installed.source,
+        PublicationSource::Installed { .. }
+    ));
+    assert_eq!(installed_bytes.as_slice(), bytes.as_slice());
+    let mut zip = zip::ZipArchive::new(Cursor::new(rebuilt.as_slice())).unwrap();
+    assert_eq!(zip.len(), 2);
+    for (name, expected) in [("adapter.json", adapter), ("SKILL.md", skill)] {
+        let mut actual = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name(name).unwrap(), &mut actual).unwrap();
+        assert_eq!(actual, expected);
+    }
 }
 
 #[test]
@@ -687,6 +735,61 @@ fn inconsistent_persisted_state_is_not_reported_as_success() {
 }
 
 #[test]
+fn ordinary_work_consumes_agent_draft_only_after_completed_send_or_reconciliation() {
+    for reconcile in [false, true] {
+        let f = Fixture::new();
+        let draft = f.draft_with_origin(true);
+        let (preview, _) = prepare_package(&f.engine, &draft.draft.id, metadata()).unwrap();
+        let record = create_publication(&f.engine, &preview).unwrap();
+        let mut record = approve_publication(&f.engine, &record.id, &preview.digest).unwrap();
+        for action in [
+            PublicationStep::CreateUpload,
+            PublicationStep::StartUpload,
+            PublicationStep::PutPart,
+            PublicationStep::CompleteUpload,
+        ] {
+            record = step(&f, &record, action);
+            assert!(draft.draft.path.is_dir());
+        }
+        let action = PublicationStep::PublishWork;
+        let pending = begin_step(&f.engine, &record.id, &preview.digest, action).unwrap();
+        assert_eq!(pending.state, PublicationState::Pending);
+        assert!(draft.draft.path.is_dir());
+
+        let completed = if reconcile {
+            let unknown = mark_unknown(&f.engine, &pending.id, action).unwrap();
+            assert_eq!(unknown.state, PublicationState::Unknown);
+            assert!(draft.draft.path.is_dir());
+            finish_reconciliation(&f.engine, &unknown, Some(91)).unwrap()
+        } else {
+            finish_step(&f.engine, &pending.id, action, pending.file_id, Some(91)).unwrap()
+        };
+        assert_eq!(completed.state, PublicationState::Completed);
+        assert_eq!(completed.work_id, Some(91));
+        assert!(!draft.draft.path.exists());
+
+        let reopened = f.reopen();
+        assert!(plugin_workflow::list_drafts(&reopened).unwrap().is_empty());
+        assert_eq!(
+            get_publication(&reopened, &completed.id).unwrap(),
+            completed
+        );
+        assert_eq!(
+            finish_step(
+                &reopened,
+                &completed.id,
+                action,
+                completed.file_id,
+                Some(91)
+            )
+            .unwrap(),
+            completed
+        );
+        assert_eq!(list_publications(&reopened, None).unwrap(), vec![completed]);
+    }
+}
+
+#[test]
 fn deleted_draft_blocks_new_steps_but_preserves_completed_history_and_installed_publication() {
     let f = Fixture::new();
     let engine = &f.engine;
@@ -720,7 +823,7 @@ fn deleted_draft_blocks_new_steps_but_preserves_completed_history_and_installed_
 
     plugin_workflow::delete_confirmed_draft(engine, &draft.draft.id).unwrap();
     let reopened = f.reopen();
-    assert_eq!(list_publications(&reopened).unwrap().len(), 2);
+    assert_eq!(list_publications(&reopened, None).unwrap().len(), 2);
     assert_eq!(
         get_publication(&reopened, &completed.id).unwrap(),
         completed

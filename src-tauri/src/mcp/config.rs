@@ -9,8 +9,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::PathBuf};
 
-// Windows Node distributions expose npx as a .cmd shim, not npx.exe.
-const NPX_COMMAND: &str = if cfg!(windows) { "npx.cmd" } else { "npx" };
+// Historical Playwright launchers used the platform-specific npx shim.
+const LEGACY_PLAYWRIGHT_COMMAND: &str = if cfg!(windows) { "npx.cmd" } else { "npx" };
+const LEGACY_PLAYWRIGHT_DESCRIPTION: &str = "在独立的浏览器会话中打开、浏览和操作网页。";
+pub(super) const PLAYWRIGHT_COMMAND: &str = "amm-playwright";
+const PLAYWRIGHT_DESCRIPTION: &str =
+    "在独立的浏览器会话中打开、浏览和操作网页。首次连接时自动下载 Chromium（若尚未安装），后续复用。";
 
 fn playwright_args(package: &str, edge: bool) -> Vec<String> {
     ["--yes", package, "--headless", "--isolated", "--no-webmcp"]
@@ -38,10 +42,10 @@ pub(super) fn playwright_output_dir(bases: impl IntoIterator<Item = PathBuf>) ->
         })
 }
 
-fn playwright_download_args() -> AppResult<Vec<String>> {
+fn default_playwright_output_dir() -> Option<String> {
     // Resolve the user's Downloads known folder (which may be redirected), not
     // an install/cwd-relative directory. Playwright creates the directory on use.
-    let output_dir = playwright_output_dir(
+    playwright_output_dir(
         [
             dirs::download_dir(),
             dirs::data_local_dir(),
@@ -51,27 +55,106 @@ fn playwright_download_args() -> AppResult<Vec<String>> {
         .flatten()
         .chain(std::iter::once_with(std::env::temp_dir)),
     )
-    .ok_or_else(|| AppError::Invalid("无法确定 Playwright MCP 下载目录的绝对路径".into()))?;
+}
+
+fn playwright_v12_args(output_dir: String) -> Vec<String> {
     let mut args = playwright_v11_args();
     args.extend([
         "--file-paths=absolute".into(),
         "--output-dir".into(),
         output_dir,
     ]);
-    Ok(args)
+    args
+}
+
+fn playwright_v17_args(output_dir: String) -> Vec<String> {
+    vec![
+        "--browser=chromium".into(),
+        "--headless".into(),
+        "--sandbox".into(),
+        "--isolated".into(),
+        "--no-webmcp".into(),
+        "--file-paths=absolute".into(),
+        "--output-dir".into(),
+        output_dir,
+    ]
+}
+
+fn require_default_playwright_output_dir() -> AppResult<String> {
+    default_playwright_output_dir()
+        .ok_or_else(|| AppError::Invalid("无法确定 Playwright MCP 下载目录的绝对路径".into()))
+}
+
+fn stock_playwright_receipt_dir(config: &ServerConfig, expected_dir: String) -> Option<PathBuf> {
+    // Treat the stored MCP settings as configuration, not filesystem authority.
+    // Only the unmodified shipped launch and independently resolved output path
+    // qualify. Never accept arbitrary --output-dir, env or launcher overrides.
+    (config.id == PLAYWRIGHT_ID
+        && config.builtin
+        && config.plugin_slug.is_none()
+        && config.name == "Playwright MCP"
+        && config.transport == McpTransport::Stdio
+        && config.command.as_deref() == Some(PLAYWRIGHT_COMMAND)
+        && config.url.is_none()
+        && config.credential_url.is_none()
+        && config.env_secret_refs.is_empty()
+        && config.bearer_secret_ref.is_none()
+        && config.args == playwright_v17_args(expected_dir.clone()))
+    .then(|| PathBuf::from(expected_dir))
+}
+
+/// Only stock Playwright may supply an external receipt folder. Customized
+/// launchers and relocated output require the explicit desktop picker.
+pub(crate) fn playwright_receipt_dir(db: &Db) -> AppResult<Option<PathBuf>> {
+    let Some(expected_dir) = default_playwright_output_dir() else {
+        return Ok(None);
+    };
+    match McpServers::new(db.clone()).get(PLAYWRIGHT_ID) {
+        Ok(config) => Ok(stock_playwright_receipt_dir(&config, expected_dir)),
+        Err(AppError::NotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Schema v12: only the stock v11 Playwright command gains an output path.
 pub(crate) fn migrate_playwright_downloads(conn: &Connection) -> AppResult<()> {
+    let args = playwright_v12_args(require_default_playwright_output_dir()?);
     conn.execute(
         "UPDATE mcp_servers SET args_json=?1, startup_digest=NULL
          WHERE id='playwright' AND builtin=1 AND plugin_slug IS NULL AND name='Playwright MCP'
            AND transport='stdio' AND command=?2 AND args_json=?3
            AND url IS NULL AND env_json='{}' AND secret_ref IS NULL",
         params![
-            serde_json::to_string(&playwright_download_args()?)?,
-            NPX_COMMAND,
+            serde_json::to_string(&args)?,
+            LEGACY_PLAYWRIGHT_COMMAND,
             serde_json::to_string(&playwright_v11_args())?
+        ],
+    )?;
+    Ok(())
+}
+
+/// Schema v17: switch only the stock v12 launch to the bundled application alias.
+/// Keep enablement and custom descriptions, but require new auto-start consent.
+pub(crate) fn migrate_bundled_playwright(conn: &Connection) -> AppResult<()> {
+    // Without an independently resolved default, there is no exact stock path to match.
+    let Some(output_dir) = default_playwright_output_dir() else {
+        return Ok(());
+    };
+    let previous_args = playwright_v12_args(output_dir.clone());
+    let bundled_args = playwright_v17_args(output_dir);
+    conn.execute(
+        "UPDATE mcp_servers SET command=?1, args_json=?2, startup_digest=NULL,
+           description=CASE WHEN description=?5 THEN ?6 ELSE description END
+         WHERE id='playwright' AND builtin=1 AND plugin_slug IS NULL AND name='Playwright MCP'
+           AND transport='stdio' AND command=?3 AND args_json=?4
+           AND url IS NULL AND credential_url IS NULL AND env_json='{}' AND secret_ref IS NULL",
+        params![
+            PLAYWRIGHT_COMMAND,
+            serde_json::to_string(&bundled_args)?,
+            LEGACY_PLAYWRIGHT_COMMAND,
+            serde_json::to_string(&previous_args)?,
+            LEGACY_PLAYWRIGHT_DESCRIPTION,
+            PLAYWRIGHT_DESCRIPTION
         ],
     )?;
     Ok(())
@@ -200,7 +283,11 @@ impl ModSourcePreset {
     }
 }
 
-fn builtin_presets(playwright_args: Vec<String>) -> impl Iterator<Item = ServerConfig> {
+fn builtin_presets(
+    playwright_command: &str,
+    playwright_args: Vec<String>,
+    playwright_description: &str,
+) -> impl Iterator<Item = ServerConfig> {
     let mut http = ServerConfig::http(GLOSSMOD_HTTP_ID, "Mod客栈", GLOSSMOD_HTTP_ENDPOINT);
     http.description = Some("搜索 Mod 客栈的模组，查看项目与下载信息。".into());
     http.credential_url = Some(GLOSSMOD_HTTP_CREDENTIAL_URL.into());
@@ -212,10 +299,10 @@ fn builtin_presets(playwright_args: Vec<String>) -> impl Iterator<Item = ServerC
     let mut playwright = ServerConfig::stdio(
         PLAYWRIGHT_ID,
         "Playwright MCP",
-        NPX_COMMAND,
+        playwright_command,
         playwright_args,
     );
-    playwright.description = Some("在独立的浏览器会话中打开、浏览和操作网页。".into());
+    playwright.description = Some(playwright_description.into());
     let mut markitdown = ServerConfig::stdio(
         MARKITDOWN_ID,
         "MarkItDown MCP",
@@ -228,10 +315,18 @@ fn builtin_presets(playwright_args: Vec<String>) -> impl Iterator<Item = ServerC
         .chain(MOD_SOURCE_PRESETS.iter().map(ModSourcePreset::config))
 }
 
+fn v11_builtin_presets() -> impl Iterator<Item = ServerConfig> {
+    builtin_presets(
+        LEGACY_PLAYWRIGHT_COMMAND,
+        playwright_v11_args(),
+        LEGACY_PLAYWRIGHT_DESCRIPTION,
+    )
+}
+
 /// Schema v11: replace only the last shipped package commands. A changed command
 /// requires a fresh Start click before it can be restored at application startup.
 pub(crate) fn migrate_unpinned_presets(conn: &Connection) -> AppResult<()> {
-    for preset in builtin_presets(playwright_v11_args()) {
+    for preset in v11_builtin_presets() {
         let previous: Vec<String> = match preset.id.as_str() {
             PLAYWRIGHT_ID => playwright_args("@playwright/mcp@0.0.85", cfg!(windows)),
             MARKITDOWN_ID => [
@@ -267,7 +362,7 @@ pub(crate) fn migrate_unpinned_presets(conn: &Connection) -> AppResult<()> {
 
 /// Schema v10: populate display metadata without changing configuration or consent.
 pub(crate) fn migrate_descriptions(conn: &Connection) -> AppResult<()> {
-    for config in builtin_presets(playwright_v11_args()) {
+    for config in v11_builtin_presets() {
         conn.execute(
             "UPDATE mcp_servers SET description=?2 WHERE id=?1 AND builtin=1 AND description IS NULL",
             params![config.id, config.description],
@@ -728,7 +823,8 @@ impl McpServers {
 
     /// Insert-only seeding never overwrites edits or re-enables a disabled server.
     pub fn seed_presets(&self) -> AppResult<()> {
-        for config in builtin_presets(playwright_download_args()?) {
+        let args = playwright_v17_args(require_default_playwright_output_dir()?);
+        for config in builtin_presets(PLAYWRIGHT_COMMAND, args, PLAYWRIGHT_DESCRIPTION) {
             match self.insert(&config, true) {
                 Ok(()) => {}
                 Err(AppError::Db(err))
@@ -920,4 +1016,60 @@ fn from_row(row: &Row<'_>) -> rusqlite::Result<ServerConfig> {
         plugin_slug: row.get(11)?,
         description: row.get(12)?,
     })
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_stock_launcher_and_independently_derived_output_path_are_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = playwright_output_dir([dir.path().to_path_buf()]).unwrap();
+        let args = playwright_v17_args(expected.clone());
+        let mut stock = builtin_presets(PLAYWRIGHT_COMMAND, args, PLAYWRIGHT_DESCRIPTION)
+            .find(|config| config.id == PLAYWRIGHT_ID)
+            .unwrap();
+        // Preset constructors are generic; only seeding marks the database row builtin.
+        stock.builtin = true;
+        assert_eq!(
+            stock_playwright_receipt_dir(&stock, expected.clone()),
+            Some(PathBuf::from(&expected))
+        );
+        let mut customized = stock.clone();
+        customized.args =
+            playwright_v17_args(dir.path().join("private").to_string_lossy().into_owned());
+        assert_eq!(
+            stock_playwright_receipt_dir(&customized, expected.clone()),
+            None
+        );
+
+        let mut customized = stock.clone();
+        customized.args.push("--output-dir=another".into());
+        assert_eq!(
+            stock_playwright_receipt_dir(&customized, expected.clone()),
+            None
+        );
+
+        let mut customized = stock.clone();
+        customized.command = Some("non-stock-launcher".into());
+        assert_eq!(
+            stock_playwright_receipt_dir(&customized, expected.clone()),
+            None
+        );
+
+        let mut customized = stock.clone();
+        customized.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
+        customized.args = playwright_v12_args(expected.clone());
+        assert_eq!(
+            stock_playwright_receipt_dir(&customized, expected.clone()),
+            None
+        );
+
+        let mut customized = stock;
+        customized
+            .env_secret_refs
+            .insert("HOME".into(), "mcp.home".into());
+        assert_eq!(stock_playwright_receipt_dir(&customized, expected), None);
+    }
 }

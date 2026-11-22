@@ -10,6 +10,8 @@ pub enum AppError {
     Net(#[from] reqwest::Error),
     #[error("序列化错误: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("下载 DNS 解析失败: {0}")]
+    DownloadDns(String),
     #[error("路径越界: {0}")]
     PathEscape(String),
     #[error("不安全归档: {0}")]
@@ -26,6 +28,9 @@ pub enum AppError {
     Unsupported(String),
     #[error("已取消")]
     Cancelled,
+    /// The model provider rejected the request for exceeding its context window.
+    #[error("{0}")]
+    ContextLength(String),
     #[error("{0}")]
     Other(String),
 }

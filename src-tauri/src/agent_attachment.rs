@@ -5,30 +5,206 @@ use crate::{
     error::{AppError, AppResult},
 };
 use serde_json::Value;
-use std::{borrow::Cow, path::Path};
+use std::{
+    borrow::Cow,
+    collections::{hash_map::Entry, HashMap},
+    path::Path,
+    sync::{Mutex, MutexGuard},
+    time::{Duration, Instant},
+};
 use tauri::{
     http::HeaderMap,
     ipc::{InvokeBody, Request},
-    State,
+    Runtime, State, WebviewWindow,
 };
 use tempfile::TempPath;
-use tokio::io::AsyncWriteExt;
+use tokio::{io::AsyncWriteExt, sync::Mutex as AsyncMutex};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
-const MAX_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_NAME_CHARS: usize = 255;
 const NAME_HEADER: &str = "x-attachment-name";
+const CONVERSION_HEADER: &str = "x-attachment-conversion-id";
+// Only reservations that never submit bytes expire. There is no conversion deadline.
+const RESERVATION_TTL: Duration = Duration::from_secs(60);
+const MAX_REGISTERED_CONVERSIONS: usize = 64;
 
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "code", content = "message", rename_all = "snake_case")]
 pub(crate) enum AttachmentConversionError {
     ConsentRequired(String),
+    Cancelled(String),
     ConversionFailed(String),
 }
 
 impl From<AppError> for AttachmentConversionError {
     fn from(error: AppError) -> Self {
-        Self::ConversionFailed(error.to_string())
+        match error {
+            AppError::Cancelled => Self::Cancelled("附件转换已取消。".into()),
+            other => Self::ConversionFailed(other.to_string()),
+        }
     }
+}
+
+type ConversionKey = (String, Uuid);
+
+enum Conversion {
+    Reserved(Instant),
+    Running(CancellationToken),
+}
+
+#[derive(Default)]
+pub(crate) struct AttachmentConversions {
+    work: Mutex<HashMap<ConversionKey, Conversion>>,
+    // Hold this through startup, use, and cleanup. A successor must not reuse
+    // the MarkItDown process that its cancelled predecessor is still stopping.
+    converter: AsyncMutex<()>,
+}
+
+impl AttachmentConversions {
+    fn lock(&self) -> MutexGuard<'_, HashMap<ConversionKey, Conversion>> {
+        self.work.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn register(&self, key: ConversionKey) -> AppResult<()> {
+        let mut work = self.lock();
+        work.retain(|_, entry| !matches!(entry, Conversion::Reserved(start) if start.elapsed() >= RESERVATION_TTL));
+        if work.len() >= MAX_REGISTERED_CONVERSIONS {
+            return Err(AppError::Conflict(
+                "等待转换的附件过多，请移除不需要的附件后重试。".into(),
+            ));
+        }
+        match work.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(Conversion::Reserved(Instant::now()));
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(AppError::Conflict("附件转换标识已使用。".into())),
+        }
+    }
+
+    fn start(&self, key: ConversionKey) -> AppResult<ActiveConversion<'_>> {
+        let mut work = self.lock();
+        match work.entry(key.clone()) {
+            Entry::Occupied(mut slot) => match slot.get() {
+                Conversion::Reserved(start) if start.elapsed() < RESERVATION_TTL => {
+                    let cancel = CancellationToken::new();
+                    slot.insert(Conversion::Running(cancel.clone()));
+                    Ok(ActiveConversion {
+                        owner: self,
+                        key,
+                        cancel,
+                    })
+                }
+                Conversion::Reserved(_) => {
+                    slot.remove();
+                    Err(AppError::Cancelled)
+                }
+                Conversion::Running(_) => Err(AppError::Conflict("此附件已提交转换。".into())),
+            },
+            Entry::Vacant(_) => Err(AppError::Cancelled),
+        }
+    }
+
+    fn cancel(&self, key: ConversionKey) {
+        if let Entry::Occupied(slot) = self.lock().entry(key) {
+            match slot.get() {
+                Conversion::Reserved(_) => {
+                    slot.remove();
+                }
+                Conversion::Running(cancel) => cancel.cancel(),
+            }
+        }
+    }
+
+    pub(crate) fn cancel_window(&self, window: &str) {
+        self.lock().retain(|(owner, _), entry| {
+            if owner != window {
+                return true;
+            }
+            match entry {
+                Conversion::Reserved(_) => false,
+                Conversion::Running(cancel) => {
+                    cancel.cancel();
+                    true
+                }
+            }
+        });
+    }
+
+    async fn wait_for_converter(
+        &self,
+        cancel: &CancellationToken,
+    ) -> AppResult<tokio::sync::MutexGuard<'_, ()>> {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(AppError::Cancelled),
+            slot = self.converter.lock() => Ok(slot),
+        }
+    }
+}
+
+struct ActiveConversion<'a> {
+    owner: &'a AttachmentConversions,
+    key: ConversionKey,
+    cancel: CancellationToken,
+}
+
+impl Drop for ActiveConversion<'_> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.owner.lock().remove(&self.key);
+    }
+}
+
+fn decode_conversion_id(raw: Option<&str>) -> AppResult<Uuid> {
+    raw.filter(|id| id.len() == 36)
+        .and_then(|id| Uuid::parse_str(id).ok())
+        .ok_or_else(|| AppError::Invalid("附件转换标识无效。".into()))
+}
+
+fn conversion_id_header(headers: &HeaderMap) -> AppResult<Option<Uuid>> {
+    let mut values = headers.get_all(CONVERSION_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(AppError::Invalid("附件转换标识无效。".into()));
+    }
+    Ok(Some(decode_conversion_id(value.to_str().ok())?))
+}
+
+fn check_cancelled(cancel: &CancellationToken) -> AppResult<()> {
+    if cancel.is_cancelled() {
+        Err(AppError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command]
+pub(crate) fn begin_agent_attachment<R: Runtime>(
+    window: WebviewWindow<R>,
+    conversions: State<'_, AttachmentConversions>,
+    conversion_id: String,
+) -> Result<(), AttachmentConversionError> {
+    Ok(conversions.register((
+        window.label().into(),
+        decode_conversion_id(Some(&conversion_id))?,
+    ))?)
+}
+
+#[tauri::command]
+pub(crate) fn cancel_agent_attachment<R: Runtime>(
+    window: WebviewWindow<R>,
+    conversions: State<'_, AttachmentConversions>,
+    conversion_id: String,
+) -> Result<(), AttachmentConversionError> {
+    conversions.cancel((
+        window.label().into(),
+        decode_conversion_id(Some(&conversion_id))?,
+    ));
+    Ok(())
 }
 
 fn decode_name(headers: &HeaderMap) -> AppResult<Cow<'_, str>> {
@@ -74,15 +250,40 @@ fn validate_upload(name: &str, size: usize) -> AppResult<()> {
     if size == 0 {
         return Err(AppError::Invalid("附件为空，请选择包含内容的文件。".into()));
     }
-    if size > MAX_ATTACHMENT_BYTES {
+    Ok(())
+}
+
+/// Already textual formats need no MCP conversion, so their content never
+/// travels through a bounded tool-result frame. Other encodings and structured
+/// formats still go through the authorized converter, as a complete file.
+fn utf8_text_attachment<'a>(name: &str, bytes: &'a [u8]) -> Option<&'a str> {
+    let extension = Path::new(name).extension()?.to_str()?;
+    if !["txt", "md", "markdown"]
+        .iter()
+        .any(|ext| extension.eq_ignore_ascii_case(ext))
+    {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes)).ok()?;
+    (!text.contains('\0')).then_some(text)
+}
+
+fn require_text(text: &str) -> AppResult<()> {
+    if text.trim().is_empty() {
         return Err(AppError::Invalid(
-            "单个附件上限为 10 MiB，请拆分文件后重试。".into(),
+            "附件未提取到文本，请选择含可读取文字的文件后重试。".into(),
         ));
     }
     Ok(())
 }
 
-async fn stage_upload(directory: &Path, name: &str, bytes: &[u8]) -> std::io::Result<TempPath> {
+async fn stage_upload(
+    directory: &Path,
+    name: &str,
+    bytes: &[u8],
+    cancel: &CancellationToken,
+) -> AppResult<TempPath> {
+    check_cancelled(cancel)?;
     // MarkItDown uses the extension as a format hint. No user path or stem reaches the server.
     let suffix = Path::new(name)
         .extension()
@@ -96,39 +297,68 @@ async fn stage_upload(directory: &Path, name: &str, bytes: &[u8]) -> std::io::Re
         .tempfile_in(directory)?;
     let (handle, path) = file.into_parts();
     let mut writer = tokio::fs::File::from_std(handle);
-    writer.write_all(bytes).await?;
+    // Do not drop an in-flight OS write and try to unlink the still-open file.
+    for chunk in bytes.chunks(128 * 1024) {
+        check_cancelled(cancel)?;
+        writer.write_all(chunk).await?;
+    }
     writer.flush().await?;
+    check_cancelled(cancel)?;
     Ok(path)
 }
 
-fn extract_markdown(result: Value) -> AppResult<String> {
+fn extract_markdown(mut result: Value) -> AppResult<String> {
     if result["isError"] == true {
         return Err(AppError::Invalid(
             "MarkItDown 未能转换此文件。请检查文件格式、是否损坏或加密，再重新选择附件。".into(),
         ));
     }
-    let text = result["content"]
-        .as_array()
+    let mut blocks = result
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
         .into_iter()
         .flatten()
         .filter(|block| block["type"] == "text")
-        .filter_map(|block| block["text"].as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    if text.trim().is_empty() {
-        return Err(AppError::Invalid(
-            "MarkItDown 未提取到文本，请选择含可读取文字的文件后重试。".into(),
-        ));
+        .filter_map(|block| match block["text"].take() {
+            Value::String(text) => Some(text),
+            _ => None,
+        });
+    // A typical converter returns one text block; move it rather than allocate
+    // another markdown-sized copy. Preserve spacing when joining several blocks.
+    let mut text = blocks.next().unwrap_or_default();
+    for block in blocks {
+        text.try_reserve(block.len().saturating_add(2))
+            .map_err(|_| {
+                AppError::Other("内存不足，无法合并附件文本。请拆分源文档后重试。".into())
+            })?;
+        text.push_str("\n\n");
+        text.push_str(&block);
     }
+    require_text(&text)?;
     Ok(text)
 }
 
 #[tauri::command]
-pub(crate) async fn convert_agent_attachment(
+pub(crate) async fn convert_agent_attachment<R: Runtime>(
+    window: WebviewWindow<R>,
+    conversions: State<'_, AttachmentConversions>,
     state: State<'_, AppServices>,
     agent: State<'_, AgentRuntime>,
     request: Request<'_>,
 ) -> Result<String, AttachmentConversionError> {
+    // Historical clients send only the filename header. For clients with an ID
+    // an absent reservation means cancellation (even if upload arrives later).
+    let id = match conversion_id_header(request.headers())? {
+        Some(id) => id,
+        None => {
+            let id = Uuid::new_v4();
+            conversions.register((window.label().into(), id))?;
+            id
+        }
+    };
+    let active = conversions.start((window.label().into(), id))?;
+    let cancel = &active.cancel;
+    check_cancelled(cancel)?;
     let InvokeBody::Raw(bytes) = request.body() else {
         return Err(AppError::Invalid(
             "请通过二进制附件上传接口传入文件内容（ArrayBuffer）。".into(),
@@ -137,27 +367,43 @@ pub(crate) async fn convert_agent_attachment(
     };
     let name = decode_name(request.headers())?;
     validate_upload(&name, bytes.len())?;
+    if let Some(text) = utf8_text_attachment(&name, bytes) {
+        require_text(text)?;
+        let text = text.to_owned();
+        check_cancelled(cancel)?;
+        return Ok(text);
+    }
+    let _slot = conversions.wait_for_converter(cancel).await?;
     let client = state
         .mcp_connections
-        .markitdown_client(&agent.settings, &agent.registry)
+        .markitdown_client(&agent.settings, &agent.registry, cancel)
         .await
         .map_err(|error| match error {
             AppError::Denied(message) => AttachmentConversionError::ConsentRequired(message),
             other => other.into(),
         })?;
-    let file = stage_upload(&std::env::temp_dir(), &name, bytes)
+    let file = stage_upload(&std::env::temp_dir(), &name, bytes, cancel)
         .await
-        .map_err(|_| {
-            AppError::Other(
+        .map_err(|error| match error {
+            AppError::Cancelled => AppError::Cancelled,
+            _ => AppError::Other(
                 "无法写入附件临时文件。请检查系统临时目录的权限和剩余空间后重试。".into(),
-            )
+            ),
         })?;
-    let result = client.call_attachment_converter(&file).await;
+    let result = client.call_attachment_converter(&file, cancel).await;
     // TempPath also unlinks on an early drop. Report a failed explicit cleanup on normal return.
-    file.close().map_err(|_| {
+    let cleanup = file.close();
+    if result.is_err() && cleanup.is_err() {
+        tracing::warn!("无法清理转换失败后的附件临时文件");
+    }
+    // A locked file on shutdown must not mask the actionable conversion error.
+    let result = result?;
+    cleanup.map_err(|_| {
         AppError::Other("无法清理附件临时文件。请检查系统临时目录权限及文件占用后重试。".into())
     })?;
-    Ok(extract_markdown(result?)?)
+    let markdown = extract_markdown(result)?;
+    check_cancelled(cancel)?;
+    Ok(markdown)
 }
 
 #[cfg(test)]
@@ -172,7 +418,7 @@ mod tests {
     use tauri::{test, Manager};
 
     #[test]
-    fn filename_and_size_boundaries() {
+    fn filename_and_empty_upload_validation() {
         for bad in [
             "",
             ".",
@@ -191,10 +437,23 @@ mod tests {
         ] {
             assert!(validate_upload(bad, 1).is_err(), "{bad:?}");
         }
-        assert!(validate_upload("说明 #100%.docx", MAX_ATTACHMENT_BYTES).is_ok());
+        assert!(validate_upload("说明 #100%.docx", 10 * 1024 * 1024 + 1).is_ok());
         assert!(validate_upload(&"文".repeat(MAX_NAME_CHARS), 1).is_ok());
         assert!(validate_upload("a.txt", 0).is_err());
-        assert!(validate_upload("a.txt", MAX_ATTACHMENT_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn only_utf8_plain_text_and_markdown_skip_conversion() {
+        let bytes = "\u{feff}# 表格\r\n  说明\n".as_bytes();
+        for file in ["a.txt", "a.MD", "a.MarkDown"] {
+            assert_eq!(
+                utf8_text_attachment(file, bytes),
+                Some("# 表格\r\n  说明\n")
+            );
+        }
+        assert_eq!(utf8_text_attachment("a.html", bytes), None);
+        assert_eq!(utf8_text_attachment("a.txt", b"\xff\xfeA\0"), None);
+        assert_eq!(utf8_text_attachment("a.md", b"A\0B"), None);
     }
 
     #[tokio::test]
@@ -202,8 +461,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let name = "私有说明 #%.docx";
         let bytes = [255, 0, 127, 13];
-        let a = stage_upload(dir.path(), name, &bytes).await.unwrap();
-        let b = stage_upload(dir.path(), name, b"different").await.unwrap();
+        let a = stage_upload(dir.path(), name, &bytes, &CancellationToken::new())
+            .await
+            .unwrap();
+        let b = stage_upload(dir.path(), name, b"different", &CancellationToken::new())
+            .await
+            .unwrap();
         assert_ne!(&*a, &*b);
         assert_eq!(a.parent(), Some(dir.path()));
         assert_eq!(a.extension().unwrap(), "docx");
@@ -264,11 +527,10 @@ mod tests {
     }
 
     #[test]
-    fn accepts_markdown_above_half_a_mebibyte_within_the_mcp_result_limit() {
-        let text = "字".repeat(200_000);
+    fn extracts_markdown_above_the_former_mcp_result_limit() {
+        let text = "字".repeat(800_000);
+        assert!(text.len() > 2 * 1024 * 1024);
         let result = json!({"content":[{"type":"text","text":text}]});
-        assert!(text.len() > 512 * 1024);
-        assert!(serde_json::to_vec(&result).unwrap().len() < crate::mcp::client::MAX_RESULT_BYTES);
         assert_eq!(extract_markdown(result).unwrap(), text);
     }
 
@@ -295,7 +557,12 @@ mod tests {
         test::mock_builder()
             .manage(state)
             .manage(agent)
-            .invoke_handler(tauri::generate_handler![convert_agent_attachment])
+            .manage(AttachmentConversions::default())
+            .invoke_handler(tauri::generate_handler![
+                begin_agent_attachment,
+                convert_agent_attachment,
+                cancel_agent_attachment,
+            ])
             .build(test::mock_context(test::noop_assets()))
             .unwrap()
     }
@@ -315,10 +582,19 @@ mod tests {
         headers: HeaderMap,
         body: InvokeBody,
     ) -> Result<String, Value> {
+        command(window, "convert_agent_attachment", headers, body)
+    }
+
+    fn command<T: serde::de::DeserializeOwned>(
+        window: &tauri::WebviewWindow<test::MockRuntime>,
+        name: &str,
+        headers: HeaderMap,
+        body: InvokeBody,
+    ) -> Result<T, Value> {
         test::get_ipc_response(
             window,
             tauri::webview::InvokeRequest {
-                cmd: "convert_agent_attachment".into(),
+                cmd: name.into(),
                 callback: tauri::ipc::CallbackFn(1),
                 error: tauri::ipc::CallbackFn(2),
                 url: (if cfg!(windows) {
@@ -346,6 +622,69 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_a_reservation_prevents_late_uploads_and_does_not_affect_other_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = desktop(dir.path(), dir.path().join("unused-runtime.zip"));
+        let main = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let other = tauri::WebviewWindowBuilder::new(&app, "other", Default::default())
+            .build()
+            .unwrap();
+        let id = Uuid::new_v4().to_string();
+        let call = |window, name| {
+            command::<()>(
+                window,
+                name,
+                HeaderMap::new(),
+                InvokeBody::Json(json!({"conversionId": id})),
+            )
+        };
+        let upload = |window| {
+            let mut headers = HeaderMap::new();
+            headers.insert(NAME_HEADER, "plain.md".parse().unwrap());
+            headers.insert(CONVERSION_HEADER, id.parse().unwrap());
+            request(
+                window,
+                headers,
+                InvokeBody::Raw(b"plain legacy-compatible text".to_vec()),
+            )
+        };
+        call(&main, "begin_agent_attachment").unwrap();
+        call(&other, "begin_agent_attachment").unwrap();
+        call(&main, "cancel_agent_attachment").unwrap();
+        call(&main, "cancel_agent_attachment").unwrap();
+        assert_ipc_error(upload(&main), "cancelled", "已取消");
+        assert_eq!(upload(&other).unwrap(), "plain legacy-compatible text");
+        assert_ipc_error(upload(&other), "cancelled", "已取消");
+        assert_eq!(invoke(&main, "legacy.txt", b"legacy").unwrap(), "legacy");
+    }
+
+    #[tokio::test]
+    async fn queued_conversions_and_a_destroyed_window_cancel_only_their_owned_work() {
+        let conversions = AttachmentConversions::default();
+        let active_key = ("active".into(), Uuid::new_v4());
+        let queued_key = ("queued".into(), Uuid::new_v4());
+        conversions.register(active_key.clone()).unwrap();
+        conversions.register(queued_key.clone()).unwrap();
+        let active = conversions.start(active_key.clone()).unwrap();
+        let queued = conversions.start(queued_key).unwrap();
+        let slot = conversions
+            .wait_for_converter(&active.cancel)
+            .await
+            .unwrap();
+        let waiting = conversions.wait_for_converter(&queued.cancel);
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        conversions.cancel_window("queued");
+        assert!(matches!(waiting.await, Err(AppError::Cancelled)));
+        assert!(!active.cancel.is_cancelled());
+        conversions.cancel(active_key);
+        assert!(active.cancel.is_cancelled());
+        drop(slot);
+    }
+
+    #[test]
     fn ipc_needs_exact_consent_and_rejects_a_custom_server_with_the_same_id() {
         let dir = tempfile::tempdir().unwrap();
         let app = desktop(dir.path(), dir.path().join("unused-runtime.zip"));
@@ -367,7 +706,7 @@ mod tests {
         for enabled in [false, true] {
             servers.set_enabled(MARKITDOWN_ID, enabled).unwrap();
             assert_ipc_error(
-                invoke(&window, "a.txt", b"content"),
+                invoke(&window, "a.html", b"content"),
                 "consent_required",
                 "确认 stdio",
             );
@@ -380,7 +719,7 @@ mod tests {
         config.name.push_str(" (edited)");
         servers.update(&config).unwrap();
         assert_ipc_error(
-            invoke(&window, "a.txt", b"content"),
+            invoke(&window, "a.html", b"content"),
             "consent_required",
             "确认 stdio",
         );
@@ -392,17 +731,34 @@ mod tests {
             .remember_start(&servers.get(MARKITDOWN_ID).unwrap())
             .unwrap();
         assert_ipc_error(
-            invoke(&window, "a.txt", b"content"),
+            invoke(&window, "a.html", b"content"),
             "conversion_failed",
             "需要内置的 stdio",
         );
         servers.remove(MARKITDOWN_ID).unwrap();
         servers.create(&config).unwrap();
         assert_ipc_error(
-            invoke(&window, "a.txt", b"content"),
+            invoke(&window, "a.html", b"content"),
             "conversion_failed",
             "需要内置",
         );
+    }
+
+    #[test]
+    fn large_utf8_attachments_use_raw_ipc_without_a_converter() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = desktop(dir.path(), dir.path().join("missing.zip"));
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let text = format!("# 大文件\r\n{}\n末尾", "x".repeat(10 * 1024 * 1024));
+        assert_eq!(invoke(&window, "big.MD", text.as_bytes()).unwrap(), text);
+        assert_ipc_error(
+            invoke(&window, "blank.md", "\u{feff} \r\n".as_bytes()),
+            "conversion_failed",
+            "未提取到文本",
+        );
+        assert!(!dir.path().join("runtime-cache").exists());
     }
 
     #[test]
@@ -428,7 +784,7 @@ mod tests {
             .remember_start(&servers.get(MARKITDOWN_ID).unwrap())
             .unwrap();
         assert_ipc_error(
-            invoke(&window, "a.txt", b"x"),
+            invoke(&window, "a.html", b"x"),
             "conversion_failed",
             "缓存被重定向",
         );

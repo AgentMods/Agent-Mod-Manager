@@ -33,6 +33,8 @@ test("云端目录本地搜索、精确选版，并显示两个原始文件、�
   expect(await calls(page, "list_manager_plugin_games")).toHaveLength(1);
   await candidate(page).click();
   await expect(tab).toContainText(release.releaseId);
+  await expect(tab.getByRole("img", {name: "插件封面"})).toBeVisible();
+  await expect(tab).toContainText("管理这款游戏已声明的模组安装规则。");
   await expect(tab).toContainText("已安装同标识适配包 minecraft-java 1.0.0");
   await expect(tab.getByRole("region", {name: "声明的 MCP 服务"})).toContainText('catalog-helper "--mode" "list only"');
   for (const [name, text] of [["adapter.json", adapterText], ["SKILL.md", skillText]]) {

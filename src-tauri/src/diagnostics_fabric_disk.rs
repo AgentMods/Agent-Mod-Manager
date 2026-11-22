@@ -10,17 +10,27 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    ffi::OsString,
     fs,
     path::{Path, PathBuf},
-    time::{Duration, Instant, SystemTime},
+    time::SystemTime,
 };
 
+#[cfg(test)]
+use std::{
+    ffi::OsString,
+    time::{Duration, Instant},
+};
+
+#[cfg(test)]
 const MAX_ENTRIES: usize = 512;
+#[cfg(test)]
 const MAX_JARS: usize = 64;
+#[cfg(test)]
 const MAX_RECORDS: usize = 128;
 const MAX_RECORD_BYTES: usize = 64 * 1024;
+#[cfg(test)]
 const MAX_MANIFEST_PATHS: usize = 4096;
+#[cfg(test)]
 const SOFT_TIME_LIMIT: Duration = Duration::from_secs(3);
 const BUILTIN_IDS: &[&str] = &["minecraft", "java", "fabricloader"];
 
@@ -108,6 +118,7 @@ impl FabricDiskEvidence {
     }
 }
 
+#[cfg(test)]
 pub(super) fn inspect(
     engine: &FileEngine,
     ctx: &Context,
@@ -157,6 +168,7 @@ fn confirm_directory(
     Err(AppError::Conflict("诊断期间 mods 目录有变化".into()))
 }
 
+#[cfg(test)]
 fn scan(
     engine: &FileEngine,
     ctx: &Context,
@@ -287,6 +299,7 @@ fn compare_log(jars: &mut [JarEvidence], startup: Option<&FabricEvidence>) {
     }
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct OwnerEvidence {
     matches: HashMap<OsString, usize>,
@@ -300,6 +313,7 @@ enum RecordedPath {
     File { path: PathBuf },
 }
 
+#[cfg(test)]
 impl OwnerEvidence {
     fn read(engine: &FileEngine, game_id: &str, dir: &Path, deadline: Instant) -> AppResult<Self> {
         let mut evidence = Self {
@@ -362,4 +376,193 @@ impl OwnerEvidence {
             _ => Ownership::Unrecorded,
         }
     }
+}
+
+/// Inventory every eligible JAR. The private spool preserves directory-wide
+/// duplicate-ID checks and name ordering across output pages without a RAM list.
+pub(super) fn stream(
+    engine: &FileEngine,
+    ctx: &Context,
+    log: Option<&FabricEvidence>,
+    cancel: &tokio_util::sync::CancellationToken,
+    mut emit: impl FnMut(FabricDiskEvidence) -> AppResult<()>,
+) -> AppResult<Option<FabricDiskEvidence>> {
+    if ctx.adapter.slug != "minecraft-java"
+        || !ctx.adapter.install_roots.iter().any(|r| {
+            r.id == "mods"
+                && r.kind == crate::plugins::RootKind::Game
+                && r.relative_path == "mods"
+                && r.platforms.contains(&ctx.platform)
+        })
+    {
+        return Ok(None);
+    }
+    let check = || {
+        if cancel.is_cancelled() {
+            Err(AppError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+    let result = (|| -> AppResult<FabricDiskEvidence> {
+        let dir = ctx.root("mods")?;
+        if dir != ctx.root.join("mods") {
+            return Err(AppError::Denied("无法确认实例的 mods 目录".into()));
+        }
+        let before = directory_state(ctx, &dir)?;
+        let temp = tempfile::tempdir()?;
+        let spool = rusqlite::Connection::open(temp.path().join("fabric.sqlite"))?;
+        spool.execute_batch(
+            "PRAGMA journal_mode=OFF; PRAGMA cache_size=-1024;
+            CREATE TABLE jars(name TEXT PRIMARY KEY,id TEXT,body TEXT NOT NULL);
+            CREATE INDEX jars_id ON jars(id);
+            CREATE TABLE owners(path TEXT PRIMARY KEY, count INTEGER NOT NULL);
+            BEGIN;",
+        )?;
+        let ownership_complete = read_owners(engine, &ctx.game.id, &dir, &spool, cancel)?;
+        let mut partial = false;
+        for entry in safe_fs::directory_entries(&dir, &before.0)? {
+            check()?;
+            let Ok((name, is_dir)) = entry else {
+                partial = true;
+                continue;
+            };
+            let Some(name) = name.to_str() else {
+                partial = true;
+                continue;
+            };
+            if is_dir || name.starts_with('.') || !name.ends_with(".jar") {
+                continue;
+            }
+            if name.len() > 255 || validate_relative_path(name, false).is_err() {
+                partial = true;
+                continue;
+            }
+            let path = dir.join(name);
+            let (metadata_status, id, version) = match inspect_jar(ctx, &path) {
+                Ok(fabric_manifest::Manifest::Present { id, version }) => {
+                    (MetadataStatus::Present, Some(id), Some(version))
+                }
+                Ok(fabric_manifest::Manifest::Absent) => (MetadataStatus::Absent, None, None),
+                Ok(fabric_manifest::Manifest::Invalid) => (MetadataStatus::Invalid, None, None),
+                Ok(fabric_manifest::Manifest::Limited) => (MetadataStatus::Limited, None, None),
+                Err(_) => (MetadataStatus::Unreadable, None, None),
+            };
+            partial |= !matches!(
+                metadata_status,
+                MetadataStatus::Present | MetadataStatus::Absent
+            );
+            let ownership = match spool.query_row(
+                "SELECT COALESCE((SELECT count FROM owners WHERE path=?1),0)",
+                [path.to_str()],
+                |row| row.get::<_, usize>(0),
+            )? {
+                2.. => Ownership::Ambiguous,
+                _ if !ownership_complete => Ownership::Unverified,
+                1 => Ownership::Recorded,
+                _ => Ownership::Unrecorded,
+            };
+            let row = JarEvidence {
+                file: super::clean_text(name),
+                metadata_status,
+                id,
+                version,
+                ownership,
+                log_relation: LogRelation::without_line(RelationStatus::Unverified),
+            };
+            spool.execute(
+                "INSERT INTO jars VALUES(?1,?2,?3)",
+                rusqlite::params![name, row.id, serde_json::to_string(&row)?],
+            )?;
+        }
+        confirm_directory(ctx, &dir, &before)?;
+        let mut report = FabricDiskEvidence::empty(if partial {
+            ScanStatus::Partial
+        } else {
+            ScanStatus::Scanned
+        });
+        let mut query = spool.prepare("SELECT body, id IS NOT NULL AND EXISTS(SELECT 1 FROM jars AS other WHERE other.id=jars.id AND other.name<>jars.name) FROM jars ORDER BY name")?;
+        let mut rows = query.query([])?;
+        while let Some(row) = rows.next()? {
+            check()?;
+            if report.jars.len() == 64 {
+                confirm_directory(ctx, &dir, &before)?;
+                emit(FabricDiskEvidence {
+                    jars: std::mem::take(&mut report.jars),
+                    ..report.clone()
+                })?;
+            }
+            let mut jar: JarEvidence = serde_json::from_str(&row.get::<_, String>(0)?)?;
+            if row.get::<_, bool>(1)? {
+                jar.log_relation = LogRelation::without_line(RelationStatus::Ambiguous);
+            } else {
+                compare_log(std::slice::from_mut(&mut jar), log);
+            }
+            report.jars.push(jar);
+        }
+        confirm_directory(ctx, &dir, &before)?;
+        Ok(report)
+    })();
+    match result {
+        Ok(report) => Ok(Some(report)),
+        Err(AppError::Cancelled) => Err(AppError::Cancelled),
+        Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(Some(FabricDiskEvidence::empty(ScanStatus::Missing)))
+        }
+        Err(_) => Ok(Some(FabricDiskEvidence::empty(ScanStatus::Unavailable))),
+    }
+}
+
+fn read_owners(
+    engine: &FileEngine,
+    game_id: &str,
+    dir: &Path,
+    spool: &rusqlite::Connection,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> AppResult<bool> {
+    let mut complete = true;
+    let mut after: Option<String> = None;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        let rows = {
+            let conn = engine.db.conn();
+            let mut query = conn.prepare(&format!(
+                "SELECT id,CASE WHEN length(CAST(files_json AS BLOB))<=?2 THEN files_json END
+                 FROM installs WHERE game_id=?1 AND (?3 IS NULL OR id>?3) AND
+                 CASE WHEN EXISTS (SELECT 1 FROM install_transactions WHERE install_id=installs.id)
+                   THEN {INSTALL_STATE} ELSE status END='enabled' ORDER BY id LIMIT 32"
+            ))?;
+            let values = query
+                .query_map(rusqlite::params![game_id, MAX_RECORD_BYTES, after], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?;
+            values.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if rows.is_empty() {
+            break;
+        }
+        for (id, files) in rows {
+            after = Some(id);
+            let Some(files): Option<Vec<RecordedPath>> =
+                files.and_then(|s| serde_json::from_str(&s).ok())
+            else {
+                complete = false;
+                continue;
+            };
+            let mut paths = std::collections::HashSet::new();
+            for RecordedPath::Legacy(path) | RecordedPath::File { path } in files {
+                if !path.is_absolute() {
+                    complete = false;
+                } else if path.parent() == Some(dir) {
+                    paths.insert(path);
+                }
+            }
+            for path in paths {
+                spool.execute("INSERT INTO owners(path,count) VALUES(?1,1) ON CONFLICT(path) DO UPDATE SET count=count+1", [path.to_str()])?;
+            }
+        }
+    }
+    Ok(complete)
 }

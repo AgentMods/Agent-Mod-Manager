@@ -17,6 +17,7 @@ pub(crate) use http::pinned_download_client;
 pub use http::validate_download_url;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,8 +137,6 @@ pub struct VersionListRequest {
 fn version_page_size() -> usize {
     20
 }
-
-const MAX_VERSION_OFFSET: usize = 10_000;
 
 fn valid_version_filter(value: &str) -> bool {
     !value.is_empty()
@@ -295,6 +294,7 @@ pub trait ModSource: Send + Sync {
     async fn dependency_graph(
         &self,
         _request: &DependencyGraphRequest,
+        _cancel: &CancellationToken,
     ) -> AppResult<DependencyGraph> {
         Err(AppError::Unsupported("此来源不支持依赖图".into()))
     }
@@ -318,11 +318,8 @@ impl Sources {
 
     /// Failures are isolated: a missing key or outage never hides other results.
     pub async fn search(&self, query: &SearchQuery) -> AppResult<SearchResult> {
-        if query.query.len() > 512 || query.limit == 0 || query.limit > 100 || query.offset > 10_000
-        {
-            return Err(AppError::Invalid(
-                "搜索范围无效 (limit 1..100, offset <=10000)".into(),
-            ));
+        if query.limit == 0 || query.limit > 100 {
+            return Err(AppError::Invalid("搜索分页大小必须为 1..100".into()));
         }
         let selected: Vec<_> = self
             .providers
@@ -376,10 +373,8 @@ impl Sources {
         &self,
         request: &VersionListRequest,
     ) -> AppResult<VersionListResult> {
-        if request.limit == 0 || request.limit > 50 || request.offset > MAX_VERSION_OFFSET {
-            return Err(AppError::Invalid(
-                "版本列表范围无效 (limit 1..50, offset <=10000)".into(),
-            ));
+        if request.limit == 0 || request.limit > 50 {
+            return Err(AppError::Invalid("版本列表分页大小必须为 1..50".into()));
         }
         // Only bounded provider filter tokens ever leave the machine.
         if [&request.game_version, &request.loader]
@@ -397,7 +392,11 @@ impl Sources {
     pub async fn modrinth_dependency_graph(
         &self,
         request: &DependencyGraphRequest,
+        cancel: &CancellationToken,
     ) -> AppResult<DependencyGraph> {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
         modrinth_id(&request.version_id)?;
         if let Some(project) = &request.project_id {
             modrinth_id(project)?;
@@ -408,6 +407,8 @@ impl Sources {
             ));
         }
         request.validate_pins()?;
-        self.provider("modrinth")?.dependency_graph(request).await
+        self.provider("modrinth")?
+            .dependency_graph(request, cancel)
+            .await
     }
 }

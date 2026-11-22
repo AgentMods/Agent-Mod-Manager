@@ -452,3 +452,64 @@ async fn one_manager_can_connect_more_than_eight_distinct_servers() {
     assert_eq!(connected_ids, expected_ids);
     assert_eq!(registry.definitions().len(), SERVER_COUNT);
 }
+
+/// Exercise the packaged CLI and the same connection and navigation path as the desktop.
+#[tokio::test]
+#[ignore = "requires the prepared runtime and a cached Chromium or access to the Playwright CDN"]
+async fn bundled_playwright_navigates_with_managed_chromium() {
+    use axum::{response::Html, routing::get, Router};
+    let (dir, servers, settings, ctx) = fixture();
+    let base = dir.path().canonicalize().unwrap();
+    let runtime = McpRuntime::bundled(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/mcp-runtime/runtime.zip"),
+        base.join("runtime"),
+    );
+    servers.seed_presets().unwrap();
+    let mut config = servers.get("playwright").unwrap();
+    let output = config
+        .args
+        .iter()
+        .position(|arg| arg == "--output-dir")
+        .unwrap()
+        + 1;
+    let downloads = dunce::simplified(&base).join("browser output");
+    config.args[output] = downloads.display().to_string();
+    config.enabled = true;
+    servers.update(&config).unwrap();
+    let consent = ConnectionConsent::after_user_confirmation(&config, true).unwrap();
+    let client = McpClient::connect(
+        servers,
+        &settings,
+        &config.id,
+        consent,
+        &runtime,
+        &ctx.cancel,
+    )
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route("/", get(|| async { Html(r#"<title>Chromium fixture</title><a id="download" download="fixture.txt" href="/file">Download</a>"#) }))
+        .route("/file", get(|| async { "Chromium downloaded this fixture" }));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let result = client
+        .call_tool("browser_navigate", json!({"url": url}), &ctx.cancel)
+        .await
+        .unwrap();
+    assert!(
+        result.to_string().contains("Page Title: Chromium fixture"),
+        "{result}"
+    );
+    let download = client
+        .call_tool("browser_click", json!({"target": "#download"}), &ctx.cancel)
+        .await
+        .unwrap();
+    client.disconnect_and_wait().await.unwrap();
+    server.abort();
+    assert_eq!(
+        std::fs::read_to_string(downloads.join("fixture.txt"))
+            .unwrap_or_else(|err| panic!("{err}: {download}")),
+        "Chromium downloaded this fixture"
+    );
+}

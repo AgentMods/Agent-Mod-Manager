@@ -185,6 +185,26 @@ export function trackAgentTurn(id: string, turnId?: string, { ifUntracked = fals
   // An unspecified turn follows the latest observed start, never the old watch.
   watched.set(id, turnId);
 }
+export function subscribeAgentToolResults(onResults: (results: AgentEvent[]) => void) {
+  return useAgent.subscribe(({ milestones }, previous) => {
+    if (milestones === previous.milestones) return;
+    const results: AgentEvent[] = [];
+    for (const [id, events] of Object.entries(milestones)) {
+      const before = previous.milestones[id] ?? [];
+      if (before === events) continue;
+      const start = latestTurnStart(events);
+      // Opening a finished conversation replays history, not new tool results.
+      if (!start || (!watched.has(id) && !activeTurn(events))) continue;
+      for (let i = lowerBound(events, start.seq); i < events.length; i++) {
+        const event = events[i];
+        if (event.kind === "tool-result" && event.turnId === start.turnId &&
+          before[lowerBound(before, event.seq)]?.seq !== event.seq) results.push(event);
+      }
+    }
+    if (results.length) onResults(results);
+  });
+}
+
 export function ensureAgentListeners() {
   if (!backendAvailable) return Promise.resolve();
   if (listening) return listening;

@@ -228,6 +228,7 @@ async fn review_with_steps(
         engine,
         &sources,
         request(artifact_id, game_id, None, json!({})),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .unwrap();
@@ -343,6 +344,7 @@ async fn desktop_graph_review_pins_project_only_edge_and_matches_in_edge_order()
             None,
             json!({"PinnedPrj": "PinnedV1"}),
         ),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .unwrap();
@@ -419,6 +421,7 @@ async fn desktop_graph_review_ignores_matching_install_in_another_game() {
         engine,
         &sources,
         request(&artifact_id, &game.id, None, json!({})),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .unwrap();
@@ -430,6 +433,60 @@ async fn desktop_graph_review_ignores_matching_install_in_another_game() {
         .as_array()
         .unwrap()
         .is_empty());
+    mock.assert_finished(2);
+}
+
+#[tokio::test]
+async fn desktop_graph_review_and_direct_check_support_large_journals() {
+    let (_temp, engine, game) = fixture();
+    let artifact_id = record_root_artifact(&engine);
+    {
+        let conn = engine.db.conn();
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute_batch(
+            "WITH RECURSIVE n(i) AS (VALUES(4100) UNION ALL SELECT i-1 FROM n WHERE i>1)
+             INSERT INTO file_transactions (id,kind,status,plan_json,created_at)
+             SELECT printf('bulk-tx-%04d',i),'install','committed','{}','fixture' FROM n;",
+        )
+        .unwrap();
+        tx.execute(
+            "WITH RECURSIVE n(i) AS (VALUES(4100) UNION ALL SELECT i-1 FROM n WHERE i>1)
+             INSERT INTO installs (id,game_id,name,source,metadata_json,installed_at,updated_at)
+             SELECT printf('bulk-%04d',i),?1,'bulk','modrinth',
+                 json_object('downloadOrigin',json_object('sourceId','modrinth','projectId','BulkProj','versionId','BulkVers')),
+                 'fixture','fixture' FROM n",
+            [&game.id],
+        ).unwrap();
+        tx.execute_batch(
+            "WITH RECURSIVE n(i) AS (VALUES(4100) UNION ALL SELECT i-1 FROM n WHERE i>1)
+             INSERT INTO install_transactions (install_id,transaction_id,action,created_at)
+             SELECT printf('bulk-%04d',i),printf('bulk-tx-%04d',i),'install','fixture' FROM n;",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+    }
+    // The one selected dependency sorts after all of the 4,100 earlier rows.
+    journal_install(&engine, "last-exact", &game.id, "ChildPrj", "ChildV01");
+    let direct_request: install_dependencies::CheckRequest = serde_json::from_value(json!({
+        "gameId": game.id,
+        "dependencies": [dependency("BulkProj", Some("BulkVers")), dependency("ChildPrj", Some("ChildV01"))],
+        "replaceInstallId": "bulk-0001"
+    })).unwrap();
+    let direct =
+        serde_json::to_value(install_dependencies::check(&engine, &direct_request).unwrap())
+            .unwrap();
+    assert_eq!(direct["excludedInstallId"], "bulk-0001");
+    assert_eq!(direct["checks"][0]["matchCount"], 4099);
+    assert_eq!(direct["checks"][0]["reason"], "ambiguous_records");
+    assert_eq!(direct["checks"][0]["matches"].as_array().unwrap().len(), 4);
+    assert_eq!(direct["checks"][0]["matches"][0]["installId"], "bulk-0002");
+    assert_eq!(direct["checks"][1]["status"], "recorded_exact");
+
+    let (review, mock) =
+        review_with_steps(engine, &artifact_id, &game.id, exact_child_steps()).await;
+    assert_eq!(review["graph"]["complete"], true);
+    assert_eq!(review["checks"][0]["status"], "recorded_exact");
+    assert_eq!(review["checks"][0]["matches"][0]["installId"], "last-exact");
     mock.assert_finished(2);
 }
 
@@ -455,6 +512,7 @@ async fn desktop_graph_review_replacement_keeps_other_project_matches() {
         engine,
         &sources,
         request(&artifact_id, &game.id, Some("replace-root"), json!({})),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .unwrap();
@@ -487,6 +545,7 @@ async fn desktop_graph_review_rejects_replacement_from_another_project_before_ne
         engine,
         &sources,
         request(&artifact_id, &game.id, Some("not-root-project"), json!({})),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .unwrap_err();
@@ -514,6 +573,7 @@ async fn desktop_graph_review_rejects_pending_recovery_before_network() {
         engine,
         &sources,
         request(&artifact_id, &game.id, None, json!({})),
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await
     .unwrap_err();
@@ -706,4 +766,22 @@ async fn desktop_graph_review_marks_out_of_scope_and_symlink_paths_unverified() 
         .any(|issue| issue["path"] == "mods/linked.jar"));
     assert_eq!(review_scope_snapshot(&engine), db_before);
     assert_eq!(engine.roots().unwrap(), roots_before);
+}
+
+#[tokio::test]
+async fn desktop_graph_review_can_cancel_before_reading_from_the_provider() {
+    let (_temp, engine, game) = fixture();
+    let artifact = record_root_artifact(&engine);
+    let (sources, mock) = sources(vec![]);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    cancel.cancel();
+    let result = install_dependencies::review_graph(
+        engine,
+        &sources,
+        request(&artifact, &game.id, None, json!({})),
+        &cancel,
+    )
+    .await;
+    assert!(matches!(result, Err(AppError::Cancelled)));
+    mock.assert_finished(0);
 }

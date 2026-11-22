@@ -6,19 +6,22 @@ use crate::db::Db;
 use crate::error::{AppError, AppResult};
 use crate::paths::{display_path, user_path};
 use crate::plugins::{self, GameAdapter, MarkerKind, Platform};
+use crate::util;
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+
+#[path = "games_scan_pages.rs"]
+pub(crate) mod pages;
 
 const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const MAX_KV_DEPTH: usize = 32;
 const MAX_KV_TOKENS: usize = 65_536;
 const MAX_KV_STRING: usize = 65_536;
-const MAX_LIBRARIES: usize = 64;
 pub const HIGH_CONFIDENCE: f64 = 0.80;
 
 fn invalid(message: impl Into<String>) -> AppError {
@@ -515,7 +518,7 @@ impl GameAdapterSelection {
         platform_name(self.matched.platform)
     }
 
-    pub(crate) fn already_applied(&self, game: &Game) -> bool {
+    fn already_applied(&self, game: &Game) -> bool {
         game.adapter_slug.as_deref() == Some(&self.adapter.slug)
             && game.adapter_version.as_deref() == Some(&self.adapter.version)
             && game.slug == self.adapter.slug
@@ -533,16 +536,28 @@ pub(crate) fn rebind_game(
     tx: &rusqlite::Transaction<'_>,
     game: Game,
     selected: &GameAdapterSelection,
+    target_name: Option<&str>,
 ) -> AppResult<Game> {
+    let changed_name = target_name.filter(|&name| name != game.name);
     if selected.already_applied(&game) {
-        return Ok(game);
+        let Some(name) = changed_name else {
+            return Ok(game);
+        };
+        // An explicit rename of an already bound package does not refresh
+        // identification metadata or any other game configuration.
+        tx.execute(
+            "UPDATE games SET name=?1,updated_at=?2 WHERE id=?3",
+            params![name, util::now(), game.id],
+        )?;
+        return get_game_from(tx, &game.id);
     }
     let now = chrono::Utc::now().to_rfc3339();
     let mut metadata = game.metadata;
     update_registration_metadata(&mut metadata, selected.identification.clone(), &now)?;
     tx.execute(
         "UPDATE games SET slug=?1,platform=?2,adapter_slug=?1,adapter_version=?3,confidence=?4,
-         steam_app_id=?5,last_scanned_at=?6,metadata_json=?7,updated_at=?6 WHERE id=?8",
+         steam_app_id=?5,last_scanned_at=?6,metadata_json=?7,updated_at=?6,
+         name=COALESCE(?9,name) WHERE id=?8",
         params![
             selected.adapter.slug,
             selected.platform(),
@@ -551,7 +566,8 @@ pub(crate) fn rebind_game(
             selected.adapter.steam_app_id,
             now,
             metadata.to_string(),
-            game.id
+            game.id,
+            changed_name,
         ],
     )?;
     get_game_from(tx, &game.id)
@@ -970,9 +986,6 @@ pub fn parse_library_folders(input: &str) -> AppResult<Vec<String>> {
             return Err(invalid("Steam 库路径无效"));
         }
         paths.insert(path.to_owned());
-        if paths.len() > MAX_LIBRARIES {
-            return Err(invalid("Steam 库数量超限"));
-        }
     }
     Ok(paths.into_iter().collect())
 }
@@ -986,10 +999,11 @@ pub struct ScanOptions {
     pub epic_manifest_dirs: Vec<PathBuf>,
     pub legendary_installed_files: Vec<PathBuf>,
     pub include_common_roots: bool,
-    /// Root itself is depth 0. Maximum accepted depth is 3, never a disk crawl.
-    pub max_depth: u8,
+    /// Root itself is depth 0; omitted depth scans explicitly selected trees.
+    pub max_depth: usize,
     pub max_directories: usize,
     pub max_entries: usize,
+    pub page: pages::PageRequest,
 }
 impl Default for ScanOptions {
     fn default() -> Self {
@@ -1000,9 +1014,10 @@ impl Default for ScanOptions {
             epic_manifest_dirs: vec![],
             legendary_installed_files: vec![],
             include_common_roots: true,
-            max_depth: 2,
-            max_directories: 2048,
-            max_entries: 16_384,
+            max_depth: usize::MAX,
+            max_directories: usize::MAX,
+            max_entries: usize::MAX,
+            page: pages::PageRequest::default(),
         }
     }
 }
@@ -1104,6 +1119,7 @@ pub struct ScanReport {
     pub directories_checked: usize,
     pub entries_checked: usize,
     pub truncated: bool,
+    pub next_cursor: Option<uuid::Uuid>,
 }
 
 fn read_metadata(path: &Path) -> AppResult<String> {
@@ -1111,10 +1127,20 @@ fn read_metadata(path: &Path) -> AppResult<String> {
     if !metadata.file_type().is_file() || metadata.len() > MAX_METADATA_BYTES as u64 {
         return Err(invalid("启动器元数据须为大小受限的普通文件"));
     }
+    let file = crate::safe_fs::open_regular(path)?;
+    let opened = file.metadata()?;
+    if opened.len() > MAX_METADATA_BYTES as u64 {
+        return Err(invalid("启动器元数据大小超限"));
+    }
     let mut bytes = Vec::new();
-    fs::File::open(path)?
+    (&file)
         .take(MAX_METADATA_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
+    crate::safe_fs::verify_regular_at(&file, path)?;
+    let current = file.metadata()?;
+    if opened.len() != current.len() || opened.modified()? != current.modified()? {
+        return Err(AppError::Conflict("启动器元数据在读取期间变化".into()));
+    }
     if bytes.len() > MAX_METADATA_BYTES {
         return Err(invalid("启动器元数据大小超限"));
     }
@@ -1125,46 +1151,38 @@ struct Scanner<'a> {
     adapters: &'a [GameAdapter],
     options: &'a ScanOptions,
     report: ScanReport,
-    probes: BTreeMap<PathBuf, Vec<DiscoverySource>>,
-    user_install_hints: BTreeSet<PathBuf>,
-    tree_listings: BTreeMap<PathBuf, TreeListing>,
-}
-
-#[derive(Default)]
-struct TreeListing {
-    children: Vec<PathBuf>,
-    install_hint: bool,
+    spool: rusqlite::Connection,
+    cancel: &'a tokio_util::sync::CancellationToken,
 }
 
 // Filename evidence for an unadapted installation, not an adapter match or a launch target.
-fn install_hint(root: &Path, entry: &fs::DirEntry, kind: fs::FileType) -> bool {
-    let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-    if kind.is_dir() {
+fn install_hint(root: &Path, name: &std::ffi::OsStr, directory: bool) -> bool {
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    if directory {
         return name == ".egstore"
             || (name == "contents"
                 && root
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("app")));
     }
-    kind.is_file()
-        && (matches!(
-            name.as_str(),
-            "unityplayer.dll" | "unityplayer.so" | "project.godot" | "steam_appid.txt"
-        ) || (name.starts_with("goggame-") && name.ends_with(".info"))
-            || name.ends_with(".x86_64")
-            || (name.ends_with(".exe")
-                && ![
-                    "setup",
-                    "install",
-                    "unins",
-                    "vc_redist",
-                    "dxsetup",
-                    "crashpad",
-                    "crashreport",
-                    "unitycrash",
-                ]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))))
+    matches!(
+        name.as_str(),
+        "unityplayer.dll" | "unityplayer.so" | "project.godot" | "steam_appid.txt"
+    ) || (name.starts_with("goggame-") && name.ends_with(".info"))
+        || name.ends_with(".x86_64")
+        || (name.ends_with(".exe")
+            && ![
+                "setup",
+                "install",
+                "unins",
+                "vc_redist",
+                "dxsetup",
+                "crashpad",
+                "crashreport",
+                "unitycrash",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix)))
 }
 impl Scanner<'_> {
     fn warn(&mut self, path: &Path, message: impl ToString) {
@@ -1180,75 +1198,93 @@ impl Scanner<'_> {
         self.report.truncated = true;
         self.warn(path, "达到扫描数量上限，结果不完整");
     }
-    fn probe(&mut self, path: &Path, source: DiscoverySource) {
-        let root = match canonical_directory(path) {
-            Ok(path) => path,
+    fn checkpoint(&self) -> AppResult<()> {
+        if self.cancel.is_cancelled() {
+            Err(AppError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn probe(&mut self, path: &Path, source: DiscoverySource) -> AppResult<()> {
+        self.checkpoint()?;
+        match canonical_directory(path) {
+            Ok(root) => {
+                self.record_probe(&root, source)?;
+            }
             Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 if source.metadata_path.is_some() {
                     self.warn(path, "启动器记录的安装目录不存在");
                 }
-                return;
             }
+            Err(e) => self.warn(path, e),
+        }
+        Ok(())
+    }
+
+    fn record_probe(&mut self, root: &Path, source: DiscoverySource) -> AppResult<bool> {
+        let root_text = root
+            .to_str()
+            .ok_or_else(|| invalid("扫描目录不是 Unicode 路径"))?;
+        if self.report.directories_checked >= self.options.max_directories {
+            let found: bool = self.spool.query_row(
+                "SELECT EXISTS(SELECT 1 FROM probes WHERE root = ?1)",
+                [root_text],
+                |row| row.get(0),
+            )?;
+            if !found {
+                self.limit(root);
+                return Ok(false);
+            }
+        }
+        self.report.directories_checked += self.spool.execute(
+            "INSERT OR IGNORE INTO probes(root) VALUES (?1)",
+            [root_text],
+        )?;
+        self.spool.execute(
+            "INSERT OR IGNORE INTO sources(root, source) VALUES (?1, ?2)",
+            params![root_text, serde_json::to_string(&source)?],
+        )?;
+        Ok(true)
+    }
+
+    fn count_entry(&mut self, path: &Path) -> AppResult<bool> {
+        self.checkpoint()?;
+        if self.report.entries_checked >= self.options.max_entries {
+            self.limit(path);
+            return Ok(false);
+        }
+        self.report.entries_checked += 1;
+        Ok(true)
+    }
+
+    fn entries(&mut self, path: &Path) -> Option<fs::ReadDir> {
+        match fs::read_dir(path) {
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
                 self.warn(path, e);
-                return;
+                None
             }
-        };
-        if self.has_probe_capacity(&root) {
-            self.record_probe(root, source);
         }
     }
 
-    fn has_probe_capacity(&mut self, root: &Path) -> bool {
-        if self.probes.len() >= self.options.max_directories && !self.probes.contains_key(root) {
-            self.limit(root);
-            return false;
-        }
-        true
-    }
-
-    fn record_probe(&mut self, root: PathBuf, source: DiscoverySource) {
-        let sources = self.probes.entry(root).or_default();
-        if !sources.contains(&source) {
-            sources.push(source);
-        }
-    }
-    fn entries(&mut self, path: &Path) -> Vec<fs::DirEntry> {
-        let mut result = Vec::new();
-        let entries = match fs::read_dir(path) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return result,
-            Err(e) => {
-                self.warn(path, e);
-                return result;
-            }
-        };
-        for entry in entries {
-            if self.report.entries_checked >= self.options.max_entries {
-                self.limit(path);
-                break;
-            }
-            self.report.entries_checked += 1;
-            match entry {
-                Ok(entry) => result.push(entry),
-                Err(e) => self.warn(path, e),
-            }
-        }
-        result.sort_by_key(fs::DirEntry::file_name);
-        result
-    }
     fn trees<'a>(
         &mut self,
-        roots: impl Iterator<Item = &'a PathBuf>,
+        roots: impl Iterator<Item = (&'a PathBuf, usize)>,
         kind: DiscoveryKind,
-        depth: u8,
-    ) {
-        // Seed all roots before visiting children. An overlapping user-selected
-        // directory then gets its own full depth and immediate-child hints.
-        let mut queue = VecDeque::new();
-        for path in roots {
+    ) -> AppResult<()> {
+        self.spool.execute("DELETE FROM queue", [])?;
+        // Start with all selected roots; each receives its own requested depth.
+        for (path, depth) in roots {
+            self.checkpoint()?;
             match canonical_directory(path) {
-                Ok(base) => queue.push_back((base, 0)),
+                Ok(path) => {
+                    let depth = i64::try_from(depth).unwrap_or(i64::MAX);
+                    self.spool.execute("INSERT INTO queue(path,level,remaining) VALUES (?1,0,?2)
+                        ON CONFLICT(path) DO UPDATE SET remaining=MAX(remaining,excluded.remaining)",
+                        params![path.to_str(),depth])?;
+                }
                 Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                     if kind == DiscoveryKind::User {
                         self.warn(path, "所选扫描目录不存在");
@@ -1257,81 +1293,150 @@ impl Scanner<'_> {
                 Err(e) => self.warn(path, e),
             }
         }
-        let mut seen = BTreeSet::new();
-        while let Some((path, level)) = queue.pop_front() {
-            if !seen.insert(path.clone()) {
-                continue;
-            }
-            if !self.has_probe_capacity(&path) {
-                continue;
-            }
-            // Children came from a listing under a canonical parent. Do not
-            // switch to a different root if a directory has since become a link.
-            match canonical_directory(&path) {
-                Ok(current) if current == path => {}
+        while let Some((id, path, level, remaining)) = self
+            .spool
+            .query_row(
+                "SELECT id,path,level,remaining FROM queue WHERE pending=1 ORDER BY id LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            self.checkpoint()?;
+            self.spool
+                .execute("UPDATE queue SET pending=0 WHERE id=?1", [id])?;
+            let root = Path::new(&path);
+            match canonical_directory(root) {
+                Ok(current) if current == root => {}
                 Ok(_) => {
-                    self.warn(&path, "目录已被链接替换，跳过扫描");
+                    self.warn(root, "目录已被链接替换，跳过扫描");
                     continue;
                 }
                 Err(e) => {
-                    self.warn(&path, e);
+                    self.warn(root, e);
                     continue;
                 }
             }
-            self.record_probe(path.clone(), DiscoverySource::simple(kind.clone()));
-            // Only treat launch files at a chosen root or its immediate children as hints;
-            // nested tool, installer and engine directories are not separate games.
-            let check_hints = kind == DiscoveryKind::User && level <= 1;
-            if level >= depth && !check_hints {
+            if !self.record_probe(root, DiscoverySource::simple(kind.clone()))? {
                 continue;
             }
-            if !self.tree_listings.contains_key(&path) {
-                let mut listing = TreeListing::default();
-                for entry in self.entries(&path) {
-                    // No recursive following of symlinks/reparse points. A root
-                    // directly chosen by the user may itself be canonicalized.
-                    let Ok(file_type) = entry.file_type() else {
-                        continue;
-                    };
-                    listing.install_hint |= install_hint(&path, &entry, file_type);
-                    if file_type.is_dir() && !file_type.is_symlink() {
-                        let name = entry.file_name();
-                        if matches!(
-                            name.to_str(),
-                            Some(
-                                ".git"
-                                    | ".egstore"
-                                    | "node_modules"
-                                    | "compatdata"
-                                    | "workshop"
-                                    | "downloading"
-                            )
-                        ) {
-                            continue;
+            let check_hints = kind == DiscoveryKind::User && level <= 1;
+            if remaining == 0 && !check_hints {
+                continue;
+            }
+            let cached: Option<bool> = self
+                .spool
+                .query_row("SELECT hint FROM listings WHERE root=?1", [&path], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            let hint = match cached {
+                Some(hint) => hint,
+                None => {
+                    let mut hint = false;
+                    let entries = crate::safe_fs::identity(root).and_then(|id| {
+                        let id = id.ok_or_else(|| invalid("扫描目录不存在"))?;
+                        crate::safe_fs::directory_entries(root, &id)
+                    });
+                    match entries {
+                        Ok(entries) => {
+                            for entry in entries {
+                                if !self.count_entry(root)? {
+                                    break;
+                                }
+                                let (name, directory) = match entry {
+                                    Ok(entry) => entry,
+                                    Err(e) => {
+                                        self.warn(root, e);
+                                        continue;
+                                    }
+                                };
+                                if install_hint(root, &name, directory)
+                                    && (directory
+                                        || fs::symlink_metadata(root.join(&name))
+                                            .is_ok_and(|metadata| metadata.file_type().is_file()))
+                                {
+                                    hint = true;
+                                }
+                                if directory
+                                    && !matches!(
+                                        name.to_str(),
+                                        Some(
+                                            ".git"
+                                                | ".egstore"
+                                                | "node_modules"
+                                                | "compatdata"
+                                                | "workshop"
+                                                | "downloading"
+                                        )
+                                    )
+                                {
+                                    if let Some(child) = root.join(name).to_str() {
+                                        self.spool.execute("INSERT OR IGNORE INTO children(root,path) VALUES (?1,?2)", params![path,child])?;
+                                    }
+                                }
+                            }
                         }
-                        listing.children.push(entry.path());
+                        Err(e) => self.warn(root, e),
                     }
+                    self.spool.execute(
+                        "INSERT INTO listings(root,hint) VALUES (?1,?2)",
+                        params![path, hint],
+                    )?;
+                    hint
                 }
-                self.tree_listings.insert(path.clone(), listing);
+            };
+            if check_hints && hint {
+                self.spool
+                    .execute("UPDATE probes SET hint=1 WHERE root=?1", [&path])?;
             }
-            let listing = &self.tree_listings[&path];
-            if check_hints && listing.install_hint {
-                self.user_install_hints.insert(path);
-            }
-            if level < depth {
-                queue.extend(
-                    listing
-                        .children
-                        .iter()
-                        .map(|child| (child.clone(), level + 1)),
-                );
+            if remaining > 0 {
+                self.spool.execute("INSERT INTO queue(path,level,remaining) SELECT path,?2+1,?3-1 FROM children WHERE root=?1
+                    ON CONFLICT(path) DO UPDATE SET remaining=excluded.remaining,pending=1
+                    WHERE queue.remaining<excluded.remaining", params![path,level,remaining])?;
             }
         }
+        Ok(())
     }
-    fn steam(&mut self, initial: &[PathBuf]) {
-        let mut queue: VecDeque<_> = initial.iter().cloned().collect();
-        let mut seen = BTreeSet::new();
-        while let Some(path) = queue.pop_front() {
+    fn enqueue_steam(&mut self, path: &Path) -> AppResult<()> {
+        if let Some(path) = path.to_str() {
+            self.spool.execute(
+                "INSERT OR IGNORE INTO steam_queue(path) VALUES (?1)",
+                [path],
+            )?;
+        } else {
+            self.warn(path, "忽略非 Unicode Steam 库路径");
+        }
+        Ok(())
+    }
+    fn steam(&mut self, initial: &[PathBuf]) -> AppResult<()> {
+        for path in initial {
+            self.enqueue_steam(path)?;
+        }
+        while let Some((id, path)) = self
+            .spool
+            .query_row(
+                "SELECT id,path FROM steam_queue WHERE pending ORDER BY id LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        PathBuf::from(row.get::<_, String>(1)?),
+                    ))
+                },
+            )
+            .optional()?
+        {
+            self.checkpoint()?;
+            self.spool
+                .execute("UPDATE steam_queue SET pending=0 WHERE id=?1", [id])?;
             let mut library = match canonical_directory(&path) {
                 Ok(path) => path,
                 Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1343,14 +1448,13 @@ impl Scanner<'_> {
             if library.file_name().is_some_and(|n| n == "steamapps") {
                 library.pop();
             }
-            if seen.contains(&library) {
+            if self.spool.execute(
+                "INSERT OR IGNORE INTO steam_seen(path) VALUES (?1)",
+                [library.to_str()],
+            )? == 0
+            {
                 continue;
             }
-            if seen.len() >= MAX_LIBRARIES {
-                self.limit(&library);
-                break;
-            }
-            seen.insert(library.clone());
             for suffix in ["steamapps/libraryfolders.vdf", "config/libraryfolders.vdf"] {
                 let file = library.join(suffix);
                 match read_metadata(&file).and_then(|s| parse_library_folders(&s)) {
@@ -1358,7 +1462,7 @@ impl Scanner<'_> {
                         for path in paths {
                             let path = PathBuf::from(path);
                             if path.is_absolute() {
-                                queue.push_back(path);
+                                self.enqueue_steam(&path)?;
                             } else {
                                 self.warn(&file, "忽略非当前平台绝对路径的 Steam 库");
                             }
@@ -1382,7 +1486,17 @@ impl Scanner<'_> {
                     continue;
                 }
             };
-            for entry in self.entries(&apps) {
+            for entry in self.entries(&apps).into_iter().flatten() {
+                if !self.count_entry(&apps)? {
+                    break;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        self.warn(&apps, e);
+                        continue;
+                    }
+                };
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else {
                     continue;
@@ -1436,9 +1550,9 @@ impl Scanner<'_> {
                                 })
                             });
                         if let Some(runtime) = runtime {
-                            self.probe(&runtime, source);
+                            self.probe(&runtime, source)?;
                         } else {
-                            self.probe(&path, source);
+                            self.probe(&path, source)?;
                         }
                     }
                     Ok(_) => self.warn(&game, "Steam 安装目录越出 common，忽略"),
@@ -1446,10 +1560,12 @@ impl Scanner<'_> {
                 }
             }
         }
+        Ok(())
     }
-    fn epic_manifests(&mut self, directories: &[PathBuf]) {
+    fn epic_manifests(&mut self, directories: &[PathBuf]) -> AppResult<()> {
         let mut seen = BTreeSet::new();
         for directory in directories {
+            self.checkpoint()?;
             let directory = match canonical_directory(directory) {
                 Ok(path) => path,
                 Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1461,7 +1577,17 @@ impl Scanner<'_> {
             if !seen.insert(directory.clone()) {
                 continue;
             }
-            for entry in self.entries(&directory) {
+            for entry in self.entries(&directory).into_iter().flatten() {
+                if !self.count_entry(&directory)? {
+                    break;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(e) => {
+                        self.warn(&directory, e);
+                        continue;
+                    }
+                };
                 if entry.path().extension().is_none_or(|s| s != "item") {
                     continue;
                 }
@@ -1489,16 +1615,18 @@ impl Scanner<'_> {
                                     !manifest.incomplete && !manifest.needs_validation,
                                 ),
                             },
-                        );
+                        )?;
                     }
                     Err(e) => self.warn(&file, e),
                 }
             }
         }
+        Ok(())
     }
-    fn legendary(&mut self, files: &[PathBuf]) {
+    fn legendary(&mut self, files: &[PathBuf]) -> AppResult<()> {
         let mut seen = BTreeSet::new();
         for file in files {
+            self.checkpoint()?;
             let canonical = match file.canonicalize() {
                 Ok(path) => path,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1523,11 +1651,9 @@ impl Scanner<'_> {
             };
             seen.insert(canonical.clone());
             for entry in entries.into_values() {
-                if self.report.entries_checked >= self.options.max_entries {
-                    self.limit(file);
+                if !self.count_entry(file)? {
                     break;
                 }
-                self.report.entries_checked += 1;
                 let entry: LegendaryInstall = match serde_json::from_value(entry) {
                     Ok(entry) => entry,
                     Err(e) => {
@@ -1552,9 +1678,10 @@ impl Scanner<'_> {
                         steam_app_id: None,
                         complete_install: entry.needs_verification.then_some(false),
                     },
-                );
+                )?;
             }
         }
+        Ok(())
     }
 }
 
@@ -1577,26 +1704,35 @@ struct LegendaryInstall {
     needs_verification: bool,
 }
 
-/// Returns discoveries only. Caller must present candidates and explicitly call
-/// register_game before treating any new directory as a managed game root.
-pub fn scan_games(db: &Db, options: &ScanOptions) -> AppResult<ScanReport> {
-    if options.max_depth > 3
-        || options.max_directories == 0
-        || options.max_directories > 10_000
-        || options.max_entries == 0
-        || options.max_entries > 100_000
-    {
-        return Err(invalid(
-            "扫描深度须为 0..=3，目录上限为 1..=10000，条目上限为 1..=100000",
-        ));
-    }
-    let roots_count = options.user_roots.len()
-        + options.steam_roots.len()
-        + options.epic_roots.len()
-        + options.epic_manifest_dirs.len()
-        + options.legendary_installed_files.len();
-    if roots_count > 256 {
-        return Err(invalid("显式扫描位置数量超限"));
+static SCAN_PAGES: pages::Sessions<ScanReport> = pages::Sessions::new();
+
+/// Discovery doesn't authorize writes or register any candidate. Each page is bounded.
+pub fn scan_games_page(
+    db: &Db,
+    options: ScanOptions,
+    scope: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> AppResult<ScanReport> {
+    let page = options.page.clone();
+    let db_worker = db.clone();
+    let (mut report, cursor) =
+        SCAN_PAGES.request(db, scope.into(), &page, cancel, move |producer| {
+            scan_with(&db_worker, &options, &producer.cancel, |report| {
+                producer.emit(report)
+            })
+        })?;
+    report.next_cursor = cursor;
+    Ok(report)
+}
+
+fn scan_with(
+    db: &Db,
+    options: &ScanOptions,
+    cancel: &tokio_util::sync::CancellationToken,
+    mut emit: impl FnMut(ScanReport) -> AppResult<()>,
+) -> AppResult<ScanReport> {
+    if options.max_directories == 0 || options.max_entries == 0 {
+        return Err(invalid("扫描目录和条目范围必须为正数"));
     }
     for path in options
         .user_roots
@@ -1611,90 +1747,159 @@ pub fn scan_games(db: &Db, options: &ScanOptions) -> AppResult<ScanReport> {
         }
     }
     let adapters = active_adapters(db)?;
-    let existing = {
-        let conn = db.conn();
-        let mut stmt = conn.prepare("SELECT root_path,id FROM games")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                PathBuf::from(row.get::<_, String>(0)?),
-                row.get::<_, String>(1)?,
-            ))
-        })?;
-        rows.collect::<Result<BTreeMap<_, _>, _>>()?
-    };
     let common = if options.include_common_roots {
         common_roots()
     } else {
         CommonRoots::default()
     };
+    // A private, auto-deleted SQLite file bounds RAM for broad traversals and
+    // merges overlapping roots/launcher evidence without retaining the tree.
+    let directory = tempfile::tempdir()?;
+    let spool = rusqlite::Connection::open(directory.path().join("scan.sqlite"))?;
+    spool.execute_batch("PRAGMA cache_size=-2048; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;
+        CREATE TABLE probes(root TEXT PRIMARY KEY, hint INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE sources(root TEXT NOT NULL, source TEXT NOT NULL, UNIQUE(root,source));
+        CREATE TABLE listings(root TEXT PRIMARY KEY, hint INTEGER NOT NULL);
+        CREATE TABLE children(root TEXT NOT NULL, path TEXT NOT NULL, PRIMARY KEY(root,path));
+        CREATE TABLE queue(id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE, level INTEGER NOT NULL,
+                           remaining INTEGER NOT NULL, pending INTEGER NOT NULL DEFAULT 1);
+        CREATE INDEX queue_pending ON queue(pending,id);
+        CREATE TABLE steam_queue(id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,pending INTEGER NOT NULL DEFAULT 1);
+        CREATE INDEX steam_pending ON steam_queue(pending,id);
+        CREATE TABLE steam_seen(path TEXT NOT NULL PRIMARY KEY);
+        BEGIN;")?;
     let mut scanner = Scanner {
         adapters: &adapters,
         options,
         report: ScanReport::default(),
-        probes: BTreeMap::new(),
-        user_install_hints: BTreeSet::new(),
-        tree_listings: BTreeMap::new(),
+        spool,
+        cancel,
     };
-    scanner.steam(
-        &options
-            .steam_roots
-            .iter()
-            .chain(&common.steam)
-            .cloned()
-            .collect::<Vec<_>>(),
-    );
-    scanner.epic_manifests(
-        &options
-            .epic_manifest_dirs
-            .iter()
-            .chain(&common.epic_manifests)
-            .cloned()
-            .collect::<Vec<_>>(),
-    );
-    scanner.legendary(
-        &options
-            .legendary_installed_files
-            .iter()
-            .chain(&common.legendary_installed_files)
-            .cloned()
-            .collect::<Vec<_>>(),
-    );
+    let roots = |explicit: &[PathBuf], defaults: &[PathBuf]| {
+        explicit.iter().chain(defaults).cloned().collect::<Vec<_>>()
+    };
+    scanner.steam(&roots(&options.steam_roots, &common.steam))?;
+    scanner.epic_manifests(&roots(&options.epic_manifest_dirs, &common.epic_manifests))?;
+    scanner.legendary(&roots(
+        &options.legendary_installed_files,
+        &common.legendary_installed_files,
+    ))?;
     scanner.trees(
-        options.user_roots.iter(),
+        options.user_roots.iter().map(|p| (p, options.max_depth)),
         DiscoveryKind::User,
-        options.max_depth,
-    );
+    )?;
     scanner.trees(
-        options.epic_roots.iter().chain(&common.epic),
+        options
+            .epic_roots
+            .iter()
+            .map(|p| (p, options.max_depth))
+            .chain(common.epic.iter().map(|p| {
+                // Automatic roots remain targeted; a selected root is an explicit deep-scan request.
+                (
+                    p,
+                    if options.max_depth == usize::MAX {
+                        2
+                    } else {
+                        options.max_depth
+                    },
+                )
+            })),
         DiscoveryKind::Epic,
-        options.max_depth,
-    );
+    )?;
     for root in &common.game_instances {
-        scanner.probe(root, DiscoverySource::simple(DiscoveryKind::Common));
+        scanner.probe(root, DiscoverySource::simple(DiscoveryKind::Common))?;
     }
-    scanner.report.directories_checked = scanner.probes.len();
-    for (root, sources) in &scanner.probes {
-        let mut candidate = identify_at(root, scanner.adapters, sources.clone())?;
-        candidate.registered_game_id = existing.get(root).cloned();
-        if candidate.matches.is_empty() && !sources.iter().any(|s| s.metadata_path.is_some()) {
-            if scanner.user_install_hints.contains(root) {
+    let mut roots = scanner
+        .spool
+        .prepare("SELECT root,hint FROM probes ORDER BY root")?;
+    let mut sources = scanner
+        .spool
+        .prepare("SELECT source FROM sources WHERE root=?1 ORDER BY rowid LIMIT 257")?;
+    let mut result_budget = 0;
+    for row in roots.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))? {
+        scanner.checkpoint()?;
+        let (root, hint) = row?;
+        let path = Path::new(&root);
+        if !canonical_directory(path).is_ok_and(|canonical| canonical == path) {
+            continue;
+        }
+        let mut provenance = sources
+            .query_map([&root], |r| r.get::<_, String>(0))?
+            .map(|row| Ok(serde_json::from_str::<DiscoverySource>(&row?)?))
+            .collect::<AppResult<Vec<_>>>()?;
+        let overflow = provenance.len() > 256;
+        provenance.truncate(256);
+        let metadata = provenance.iter().any(|s| s.metadata_path.is_some());
+        let user = provenance.iter().any(|s| s.kind == DiscoveryKind::User);
+        let mut candidate = identify_at(path, scanner.adapters, provenance)?;
+        candidate.registered_game_id = db
+            .conn()
+            .query_row("SELECT id FROM games WHERE root_path=?1", [&root], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if candidate.matches.is_empty() && !metadata {
+            if hint {
                 candidate
                     .warnings
                     .push("检测到可能的游戏文件，未匹配适配包，请核对后再添加。".into());
-            } else if candidate.registered_game_id.is_none()
-                || !sources.iter().any(|s| s.kind == DiscoveryKind::User)
-            {
+            } else if candidate.registered_game_id.is_none() || !user {
                 continue;
             }
         }
+        if overflow {
+            candidate
+                .warnings
+                .push("同一目录的重复来源证据过多，仅显示部分来源。".into());
+        }
+        let bytes = serde_json::to_vec(&candidate)?.len();
+        if !scanner.report.candidates.is_empty()
+            && (scanner.report.candidates.len() >= 64 || result_budget + bytes > 512 * 1024)
+        {
+            let mut page = ScanReport {
+                candidates: std::mem::take(&mut scanner.report.candidates),
+                warnings: std::mem::take(&mut scanner.report.warnings),
+                ..scanner.report
+            };
+            sort_candidates(&mut page.candidates);
+            emit(page)?;
+            result_budget = 0;
+        }
+        result_budget += bytes;
         scanner.report.candidates.push(candidate);
     }
-    scanner.report.candidates.sort_by(|a, b| {
+    sort_candidates(&mut scanner.report.candidates);
+    Ok(scanner.report)
+}
+
+fn sort_candidates(candidates: &mut [GameCandidate]) {
+    candidates.sort_by(|a, b| {
         b.confidence
             .total_cmp(&a.confidence)
             .then_with(|| a.root_path.cmp(&b.root_path))
     });
-    Ok(scanner.report)
+}
+
+#[cfg(test)]
+pub fn scan_games(db: &Db, options: &ScanOptions) -> AppResult<ScanReport> {
+    let mut candidates = Vec::new();
+    let mut warnings = Vec::new();
+    let mut report = scan_with(
+        db,
+        options,
+        &tokio_util::sync::CancellationToken::new(),
+        |mut page| {
+            candidates.append(&mut page.candidates);
+            warnings.append(&mut page.warnings);
+            Ok(())
+        },
+    )?;
+    candidates.append(&mut report.candidates);
+    warnings.append(&mut report.warnings);
+    sort_candidates(&mut candidates);
+    report.candidates = candidates;
+    report.warnings = warnings;
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -2344,7 +2549,81 @@ mod tests {
                 ..scan_options()
             }
         )
-        .is_err());
+        .unwrap()
+        .candidates
+        .iter()
+        .any(|candidate| candidate.root_path.ends_with("hidden")));
+    }
+
+    #[test]
+    fn explicit_tree_pages_keep_deep_candidates_without_registering_new_games() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db(&temp);
+        let root = temp.path().join("selected");
+        let deep = root.join("one/two/three/four/five/game");
+        fs::create_dir_all(&deep).unwrap();
+        let existing = register_game(&db, &deep, None).unwrap();
+        for n in 0..66 {
+            make_file(&root.join(format!("portable-{n:02}")), "game.exe");
+        }
+        let mut options = ScanOptions {
+            user_roots: vec![root],
+            ..scan_options()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let first = scan_games_page(&db, options.clone(), "test", &cancel).unwrap();
+        assert_eq!(first.candidates.len(), 64);
+        assert!(first
+            .candidates
+            .iter()
+            .any(|row| row.registered_game_id.as_deref() == Some(existing.id.as_str())));
+        options.page.cursor = first.next_cursor;
+        assert!(options.page.cursor.is_some());
+        let second = scan_games_page(&db, options, "test", &cancel).unwrap();
+        assert_eq!(second.candidates.len(), 3);
+        assert!(second.next_cursor.is_none());
+        assert_eq!(list_games(&db).unwrap().len(), 1);
+    }
+
+    #[test]
+    #[ignore = "large filesystem stress case: creates more than 100,000 entries"]
+    fn selected_scan_paginates_more_than_old_depth_and_directory_entry_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db(&temp);
+        let root = temp.path().join("selected");
+        fs::create_dir_all(&root).unwrap();
+        // At least 100k total entries without creating 100k separate files.
+        let broad = root.join("broad");
+        fs::create_dir(&broad).unwrap();
+        for directory in 0..10_001 {
+            let path = broad.join(format!("d{directory:05}"));
+            fs::create_dir(&path).unwrap();
+            for file in 0..9 {
+                fs::write(path.join(format!("x{file}")), []).unwrap();
+            }
+        }
+        let deep = root.join("one/two/three/four/five/six");
+        // Unidentified explicit root hints are intentionally limited to level 0/1;
+        // an existing path picked as a second root can still be registered/reconciled.
+        for n in 0..66 {
+            make_file(&deep.join(format!("game-{n:02}")), "game.exe");
+        }
+        let mut options = ScanOptions {
+            user_roots: vec![root, deep],
+            ..scan_options()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let first = scan_games_page(&db, options.clone(), "test", &cancel).unwrap();
+        assert!(first.entries_checked > 100_000);
+        assert!(first.directories_checked > 10_000);
+        assert!(!first.truncated);
+        assert_eq!(first.candidates.len(), 64);
+        options.page.cursor = first.next_cursor;
+        assert!(options.page.cursor.is_some());
+        let second = scan_games_page(&db, options, "test", &cancel).unwrap();
+        assert_eq!(second.candidates.len(), 2);
+        assert!(second.next_cursor.is_none());
+        assert!(list_games(&db).unwrap().is_empty());
     }
 
     #[test]

@@ -67,17 +67,18 @@ The presets below appear in Settings → 工具.
 
 Schema v9 migrates the stock 3DM stdio preset to the remote endpoint and revokes the old launch consent. Reconnect from Settings to use the new transport.
 
-- [Playwright MCP](https://github.com/microsoft/playwright-mcp):
-  on Windows the preset uses the installed Microsoft Edge:
-  `npx.cmd --yes @playwright/mcp@latest --headless --isolated --no-webmcp --browser=msedge`.
-  macOS and Linux keep `npx --yes @playwright/mcp@latest --headless --isolated --no-webmcp`
-  (Chrome by default). Node.js and npm are bundled. The selected browser must be available separately.
-  The stock preset also passes `--file-paths=absolute` and `--output-dir` pointing to
-  `Agent Mod Manager/Playwright` under the user’s downloads directory or a user-writable fallback.
-  Schema v12 upgrades the old stock arguments; start the updated service once from Settings.
-  To select a different browser, edit the arguments in Settings → 工具.
-  Uses a separate temporary browser profile;
-  it does not attach to an existing signed-in browser. No API key is needed.
+- [Playwright MCP](https://github.com/microsoft/playwright-mcp) uses the bundled
+  Node.js and Playwright CLI on Windows, macOS and Linux. The preset command is
+  `amm-playwright --browser=chromium --headless --sandbox --isolated --no-webmcp` with
+  `--file-paths=absolute` and an `--output-dir` under the user's Downloads folder
+  (`Agent Mod Manager/Playwright`) or the existing writable fallback.
+  Starting the tool prepares the matching Chromium build in the user's Playwright
+  cache before the MCP handshake. The first download needs network access.
+  Setup allows up to ten minutes, respects download proxy settings and can be retried from Settings.
+  Later connections reuse that build. Sessions use a temporary browser profile.
+  Schema v17 migrates the previous stock launch command and expires its saved
+  startup consent. Click Start once in Settings → 工具 to authorize the new command.
+  Custom launch commands and browser selections are preserved.
 - [MarkItDown MCP](https://github.com/microsoft/markitdown/tree/main/packages/markitdown-mcp):
   `uvx --prerelease allow markitdown-mcp@latest`. This preset accepts prereleases for MarkItDown and its dependencies.
   Converts documents to Markdown via stdio, without an API key. Its `file:`
@@ -88,7 +89,7 @@ application-owned launchers. Their child environments select npmmirror
 (`npm_config_registry`) or the Tsinghua PyPI mirror (`UV_DEFAULT_INDEX`).
 Explicit CLI registry options take precedence. MarkItDown inherits the bundled uvx default.
 Other commands, including absolute paths, keep their own executable and package configuration.
-MCP packages, Python interpreter downloads and browsers are separate from the launchers.
+Package-backed MCPs and their Python interpreters are fetched by their launchers.
 Schema v4 revokes old auto-start consent for affected bare aliases, including custom connections,
 while preserving commands, arguments and credentials.
 Schema v11 updates the six stock package-backed presets to resolve current versions at launch.
@@ -172,16 +173,17 @@ HTTP timeout in the child environment. A failed start can be retried from Settin
 ## Bounds And Cancellation
 
 Connection initialization: HTTP 20 seconds, direct `uvx` launchers 600 seconds,
-other stdio launchers 120 seconds. Listing/call: 30 seconds including pagination.
+other stdio launchers 120 seconds. Each discovery page has a 30-second response deadline. Ordinary tool calls run until the provider replies, the connection fails, or the user cancels.
 Cancellation disconnects failed requests, sends best-effort SDK cancellation,
 and kills the direct stdio child. Timeout/cancellation cannot guarantee that an
 external side effect did not happen; never blindly retry it.
 
-Limits: 128 tools, 8 pages, 2 MiB total listing, 64 KiB schema, 16 KiB description,
-256 KiB arguments, 1 MiB returned result. stdio lines and HTTP SSE events are
-bounded at 2 MiB before parsing. rmcp's built-in HTTP JSON collector has a
-16 MiB pre-parse cap (64 KiB error bodies); the stricter result cap is enforced
-after parsing. SDK queues/concurrent HTTP requests are bounded.
+Discovery follows server pagination and rejects malformed schemas, duplicates and
+non-advancing cursors. The desktop limits allocation for a connection according to
+available memory and concurrent work. Ordinary tool calls can run until completion
+or cancellation. A single stdio line or HTTP SSE event must fit the connection's
+frame allowance. The rmcp SDK limits HTTP JSON responses to 16 MiB and error bodies
+to 64 KiB. Queues and concurrent HTTP requests provide transport backpressure.
 
 ## Tests
 

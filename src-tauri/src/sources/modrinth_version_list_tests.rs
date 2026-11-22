@@ -60,7 +60,7 @@ async fn modrinth_version_list_filters_then_pages_and_resolves_an_explicit_older
     assert!(
         !shaped.contains("files") && !shaped.contains("https:") && !shaped.contains("changelog")
     );
-    req.offset = 2;
+    req.offset = 10_001;
     let after_end = sources.list_versions(&req).await.unwrap();
     assert!(after_end.versions.is_empty() && !after_end.has_more);
     let expected_filters = BTreeMap::from([
@@ -121,10 +121,6 @@ async fn version_list_rejects_bad_bounds_and_filters_without_requests() {
         },
         VersionListRequest {
             limit: 51,
-            ..request()
-        },
-        VersionListRequest {
-            offset: 10_001,
             ..request()
         },
         VersionListRequest {

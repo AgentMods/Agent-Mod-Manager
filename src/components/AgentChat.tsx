@@ -289,7 +289,11 @@ export function AgentChat() {
     const { request, outcome, structured, questions: steps, title } = questionnaire;
     if (outcome) {
       // Historical answers start a new turn in the same chat. The original approval is final.
-      const lines = steps.map((item, index) => `${index + 1}. ${item!.question}\n回答：${answers[index] ?? "已跳过"}`);
+      const lines = steps.map((item, index) => {
+        const answer = answers[index];
+        const reply = Array.isArray(answer) ? "\n" + answer.map((label) => `- ${label}`).join("\n") : answer ?? "已跳过";
+        return `${index + 1}. ${item!.question}\n回答：${reply}`;
+      });
       const started = await send(`补充回答：${title}\n\n${lines.join("\n\n")}`, { questionnaire: true });
       if (!started) throw new Error("当前对话正在处理其他请求，请稍后提交。");
       setReanswerRequest((current) => current === request ? null : current);
@@ -431,6 +435,7 @@ export function AgentChat() {
             onSubmit={(answers) => submitAnswers(activeQuestion, answers)}
             onCancel={pendingQuestion ? () => void cancel(pendingQuestion.request.turnId) : () => setReanswerRequest(null)}
           /> : <AgentComposer
+            libraryGameName={adapterChat?.gameId && !activeEdit ? adapterChat.label : undefined}
             input={draft.text}
             inputRef={composerInput}
             attachments={draft.attachments}
@@ -440,9 +445,12 @@ export function AgentChat() {
               if (activeEdit) setEdit((current) => current && { ...current, text });
               else setComposer((current) => ({ ...current, text }));
             }}
-            onSend={(attachments) => {
+            onSend={(attachments, newGameName) => {
               const restart = activeEdit ? { messageId: activeEdit.messageId, edit: true } : undefined;
-              void send(draft.text.trim(), { attachments: attachments.length || activeEdit ? attachments : undefined, restart });
+              const content = newGameName
+                ? `${draft.text.trim()}\n\n请在绑定适配包时，将这款游戏在游戏库中的显示名称改为 ${JSON.stringify(newGameName)}。`
+                : draft.text.trim();
+              void send(content, { attachments: attachments.length || activeEdit ? attachments : undefined, restart });
             }}
             onCancel={turn ? () => { void cancel(); } : undefined}
             disabled={!backendAvailable || archivedConversation}

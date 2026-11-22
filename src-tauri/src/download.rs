@@ -4,7 +4,7 @@ use crate::{
     error::{AppError, AppResult},
     sources::{
         pinned_download_client, validate_download_url,
-        web_download::{self, ArchiveKind, WebDownload, MAX_WEB_BYTES},
+        web_download::{self, ArchiveKind, WebDownload},
         FileHashes, ResolvedMod,
     },
     storage::AppPaths,
@@ -30,7 +30,8 @@ use tokio_util::sync::CancellationToken;
 pub struct DownloadOptions {
     pub max_attempts: u32,
     pub retry_delay: Duration,
-    pub request_timeout: Duration,
+    /// Maximum time without a successful HTTP read, not a transfer deadline.
+    pub read_idle_timeout: Duration,
     pub max_bytes: u64,
 }
 impl Default for DownloadOptions {
@@ -38,8 +39,8 @@ impl Default for DownloadOptions {
         Self {
             max_attempts: 3,
             retry_delay: Duration::from_millis(500),
-            request_timeout: Duration::from_secs(30 * 60),
-            max_bytes: 20 * 1024 * 1024 * 1024,
+            read_idle_timeout: Duration::from_secs(30 * 60),
+            max_bytes: u64::MAX,
         }
     }
 }
@@ -303,7 +304,7 @@ impl DownloadManager {
                 hashes: &FileHashes::default(),
                 warnings: &["网页直链下载，未绑定任何目录来源、项目或版本；仅检查归档头，内容和来源仍需审查".into()],
                 kind: TransferKind::Web(request.archive()),
-                max_bytes: self.options.max_bytes.min(MAX_WEB_BYTES),
+                max_bytes: self.options.max_bytes,
             },
             cancel,
             progress,
@@ -330,7 +331,7 @@ impl DownloadManager {
                 hashes: &FileHashes::default(),
                 warnings: &["MCP 回执下载，仅检查归档头和回执提供的大小；归档内容仍需审查".into()],
                 kind: TransferKind::Mcp(archive),
-                max_bytes: self.options.max_bytes.min(MAX_WEB_BYTES),
+                max_bytes: self.options.max_bytes,
             },
             cancel,
             progress,
@@ -366,10 +367,10 @@ impl DownloadManager {
         };
         let _lock = tokio::select! { biased; _ = cancel.cancelled() => return Err(AppError::Cancelled), guard = self.lock.lock() => guard };
         let directory = self.root.join(&fingerprint);
-        match std::fs::create_dir(&directory) {
+        match crate::safe_fs::create_dir(&directory) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
+            Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
         }
         self.guard_dir(&directory)?;
         // A process-wide lock covers all manager instances, without deleting
@@ -440,52 +441,68 @@ impl DownloadManager {
         directory: &Path,
         fingerprint: &str,
         max_bytes: u64,
+        cancel: &CancellationToken,
     ) -> AppResult<Option<Partial>> {
         self.guard_dir(directory)?;
         let mut best: Option<Partial> = None;
-        for entry in std::fs::read_dir(directory)?.take(2000) {
-            let entry = entry?;
+        let mut entries = tokio::select! { biased;
+            _ = cancel.cancelled() => return Err(AppError::Cancelled),
+            entries = tokio::fs::read_dir(directory) => entries?,
+        };
+        while let Some(entry) = tokio::select! { biased;
+            _ = cancel.cancelled() => return Err(AppError::Cancelled),
+            entry = entries.next_entry() => entry?,
+        } {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".json") {
+            if !name
+                .strip_suffix(".json")
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+            {
+                continue;
+            }
+            let Some(id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            let path = directory.join(format!("{id}.part"));
+            if directory.join(format!("{id}.rejected")).exists() || !path.try_exists()? {
                 continue;
             }
             let meta_path = entry.path();
             if check_regular(&meta_path)?.len() > 4096 {
                 continue;
             }
-            let Ok(meta) = serde_json::from_slice::<PartialMeta>(&std::fs::read(&meta_path)?)
-            else {
+            let file = crate::safe_fs::open_regular(&meta_path)?;
+            let mut data = Vec::new();
+            std::io::Read::read_to_end(&mut std::io::Read::take(file, 4097), &mut data)?;
+            if data.len() > 4096 {
+                continue;
+            }
+            let Ok(meta) = serde_json::from_slice::<PartialMeta>(&data) else {
                 continue;
             };
             if meta.fingerprint != fingerprint
-                || uuid::Uuid::parse_str(&meta.id).is_err()
+                || name.strip_suffix(".json") != Some(meta.id.as_str())
                 || strong_etag(header::HeaderValue::from_str(&meta.etag).ok().as_ref()).is_none()
             {
-                continue;
-            }
-            let path = directory.join(format!("{}.part", meta.id));
-            if directory.join(format!("{}.rejected", meta.id)).exists() || !path.try_exists()? {
                 continue;
             }
             let length = check_regular(&path)?.len();
             if length == 0 || meta.total.is_some_and(|t| length >= t) || length > max_bytes {
                 continue;
             }
-            let file = tokio::fs::OpenOptions::new()
-                .append(true)
-                .read(true)
-                .open(&path)
-                .await?;
-            // Recheck after opening and compare the handle to the checked file.
-            same_file(&path, &file.metadata().await?)?;
-            if best.as_ref().is_none_or(|b| b.offset < length) {
-                best = Some(Partial {
-                    meta,
-                    file,
-                    path,
-                    offset: length,
-                });
+            if best.as_ref().is_some_and(|b| b.offset >= length) {
+                continue;
             }
+            let mut file = tokio::fs::File::from_std(crate::safe_fs::open_transfer(&path, false)?);
+            if file.seek(std::io::SeekFrom::End(0)).await? != length {
+                return Err(denied("下载文件长度在续传扫描期间已变化"));
+            }
+            best = Some(Partial {
+                meta,
+                file,
+                path,
+                offset: length,
+            });
         }
         Ok(best)
     }
@@ -505,17 +522,10 @@ impl DownloadManager {
             total,
         };
         let path = directory.join(format!("{}.part", meta.id));
-        let file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .read(true)
-            .create_new(true)
-            .open(&path)
-            .await?;
-        let mut sidecar = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(directory.join(format!("{}.json", meta.id)))
-            .await?;
+        let file = tokio::fs::File::from_std(crate::safe_fs::open_transfer(&path, true)?);
+        let mut sidecar = tokio::fs::File::from_std(crate::safe_fs::create_new(
+            &directory.join(format!("{}.json", meta.id)),
+        )?);
         sidecar.write_all(&serde_json::to_vec(&meta)?).await?;
         sidecar.sync_all().await?;
         Ok(Partial {
@@ -535,7 +545,7 @@ impl DownloadManager {
         let mut url = request_spec.kind.validate_endpoint(request_spec.url)?;
         for _ in 0..=5 {
             let client = tokio::select! { biased; _ = cancel.cancelled() => return Err(AppError::Cancelled),
-            c = pinned_download_client(&url, self.options.request_timeout) => c? };
+            c = pinned_download_client(&url, self.options.read_idle_timeout) => c? };
             let mut request = client
                 .get(url.clone())
                 .header(header::ACCEPT_ENCODING, "identity");
@@ -575,11 +585,15 @@ impl DownloadManager {
         // Keep its ETag out of sidecars; catalog and public-link downloads retain resume support.
         let resumable = !matches!(request.kind, TransferKind::Mcp(_));
         let mut partial = if resumable {
-            self.resume(directory, fingerprint, request.max_bytes)
+            self.resume(directory, fingerprint, request.max_bytes, cancel)
                 .await?
         } else {
             None
         };
+        if let Some(size) = request.size {
+            let offset = partial.as_ref().map_or(0, |p| p.offset);
+            crate::safe_fs::DiskBudget::new(directory)?.require(size.saturating_sub(offset))?;
+        }
         let mut response = self.response(request, partial.as_ref(), cancel).await?;
         if let Some(p) = &partial {
             let valid = response.status() == StatusCode::PARTIAL_CONTENT
@@ -633,6 +647,15 @@ impl DownloadManager {
                 return Err(invalid("响应大小与来源文件大小不符"));
             }
         }
+        let mut disk = crate::safe_fs::DiskBudget::new(directory)?;
+        let expected = total.or(request.size);
+        if let Some(total) = expected {
+            disk.require(total - partial.as_ref().map_or(0, |p| p.offset))?;
+        }
+        // Transfer-Encoding may omit a trustworthy size. Such a response can
+        // never claim more than half the initial usable space, and writes are
+        // also rechecked against the live space budget below.
+        let unknown_limit = disk.limit() / 2;
         let etag = if resumable {
             strong_etag(response.headers().get(header::ETAG))
         } else {
@@ -641,11 +664,12 @@ impl DownloadManager {
         let mut partial = match partial {
             Some(p) => p,
             None => {
-                self.new_partial(directory, fingerprint, etag, total)
+                self.new_partial(directory, fingerprint, etag, expected)
                     .await?
             }
         };
         let mut downloaded = partial.offset;
+        let initial_offset = downloaded;
         let mut stream = response.bytes_stream();
         emit(
             DownloadPhase::Downloading,
@@ -653,20 +677,31 @@ impl DownloadManager {
             total.or(request.size),
         );
         loop {
-            let chunk = tokio::select! { biased; _ = cancel.cancelled() => { partial.file.sync_data().await?; return Err(AppError::Cancelled); }, chunk = stream.next() => chunk };
+            let chunk = tokio::select! { biased;
+                _ = cancel.cancelled() => {
+                    if partial.meta.etag.is_empty() {
+                        self.discard_partial(directory, partial).await;
+                    } else if let Err(error) = partial.file.sync_data().await {
+                        tracing::warn!(%error, "暂停下载后未能同步下载片段");
+                    }
+                    return Err(AppError::Cancelled);
+                },
+                chunk = stream.next() => chunk,
+            };
             let Some(chunk) = chunk else {
                 break;
             };
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(_) => {
+                    if partial.meta.etag.is_empty() {
+                        self.discard_partial(directory, partial).await;
+                        return Err(AppError::Other(
+                            "下载流中断；无安全续传标识，已尝试清理未完成片段".into(),
+                        ));
+                    }
                     partial.file.sync_data().await?;
-                    let message = if resumable {
-                        "下载流中断，可安全续传的片段已保留"
-                    } else {
-                        "下载流中断，未完成的片段已保留"
-                    };
-                    return Err(AppError::Other(message.into()));
+                    return Err(AppError::Other("下载流中断，可安全续传的片段已保留".into()));
                 }
             };
             downloaded = downloaded
@@ -681,7 +716,21 @@ impl DownloadManager {
             }
             self.guard_dir(directory)?;
             same_file(&partial.path, &partial.file.metadata().await?)?;
-            write_chunk(&mut partial.file, &chunk).await?;
+            let disk_check = if expected.is_none() && downloaded - initial_offset > unknown_limit {
+                Err(invalid("无声明大小的响应超过可用空间预算"))
+            } else {
+                disk.charge(chunk.len() as u64)
+            };
+            if let Err(error) = disk_check {
+                self.discard_partial(directory, partial).await;
+                return Err(error);
+            }
+            if let Err(error) = write_chunk(&mut partial.file, &chunk).await {
+                if partial.meta.etag.is_empty() {
+                    self.discard_partial(directory, partial).await;
+                }
+                return Err(error.into());
+            }
             emit(
                 DownloadPhase::Downloading,
                 downloaded,
@@ -695,7 +744,15 @@ impl DownloadManager {
         emit(DownloadPhase::Verifying, downloaded, Some(downloaded));
         self.guard_dir(directory)?;
         same_file(&partial.path, &partial.file.metadata().await?)?;
-        let hashes = hash_open_file(&mut partial.file, downloaded, request.hashes, cancel).await?;
+        let hashes =
+            match hash_open_file(&mut partial.file, downloaded, request.hashes, cancel).await {
+                Ok(hashes) => hashes,
+                Err(AppError::Cancelled) => {
+                    self.discard_partial(directory, partial).await;
+                    return Err(AppError::Cancelled);
+                }
+                Err(error) => return Err(error),
+            };
         if request
             .kind
             .archive()
@@ -733,6 +790,7 @@ impl DownloadManager {
         let filename = format!("{}-{}", partial.meta.id, request.filename);
         let destination = directory.join(&filename);
         if cancel.is_cancelled() {
+            self.discard_partial(directory, partial).await;
             return Err(AppError::Cancelled);
         }
         let checked_destination = destination.clone();
@@ -782,14 +840,37 @@ impl DownloadManager {
         })
     }
 
+    async fn discard_partial(&self, directory: &Path, partial: Partial) {
+        let Ok(()) = self.guard_dir(directory) else {
+            return;
+        };
+        let file = partial.file.into_std().await;
+        let result = tokio::task::spawn_blocking(move || -> AppResult<()> {
+            let Some(identity) = crate::safe_fs::identity(&partial.path)? else {
+                return Ok(());
+            };
+            crate::safe_fs::verify_regular_at(&file, &partial.path)?;
+            drop(file);
+            let tombstone = partial
+                .path
+                .with_extension(format!("discard-{}", uuid::Uuid::new_v4()));
+            crate::safe_fs::rename_checked(&partial.path, &tombstone, &identity)?;
+            if crate::safe_fs::identity(&tombstone)?.as_ref() == Some(&identity) {
+                std::fs::remove_file(tombstone)?;
+            }
+            // A sidecar without its data file is inert and is skipped on resume.
+            Ok(())
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            tracing::warn!("未能清理未完成下载片段");
+        }
+    }
+
     async fn reject(&self, directory: &Path, id: &str, reason: &str) -> AppResult<()> {
         self.guard_dir(directory)?;
         let path = directory.join(format!("{id}.rejected"));
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .await?;
+        let mut file = tokio::fs::File::from_std(crate::safe_fs::create_new(&path)?);
         file.write_all(reason.as_bytes()).await?;
         file.sync_all().await?;
         Ok(())
@@ -917,6 +998,7 @@ mod tests {
         headers: Vec<(&'static str, String)>,
         body: Vec<u8>,
         stall: bool,
+        byte_interval: Option<Duration>,
     }
     impl Reply {
         fn new(code: u16, body: &[u8], length: usize, etag: Option<&str>) -> Self {
@@ -929,6 +1011,7 @@ mod tests {
                 headers,
                 body: body.into(),
                 stall: false,
+                byte_interval: None,
             }
         }
         fn range(mut self, value: &str) -> Self {
@@ -972,7 +1055,18 @@ mod tests {
                 }
                 response.push_str("\r\n");
                 socket.write_all(response.as_bytes()).await.unwrap();
-                let _ = socket.write_all(&reply.body).await;
+                if let Some(interval) = reply.byte_interval {
+                    for (index, byte) in reply.body.iter().enumerate() {
+                        if index > 0 {
+                            tokio::time::sleep(interval).await;
+                        }
+                        if socket.write_all(std::slice::from_ref(byte)).await.is_err() {
+                            break;
+                        }
+                    }
+                } else {
+                    let _ = socket.write_all(&reply.body).await;
+                }
                 if reply.stall {
                     tokio::time::sleep(Duration::from_secs(10)).await;
                 }
@@ -1008,10 +1102,21 @@ mod tests {
         DownloadOptions {
             max_attempts: attempts,
             retry_delay: Duration::from_millis(1),
-            request_timeout: Duration::from_secs(5),
+            read_idle_timeout: Duration::from_secs(5),
             max_bytes: 1024,
         }
     }
+    fn assert_no_transfer_cache(paths: &AppPaths) {
+        let downloads = paths.downloads();
+        assert_eq!(std::fs::read_dir(&downloads).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(downloads.join("incoming"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
     fn setup(attempts: u32) -> (tempfile::TempDir, AppPaths, DownloadManager) {
         let dir = tempfile::tempdir().unwrap();
         let paths = AppPaths::new(dir.path().join("app")).unwrap();
@@ -1127,24 +1232,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_web_download_has_an_independent_byte_cap() {
-        let server = mock(vec![Reply::new(200, b"", MAX_WEB_BYTES as usize + 1, None)]).await;
+    async fn web_download_can_start_above_former_one_gib_limit() {
+        const DECLARED: usize = 1024 * 1024 * 1024 + 1;
         let (_dir, paths, _) = setup(1);
+        if crate::safe_fs::available_data_space(&paths.downloads()).unwrap() < DECLARED as u64 {
+            return;
+        }
+        let mut reply = Reply::new(200, b"", DECLARED, None);
+        reply.stall = true;
+        let server = mock(vec![reply]).await;
         let manager = DownloadManager::new(&paths).unwrap();
-        assert!(manager.options.max_bytes > MAX_WEB_BYTES);
         let request = WebDownload::parse(&server.url).unwrap();
-        let error = manager
+        let cancel = CancellationToken::new();
+        let signal = cancel.clone();
+        let progress = Arc::new(move |event: DownloadProgress| {
+            if event.phase == DownloadPhase::Downloading {
+                assert_eq!(event.total, Some(DECLARED as u64));
+                signal.cancel();
+            }
+        });
+        assert!(matches!(
+            manager.download_web(&request, cancel, Some(progress)).await,
+            Err(AppError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn web_download_uses_disk_admission_not_a_static_gib_limit() {
+        let (_dir, paths, _) = setup(1);
+        let budget = crate::safe_fs::available_data_space(&paths.downloads()).unwrap();
+        let impossible = budget.saturating_add(1024 * 1024 * 1024);
+        let server = mock(vec![Reply::new(200, b"", impossible as usize, None)]).await;
+        let manager = DownloadManager::new(&paths).unwrap();
+        let request = WebDownload::parse(&server.url).unwrap();
+        assert!(manager
             .download_web(&request, CancellationToken::new(), None)
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("响应超过下载大小限制"));
-        assert_eq!(
-            walkdir::WalkDir::new(paths.downloads())
-                .min_depth(2)
-                .into_iter()
-                .count(),
-            0
-        );
+            .unwrap_err()
+            .to_string()
+            .contains("磁盘空间不足"));
+        assert_eq!(manager.options.max_bytes, u64::MAX);
     }
 
     fn mock_signed_url(server: &Server) -> String {
@@ -1267,37 +1394,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_archive_enforces_one_gib_limit_before_request_and_from_headers() {
-        let over_cap = MAX_WEB_BYTES + 1;
-        let server = mock(vec![Reply::new(200, b"", over_cap as usize, None)]).await;
+    async fn signed_archive_checks_space_before_creating_a_partial() {
         let (_dir, paths, _) = setup(1);
         let manager = DownloadManager::new(&paths).unwrap();
-        let url = mock_signed_url(&server);
-        let message = manager
-            .download_mcp_archive(
-                &url,
-                "test.zip",
-                Some(over_cap),
-                CancellationToken::new(),
-                None,
-            )
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(message.contains("文件超过下载大小限制"));
-        assert!(server.requests.lock().unwrap().is_empty());
-        assert!(std::fs::read_dir(paths.downloads())
+        let impossible = crate::safe_fs::available_data_space(&paths.downloads())
             .unwrap()
-            .next()
-            .is_none());
-
-        let message = manager
+            .saturating_add(1024 * 1024 * 1024) as usize;
+        let server = mock(vec![Reply::new(200, b"", impossible, None)]).await;
+        let url = mock_signed_url(&server);
+        let error = manager
             .download_mcp_archive(&url, "test.zip", None, CancellationToken::new(), None)
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(message.contains("响应超过下载大小限制"));
-        assert_eq!(server.requests.lock().unwrap().len(), 1);
+            .unwrap_err();
+        assert!(error.to_string().contains("磁盘空间不足"), "{error}");
         assert_eq!(
             walkdir::WalkDir::new(paths.downloads())
                 .min_depth(2)
@@ -1690,7 +1799,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(std::fs::read_dir(paths.downloads()).unwrap().count(), 0);
+        assert_no_transfer_cache(&paths);
         assert!(server.requests.lock().unwrap().is_empty());
     }
 
@@ -1844,6 +1953,139 @@ mod tests {
             })
             .unwrap();
         assert_eq!(std::fs::read(partial).unwrap(), &data[..4]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_stream_with_no_validator_discards_payload() {
+        let data = b"0123456789";
+        let mut reply = Reply::new(200, &data[..4], data.len(), None);
+        reply.stall = true;
+        let server = mock(vec![reply]).await;
+        let (_dir, paths, manager) = setup(1);
+        let cancel = CancellationToken::new();
+        let signal = cancel.clone();
+        let progress = Arc::new(move |event: DownloadProgress| {
+            if event.phase == DownloadPhase::Downloading && event.downloaded > 0 {
+                signal.cancel();
+            }
+        });
+        assert!(matches!(
+            manager
+                .download_with_progress(&input(&server.url, data), cancel, Some(progress))
+                .await,
+            Err(AppError::Cancelled)
+        ));
+        assert!(!walkdir::WalkDir::new(paths.downloads())
+            .into_iter()
+            .filter_map(Result::ok)
+            .any(|e| e
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "part" || ext == "zip")));
+    }
+
+    #[tokio::test]
+    async fn read_idle_timeout_allows_continuous_download_beyond_interval() {
+        let (_dir, paths, _) = setup(1);
+        let idle = Duration::from_millis(900);
+        let data = b"12345678";
+        let mut reply = Reply::new(200, data, data.len(), None);
+        reply.byte_interval = Some(Duration::from_millis(220));
+        let server = mock(vec![reply]).await;
+        let manager = DownloadManager::with_options(
+            &paths,
+            DownloadOptions {
+                read_idle_timeout: idle,
+                ..options(1)
+            },
+        )
+        .unwrap();
+        let started = tokio::time::Instant::now();
+        let artifact = manager
+            .download_with_progress(&input(&server.url, data), CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert!(started.elapsed() > idle);
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert_eq!(std::fs::read(artifact.path).unwrap(), data);
+    }
+
+    #[tokio::test]
+    async fn read_idle_timeout_releases_a_stalled_download() {
+        let (_dir, paths, _) = setup(1);
+        let data = b"12345678";
+        let mut reply = Reply::new(200, &data[..4], data.len(), Some("\"v1\""));
+        reply.stall = true;
+        let server = mock(vec![reply]).await;
+        let manager = DownloadManager::with_options(
+            &paths,
+            DownloadOptions {
+                read_idle_timeout: Duration::from_millis(400),
+                ..options(1)
+            },
+        )
+        .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            manager.download_with_progress(
+                &input(&server.url, data),
+                CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("the stalled response must release the reader before the watchdog");
+        assert!(matches!(result, Err(AppError::Other(_))));
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resume_scans_past_two_thousand_entries_and_checks_cancellation() {
+        let (_dir, paths, manager) = setup(1);
+        let key = "fixture";
+        let dir = paths.downloads().join(key);
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..2050 {
+            std::fs::write(
+                dir.join(format!("{}.json", uuid::Uuid::from_u128(i))),
+                b"{}",
+            )
+            .unwrap();
+        }
+        let last = std::fs::read_dir(&dir)
+            .unwrap()
+            .last()
+            .unwrap()
+            .unwrap()
+            .path();
+        let id = last.file_stem().unwrap().to_str().unwrap().to_owned();
+        std::fs::write(
+            &last,
+            serde_json::to_vec(&PartialMeta {
+                id: id.clone(),
+                fingerprint: key.into(),
+                etag: "\"test\"".into(),
+                total: Some(5),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join(format!("{id}.part")), b"abc").unwrap();
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            manager
+                .resume(&dir, key, u64::MAX, &cancel)
+                .await
+                .unwrap()
+                .unwrap()
+                .offset,
+            3
+        );
+        cancel.cancel();
+        assert!(matches!(
+            manager.resume(&dir, key, u64::MAX, &cancel).await,
+            Err(AppError::Cancelled)
+        ));
     }
 
     #[tokio::test]
@@ -2011,7 +2253,7 @@ mod tests {
                 .await
                 .is_err());
         }
-        assert_eq!(std::fs::read_dir(paths.downloads()).unwrap().count(), 0);
+        assert_no_transfer_cache(&paths);
         let server = mock(vec![Reply::new(200, b"too long", 8, None)]).await;
         assert!(manager
             .download_with_progress(&input(&server.url, b"test"), CancellationToken::new(), None)

@@ -181,7 +181,7 @@ export default function PluginsPage() {
                   <ul className="text-sm">{selected.mcpServerNames.map((name, index) => <li key={index} className="wrap-anywhere">{name}</li>)}</ul>
                   <CardDescription>{selected.enabled ? '可在「设置 → 工具」中配置凭据和启动连接。' : '启用适配包后，可在「设置 → 工具」中启动连接。'}</CardDescription>
                 </div>}
-                <Button variant="outline" disabled={!writable || busy || !selected.validated || selected.source !== 'external'} onClick={() => setPublishDraft({ slug: selected.slug })}><UploadIcon data-icon="inline-start" />发布管理器插件</Button>
+                <Button variant="outline" disabled={!writable || busy || !selected.validated || selected.source !== 'external'} onClick={() => setPublishDraft({ slug: selected.slug })}><UploadIcon data-icon="inline-start" />发布插件</Button>
                 <Button disabled={!writable || busy || !selected.validated} onClick={() => startAdapterChat({ name: selected.name, slug: selected.slug })}><SparklesIcon data-icon="inline-start" />用 Agent 修改</Button>
               </> : <p className="text-sm text-muted-foreground">未选择适配包</p>}
             </CardContent>
@@ -199,7 +199,7 @@ export default function PluginsPage() {
             <TableCell><PathText>{draft.writeTransactionId}</PathText></TableCell>
             <TableCell><div className="flex flex-wrap justify-end gap-2 xl:flex-nowrap">
               <Button variant="outline" size="sm" disabled={!backendAvailable || busy} onClick={() => { void validate(draft); }}><ShieldCheckIcon data-icon="inline-start" />验证</Button>
-              <Button variant="outline" size="sm" disabled={!writable || busy} aria-label={`准备发布 ${draft.slug}`} onClick={() => setPublishDraft(draft)}><UploadIcon data-icon="inline-start" />准备发布</Button>
+              <Button variant="outline" size="sm" disabled={!writable || busy} aria-label={`发布插件 ${draft.slug}`} onClick={() => setPublishDraft(draft)}><UploadIcon data-icon="inline-start" />发布插件</Button>
               <Button variant="outline" size="sm" disabled={!writable || busy} aria-label={`删除草稿 ${draft.slug}`} onClick={event => { deleteButton.current = event.currentTarget; setDeleteError(null); setDeleteTarget(draft); }}><Trash2Icon data-icon="inline-start" />删除</Button>
             </div></TableCell>
           </TableRow>)}</TableBody>

@@ -15,6 +15,7 @@ const NPM_REGISTRY: &str = "https://registry.npmmirror.com";
 const NPX_CLI: &str = "npm/bin/npx-cli.js";
 const BING_HELPER: &str = "bin/bing-search.cjs";
 const PLAYWRIGHT_PACKAGE: &str = "bin/node_modules/playwright-core/package.json";
+const PLAYWRIGHT_CLI: &str = "bin/node_modules/playwright-core/cli.js";
 const PLAYWRIGHT_ENTRY: &str = "bin/node_modules/playwright-core/index.js";
 const NODE: &str = if cfg!(windows) { "node.exe" } else { "node" };
 const UVX: &str = if cfg!(windows) { "uvx.exe" } else { "uvx" };
@@ -74,21 +75,47 @@ impl McpRuntime {
         cancel: &CancellationToken,
     ) -> AppResult<Command> {
         let root = self.prepare_root(cancel, Bundle::bing_root).await?;
-        let root = dunce::simplified(&root);
-        let mut cmd = Command::new(root.join("bin").join(NODE));
-        cmd.arg("--no-global-search-paths")
-            .arg(root.join(BING_HELPER))
-            .current_dir(root.join("bin"))
-            .kill_on_drop(true)
-            .env_clear();
-        for key in BROWSER_ENV {
+        let mut cmd = browser_node(&root, BING_HELPER);
+        cmd.current_dir(dunce::simplified(&root).join("bin"));
+        Ok(cmd)
+    }
+
+    pub(super) async fn playwright_commands(
+        &self,
+        cancel: &CancellationToken,
+    ) -> AppResult<(Command, Command)> {
+        let root = self.prepare_root(cancel, Bundle::playwright_root).await?;
+        // Use the same locked CLI and per-user Playwright cache for both processes.
+        let mut install = browser_node(&root, PLAYWRIGHT_CLI);
+        install.args([
+            "install",
+            "--no-shell",
+            "--no-remove",
+            "--no-progress",
+            "chromium",
+        ]);
+        // Large CDN responses can take longer than Playwright's default socket timeout.
+        install.env("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT", "120000");
+        // Only the official downloader receives transport proxy settings.
+        for key in [
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "NO_PROXY",
+            "ALL_PROXY",
+            "https_proxy",
+            "http_proxy",
+            "no_proxy",
+            "all_proxy",
+        ] {
             if let Some(value) = std::env::var_os(key) {
-                cmd.env(key, value);
+                install.env(key, value);
             }
         }
         #[cfg(windows)]
-        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-        Ok(cmd)
+        windows_installer_proxy(&mut install);
+        let mut server = browser_node(&root, PLAYWRIGHT_CLI);
+        server.arg("mcp");
+        Ok((install, server))
     }
 
     async fn prepare_root(
@@ -154,6 +181,76 @@ const BROWSER_ENV: &[&str] = &[
     "XDG_DATA_HOME",
 ];
 
+// Node's downloader reads proxy environment variables, unlike a Windows browser which
+// also uses Internet Settings. Import only an enabled, static HTTPS proxy for setup.
+#[cfg(windows)]
+fn windows_installer_proxy(install: &mut Command) {
+    if std::env::var_os("HTTPS_PROXY").is_some() || std::env::var_os("ALL_PROXY").is_some() {
+        return;
+    }
+    let Ok(settings) = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+    else {
+        return;
+    };
+    if settings.get_value::<u32, _>("ProxyEnable").unwrap_or(0) == 0 {
+        return;
+    }
+    let Ok(value) = settings.get_value::<String, _>("ProxyServer") else {
+        return;
+    };
+    let proxy = if value.contains('=') {
+        value
+            .split(';')
+            .filter_map(|part| part.split_once('='))
+            .find_map(|(scheme, address)| {
+                scheme
+                    .trim()
+                    .eq_ignore_ascii_case("https")
+                    .then_some(address.trim())
+            })
+    } else {
+        Some(value.trim())
+    };
+    let Some(address) = proxy.filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let url = if address.contains("://") {
+        address.to_owned()
+    } else {
+        format!("http://{address}")
+    };
+    let Ok(url) = url::Url::parse(&url) else {
+        return;
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        return;
+    }
+    install.env("HTTPS_PROXY", url.as_str());
+    if std::env::var_os("NO_PROXY").is_none() {
+        if let Ok(bypass) = settings.get_value::<String, _>("ProxyOverride") {
+            install.env("NO_PROXY", bypass.replace(';', ","));
+        }
+    }
+}
+
+fn browser_node(root: &Path, script: &str) -> Command {
+    let root = dunce::simplified(root);
+    let mut cmd = Command::new(root.join("bin").join(NODE));
+    cmd.arg("--no-global-search-paths")
+        .arg(root.join(script))
+        .kill_on_drop(true)
+        .env_clear();
+    for key in BROWSER_ENV {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    cmd
+}
+
 fn bundled_command(launcher: Launcher, root: &Path, path: Option<OsString>) -> AppResult<Command> {
     // npm package shims must find this same Node; avoid verbatim paths in Windows .cmd files.
     let root = dunce::simplified(root);
@@ -176,6 +273,12 @@ fn bundled_command(launcher: Launcher, root: &Path, path: Option<OsString>) -> A
     Ok(cmd)
 }
 impl Bundle {
+    fn playwright_root(&self) -> AppResult<PathBuf> {
+        let root = self.root()?;
+        verify_files([root.join("bin").join(NODE), root.join(PLAYWRIGHT_CLI)])?;
+        Ok(root)
+    }
+
     fn bing_root(&self) -> AppResult<PathBuf> {
         let root = self.root()?;
         // Keep Bing-only requirements out of the independent MCP launcher paths.
@@ -357,6 +460,31 @@ mod tests {
         assert!(runtime.command("uvx", &cancel).await.is_err());
         assert_eq!(dir.path().join("cache").read_dir().unwrap().count(), 0);
         assert!(!dir.path().join("escape").exists());
+    }
+
+    #[tokio::test]
+    async fn playwright_installer_and_mcp_share_the_cli_but_not_proxy_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = archive(&tmp.path().canonicalize().unwrap(), &[PLAYWRIGHT_CLI]);
+        let cancel = CancellationToken::new();
+        let (install, server) = runtime.playwright_commands(&cancel).await.unwrap();
+        let (install, server) = (install.as_std(), server.as_std());
+        assert_eq!(install.get_program(), server.get_program());
+        assert_eq!(
+            install.get_args().take(2).collect::<Vec<_>>(),
+            server.get_args().take(2).collect::<Vec<_>>()
+        );
+        assert!(install.get_args().any(|arg| arg == "install"));
+        assert!(server.get_args().any(|arg| arg == "mcp"));
+        assert!(!server.get_envs().any(|(key, _)| key
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .ends_with("_PROXY")));
+        cancel.cancel();
+        assert!(matches!(
+            runtime.playwright_commands(&cancel).await,
+            Err(AppError::Cancelled)
+        ));
     }
 
     #[tokio::test]

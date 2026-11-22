@@ -6,18 +6,33 @@ use crate::{
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashSet, net::IpAddr, process::Stdio, sync::OnceLock, time::Duration};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    future::Future,
+    net::IpAddr,
+    process::Stdio,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
 };
 use tokio_util::sync::CancellationToken;
 use url::Url;
+use uuid::Uuid;
 
 pub const PROVIDER: &str = "bing";
 pub const ENDPOINT: &str = "https://www.bing.com/search";
-pub const MAX_QUERY_CHARS: usize = 512;
-pub const MAX_TOOL_RESULT_BYTES: usize = 32 * 1024;
+// Limits on individual transfers, not on the length of an active result stream.
+const MAX_BROWSER_REQUEST: usize = 256 * 1024;
+const MAX_TOOL_PAGE_BYTES: usize = 64 * 1024;
+const PAGE_ENVELOPE_BYTES: usize = 1024;
+const MAX_BROWSER_ROWS: usize = 24;
+const MAX_JS_INTEGER: u64 = (1 << 53) - 1;
+const CURSOR_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+const MAX_IDLE_CURSORS: usize = 16;
 const MAX_TITLE_BYTES: usize = 512;
 const MAX_SNIPPET_BYTES: usize = 1536;
 const MAX_URL_BYTES: usize = 2048;
@@ -25,7 +40,7 @@ const MAX_SOURCE_TEXT_BYTES: usize = 16 * 1024;
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_BROWSER_OUTPUT: usize = 256 * 1024;
 
-fn default_count() -> u8 {
+pub(crate) fn default_count() -> usize {
     5
 }
 
@@ -34,32 +49,32 @@ fn default_count() -> u8 {
 pub struct WebSearchQuery {
     pub query: String,
     #[serde(default = "default_count")]
-    pub count: u8,
+    pub count: usize,
 }
 
 impl WebSearchQuery {
     pub fn validate(&self) -> AppResult<()> {
         if self.query.trim().is_empty()
-            || self.query.chars().count() > MAX_QUERY_CHARS
-            || self.query.split_whitespace().count() > 75
             || self.query.chars().any(unsafe_character)
-            || !(1..=10).contains(&self.count)
+            || self.count == 0
         {
             return Err(AppError::Invalid(
-                "搜索词须为 1 至 512 个字符，最多 75 个词，结果数量须为 1 至 10 条".into(),
+                "搜索词不能为空或包含控制字符，结果数量须为正整数".into(),
             ));
+        }
+        // Reserve space for the JSON request metadata; never shorten a submitted query.
+        if self.query.len() > MAX_BROWSER_REQUEST - 128
+            || serde_json::to_vec(&self.query)?.len() > MAX_BROWSER_REQUEST - 128
+        {
+            return Err(AppError::Invalid("搜索词超过浏览器传输大小限制".into()));
         }
         if private_path(&self.query) {
             return Err(AppError::Denied(
                 "搜索词中不能包含本地路径或私人文件内容".into(),
             ));
         }
-        for word in self.query.split_whitespace() {
-            let word = word.trim_matches(['\'', '"', '(', ')', '<', '>']);
-            if word.split_once("://").is_some_and(|(scheme, _)| {
-                scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-            }) && safe_url(word).is_none()
-            {
+        for candidate in web_urls().find_iter(&self.query) {
+            if public_url(candidate.as_str().trim_end_matches([')', '}'])).is_none() {
                 return Err(AppError::Denied(
                     "搜索词中不能包含本地或带凭据的网址".into(),
                 ));
@@ -105,23 +120,42 @@ impl WebSearchResult {
             untrusted: true,
         }
     }
+}
 
-    fn bound(&mut self) -> AppResult<()> {
-        loop {
-            if serde_json::to_vec(self)?.len() <= MAX_TOOL_RESULT_BYTES {
-                return Ok(());
-            }
-            if self.results.pop().is_none() {
-                return Err(AppError::Other("联网搜索结果超过大小限制".into()));
-            }
-            self.truncated = true;
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct BingPosition {
+    first: u64,
+    row_offset: u64,
+}
 
-    pub fn into_tool_value(mut self) -> AppResult<Value> {
-        self.bound()?;
-        Ok(serde_json::to_value(self)?)
+impl BingPosition {
+    const START: Self = Self {
+        first: 1,
+        row_offset: 0,
+    };
+
+    fn permits(self, next: Self) -> bool {
+        next.first <= MAX_JS_INTEGER
+            && next.row_offset <= MAX_JS_INTEGER
+            && ((next.first > self.first && next.row_offset == 0)
+                || (next.first == self.first
+                    && next.row_offset > self.row_offset
+                    && next.row_offset - self.row_offset <= MAX_BROWSER_ROWS as u64))
     }
+}
+
+#[derive(Serialize)]
+struct BrowserRequest<'a> {
+    query: &'a str,
+    count: usize,
+    position: BingPosition,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BrowserReason {
+    InvalidPagination,
+    QueryRejected,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +163,10 @@ struct BrowserResponse {
     status: WebSearchStatus,
     results: Vec<WebSearchHit>,
     truncated: bool,
+    #[serde(default)]
+    next: Option<BingPosition>,
+    #[serde(default)]
+    reason: Option<BrowserReason>,
 }
 
 fn clean_text(text: &str, max: usize) -> String {
@@ -148,87 +186,346 @@ fn clean_text(text: &str, max: usize) -> String {
     output.trim().to_owned()
 }
 
-fn unavailable() -> WebSearchResult {
-    WebSearchResult::empty(
-        WebSearchStatus::Unavailable,
-        "未能读取 Bing 搜索结果。请检查网络后重试。若 Bing 要求验证码或更改了结果页面，请稍后再试。",
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PageEnd {
+    MoreResults,
+    BingExhausted,
+    InvalidPagination,
+    QueryRejected,
+    BingUnavailable,
+    NeedsConfiguration,
+    PageTimeout,
 }
 
-impl BrowserResponse {
-    fn into_result(self, count: u8) -> AppResult<WebSearchResult> {
-        match self.status {
-            WebSearchStatus::NeedsConfiguration => {
-                return Ok(WebSearchResult::empty(
-                    self.status,
-                    "Playwright 无法启动浏览器。请安装 Microsoft Edge、Google Chrome 或 Playwright Chromium 后重试。",
-                ));
+impl PageEnd {
+    fn message(self) -> &'static str {
+        match self {
+            Self::MoreResults => "Bing 网页摘要仅供参考。可使用 next_cursor 继续读取。",
+            Self::BingExhausted => {
+                "当前 Bing 结果页没有可继续读取的链接。网页摘要仅供参考，请核实来源和下载地址。"
             }
-            WebSearchStatus::Unavailable => return Ok(unavailable()),
+            Self::InvalidPagination => {
+                "Bing 的续页链接无效或指回已请求的位置，不能确认是否还有更多结果。"
+            }
+            Self::QueryRejected => {
+                "Bing 拒绝了搜索请求（可能是编码后的搜索网址过长）；未自动缩短搜索词。"
+            }
+            Self::BingUnavailable => {
+                "未能读取 Bing 搜索结果。请检查网络后重试。若 Bing 要求验证码或更改了结果页面，请稍后再试。"
+            }
+            Self::NeedsConfiguration => {
+                "无法启动内置 Playwright 搜索；请检查应用组件和已安装的浏览器。"
+            }
+            Self::PageTimeout => "本次 Bing 续页超时；如有 next_cursor，可重试尚未读取的位置。",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct SearchPage {
+    #[serde(flatten)]
+    result: WebSearchResult,
+    next_cursor: Option<Uuid>,
+    page_end: PageEnd,
+}
+
+struct SearchSession {
+    position: Option<BingPosition>,
+    pending: VecDeque<WebSearchHit>,
+    // Retain only fingerprints of emitted links, not previous pages or private inputs.
+    seen: HashSet<[u8; 32]>,
+    started: bool,
+    terminal: PageEnd,
+    pending_text_cut: bool,
+}
+
+impl Default for SearchSession {
+    fn default() -> Self {
+        Self {
+            position: Some(BingPosition::START),
+            pending: VecDeque::new(),
+            seen: HashSet::new(),
+            started: false,
+            terminal: PageEnd::BingExhausted,
+            pending_text_cut: false,
+        }
+    }
+}
+
+struct IdleCursor {
+    query_digest: [u8; 32],
+    touched: Instant,
+    session: SearchSession,
+}
+
+/// Opaque in-process continuations for the desktop tool. At most one caller can
+/// consume each cursor; a cancelled request closes its chain and its browser.
+#[derive(Default)]
+pub(crate) struct SearchSessions(Mutex<HashMap<Uuid, IdleCursor>>);
+
+impl SearchSessions {
+    fn take(&self, cursor: Uuid, query_digest: [u8; 32]) -> AppResult<SearchSession> {
+        let mut cursors = self.0.lock().unwrap();
+        cursors.retain(|_, cursor| cursor.touched.elapsed() < CURSOR_IDLE_TTL);
+        if !cursors
+            .get(&cursor)
+            .is_some_and(|entry| entry.query_digest == query_digest)
+        {
+            return Err(AppError::NotFound(
+                "搜索游标已结束、过期或不属于此搜索词，请重新搜索".into(),
+            ));
+        }
+        Ok(cursors.remove(&cursor).unwrap().session)
+    }
+
+    fn save(&self, query_digest: [u8; 32], session: SearchSession) -> Uuid {
+        let mut cursors = self.0.lock().unwrap();
+        cursors.retain(|_, cursor| cursor.touched.elapsed() < CURSOR_IDLE_TTL);
+        if cursors.len() >= MAX_IDLE_CURSORS {
+            if let Some(oldest) = cursors
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(id, _)| *id)
+            {
+                cursors.remove(&oldest);
+            }
+        }
+        let cursor = Uuid::new_v4();
+        cursors.insert(
+            cursor,
+            IdleCursor {
+                query_digest,
+                touched: Instant::now(),
+                session,
+            },
+        );
+        cursor
+    }
+
+    pub(crate) async fn search_page(
+        &self,
+        runtime: &McpRuntime,
+        query: &WebSearchQuery,
+        cursor: Option<Uuid>,
+        cancel: &CancellationToken,
+    ) -> AppResult<Value> {
+        self.search_using(query, cursor, cancel, |position, cancel| {
+            fetch_page(runtime, &query.query, position, cancel)
+        })
+        .await
+    }
+
+    async fn search_using<F, Fut>(
+        &self,
+        query: &WebSearchQuery,
+        cursor: Option<Uuid>,
+        cancel: &CancellationToken,
+        fetch: F,
+    ) -> AppResult<Value>
+    where
+        F: FnMut(BingPosition, CancellationToken) -> Fut,
+        Fut: Future<Output = AppResult<BrowserResponse>>,
+    {
+        check_cancel(cancel)?;
+        query.validate()?;
+        let digest = Sha256::digest(query.query.trim().as_bytes()).into();
+        let mut session = match cursor {
+            Some(cursor) => self.take(cursor, digest)?,
+            None => SearchSession::default(),
+        };
+        let mut page = collect_page(&mut session, query.count, cancel, fetch).await?;
+        if !session.pending.is_empty() || (session.started && session.position.is_some()) {
+            page.next_cursor = Some(self.save(digest, session));
+            page.result.truncated = true;
+        }
+        Ok(serde_json::to_value(page)?)
+    }
+}
+
+fn check_cancel(cancel: &CancellationToken) -> AppResult<()> {
+    if cancel.is_cancelled() {
+        Err(AppError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+async fn collect_page<F, Fut>(
+    session: &mut SearchSession,
+    count: usize,
+    cancel: &CancellationToken,
+    mut fetch: F,
+) -> AppResult<SearchPage>
+where
+    F: FnMut(BingPosition, CancellationToken) -> Fut,
+    Fut: Future<Output = AppResult<BrowserResponse>>,
+{
+    let mut result = WebSearchResult::empty(WebSearchStatus::Available, "");
+    let mut bytes = PAGE_ENVELOPE_BYTES;
+    let deadline = tokio::time::Instant::now() + SEARCH_TIMEOUT;
+    let page_end = loop {
+        check_cancel(cancel)?;
+        if let Some(hit) = session.pending.front() {
+            let key =
+                Sha256::digest(hit.url.split('#').next().unwrap_or_default().as_bytes()).into();
+            if session.seen.contains(&key) {
+                session.pending.pop_front();
+                continue;
+            }
+            let hit_bytes = serde_json::to_vec(hit)?.len() + 1; // JSON field escapes and comma.
+            if result.results.len() == count || bytes + hit_bytes > MAX_TOOL_PAGE_BYTES {
+                break PageEnd::MoreResults;
+            }
+            bytes += hit_bytes;
+            session.seen.insert(key);
+            result.results.push(session.pending.pop_front().unwrap());
+            result.truncated |= session.pending_text_cut;
+            continue;
+        }
+        let Some(position) = session.position else {
+            break session.terminal;
+        };
+        if result.results.len() == count {
+            break PageEnd::MoreResults;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break PageEnd::PageTimeout;
+        }
+        let fetch_cancel = cancel.child_token();
+        let receive = fetch(position, fetch_cancel.clone());
+        tokio::pin!(receive);
+        let response = tokio::select! {
+            biased;
+            response = &mut receive => response,
+            _ = tokio::time::sleep_until(deadline) => {
+                fetch_cancel.cancel();
+                // Give the helper EOF and let it close the browser before reporting timeout.
+                let _ = receive.await;
+                check_cancel(cancel)?;
+                break PageEnd::PageTimeout;
+            }
+        };
+        check_cancel(cancel)?;
+        let response = match response {
+            Ok(response) => response,
+            Err(AppError::Cancelled) => return Err(AppError::Cancelled),
+            Err(_) => break PageEnd::BingUnavailable,
+        };
+        match response.status {
+            WebSearchStatus::NeedsConfiguration => break PageEnd::NeedsConfiguration,
+            WebSearchStatus::Unavailable => {
+                if matches!(response.reason, Some(BrowserReason::QueryRejected)) {
+                    session.position = None;
+                    break PageEnd::QueryRejected;
+                }
+                break PageEnd::BingUnavailable;
+            }
             WebSearchStatus::Available => {}
         }
-        let mut result =
-            WebSearchResult::empty(self.status, "Bing 网页摘要仅供参考，请核实来源和下载地址。");
-        result.truncated = self.truncated;
-        let mut seen = HashSet::new();
-        for hit in self.results {
-            if result.results.len() >= usize::from(count) {
-                result.truncated = true;
-                break;
-            }
+        if response.results.len() > MAX_BROWSER_ROWS {
+            break PageEnd::BingUnavailable;
+        }
+        session.started = true;
+        session.pending_text_cut = response.truncated;
+        (session.position, session.terminal) = match (response.next, response.reason) {
+            (Some(next), None) if position.permits(next) => (Some(next), PageEnd::MoreResults),
+            (None, None) => (None, PageEnd::BingExhausted),
+            _ => (None, PageEnd::InvalidPagination),
+        };
+        for hit in response.results {
             let Some(url) = safe_url(&hit.url) else {
                 result.truncated = true;
                 continue;
             };
             let title = clean_text(&hit.title, MAX_TITLE_BYTES);
             let snippet = clean_text(&hit.snippet, MAX_SNIPPET_BYTES);
-            result.truncated |= title != hit.title || snippet != hit.snippet;
-            if title.is_empty() || !seen.insert(url.clone()) {
-                continue;
+            session.pending_text_cut |= title != hit.title || snippet != hit.snippet;
+            if !title.is_empty() {
+                session.pending.push_back(WebSearchHit {
+                    title,
+                    url,
+                    snippet,
+                });
             }
-            result.results.push(WebSearchHit {
-                title,
-                url,
-                snippet,
-            });
         }
-        result.bound()?;
-        Ok(result)
+    };
+    result.message = page_end.message();
+    result.truncated |=
+        page_end != PageEnd::BingExhausted && (!result.results.is_empty() || session.started);
+    if result.results.is_empty() {
+        result.status = match page_end {
+            PageEnd::MoreResults | PageEnd::BingExhausted => WebSearchStatus::Available,
+            PageEnd::NeedsConfiguration => WebSearchStatus::NeedsConfiguration,
+            _ => WebSearchStatus::Unavailable,
+        };
     }
+    Ok(SearchPage {
+        result,
+        next_cursor: None,
+        page_end,
+    })
 }
 
+// The game-identity caller still requests a single bounded preview and uses the
+// original Rust result shape. The web_search tool uses SearchSessions instead.
 pub async fn search(
     runtime: &McpRuntime,
     query: &WebSearchQuery,
     cancel: &CancellationToken,
 ) -> AppResult<WebSearchResult> {
-    if cancel.is_cancelled() {
-        return Err(AppError::Cancelled);
-    }
+    check_cancel(cancel)?;
     query.validate()?;
-    let command = match runtime.bing_search_command(cancel).await {
+    let mut session = SearchSession::default();
+    Ok(
+        collect_page(&mut session, query.count, cancel, |position, cancel| {
+            fetch_page(runtime, &query.query, position, cancel)
+        })
+        .await?
+        .result,
+    )
+}
+
+async fn fetch_page(
+    runtime: &McpRuntime,
+    query: &str,
+    position: BingPosition,
+    cancel: CancellationToken,
+) -> AppResult<BrowserResponse> {
+    let command = match runtime.bing_search_command(&cancel).await {
         Ok(cmd) => cmd,
         Err(AppError::Cancelled) => return Err(AppError::Cancelled),
         Err(_) => {
-            return Ok(WebSearchResult::empty(
-                WebSearchStatus::NeedsConfiguration,
-                "无法加载内置 Playwright 搜索组件，请重新安装应用或从源码重新构建运行时。",
-            ))
+            return Ok(BrowserResponse {
+                status: WebSearchStatus::NeedsConfiguration,
+                results: Vec::new(),
+                truncated: false,
+                next: None,
+                reason: None,
+            })
         }
     };
-    match run_browser(command, query, cancel).await {
-        Ok(response) => response.into_result(query.count),
-        Err(AppError::Cancelled) => Err(AppError::Cancelled),
-        Err(_) => Ok(unavailable()),
-    }
+    run_browser(
+        command,
+        &BrowserRequest {
+            query,
+            count: MAX_BROWSER_ROWS,
+            position,
+        },
+        &cancel,
+    )
+    .await
 }
 
 async fn run_browser(
     mut command: Command,
-    query: &WebSearchQuery,
+    request: &BrowserRequest<'_>,
     cancel: &CancellationToken,
 ) -> AppResult<BrowserResponse> {
-    let mut request = serde_json::to_vec(query)?;
+    let mut request = serde_json::to_vec(request)?;
+    if request.len() > MAX_BROWSER_REQUEST {
+        return Err(AppError::Invalid("搜索词超过浏览器传输大小限制".into()));
+    }
     request.push(b'\n');
     if cancel.is_cancelled() {
         return Err(AppError::Cancelled);
@@ -276,12 +573,14 @@ fn unsafe_character(ch: char) -> bool {
     ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
-fn private_path(text: &str) -> bool {
+fn web_urls() -> &'static Regex {
     static URL: OnceLock<Regex> = OnceLock::new();
+    URL.get_or_init(|| Regex::new(r#"(?i)https?://[^\s\x22'<>]*"#).expect("constant URL regex"))
+}
+
+fn private_path(text: &str) -> bool {
     static PATH: OnceLock<Regex> = OnceLock::new();
-    let text = URL
-        .get_or_init(|| Regex::new(r#"(?i)https?://[^\s\x22'<>]+"#).expect("constant URL regex"))
-        .replace_all(text, " ");
+    let text = web_urls().replace_all(text, " ");
     PATH.get_or_init(|| {
         Regex::new(r#"(?i)(?:file://|[a-z]:[\\/]|\\\\|(?:^|[\s\x22'(<=>])(?:~[\\/]|/[^\s/]))"#)
             .expect("constant path regex")
@@ -322,10 +621,17 @@ fn public_ip(ip: IpAddr) -> bool {
 }
 
 fn safe_url(raw: &str) -> Option<String> {
-    if raw.len() > MAX_URL_BYTES
-        || raw
-            .chars()
-            .any(|ch| unsafe_character(ch) || ch.is_whitespace())
+    if raw.len() > MAX_URL_BYTES {
+        return None;
+    }
+    let url = public_url(raw)?;
+    (url.as_str().len() <= MAX_URL_BYTES).then(|| url.into())
+}
+
+fn public_url(raw: &str) -> Option<Url> {
+    if raw
+        .chars()
+        .any(|ch| unsafe_character(ch) || ch.is_whitespace())
     {
         return None;
     }
@@ -358,7 +664,7 @@ fn safe_url(raw: &str) -> Option<String> {
             return None;
         }
     }
-    (url.as_str().len() <= MAX_URL_BYTES).then(|| url.into())
+    Some(url)
 }
 
 #[cfg(test)]

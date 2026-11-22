@@ -21,6 +21,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(approved: bool) -> Self {
+        Self::with_skill_body(approved, "")
+    }
+
+    fn with_skill_body(approved: bool, extra: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::new(temp.path().join("manager")).unwrap();
         let engine = FileEngine::new(Db::open(&paths.db_file()).unwrap(), paths);
@@ -32,7 +36,7 @@ impl Fixture {
         adapter["version"] = json!("1.2.3");
         let draft = plugin_workflow::plan_write_draft(
             &engine, "remote-publish-test", &serde_json::to_string_pretty(&adapter).unwrap(),
-            "---\nname: remote-publish-test\ndescription: Remote test\n---\n\nExact text.\r\n  Keep whitespace.\n",
+            &format!("---\nname: remote-publish-test\ndescription: Remote test\n---\n\nExact text.\r\n  Keep whitespace.\n{extra}"),
         ).unwrap();
         engine.approve_plan(&draft.plan.id).unwrap();
         engine.apply_file_ops(&draft.plan.id).unwrap();
@@ -388,6 +392,19 @@ impl crate::settings::SecretStore for NoCredentials {
     fn write(&self, _: &str, _: &str) -> AppResult<()> {
         panic!("must not write credentials")
     }
+}
+
+#[tokio::test]
+async fn reviewed_zip_above_old_limit_uses_server_advertised_part_size() {
+    let f = Fixture::with_skill_body(true, &"合规声明\n".repeat(96 * 1024));
+    assert!(f.bytes.len() > 1024 * 1024);
+    let remote = MockRemote::new(&f, script(&f));
+    let published = f.run(&remote).await.unwrap();
+    assert_eq!(published.phase, PublicationPhase::Completed);
+    assert_eq!(
+        f.stored().preview.package.archive_size,
+        f.bytes.len() as u64
+    );
 }
 
 #[tokio::test]

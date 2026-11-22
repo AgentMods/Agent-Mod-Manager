@@ -14,6 +14,8 @@ use serde_json::{json, Value};
 const DEFAULT_TITLE: &str = "新对话";
 const TITLE_LIMIT: usize = 60;
 
+type AgentMessages = Vec<(String, Value)>;
+
 fn first_message_title(content: &str) -> String {
     let line = content
         .lines()
@@ -385,7 +387,7 @@ impl History {
             "DELETE FROM messages WHERE conversation_id=?1 AND rowid>?2",
             params![conversation, cutoff],
         )?;
-        tx.execute("UPDATE conversations SET task_summary=NULL,message_count=message_count-?2,updated_at=?3 WHERE id=?1",
+        tx.execute("UPDATE conversations SET task_summary=NULL,context_summary_through_message_id=NULL,message_count=message_count-?2,updated_at=?3 WHERE id=?1",
             params![conversation, removed, now()])?;
         Ok((user_id, history_through_seq))
     }
@@ -459,10 +461,28 @@ impl History {
 
     pub fn set_summary(&self, conversation_id: &str, summary: &str) -> AppResult<()> {
         let changed = self.db.conn().execute(
-            "UPDATE conversations SET task_summary=?2,updated_at=?3 WHERE id=?1",
+            "UPDATE conversations SET task_summary=?2,context_summary_through_message_id=NULL,updated_at=?3 WHERE id=?1",
             params![conversation_id, summary, now()],
         )?;
         require_changed(changed, "会话")
+    }
+
+    /// Store a summary together with the last message it covers. The UPDATE
+    /// validates ownership and writes both fields in a single SQLite statement.
+    pub fn save_context_summary(
+        &self,
+        conv: &str,
+        through_message_id: &str,
+        summary: &str,
+    ) -> AppResult<()> {
+        let changed = self.db.conn().execute(
+            "UPDATE conversations SET task_summary=?3,context_summary_through_message_id=?2
+             WHERE id=?1 AND EXISTS (
+                 SELECT 1 FROM messages WHERE id=?2 AND conversation_id=?1
+             )",
+            params![conv, through_message_id, summary],
+        )?;
+        require_changed(changed, "会话或消息")
     }
 
     /// None removes just the override and restores inheritance.
@@ -649,6 +669,44 @@ impl History {
             .collect())
     }
 
+    /// Replay only the model-visible suffix of a valid compression checkpoint.
+    /// A legacy/manual summary without a cutoff is not a model checkpoint.
+    pub fn agent_context(&self, conv: &str) -> AppResult<(Option<String>, AgentMessages)> {
+        let mut conn = self.db.conn();
+        let tx = conn.transaction()?;
+        let (summary, cutoff): (Option<String>, Option<i64>) = tx
+            .query_row(
+                "SELECT CASE WHEN m.rowid IS NOT NULL THEN c.task_summary END,m.rowid FROM conversations c
+                 LEFT JOIN messages m ON m.id=c.context_summary_through_message_id AND m.conversation_id=c.id
+                 WHERE c.id=?1",
+                [conv],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| AppError::NotFound("会话".into()))?;
+        let (summary, cutoff) = summary.zip(cutoff).unzip();
+        let mut messages = read_agent_messages(&tx, conv, cutoff)?;
+        if let Some(cutoff) = cutoff {
+            if !messages.iter().any(|(_, value)| value["role"] == "user") {
+                // The current turn may already have been compacted. Keep its
+                // real user prompt and attachments, but not other covered rows.
+                let sql = format!(
+                    "SELECT {AGENT_MESSAGE_COLUMNS} FROM messages
+                     WHERE conversation_id=?1 AND role='user' AND rowid<=?2
+                     ORDER BY rowid DESC LIMIT 1"
+                );
+                if let Some(user) = tx
+                    .query_row(&sql, params![conv, cutoff], agent_message_from_row)
+                    .optional()?
+                {
+                    messages.insert(0, user);
+                }
+            }
+        }
+        tx.commit()?;
+        Ok((summary, messages))
+    }
+
     /// Upsert execution state; message payloads are set separately by update_tool_calls.
     /// IDs cannot be rebound across conversations/messages. Existing start times persist.
     pub fn set_tool_call(
@@ -798,19 +856,53 @@ fn read_messages(conn: &Connection, id: &str) -> AppResult<Vec<Message>> {
     // created_at has millisecond precision; UUIDs are random. Neither is sequence.
     let mut stmt = conn.prepare("SELECT id,role,content,reasoning,tool_calls_json,tool_call_id,attachments_json FROM messages WHERE conversation_id=?1 ORDER BY rowid")?;
     let result = stmt
-        .query_map([id], |row| {
-            Ok(Message {
-                id: row.get(0)?,
-                role: row.get(1)?,
-                content: row.get(2)?,
-                reasoning: row.get(3)?,
-                tool_calls: json_column(row, 4)?,
-                tool_call_id: row.get(5)?,
-                attachments: serde_column(row, 6)?.unwrap_or_default(),
-            })
-        })?
+        .query_map([id], message_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(result)
+}
+
+// Do not read the stored reasoning when preparing requests to the model.
+const AGENT_MESSAGE_COLUMNS: &str =
+    "id,role,content,NULL,tool_calls_json,tool_call_id,attachments_json";
+
+fn read_agent_messages(
+    conn: &Connection,
+    conv: &str,
+    cutoff: Option<i64>,
+) -> AppResult<AgentMessages> {
+    // Use distinct SQL shapes so SQLite can seek to the rowid lower bound.
+    let after = if cutoff.is_some() {
+        " AND rowid>?2"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT {AGENT_MESSAGE_COLUMNS} FROM messages WHERE conversation_id=?1{after} ORDER BY rowid"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = match cutoff {
+        Some(cutoff) => stmt.query_map(params![conv, cutoff], agent_message_from_row)?,
+        None => stmt.query_map([conv], agent_message_from_row)?,
+    };
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
+    Ok(Message {
+        id: row.get(0)?,
+        role: row.get(1)?,
+        content: row.get(2)?,
+        reasoning: row.get(3)?,
+        tool_calls: json_column(row, 4)?,
+        tool_call_id: row.get(5)?,
+        attachments: serde_column(row, 6)?.unwrap_or_default(),
+    })
+}
+
+fn agent_message_from_row(row: &Row<'_>) -> rusqlite::Result<(String, Value)> {
+    let message = message_from_row(row)?;
+    let value = message.to_openai();
+    Ok((message.id, value))
 }
 
 fn tool_call_from_row(row: &Row<'_>) -> rusqlite::Result<ToolCallRecord> {
@@ -939,6 +1031,10 @@ fn validate_tool_update(update: &ToolCallUpdate) -> AppResult<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "history_context_tests.rs"]
+mod context_tests;
 
 #[cfg(test)]
 mod tests {

@@ -152,6 +152,284 @@ async fn agent_can_inspect_game_parent_and_sibling_files_without_registering_the
 }
 
 #[tokio::test]
+async fn agent_read_file_lists_playsets_backup_and_can_read_a_returned_path() {
+    let f = Fixture::new();
+    let backup = f.external.join("playsets_backup");
+    let child_dir = backup.join("profiles");
+    fs::create_dir_all(&child_dir).unwrap();
+    fs::write(child_dir.join("nested.json"), "{}").unwrap();
+    let note = backup.join("playset.json");
+    fs::write(&note, "{\n}\n").unwrap();
+
+    let tool = f.registry.get("read_file").unwrap();
+    assert!(tool.definition().description.contains("直接子项"));
+    assert!(!tool.inbound_definition().description.contains("直接子项"));
+    let agent = f.agent();
+    let args = json!({"path":backup});
+    let prepared = tool.prepare(&agent, &args).await.unwrap();
+    assert_eq!(prepared.effect, Effect::Read);
+    let dir = tool.execute(&agent, args.clone(), prepared).await.unwrap();
+    let display = |path: &Path| crate::paths::display_path(&path.canonicalize().unwrap());
+    assert_eq!(
+        dir,
+        json!({
+            "kind":"directory",
+            "path":display(&backup),
+            "entries":[
+                {"name":"playset.json","path":display(&note),"is_dir":false},
+                {"name":"profiles","path":display(&child_dir),"is_dir":true},
+            ],
+            "truncated":false,
+        })
+    );
+    let text = f
+        .call(
+            &agent,
+            "read_file",
+            json!({"path":dir["entries"][0]["path"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        text,
+        json!({
+            "lines":[{"line":1,"text":"{"},{"line":2,"text":"}"}], "truncated":false
+        })
+    );
+    for context in f.restricted() {
+        assert!(matches!(
+            f.call(&context, "read_file", args.clone()).await,
+            Err(crate::error::AppError::PathEscape(_))
+        ));
+        assert!(f
+            .call(&context, "read_file", json!({"path":f.game}))
+            .await
+            .is_err());
+    }
+    let binary = backup.join("binary.dat");
+    fs::write(&binary, b"a\0b").unwrap();
+    assert!(matches!(
+        f.call(&agent, "read_file", json!({"path":binary})).await,
+        Err(crate::error::AppError::Invalid(_))
+    ));
+    assert!(matches!(
+        f.call(&agent, "read_file", json!({"path":backup.join("missing")}))
+            .await,
+        Err(crate::error::AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+    ));
+}
+
+#[tokio::test]
+async fn agent_native_directory_tools_page_but_restricted_tools_keep_the_old_contract() {
+    let f = Fixture::new();
+    let ctx = f.agent();
+    let dir = f.game.join("ordered");
+    fs::create_dir(&dir).unwrap();
+    for name in ["e.txt", "b.txt", "a.txt", "d.txt"] {
+        fs::write(dir.join(name), name).unwrap();
+    }
+    fs::create_dir(dir.join("c-dir")).unwrap();
+
+    for name in ["read_dir", "read_file"] {
+        let tool = f.registry.get(name).unwrap();
+        assert_eq!(
+            tool.definition().parameters["properties"]["offset"]["minimum"],
+            0
+        );
+        assert_eq!(
+            tool.inbound_definition().parameters,
+            json!({
+                "type":"object", "properties":{"path":{"type":"string"}},
+                "required":["path"], "additionalProperties":false
+            })
+        );
+        let mut offset = json!(0);
+        let mut names = Vec::new();
+        loop {
+            let page = f
+                .call(&ctx, name, json!({"path":dir,"offset":offset,"limit":2}))
+                .await
+                .unwrap();
+            let entries = page["entries"].as_array().unwrap();
+            assert!(entries.len() <= 2);
+            for entry in entries {
+                let entry_name = entry["name"].as_str().unwrap();
+                names.push(entry_name.to_owned());
+                assert_eq!(entry["is_dir"], entry_name == "c-dir");
+                if name == "read_dir" && entry_name != "c-dir" {
+                    assert_eq!(entry["size"], entry_name.len());
+                    assert!(!entry["modified"].as_str().unwrap().is_empty());
+                }
+            }
+            offset = page["next_offset"].clone();
+            assert_eq!(page["truncated"], !offset.is_null());
+            if offset.is_null() {
+                break;
+            }
+            assert_eq!(offset, names.len());
+        }
+        assert_eq!(names, ["a.txt", "b.txt", "c-dir", "d.txt", "e.txt"]);
+        let past_end = f
+            .call(&ctx, name, json!({"path":dir,"offset":999}))
+            .await
+            .unwrap();
+        assert_eq!(past_end["entries"], json!([]));
+        assert_eq!(past_end["truncated"], false);
+        for args in [
+            json!({"path":dir,"offset":-1}),
+            json!({"path":dir,"limit":0}),
+            json!({"path":dir,"limit":2001}),
+        ] {
+            assert!(matches!(
+                f.call(&ctx, name, args).await,
+                Err(crate::error::AppError::Invalid(_))
+            ));
+        }
+    }
+
+    let file = dir.join("a.txt");
+    assert!(f
+        .call(&ctx, "read_dir", json!({"path":file,"offset":0}))
+        .await
+        .is_err());
+    assert!(f
+        .call(
+            &ctx,
+            "read_dir",
+            json!({"path":dir.join("missing"),"offset":99})
+        )
+        .await
+        .is_err());
+    assert!(f
+        .call(&ctx, "read_file", json!({"path":file,"offset":0}))
+        .await
+        .is_err());
+    assert!(f
+        .call(&ctx, "read_file", json!({"path":dir,"byte_offset":0}))
+        .await
+        .is_err());
+    for restricted in f.restricted() {
+        let listing = f
+            .call(&restricted, "read_dir", json!({"path":dir}))
+            .await
+            .unwrap();
+        assert_eq!(listing.as_array().unwrap().len(), 5);
+        let text = f
+            .call(&restricted, "read_file", json!({"path":file}))
+            .await
+            .unwrap();
+        assert_eq!(
+            text,
+            json!({"lines":[{"line":1,"text":"a.txt"}],"truncated":false})
+        );
+        assert!(f
+            .call(&restricted, "read_file", json!({"path":dir}))
+            .await
+            .is_err());
+        // Even if a client supplies an undeclared field, it cannot select local paging or scope.
+        assert_eq!(
+            f.call(&restricted, "read_dir", json!({"path":dir,"limit":1}))
+                .await
+                .unwrap(),
+            listing
+        );
+        assert_eq!(
+            f.call(
+                &restricted,
+                "read_file",
+                json!({"path":file,"byte_offset":2})
+            )
+            .await
+            .unwrap(),
+            text
+        );
+    }
+}
+
+#[tokio::test]
+async fn agent_read_file_can_resume_beyond_both_previous_total_limits() {
+    let f = Fixture::new();
+    let ctx = f.agent();
+    let file = f.external.join("giant.txt");
+    let lines = "x\n".repeat(2001);
+    let long = format!("{}🌱{}", "x".repeat(256 * 1024 - 2), "z".repeat(17));
+    fs::write(&file, format!("{lines}{long}\r\nlast")).unwrap();
+
+    let first = f
+        .call(&ctx, "read_file", json!({"path":file}))
+        .await
+        .unwrap();
+    assert_eq!(first["lines"].as_array().unwrap().len(), 2000);
+    assert_eq!(first["next_byte_offset"], 4000);
+    let second = f
+        .call(
+            &ctx,
+            "read_file",
+            json!({"path":file,"byte_offset":first["next_byte_offset"],"max_lines":1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["lines"], json!([{"line":2001,"text":"x"}]));
+    let head = f
+        .call(&ctx, "read_file", json!({"path":file,"start_line":2002}))
+        .await
+        .unwrap();
+    assert_eq!(head["byte_offset"], second["next_byte_offset"]);
+    assert_eq!(head["ends_mid_line"], true);
+    assert_eq!(head["lines"][0]["line"], 2002);
+    let tail = f
+        .call(
+            &ctx,
+            "read_file",
+            json!({"path":file,"byte_offset":head["next_byte_offset"]}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tail["starts_mid_line"], true);
+    assert_eq!(tail["lines"][0]["line"], 2002);
+    assert_eq!(
+        format!(
+            "{}{}",
+            head["lines"][0]["text"].as_str().unwrap(),
+            tail["lines"][0]["text"].as_str().unwrap()
+        ),
+        long
+    );
+    assert_eq!(tail["lines"][1], json!({"line":2003,"text":"last"}));
+    assert_eq!(tail["truncated"], false);
+    assert!(tail["next_byte_offset"].is_null());
+
+    let inside_scalar = head["next_byte_offset"].as_u64().unwrap() + 1;
+    let inside_crlf = lines.len() + long.len() + 1;
+    for paging in [
+        json!({"byte_offset":inside_scalar}),
+        json!({"byte_offset":inside_crlf}),
+        json!({"byte_offset":-1}),
+        json!({"byte_offset":0,"start_line":1}),
+        json!({"start_line":0}),
+        json!({"max_lines":2001}),
+        json!({"max_bytes":3}),
+    ] {
+        let mut args = paging;
+        args["path"] = json!(file);
+        assert!(matches!(
+            f.call(&ctx, "read_file", args).await,
+            Err(crate::error::AppError::Invalid(_))
+        ));
+    }
+    for args in [
+        json!({"path":file,"start_line":u64::MAX}),
+        json!({"path":file,"byte_offset":u64::MAX}),
+        json!({"path":file,"byte_offset":tail["end_byte_offset"]}),
+    ] {
+        let page = f.call(&ctx, "read_file", args).await.unwrap();
+        assert_eq!(page["lines"], json!([]));
+        assert_eq!(page["truncated"], false);
+        assert!(page["next_byte_offset"].is_null());
+    }
+}
+
+#[tokio::test]
 async fn archive_sample_pages_keep_global_metadata_and_validate_unreturned_entries() {
     let f = Fixture::new();
     let ctx = f.agent();
@@ -297,7 +575,8 @@ async fn startup_recovers_external_overwrite_from_its_journal() {
 }
 
 #[tokio::test]
-async fn write_text_is_desktop_agent_only_even_in_game_and_capped_in_aggregate() {
+async fn write_text_is_desktop_agent_only_even_in_game_and_accepts_more_than_one_mib_in_aggregate()
+{
     let f = Fixture::new();
     let dst = f.game.join("settings.txt");
     let ops = json!([write(&dst, "fixture")]);
@@ -316,16 +595,18 @@ async fn write_text_is_desktop_agent_only_even_in_game_and_capped_in_aggregate()
     f.apply_after_review(&id, Effect::ManagerWrite).await;
     assert_eq!(fs::read_to_string(&dst).unwrap(), "fixture");
     let large = "x".repeat(1024 * 512 + 1);
-    assert!(f
+    let other = f.game.join("other.txt");
+    let id = f
         .plan(
             &f.agent(),
-            json!([
-                write(&dst, &large),
-                write(&f.game.join("other.txt"), &large)
-            ])
+            json!([write(&dst, &large), write(&other, &large)]),
         )
         .await
-        .is_err());
+        .unwrap();
+    assert!(!other.exists());
+    f.apply_after_review(&id, Effect::ManagerWrite).await;
+    assert_eq!(fs::read_to_string(dst).unwrap(), large);
+    assert_eq!(fs::read_to_string(other).unwrap(), large);
 }
 
 #[tokio::test]
@@ -338,6 +619,14 @@ async fn local_file_access_still_protects_env_and_manager_credentials() {
         .call(&agent, "read_dir", json!({"path":private}))
         .await
         .is_err());
+    let env_directory = f.external.join(".env.backup");
+    fs::create_dir(&env_directory).unwrap();
+    for directory in [&private, &env_directory] {
+        assert!(matches!(
+            f.call(&agent, "read_file", json!({"path":directory})).await,
+            Err(crate::error::AppError::Denied(_))
+        ));
+    }
     for path in [
         private.join("credentials.json"),
         f.external.join(".env.local"),

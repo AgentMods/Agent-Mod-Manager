@@ -71,15 +71,16 @@ test.describe("游戏卡片操作", () => {
     const minecraft = card(page, "Minecraft Java Edition");
     await minecraft.getByRole("button", {name: "更多操作", exact: true}).click();
     await page.getByRole("menuitem", {name: "编辑", exact: true}).click();
+    const newName = "游戏显示名称 ".repeat(90) + "终章";
     const dialog = page.getByRole("dialog", {name: "编辑游戏", exact: true});
     await expect(dialog.getByLabel("游戏名称", {exact: true})).toHaveValue("Minecraft Java Edition");
-    await dialog.getByLabel("游戏名称", {exact: true}).fill("我的世界");
+    await dialog.getByLabel("游戏名称", {exact: true}).fill(newName);
     await dialog.getByLabel("启动程序", {exact: true}).fill("/sandbox/minecraft/launcher.exe");
     await dialog.getByRole("button", {name: "保存", exact: true}).click();
     await expect(dialog).not.toBeVisible();
-    await expect(card(page, "我的世界")).toBeVisible();
-    expect((await calls(page, "update_game"))[0].args).toEqual({id: "game-fixture", name: "我的世界", launchPath: "/sandbox/minecraft/launcher.exe"});
-    await card(page, "我的世界").getByRole("button", {name: "启动游戏", exact: true}).click();
+    await expect(card(page, newName)).toBeVisible();
+    expect((await calls(page, "update_game"))[0].args).toEqual({id: "game-fixture", name: newName, launchPath: "/sandbox/minecraft/launcher.exe"});
+    await card(page, newName).getByRole("button", {name: "启动游戏", exact: true}).click();
     await expect.poll(async () => (await calls(page, "launch_game")).length).toBe(1);
     await expect(page.locator("main [role=alert]")).toHaveCount(0);
   });
@@ -125,6 +126,12 @@ test.describe("游戏卡片操作", () => {
     // The onboarding fixture registers "Fixture Game" with zero installed Mods.
     await installMockTauri(page, {onboarding: true, withExternalAdapter: true});
     await page.goto("/");
+    await page.getByRole("button", {name: "下一步", exact: true}).click();
+    await expect(page.getByRole("heading", {name: "配置 AI 模型服务", exact: true})).toBeVisible();
+    await page.getByRole("button", {name: "跳过配置", exact: true}).click();
+    await expect(page.getByRole("heading", {name: "启用可用工具", exact: true})).toBeVisible();
+    await page.getByRole("button", {name: "下一步", exact: true}).click();
+    await expect(page.getByRole("heading", {name: "扫描游戏列表", exact: true})).toBeVisible();
     await page.getByRole("button", {name: "扫描已安装游戏"}).click();
     const fixture = page.getByRole("listitem").filter({hasText: "Fixture Game"});
     await fixture.getByRole("checkbox", {name: "选择 Fixture Game"}).check();

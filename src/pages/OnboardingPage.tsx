@@ -1,10 +1,11 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { ArrowLeftIcon, ArrowRightIcon, BotIcon, CheckIcon, CircleAlertIcon, Gamepad2Icon, MoonIcon, PlugIcon, RadarIcon, ScanSearchIcon, SunIcon, TriangleAlertIcon } from "lucide-react";
+import { ArrowLeftIcon, ArrowRightIcon, BotIcon, CheckIcon, CircleAlertIcon, CircleCheckIcon, FolderOpenIcon, MoonIcon, PlugIcon, RadarIcon, ScanSearchIcon, SunIcon, TriangleAlertIcon } from "lucide-react";
 import { api, errorText, useBackendQuery } from "@/lib/api";
-import { useUI } from "@/lib/store";
-import type { BootstrapState, Game, GameCandidate, ScanReport } from "@/lib/types";
+import { pendingOnboardingMigration, rememberOnboardingMigration, useUI } from "@/lib/store";
+import type { AppSettings, BootstrapState, Game, GameCandidate, ScanReport } from "@/lib/types";
 import { AgentConfiguration } from "@/components/AgentConfiguration";
+import { StorageDirectory } from "@/components/StorageDirectory";
 import { McpTools } from "@/components/McpTools";
 import { GameMatchBadge } from "@/components/GameMatchBadge";
 import { PathText } from "@/components/ui";
@@ -20,62 +21,78 @@ import { Item, ItemActions, ItemContent, ItemDescription, ItemGroup, ItemTitle }
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Spinner } from "@/components/ui/spinner";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 
-const steps = ["添加", "配置 Agent", "功能导览"];
+const steps = [
+  { id: "storage", icon: FolderOpenIcon, title: "设置数据存储目录", description: "选择存放 Mod 下载、数据库和快照的位置，也可以直接使用当前目录。" },
+  { id: "agent", icon: BotIcon, title: "配置 AI 模型服务", description: "为 Agent 设置服务地址、默认模型和权限。你也可以稍后在设置中配置。" },
+  { id: "mcp", icon: PlugIcon, title: "启用可用工具", description: "选择 Agent 可以调用的 MCP 工具，或直接继续。" },
+  { id: "scan", icon: RadarIcon, title: "扫描游戏列表", description: "在 Steam、Epic 等常见位置查找游戏。核对候选目录后，选择要添加的游戏。" },
+  { id: "done", icon: CircleCheckIcon, title: "完成", description: "确认当前设置后即可进入游戏库。" },
+] as const;
 
-const panels = {
-  scan: { step: 0, icon: RadarIcon, title: "先找到你想管理的游戏", description: "检查 Steam、Epic 等常见游戏目录。请核对候选路径，然后逐项添加。" },
-  agent: { step: 1, icon: BotIcon, title: "配置你的 AI Agent", description: "设置模型服务和默认权限。也可以稍后在设置中配置。" },
-  mcp: { step: 1, icon: PlugIcon, title: "启用 MCP 工具", description: "按需启动工具，供 Agent 在对话中调用。也可直接继续，稍后在「设置 → 工具」中启用。" },
-  tour: { step: 2, icon: Gamepad2Icon, title: "认识 Agent Mod Manager", description: "选择功能分类，查看使用方法和操作边界。" },
-} as const;
-type Panel = keyof typeof panels;
-
-const features = [
-  { id: "library", title: "游戏库", details: "点击「扫描游戏」打开弹窗，查看常用位置的候选游戏。也可以输入路径，选择「扫描此目录」或「检查单个游戏」。核对路径和适配包后，即可逐项添加。扫描候选没有写入授权。" },
-  { id: "detail", title: "游戏详情", details: "从游戏库打开游戏，查看目录文件和已装 Mod，创建或还原快照。诊断会列出日志和文件证据，实际修复效果与游戏启动结果需另外验证。" },
-  { id: "agent", title: "Agent 对话", details: "用自然语言搜索、下载 Mod，或检查游戏的 Mod 加载日志。可查看工具调用和文件计划。预览展示拟议变更，实际写入须经过当前权限策略审批。" },
-  { id: "plugins", title: "插件中心", details: "查看游戏适配包、版本和验证状态，按需启用或安装。适配包为受支持的游戏提供目录识别和 Mod 安装规则。" },
-  { id: "trash", title: "回收站", details: "选择条目并审阅恢复计划，可将文件还原到原路径。永久删除需要单独确认，该操作无法撤回。" },
-  { id: "history", title: "历史对话", details: "打开过去的 Agent 会话查看消息和任务进度。可以归档会话，也可以从归档中恢复。" },
-  { id: "settings", title: "设置", details: "在「AI 与模型」配置服务和权限，在「工具」管理连接，在「Skills」管理指引，在「外观与存储」切换主题并查看数据目录。外部 stdio MCP 进程拥有当前用户的系统权限，运行在本地文件事务沙盒之外。" },
-];
-
-export default function OnboardingPage({ automatic = false, recoveryError = null }: { automatic?: boolean; recoveryError?: string | null }) {
+export default function OnboardingPage({ automatic = false, bootstrap }: { automatic?: boolean; bootstrap: BootstrapState }) {
+  const { dataRoot, recoveryError } = bootstrap;
   const navigate = useUI((state) => state.navigate);
   const theme = useUI((state) => state.theme);
   const toggleTheme = useUI((state) => state.toggleTheme);
   const client = useQueryClient();
-  const [panel, setPanel] = useState<Panel>("scan");
-  const { step, icon: StepIcon, title, description } = panels[panel];
-  const [mcpBusy, setMcpBusy] = useState(false);
+  const [step, setStep] = useState(() => {
+    const previousRoot = pendingOnboardingMigration();
+    const migrated = previousRoot && !bootstrap.storageMigrationError && previousRoot !== dataRoot;
+    return migrated ? 1 : 0;
+  });
+  useEffect(() => { rememberOnboardingMigration(null); }, []);
+  const { id: panel, icon: StepIcon, title, description } = steps[step];
+  const [configurationBusy, setConfigurationBusy] = useState(false);
   const [report, setReport] = useState<ScanReport | null>(null);
-  const games = useBackendQuery<Game[]>(["games"], "list_games", undefined, report !== null);
+  const games = useBackendQuery<Game[]>(["games"], "list_games", undefined, panel === "scan" && report !== null);
   const [selected, setSelected] = useState<string[]>([]);
   const [candidateErrors, setCandidateErrors] = useState<Record<string, string>>({});
-  const [busy, setBusy] = useState<"scan" | "register" | "settings" | "finish" | null>(null);
+  const [busy, setBusy] = useState<"scan" | "register" | "finish" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const navigationDisabled = !!busy || configurationBusy;
   const heading = useRef<HTMLHeadingElement>(null);
+  const previousStep = useRef(step);
+  useEffect(() => {
+    if (previousStep.current !== step) heading.current?.focus();
+    previousStep.current = step;
+  }, [step]);
   const resumeRecorded = useRef(false);
+  const scanRequest = useRef<string | null>(null);
+  useEffect(() => () => {
+    const requestId = scanRequest.current;
+    scanRequest.current = null;
+    if (requestId) void api("scan_games", { options: { page: { requestId, cancel: true } } }).catch(() => {});
+  }, []);
 
-  function moveTo(next: Panel) {
+  function moveTo(next: number) {
     setError(null);
-    setPanel(next);
-    heading.current?.focus();
+    if (panel === "scan") stopScan();
+    setStep(next);
   }
 
-  async function scan() {
+  function stopScan() {
+    const requestId = scanRequest.current;
+    scanRequest.current = null;
+    if (requestId) void api("scan_games", { options: { page: { requestId, cancel: true } } }).catch(() => {});
+    setReport((current) => current && { ...current, nextCursor: null });
+  }
+  async function scan(cursor?: string) {
+    if (!cursor) stopScan();
+    const requestId = cursor ?? crypto.randomUUID();
+    scanRequest.current = requestId;
     setBusy("scan");
     setError(null);
     try {
-      const result = await api<ScanReport>("scan_games", { options: {} });
+      const result = await api<ScanReport>("scan_games", { options: { page: cursor ? { cursor } : { requestId } } });
+      if (scanRequest.current !== requestId) return;
+      scanRequest.current = result.nextCursor ?? null;
       setReport({ ...result, candidates: reconcileCandidates(result.candidates) });
       setSelected([]);
       setCandidateErrors({});
     } catch (failure) {
-      setError(errorText(failure));
+      if (scanRequest.current === requestId) { stopScan(); setError(errorText(failure)); }
     } finally {
       setBusy(null);
     }
@@ -107,7 +124,8 @@ export default function OnboardingPage({ automatic = false, recoveryError = null
   }
 
   async function finish() {
-    if (busy || mcpBusy) return;
+    if (navigationDisabled) return;
+    stopScan();
     setBusy("finish");
     setError(null);
     try {
@@ -131,40 +149,50 @@ export default function OnboardingPage({ automatic = false, recoveryError = null
         {theme === "light" ? <MoonIcon /> : <SunIcon />}
       </Button>
     </header>
-    <main className="mx-auto grid max-w-5xl gap-8 px-4 py-10 sm:px-8 md:grid-cols-[11rem_minmax(0,1fr)] md:py-16">
+    <main className="mx-auto grid max-w-5xl items-start gap-5 px-4 py-8 sm:px-8 md:grid-cols-[11rem_minmax(0,1fr)] md:gap-8 md:py-14">
       <header className="flex flex-col items-center gap-2 text-center md:col-span-2">
-        <h1 ref={heading} tabIndex={-1} className="text-3xl font-semibold tracking-tight outline-none sm:text-4xl">欢迎使用 Agent Mod Manager</h1>
+        <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">欢迎使用 Agent Mod Manager</h1>
       </header>
       <div className="flex flex-col gap-2 md:hidden">
         <span className="text-sm text-muted-foreground">步骤 {step + 1} / {steps.length}</span>
-        <Progress aria-label="引导进度" value={100 * (step + 1) / steps.length} aria-valuetext={`步骤 ${step + 1} / ${steps.length}`} />
+        <Progress aria-label="引导进度" aria-valuemin={1} aria-valuemax={steps.length} aria-valuenow={step + 1}
+          value={100 * (step + 1) / steps.length} aria-valuetext={`步骤 ${step + 1} / ${steps.length}`}
+          className="motion-reduce:[&_[data-slot=progress-indicator]]:transition-none" />
       </div>
       <ol className="hidden flex-col gap-5 py-2 md:flex" aria-label="引导步骤">
-        {steps.map((title, index) => <li key={title} aria-current={index === step ? "step" : undefined} className={cn("flex items-center gap-3 text-sm font-medium text-muted-foreground transition-colors duration-300", index === step && "text-primary")}>
-          <span aria-hidden="true" className={cn("grid size-8 shrink-0 place-items-center rounded-full border bg-background text-xs transition-colors duration-300", index === step && "border-primary", index < step && "border-primary bg-primary text-primary-foreground")}>{index < step ? <CheckIcon className="size-4 motion-safe:animate-pop-in" /> : index + 1}</span>{title}
+        {steps.map(({ id, title }, index) => <li key={id} aria-current={index === step ? "step" : undefined} className={cn(
+          "relative flex items-center gap-3 text-sm text-muted-foreground after:absolute after:top-8 after:left-4 after:h-5 after:border-l after:border-border last:after:hidden",
+          index === step && "font-semibold text-foreground",
+        )}>
+          <span aria-hidden="true" className={cn("grid size-8 shrink-0 place-items-center rounded-full border bg-background text-xs",
+            index === step && "border-primary bg-primary text-primary-foreground", index < step && "bg-accent text-accent-foreground",
+          )}>{index < step ? <CheckIcon className="size-4" /> : index + 1}</span>{title}
         </li>)}
       </ol>
-      <Card key={panel} className="min-w-0 gap-0 motion-safe:animate-rise-in">
-        <CardHeader className="flex-row items-start gap-4 pb-6">
+      <Card key={panel} inert={busy === "finish"} aria-busy={navigationDisabled} className="min-w-0 gap-0 motion-safe:animate-soft-fade">
+        <CardHeader className="flex items-start gap-4 pb-6">
           <span aria-hidden="true" className="grid size-10 shrink-0 place-items-center rounded-lg bg-accent text-accent-foreground"><StepIcon className="size-5" /></span>
           <div className="flex min-w-0 flex-col gap-1.5">
-            <CardTitle>{title}</CardTitle>
+            <CardTitle ref={heading} tabIndex={-1} className="text-xl tracking-tight outline-none">{title}</CardTitle>
             <CardDescription>{description}</CardDescription>
           </div>
         </CardHeader>
+        {error && <CardContent className="pb-4"><OnboardingAlert warning={false}>{error}</OnboardingAlert></CardContent>}
         {panel === "agent" ? <AgentConfiguration
-          navigation={{ onBack: () => moveTo("scan"), onSkip: () => moveTo("mcp") }}
-          onSaved={() => moveTo("mcp")}
-          onSavingChange={(saving) => setBusy(saving ? "settings" : null)}
+          navigation={{ onBack: () => moveTo(step - 1), onSkip: () => moveTo(step + 1) }}
+          onSaved={() => moveTo(step + 1)} onSavingChange={setConfigurationBusy}
         /> : <>
           <CardContent className="flex flex-col gap-4">
-            {error && <OnboardingAlert warning={false}>{error}</OnboardingAlert>}
+            {panel === "storage" && <StorageDirectory onBusyChange={setConfigurationBusy} onMigrationRequest={rememberOnboardingMigration} />}
+            {panel === "mcp" && <McpTools onboarding onBusyChange={setConfigurationBusy} />}
             {panel === "scan" && <>
               <div className="flex flex-wrap items-center gap-3">
                 <Button size="lg" onClick={() => void scan()} disabled={!!busy}>
                   {busy === "scan" ? <Spinner data-icon="inline-start" /> : <ScanSearchIcon data-icon="inline-start" />}
                   {busy === "scan" ? "正在扫描…" : report ? "重新扫描" : "扫描已安装游戏"}
                 </Button>
+                {report?.nextCursor && busy !== "scan" && <Button variant="outline" disabled={!!busy} onClick={() => void scan(report.nextCursor!)}>下一批候选</Button>}
+                {(busy === "scan" || report?.nextCursor) && <Button variant="ghost" onClick={stopScan}>停止扫描</Button>}
                 <span role="status" className="text-sm text-muted-foreground">{busy === "scan" ? "正在检查常见游戏目录" : report ? `已检查 ${report.directoriesChecked} 个目录、${report.entriesChecked} 个条目` : "扫描仅用于发现候选目录"}</span>
               </div>
               {recoveryError && <OnboardingAlert warning>文件事务恢复需要处理，暂时无法添加游戏。{recoveryError}</OnboardingAlert>}
@@ -181,31 +209,46 @@ export default function OnboardingPage({ automatic = false, recoveryError = null
                       checked ? [...previous, key] : previous.filter((path) => path !== key),
                     )} onRegister={() => void register(candidate)} />;
                 })}
-              </ItemGroup> : <Empty className="border"><EmptyHeader><EmptyTitle>未发现候选目录</EmptyTitle><EmptyDescription>未发现候选目录。可在游戏库中手动添加游戏。</EmptyDescription></EmptyHeader></Empty>)}
+              </ItemGroup> : !report.nextCursor && <Empty className="border"><EmptyHeader><EmptyTitle>未发现候选目录</EmptyTitle><EmptyDescription>未发现候选目录。可在游戏库中手动添加游戏。</EmptyDescription></EmptyHeader></Empty>)}
             </>}
-            {panel === "mcp" && <McpTools onboarding onBusyChange={setMcpBusy} />}
-            {panel === "tour" && <Tabs defaultValue="library" className="gap-4">
-              <div className="max-w-full overflow-x-auto"><TabsList aria-label="功能分类">
-                {features.map(({ id, title }) => <TabsTrigger key={id} value={id}>{title}</TabsTrigger>)}
-              </TabsList></div>
-              {features.map(({ id, title, details }) => <TabsContent key={id} value={id}>
-                <Card className="gap-2 bg-muted/40 p-5 shadow-none"><h3 className="font-medium">{title}</h3><p className="text-sm leading-relaxed text-muted-foreground">{details}</p></Card>
-              </TabsContent>)}
-            </Tabs>}
+            {panel === "done" && <SetupSummary dataRoot={dataRoot} />}
           </CardContent>
-          <CardFooter className="mt-6 justify-between gap-2 border-t pt-6">
-            {panel !== "scan" ? <Button variant="ghost" disabled={!!busy || mcpBusy} onClick={() => moveTo(panel === "tour" ? "mcp" : "agent")}><ArrowLeftIcon data-icon="inline-start" />上一步</Button> : <span />}
-            <div className="flex items-center gap-2">
-              {panel === "scan" && <Button disabled={!!busy} onClick={() => moveTo("agent")}>{report ? "继续配置 Agent" : "稍后再扫"}<ArrowRightIcon data-icon="inline-end" /></Button>}
-              {panel === "mcp" && <Button disabled={!!busy || mcpBusy} onClick={() => moveTo("tour")}>继续功能导览<ArrowRightIcon data-icon="inline-end" /></Button>}
-              {panel === "tour" && <Button disabled={!!busy} onClick={() => void finish()}>完成并进入游戏库<CheckIcon data-icon="inline-end" /></Button>}
-            </div>
+          <CardFooter className="mt-6 flex-wrap gap-2 border-t pt-6">
+            {step > 0 && <Button variant="ghost" disabled={navigationDisabled} onClick={() => moveTo(step - 1)}><ArrowLeftIcon data-icon="inline-start" />上一步</Button>}
+            {panel === "done" ? <Button className="ml-auto" disabled={navigationDisabled} onClick={() => void finish()}>
+              完成并进入游戏库<CheckIcon data-icon="inline-end" />
+            </Button> : <Button className="ml-auto" disabled={navigationDisabled} onClick={() => moveTo(step + 1)}>
+              {panel === "scan" && !report ? "稍后再扫" : "下一步"}<ArrowRightIcon data-icon="inline-end" />
+            </Button>}
           </CardFooter>
         </>}
       </Card>
-      <footer className="flex justify-center md:col-span-2"><Button variant="outline" disabled={!!busy || mcpBusy} onClick={() => void finish()}>退出引导</Button></footer>
+      <footer className="flex justify-center md:col-span-2"><Button variant="outline" disabled={navigationDisabled} onClick={() => void finish()}>退出引导</Button></footer>
     </main>
   </div>;
+}
+
+function describeSetting<T>(query: { data?: T; isError: boolean }, describe: (data: T) => string) {
+  if (query.isError) return "读取失败";
+  return query.data === undefined ? "读取中…" : describe(query.data);
+}
+
+function SetupSummary({ dataRoot }: { dataRoot: string }) {
+  const settings = useBackendQuery<AppSettings>(["settings"], "get_settings");
+  const connections = useBackendQuery<{ serverId: string }[]>(["mcp", "connections"], "mcp_connections");
+  const games = useBackendQuery<Game[]>(["games"], "list_games");
+  const rows = [
+    { title: "存储目录", value: <PathText>{displayPath(dataRoot)}</PathText> },
+    { title: "默认模型", value: describeSetting(settings, ({ model, models }) =>
+      models?.find((item) => item.id === model)?.display_name || model || "尚未配置") },
+    { title: "运行中的工具服务", value: describeSetting(connections, (items) => `${items.length} 个`) },
+    { title: "游戏库", value: describeSetting(games, (items) => `${items.length} 款游戏`) },
+  ];
+  return <dl className="divide-y rounded-lg border bg-muted/30 px-4">
+    {rows.map(({ title, value }) => <div key={title} className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 py-3 text-sm">
+      <dt className="text-muted-foreground">{title}</dt><dd className="min-w-0 wrap-anywhere font-medium">{value}</dd>
+    </div>)}
+  </dl>;
 }
 
 function CandidateRow({ candidate, selected, disabled, error, onSelect, onRegister }: {

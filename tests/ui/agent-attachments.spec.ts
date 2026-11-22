@@ -10,30 +10,46 @@ type ConversionOutcome =
   | {kind: "resolve"; markdown: string}
   | {kind: "reject"; message: string}
   | {kind: "consent"; message: string}
-  | {kind: "defer"};
+  | {kind: "defer"; ignoreCancel?: boolean};
 
-async function installAttachmentMock(page: Page, outcomes: ConversionOutcome[] = []) {
+async function installAttachmentMock(page: Page, outcomes: ConversionOutcome[] = [], holdBegin = false) {
   await installMockTauri(page);
-  await page.addInitScript((conversionOutcomes) => {
+  await page.addInitScript(({conversionOutcomes, holdBegin}) => {
     window.addEventListener("DOMContentLoaded", () => {
       const target = window as any;
       const fixture = target.__AMM_TEST__;
       const tauri = target.__TAURI_INTERNALS__;
       const originalInvoke = tauri.invoke;
-      const resolvers = new Map<number, (markdown: string) => void>();
+      const resolvers = new Map<number, {id: string; resolve: (markdown: string) => void; cancel: () => void}>();
+      const registered = new Set<string>();
       const settled: boolean[] = [];
       let conversionIndex = 0;
 
       target.__AMM_ATTACHMENT_TEST__ = {
         settled,
+        finishBegin: undefined as (() => void) | undefined,
         resolve(index: number, markdown: string) {
-          resolvers.get(index)?.(markdown);
+          resolvers.get(index)?.resolve(markdown);
         },
       };
 
       tauri.invoke = async (command: string, args: any = {}, options?: Record<string, any>) => {
+        if (command === "begin_agent_attachment") {
+          fixture.calls.push({command, args});
+          if (holdBegin) await new Promise<void>((resolve) => { target.__AMM_ATTACHMENT_TEST__.finishBegin = resolve; });
+          registered.add(args.conversionId);
+          return null;
+        }
+        if (command === "cancel_agent_attachment") {
+          fixture.calls.push({command, args});
+          registered.delete(args.conversionId);
+          for (const entry of resolvers.values()) if (entry.id === args.conversionId) entry.cancel();
+          return null;
+        }
         if (command !== "convert_agent_attachment") return originalInvoke(command, args, options);
 
+        const id = options?.headers["x-attachment-conversion-id"];
+        if (!registered.delete(id)) throw {code: "cancelled", message: "附件转换已取消"};
         const index = conversionIndex++;
         fixture.calls.push({command, args, options});
         const outcome = conversionOutcomes[index] ?? {kind: "resolve", markdown: "# Converted attachment"};
@@ -41,15 +57,19 @@ async function installAttachmentMock(page: Page, outcomes: ConversionOutcome[] =
           if (outcome.kind === "reject") throw new Error(outcome.message);
           if (outcome.kind === "consent") throw {code: "consent_required", message: outcome.message};
           if (outcome.kind === "defer") {
-            return await new Promise<string>((resolve) => resolvers.set(index, resolve));
+            return await new Promise<string>((resolve, reject) => resolvers.set(index, {
+              id, resolve,
+              cancel: () => { if (!outcome.ignoreCancel) reject({code: "cancelled", message: "附件转换已取消"}); },
+            }));
           }
           return outcome.markdown;
         } finally {
+          resolvers.delete(index);
           settled[index] = true;
         }
       };
     }, {once: true});
-  }, outcomes);
+  }, {conversionOutcomes: outcomes, holdBegin});
 }
 
 const markitdownPreset = {
@@ -99,8 +119,8 @@ async function installMarkitdownMock(page: Page, {holdConnect = false, failConne
   }, {preset: markitdownPreset, holdConnect, failConnect});
 }
 
-async function openAgent(page: Page, outcomes: ConversionOutcome[] = [], markitdown?: MarkitdownMockOptions) {
-  await installAttachmentMock(page, outcomes);
+async function openAgent(page: Page, outcomes: ConversionOutcome[] = [], markitdown?: MarkitdownMockOptions, holdBegin = false) {
+  await installAttachmentMock(page, outcomes, holdBegin);
   if (markitdown) await installMarkitdownMock(page, markitdown);
   await page.goto("/");
   await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
@@ -152,7 +172,7 @@ test("文档转换失败后可重选，保留草稿和已添加图片并按约�
   const composer = page.getByRole("textbox", {name: "告诉 Agent 你想做什么", exact: true});
   await composer.fill("请结合图片阅读这份说明");
   const fileInput = page.locator('input[type="file"]');
-  const document = {name: "manual.txt", mimeType: "text/plain", buffer: toBuffer("source document")};
+  const document = {name: "manual.html", mimeType: "text/html", buffer: toBuffer("source document")};
   await fileInput.setInputFiles([pngFile, document]);
 
   await page.waitForFunction(() => (window as any).__AMM_ATTACHMENT_TEST__?.settled[0] === true);
@@ -160,11 +180,11 @@ test("文档转换失败后可重选，保留草稿和已添加图片并按约�
   await expect(page.getByRole("button", {name: "发送消息", exact: true})).toBeDisabled();
   expect(await commandCalls(page, "start_turn")).toEqual([]);
 
-  await page.getByRole("button", {name: "重试 manual.txt", exact: true}).click();
+  await page.getByRole("button", {name: "重试 manual.html", exact: true}).click();
   await page.waitForFunction(() => (window as any).__AMM_ATTACHMENT_TEST__?.settled[1] === true);
   await expect(composer).toHaveValue("请结合图片阅读这份说明");
   await expect(page.getByText("screenshot.png", {exact: true})).toBeVisible();
-  await expect(page.getByText("manual.txt", {exact: true})).toBeVisible();
+  await expect(page.getByText("manual.html", {exact: true})).toBeVisible();
   await expect(page.getByRole("button", {name: "发送消息", exact: true})).toBeEnabled();
 
   const conversions = await page.evaluate(() => (window as any).__AMM_TEST__.calls
@@ -173,9 +193,12 @@ test("文档转换失败后可重选，保留草稿和已添加图片并按约�
       name: call.options.headers["x-attachment-name"],
       bytes: Array.from(new Uint8Array(call.args as ArrayBuffer)),
     })));
+  const attempts = (await commandCalls(page, "begin_agent_attachment")).map((call) => call.args.conversionId);
+  expect(new Set(attempts).size).toBe(2);
+  expect(attempts).toEqual((await commandCalls(page, "convert_agent_attachment")).map((call) => call.options.headers["x-attachment-conversion-id"]));
   expect(conversions).toEqual([
-    {name: encodeURIComponent("manual.txt"), bytes: Array.from(new TextEncoder().encode("source document"))},
-    {name: encodeURIComponent("manual.txt"), bytes: Array.from(new TextEncoder().encode("source document"))},
+    {name: encodeURIComponent("manual.html"), bytes: Array.from(new TextEncoder().encode("source document"))},
+    {name: encodeURIComponent("manual.html"), bytes: Array.from(new TextEncoder().encode("source document"))},
   ]);
 
   await page.getByRole("button", {name: "发送消息", exact: true}).click();
@@ -184,17 +207,76 @@ test("文档转换失败后可重选，保留草稿和已添加图片并按约�
   expect(request.content).toBe("请结合图片阅读这份说明");
   expect(request.attachments).toEqual([
     {kind: "image", name: "screenshot.png", dataUrl: pngDataUrl},
-    {kind: "document", name: "manual.txt", markdown},
+    {kind: "document", name: "manual.html", markdown},
   ]);
   await expect(page.getByLabel("消息附件")).toBeVisible();
   await expect(page.getByRole("button", {name: "预览 screenshot.png", exact: true})).toBeVisible();
-  await expect(page.getByRole("button", {name: "预览 manual.txt", exact: true})).toBeVisible();
+  await expect(page.getByRole("button", {name: "预览 manual.html", exact: true})).toBeVisible();
 });
 
-test("转换未完成时切换会话，迟到结果不会进入新会话", async ({page}) => {
+test("大图片、文档和多附件不会阻止消息发送", async ({page}) => {
+  await openAgent(page);
+  const composer = page.getByRole("textbox", {name: "告诉 Agent 你想做什么", exact: true});
+  const text = "长".repeat(45_000) + "结尾";
+  await composer.fill(text);
+  await page.locator('input[type="file"]').evaluate((input: HTMLInputElement, png) => {
+    const MiB = 1024 * 1024;
+    const pngBytes = Uint8Array.from(atob(png), (char) => char.charCodeAt(0));
+    const files = new DataTransfer();
+    const payload = new Uint8Array(5 * MiB);
+    for (let i = 0; i < 4; i++) {
+      files.items.add(new File([pngBytes, payload], `large-${i}.png`, {type: "image/png"}));
+    }
+    for (let i = 0; i < 7; i++) {
+      files.items.add(new File([pngBytes], `small-${i}.png`, {type: "image/png"}));
+    }
+    files.items.add(new File(["# Large", new Uint8Array(10 * MiB).fill(120)], "large.md", {type: "text/markdown"}));
+    input.files = files.files;
+    input.dispatchEvent(new Event("change", {bubbles: true}));
+  }, pngBase64);
+
+  const send = page.getByRole("button", {name: "发送消息", exact: true});
+  await expect(page.getByLabel("待发送附件").getByRole("button", {name: /^移除 /})).toHaveCount(12);
+  await expect(send).toBeEnabled({timeout: 15_000});
+  await send.click();
+  await expect.poll(() => page.evaluate(() => {
+    const calls = (window as any).__AMM_TEST__.calls;
+    const sent = calls.find((call: any) => call.command === "start_turn")?.args.request;
+    const converted = calls.find((call: any) => call.command === "convert_agent_attachment");
+    return sent && {
+      textLength: sent.content.length,
+      textSuffix: sent.content.slice(-2),
+      attachments: sent.attachments.length,
+      bigImages: sent.attachments.filter((entry: any) => entry.kind === "image" && entry.dataUrl.length > 5 * 1024 * 1024 * 4 / 3).length,
+      bigDoc: converted.args.byteLength > 10 * 1024 * 1024,
+      lastAttachment: sent.attachments.at(-1).name,
+    };
+  })).toEqual({textLength: text.length, textSuffix: "结尾", attachments: 12, bigImages: 4, bigDoc: true, lastAttachment: "large.md"});
+});
+
+test("移除转换中的附件会取消对应请求并继续下一个附件", async ({page}) => {
   await openAgent(page, [{kind: "defer"}]);
   const fileInput = page.locator('input[type="file"]');
-  await fileInput.setInputFiles({name: "late.md", mimeType: "text/markdown", buffer: toBuffer("late result")});
+  await fileInput.setInputFiles([
+    {name: "first.html", mimeType: "text/html", buffer: toBuffer("<p>First</p>")},
+    {name: "second.html", mimeType: "text/html", buffer: toBuffer("<p>Second</p>")},
+  ]);
+  await expect.poll(async () => (await commandCalls(page, "convert_agent_attachment")).length).toBe(1);
+  await page.getByRole("button", {name: "移除 first.html", exact: true}).click();
+  await expect(page.getByRole("button", {name: "移除 first.html", exact: true})).toHaveCount(0);
+  const firstCall = (await commandCalls(page, "convert_agent_attachment"))[0];
+  await expect.poll(() => commandCalls(page, "cancel_agent_attachment")).toEqual([
+    {command: "cancel_agent_attachment", args: {conversionId: firstCall.options.headers["x-attachment-conversion-id"]}},
+  ]);
+  await expect(page.getByRole("button", {name: "发送消息", exact: true})).toBeEnabled();
+  expect((await commandCalls(page, "convert_agent_attachment")).map((call) => call.options.headers["x-attachment-name"]))
+    .toEqual(["first.html", "second.html"]);
+});
+
+test("转换未完成时切换会话会发送取消，迟到结果不会进入新会话", async ({page}) => {
+  await openAgent(page, [{kind: "defer", ignoreCancel: true}]);
+  const fileInput = page.locator('input[type="file"]');
+  await fileInput.setInputFiles({name: "late.html", mimeType: "text/html", buffer: toBuffer("late result")});
   await page.waitForFunction(() => (window as any).__AMM_ATTACHMENT_TEST__?.settled.length === 0
     && (window as any).__AMM_TEST__.calls.some((call: any) => call.command === "convert_agent_attachment"));
   await expect(page.getByRole("button", {name: "发送消息", exact: true})).toBeDisabled();
@@ -202,11 +284,40 @@ test("转换未完成时切换会话，迟到结果不会进入新会话", async
 
   await page.getByRole("button", {name: "新建对话", exact: true}).click();
   await expect(page.locator(".chat-header h1")).toHaveText("Agent 对话");
+  const conversionId = (await commandCalls(page, "begin_agent_attachment"))[0].args.conversionId;
+  await expect.poll(() => commandCalls(page, "cancel_agent_attachment")).toEqual([
+    {command: "cancel_agent_attachment", args: {conversionId}},
+  ]);
   await page.evaluate(() => (window as any).__AMM_ATTACHMENT_TEST__.resolve(0, "# Late result"));
   await page.waitForFunction(() => (window as any).__AMM_ATTACHMENT_TEST__?.settled[0] === true);
 
-  await expect(page.getByText("late.md", {exact: true})).toHaveCount(0);
+  await expect(page.getByText("late.html", {exact: true})).toHaveCount(0);
   expect(await commandCalls(page, "start_turn")).toEqual([]);
+});
+
+test("注册尚未完成时移除附件，只取消其预留，不再上传", async ({page}) => {
+  await openAgent(page, [], undefined, true);
+  await page.locator('input[type="file"]').setInputFiles({name: "reserved.html", mimeType: "text/html", buffer: toBuffer("reserved")});
+  await expect.poll(async () => (await commandCalls(page, "begin_agent_attachment")).length).toBe(1);
+  const conversionId = (await commandCalls(page, "begin_agent_attachment"))[0].args.conversionId;
+  await page.getByRole("button", {name: "移除 reserved.html", exact: true}).click();
+  await page.evaluate(() => (window as any).__AMM_ATTACHMENT_TEST__.finishBegin());
+  await expect.poll(() => commandCalls(page, "cancel_agent_attachment")).toEqual([
+    {command: "cancel_agent_attachment", args: {conversionId}},
+  ]);
+  expect(await commandCalls(page, "convert_agent_attachment")).toEqual([]);
+});
+
+test("离开 Agent 页面会取消在途附件转换", async ({page}) => {
+  await openAgent(page, [{kind: "defer"}]);
+  await page.locator('input[type="file"]').setInputFiles({name: "closing.html", mimeType: "text/html", buffer: toBuffer("closing")});
+  await expect.poll(async () => (await commandCalls(page, "convert_agent_attachment")).length).toBe(1);
+  const conversionId = (await commandCalls(page, "begin_agent_attachment"))[0].args.conversionId;
+  await page.getByRole("button", {name: "设置", exact: true}).click();
+  await expect.poll(() => commandCalls(page, "cancel_agent_attachment")).toEqual([
+    {command: "cancel_agent_attachment", args: {conversionId}},
+  ]);
+  await page.waitForFunction(() => (window as any).__AMM_ATTACHMENT_TEST__.settled[0] === true);
 });
 
 test("添加文档不会授权启动，点击 MarkItDown 按钮后直接连接并自动重试多文件", async ({page}) => {
@@ -224,8 +335,8 @@ test("添加文档不会授权启动，点击 MarkItDown 按钮后直接连接�
   const fileInput = page.locator('input[type="file"]');
   await fileInput.setInputFiles([
     pngFile,
-    {name: "first.md", mimeType: "text/markdown", buffer: toBuffer("first source")},
-    {name: "second.md", mimeType: "text/markdown", buffer: toBuffer("second source")},
+    {name: "first.html", mimeType: "text/html", buffer: toBuffer("first source")},
+    {name: "second.html", mimeType: "text/html", buffer: toBuffer("second source")},
   ]);
 
   const launchButton = page.getByRole("button", {name: "启动 MarkItDown MCP", exact: true});
@@ -262,8 +373,8 @@ test("添加文档不会授权启动，点击 MarkItDown 按钮后直接连接�
   expect(request.content).toBe("请读取这两份文件");
   expect(request.attachments).toEqual([
     {kind: "image", name: "screenshot.png", dataUrl: pngDataUrl},
-    {kind: "document", name: "first.md", markdown: firstMarkdown},
-    {kind: "document", name: "second.md", markdown: secondMarkdown},
+    {kind: "document", name: "first.html", markdown: firstMarkdown},
+    {kind: "document", name: "second.html", markdown: secondMarkdown},
   ]);
 });
 
@@ -274,13 +385,13 @@ test("MarkItDown 启动期间切换会话，不会自动重试新会话中的附
   ], {holdConnect: true});
   const fileInput = page.locator('input[type="file"]');
   const launchButton = page.getByRole("button", {name: "启动 MarkItDown MCP", exact: true});
-  await fileInput.setInputFiles({name: "old.md", mimeType: "text/markdown", buffer: toBuffer("old")});
+  await fileInput.setInputFiles({name: "old.html", mimeType: "text/html", buffer: toBuffer("old")});
   await launchButton.click();
   await expect.poll(async () => (await commandCalls(page, "mcp_connect")).length).toBe(1);
 
   await page.getByRole("button", {name: "新建对话", exact: true}).click();
-  await expect(page.getByText("old.md", {exact: true})).toHaveCount(0);
-  await fileInput.setInputFiles({name: "new.md", mimeType: "text/markdown", buffer: toBuffer("new")});
+  await expect(page.getByText("old.html", {exact: true})).toHaveCount(0);
+  await fileInput.setInputFiles({name: "new.html", mimeType: "text/html", buffer: toBuffer("new")});
   await expect(launchButton).toBeDisabled();
   await page.evaluate(() => (window as any).__AMM_MARKITDOWN_TEST__.finishConnect());
   await expect(launchButton).toBeEnabled();
@@ -294,7 +405,7 @@ test("MarkItDown 启动失败会在聊天中显示原因，可再次点击启动
     {kind: "consent", message: "需要确认启动 MarkItDown MCP"},
     {kind: "resolve", markdown: "# Retried document"},
   ], {failConnect: failure});
-  await page.locator('input[type="file"]').setInputFiles({name: "retry.md", mimeType: "text/markdown", buffer: toBuffer("retry source")});
+  await page.locator('input[type="file"]').setInputFiles({name: "retry.html", mimeType: "text/html", buffer: toBuffer("retry source")});
   const launchButton = page.getByRole("button", {name: "启动 MarkItDown MCP", exact: true});
   await launchButton.click();
   await expect(page.getByRole("alert").filter({hasText: failure})).toBeVisible();

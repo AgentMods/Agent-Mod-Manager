@@ -1,7 +1,7 @@
 use super::*;
 use serde_json::json;
 
-fn query(value: impl Into<String>, count: u8) -> WebSearchQuery {
+fn query(value: impl Into<String>, count: usize) -> WebSearchQuery {
     WebSearchQuery {
         query: value.into(),
         count,
@@ -9,11 +9,14 @@ fn query(value: impl Into<String>, count: u8) -> WebSearchQuery {
 }
 
 #[test]
-fn validates_query_limits_and_public_url_terms_without_false_path_matches() {
+fn accepts_long_public_queries_and_keeps_private_query_guards() {
     query("x", 1).validate().unwrap();
-    query("x".repeat(MAX_QUERY_CHARS), 10).validate().unwrap();
-    query("界".repeat(MAX_QUERY_CHARS), 5).validate().unwrap();
-    query("word ".repeat(74) + "word", 5).validate().unwrap();
+    query("x".repeat(1024), 1000).validate().unwrap();
+    query("界".repeat(900), 5).validate().unwrap();
+    query("word ".repeat(150) + "word", 5).validate().unwrap();
+    query(format!("https://docs.rs/{}", "a".repeat(2500)), 5)
+        .validate()
+        .unwrap();
     query("https://docs.rs/serde/latest/serde/", 5)
         .validate()
         .unwrap();
@@ -23,14 +26,20 @@ fn validates_query_limits_and_public_url_terms_without_false_path_matches() {
 
     for invalid in [
         query("", 1),
-        query("x".repeat(MAX_QUERY_CHARS + 1), 5),
-        query("word ".repeat(75) + "word", 5),
+        query("x".repeat(MAX_BROWSER_REQUEST), 5),
+        query("word ".repeat(150) + " file:///private/data", 5),
+        query(
+            "word ".repeat(150) + " https://user:password@example.com/",
+            5,
+        ),
         query("x", 0),
-        query("x", 11),
+        query("mod￾\u{202e}", 11),
         query("/Users/alice/private.txt", 5),
         query(r#"C:\Users\alice\private.txt"#, 5),
         query("file:///etc/passwd", 5),
         query("https://localhost/private", 5),
+        query("site:https://localhost/private", 5),
+        query("site:https://alice:secret@example.com/private", 5),
         query("https://127.0.0.1/private", 5),
         query("https://user:password@example.com/private", 5),
     ] {
@@ -77,82 +86,320 @@ fn result_urls_only_allow_public_http_urls() {
     }
 }
 
-fn browser_result(results: Vec<Value>, count: u8) -> Value {
-    let response: BrowserResponse = serde_json::from_value(json!({
-        "status":"available", "truncated": false, "results":results,
+fn browser_response(results: Vec<Value>, next: Option<BingPosition>) -> BrowserResponse {
+    serde_json::from_value(json!({
+        "status":"available", "truncated": false, "results":results, "next":next,
     }))
-    .unwrap();
-    response
-        .into_result(count)
-        .unwrap()
-        .into_tool_value()
-        .unwrap()
+    .unwrap()
 }
 
-#[test]
-fn bounds_sanitizes_and_deduplicates_results_in_rank_order() {
-    let make_hit =
-        |title: &str, url: &str, snippet: &str| json!({"title":title,"url":url,"snippet":snippet});
-    let result = browser_result(
-        vec![
-            make_hit("Private", "http://127.0.0.1/", ""),
-            make_hit(
-                "First\u{202e}",
-                "https://example.org/first",
-                "See C:\\Users\\alice\\private",
-            ),
-            make_hit("Duplicate", "https://example.org/first", ""),
-            make_hit("Second", "https://example.org/second", ""),
-            make_hit("Third", "https://example.org/third", ""),
-        ],
-        2,
-    );
-    let hits = result["results"].as_array().unwrap();
-    assert_eq!(hits.len(), 2);
-    assert_eq!(
-        hits[0],
+fn make_hit(title: &str, url: &str, snippet: &str) -> Value {
+    json!({"title":title,"url":url,"snippet":snippet})
+}
+
+fn cursor(value: &Value) -> Option<Uuid> {
+    serde_json::from_value(value["next_cursor"].clone()).unwrap()
+}
+
+#[tokio::test]
+async fn sanitizes_hits_and_keeps_remainder_with_a_bound_cursor() {
+    let rows = vec![
+        make_hit("Blocked", "https://localhost/private", ""),
         make_hit(
-            "First",
+            " First\u{202e} ",
             "https://example.org/first",
-            "[PRIVATE_PATH_OMITTED]"
-        )
-    );
-    assert_eq!(hits[1]["title"], "Second");
-    assert_eq!(result["provider"], "bing");
-    assert_eq!(result["untrusted"], true);
-    assert_eq!(result["truncated"], true);
-    let large = (0..10)
-        .map(|i| {
+            "From C:\\Users\\alice",
+        ),
+        make_hit("Duplicate", "https://example.org/first#duplicate", ""),
+        make_hit("Second", "https://example.org/second", ""),
+        make_hit("Third", "https://example.org/third", ""),
+    ];
+    let sessions = SearchSessions::default();
+    let cancel = CancellationToken::new();
+    let request = query("mod data", 2);
+    let page = sessions
+        .search_using(&request, None, &cancel, |position, _| {
+            assert_eq!(position, BingPosition::START);
+            std::future::ready(Ok(browser_response(rows.clone(), None)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(page["provider"], "bing");
+    assert_eq!(page["untrusted"], true);
+    assert_eq!(page["truncated"], true);
+    assert_eq!(
+        page["results"],
+        json!([
             make_hit(
-                &"游".repeat(300),
-                &format!("https://example.org/{i}/{}", "x".repeat(1950)),
-                &"戏".repeat(900),
+                "First",
+                "https://example.org/first",
+                "[PRIVATE_PATH_OMITTED]"
+            ),
+            make_hit("Second", "https://example.org/second", ""),
+        ])
+    );
+    assert_eq!(page["page_end"], "more_results");
+    let next = cursor(&page).unwrap();
+    let fetch_unexpected = |_, _| async { panic!("buffered rows must not be refetched") };
+    assert!(matches!(
+        sessions
+            .search_using(
+                &query("different", 99),
+                Some(next),
+                &cancel,
+                fetch_unexpected
+            )
+            .await,
+        Err(AppError::NotFound(_))
+    ));
+    let last = sessions
+        .search_using(
+            &query("mod data", 100),
+            Some(next),
+            &cancel,
+            fetch_unexpected,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        last["results"],
+        json!([make_hit("Third", "https://example.org/third", "")])
+    );
+    assert_eq!(last["page_end"], "bing_exhausted");
+    assert_eq!(cursor(&last), None);
+    assert!(matches!(
+        sessions
+            .search_using(&request, Some(next), &cancel, fetch_unexpected)
+            .await,
+        Err(AppError::NotFound(_))
+    ));
+}
+
+#[tokio::test]
+async fn delivers_large_results_through_to_site_end_without_duplicates() {
+    let make = |index| {
+        make_hit(
+            &"游".repeat(170),
+            &format!("https://example.org/{index}/{}", "x".repeat(1930)),
+            &"戏".repeat(510),
+        )
+    };
+    let sessions = SearchSessions::default();
+    let cancel = CancellationToken::new();
+    let request = query("public mod", 2000);
+    let fetch = |position: BingPosition, _| async move {
+        Ok(match position.first {
+            1 => browser_response(
+                (1..=24).map(make).collect(),
+                Some(BingPosition {
+                    first: 25,
+                    row_offset: 0,
+                }),
+            ),
+            25 => browser_response(
+                (20..=43).map(make).collect(),
+                Some(BingPosition {
+                    first: 49,
+                    row_offset: 0,
+                }),
+            ),
+            49 => browser_response((42..=60).map(make).collect(), None),
+            _ => panic!("unexpected position: {position:?}"),
+        })
+    };
+    let mut next = None;
+    let mut found = Vec::new();
+    for page_index in 0..8 {
+        let page = sessions
+            .search_using(&request, next, &cancel, fetch)
+            .await
+            .unwrap();
+        let wire_bytes = serde_json::to_vec(&page).unwrap().len();
+        assert!(wire_bytes <= MAX_TOOL_PAGE_BYTES);
+        let hits = page["results"].as_array().unwrap();
+        if page_index == 0 {
+            assert!(wire_bytes > 32 * 1024);
+            assert!(hits.len() > 10);
+        }
+        found.extend(hits.iter().cloned());
+        next = cursor(&page);
+        if next.is_none() {
+            assert_eq!(page["page_end"], "bing_exhausted");
+            break;
+        }
+    }
+    assert_eq!(found, (1..=60).map(make).collect::<Vec<_>>());
+    assert_eq!(next, None);
+}
+
+#[tokio::test]
+async fn crosses_bing_pages_and_does_not_treat_a_failed_page_as_exhausted() {
+    let sessions = SearchSessions::default();
+    let cancel = CancellationToken::new();
+    let request = query("public terms", 30);
+    let fetch = |position: BingPosition, _| async move {
+        let base = position.first;
+        Ok(if base == 21 {
+            serde_json::from_value(json!({"status":"unavailable","truncated":false,"results":[]}))
+                .unwrap()
+        } else {
+            browser_response(
+                (base..base + 10)
+                    .map(|i| make_hit("Result", &format!("https://example.org/{i}"), ""))
+                    .collect(),
+                Some(BingPosition {
+                    first: base + 10,
+                    row_offset: 0,
+                }),
             )
         })
-        .collect();
-    let result = browser_result(large, 10);
-    assert!(serde_json::to_vec(&result).unwrap().len() <= MAX_TOOL_RESULT_BYTES);
-    let hits = result["results"].as_array().unwrap();
-    assert!(!hits.is_empty() && hits.len() < 10);
-    for hit in hits {
-        assert!(hit["title"].as_str().unwrap().len() <= MAX_TITLE_BYTES);
-        assert!(hit["snippet"].as_str().unwrap().len() <= MAX_SNIPPET_BYTES);
+    };
+    let page = sessions
+        .search_using(&request, None, &cancel, fetch)
+        .await
+        .unwrap();
+    assert_eq!(page["status"], "available");
+    assert_eq!(page["results"].as_array().unwrap().len(), 20);
+    assert_eq!(page["page_end"], "bing_unavailable");
+    let final_page = sessions
+        .search_using(&request, cursor(&page), &cancel, |position, _| async move {
+            assert_eq!(
+                position,
+                BingPosition {
+                    first: 21,
+                    row_offset: 0
+                }
+            );
+            Ok(browser_response(
+                vec![make_hit("Last", "https://example.org/21", "")],
+                None,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(final_page["results"].as_array().unwrap().len(), 1);
+    assert_eq!(final_page["page_end"], "bing_exhausted");
+    assert_eq!(cursor(&final_page), None);
+}
+
+#[tokio::test]
+async fn unavailable_responses_cannot_supply_hits_and_invalid_positions_are_not_followed() {
+    let sessions = SearchSessions::default();
+    let cancel = CancellationToken::new();
+    for (status, reason, expected) in [
+        ("unavailable", None, "bing_unavailable"),
+        ("unavailable", Some("query_rejected"), "query_rejected"),
+        ("needs_configuration", None, "needs_configuration"),
+    ] {
+        let page = sessions
+            .search_using(&query("public", 5), None, &cancel, |_, _| async move {
+                Ok(serde_json::from_value(
+                    json!({"status":status,"reason":reason,"truncated":false,
+                "results":[make_hit("Unexpected","https://example.org", "")]}),
+                )
+                .unwrap())
+            })
+            .await
+            .unwrap();
+        assert_eq!(page["status"], status);
+        assert_eq!(page["results"], json!([]));
+        assert_eq!(page["page_end"], expected);
+        assert_eq!(cursor(&page), None);
+    }
+    for next in [
+        BingPosition::START,
+        BingPosition {
+            first: 1,
+            row_offset: 99,
+        },
+        BingPosition {
+            first: 2,
+            row_offset: 1,
+        },
+    ] {
+        let page = sessions
+            .search_using(
+                &query("public", 5),
+                None,
+                &cancel,
+                |position, _| async move {
+                    assert_eq!(position, BingPosition::START);
+                    Ok(browser_response(
+                        vec![make_hit("Valid", "https://example.org/", "")],
+                        Some(next),
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page["results"].as_array().unwrap().len(), 1);
+        assert_eq!(page["page_end"], "invalid_pagination");
+        assert_eq!(cursor(&page), None);
     }
 }
 
-#[test]
-fn only_available_responses_can_supply_hits() {
-    for status in ["unavailable", "needs_configuration"] {
-        let response: BrowserResponse = serde_json::from_value(json!({
-            "status":status, "truncated":false,
-            "results":[{"title":"Unexpected", "url":"https://example.org/", "snippet":""}],
-        }))
-        .unwrap();
-        let value = response.into_result(5).unwrap().into_tool_value().unwrap();
-        assert_eq!(value["status"], status);
-        assert_eq!(value["results"], json!([]));
+fn wire(query: &str, count: usize) -> BrowserRequest<'_> {
+    BrowserRequest {
+        query,
+        count,
+        position: BingPosition::START,
     }
-    assert_eq!(browser_result(vec![], 5)["status"], "available");
+}
+
+#[tokio::test]
+async fn cancels_an_active_continuation_and_invalidates_its_cursor() {
+    let sessions = std::sync::Arc::new(SearchSessions::default());
+    let cancel = CancellationToken::new();
+    let request = query("mod data", 1);
+    let first = sessions
+        .search_using(&request, None, &cancel, |_, _| async {
+            Ok(browser_response(
+                vec![make_hit("First", "https://example.org/1", "")],
+                Some(BingPosition {
+                    first: 11,
+                    row_offset: 0,
+                }),
+            ))
+        })
+        .await
+        .unwrap();
+    let next = cursor(&first);
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (closed, cleaned) = tokio::sync::oneshot::channel();
+    let worker = {
+        let sessions = sessions.clone();
+        let cancel = cancel.clone();
+        let request = request.clone();
+        let mut started = Some(started);
+        let mut closed = Some(closed);
+        tokio::spawn(async move {
+            sessions
+                .search_using(&request, next, &cancel, |position, child| {
+                    assert_eq!(position.first, 11);
+                    let started = started.take().unwrap();
+                    let closed = closed.take().unwrap();
+                    async move {
+                        started.send(()).unwrap();
+                        child.cancelled().await;
+                        closed.send(()).unwrap();
+                        Err(AppError::Cancelled)
+                    }
+                })
+                .await
+        })
+    };
+    ready.await.unwrap();
+    cancel.cancel();
+    assert!(matches!(worker.await.unwrap(), Err(AppError::Cancelled)));
+    cleaned.await.unwrap();
+    assert!(matches!(
+        sessions
+            .search_using(&request, next, &CancellationToken::new(), |_, _| async {
+                panic!("cancelled cursor must not be resumed")
+            })
+            .await,
+        Err(AppError::NotFound(_))
+    ));
 }
 
 fn fixture_command(script: &str) -> Command {
@@ -174,7 +421,7 @@ async fn exchanges_utf8_json_with_the_browser_helper() {
     );
     let response = run_browser(
         command,
-        &query("模组 & \"wiki\"", 2),
+        &wire("模组 & \"wiki\"", 2),
         &CancellationToken::new(),
     )
     .await
@@ -191,7 +438,7 @@ async fn rejects_broken_or_oversized_browser_replies() {
     ] {
         let result = run_browser(
             fixture_command(script),
-            &query("public game", 1),
+            &wire("public game", 1),
             &CancellationToken::new(),
         ).await;
         assert!(result.is_err());
@@ -213,7 +460,7 @@ async fn cancelling_a_running_search_closes_its_browser_session() {
     let cancel = CancellationToken::new();
     let token = cancel.clone();
     let task =
-        tokio::spawn(async move { run_browser(command, &query("public game", 1), &token).await });
+        tokio::spawn(async move { run_browser(command, &wire("public game", 1), &token).await });
     tokio::time::timeout(Duration::from_secs(10), async {
         while !started.is_file() {
             tokio::time::sleep(Duration::from_millis(20)).await;

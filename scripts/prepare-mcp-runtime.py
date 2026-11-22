@@ -23,6 +23,7 @@ CACHE = ROOT / 'src-tauri/target/mcp-runtime-downloads'
 MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
 BING_HELPER = 'bin/bing-search.cjs'
 PLAYWRIGHT_DIR = 'bin/node_modules/playwright-core'
+PLAYWRIGHT_CLI = f'{PLAYWRIGHT_DIR}/cli.js'
 
 # Node's names differ from both Rust's target triples and Astral's asset names.
 NODE_TARGETS = {
@@ -221,7 +222,7 @@ def prepare(target):
                 'npm/bin/npm-cli.js', 'npm/bin/npx-cli.js', 'npm/package.json', 'npm/LICENSE',
                 'licenses/node/LICENSE', 'licenses/uv/LICENSE-APACHE', 'licenses/uv/LICENSE-MIT',
                 BING_HELPER, f'{PLAYWRIGHT_DIR}/index.js', f'{PLAYWRIGHT_DIR}/LICENSE',
-                f'{PLAYWRIGHT_DIR}/package.json',
+                f'{PLAYWRIGHT_DIR}/package.json', PLAYWRIGHT_CLI,
             }
             if missing := required - runtime.names:
                 raise ValueError(f'Missing entries in assembled MCP runtime: {", ".join(sorted(missing))}')
@@ -233,6 +234,8 @@ def prepare(target):
             if (playwright_package['name'] != 'playwright-core'
                     or playwright_package['version'] != playwright_version):
                 raise ValueError('Playwright distribution does not match the Yarn lock')
+            if playwright_package.get('bin', {}).get('playwright-core') != 'cli.js':
+                raise ValueError('Bundled playwright-core does not expose its CLI at cli.js')
             if any(playwright_package.get(key) for key in ('dependencies', 'optionalDependencies', 'peerDependencies')):
                 raise ValueError('Bundled playwright-core must not need external runtime packages')
         digest = hash_file(path)

@@ -465,15 +465,10 @@ impl Provider {
             }
             versions.push(modrinth_version_summary(version, id)?);
         }
-        let at_limit = r.offset + r.limit > MAX_VERSION_OFFSET;
         Ok(VersionListResult {
-            status: if more && at_limit {
-                self.state(SourceState::Limited, "达到版本浏览上限，请缩小筛选范围")
-            } else {
-                self.status()
-            },
+            status: self.status(),
             versions,
-            has_more: more && !at_limit,
+            has_more: more,
         })
     }
 
@@ -487,8 +482,10 @@ impl Provider {
         let game = segment(game)?;
         let mut mods = Vec::new();
         // Official API uses fixed pages of 20; map our offset/limit exactly.
-        let first = q.offset / 20;
-        let last = (q.offset + q.limit - 1) / 20;
+        let offset = u64::from(q.offset);
+        let end = offset + u64::from(q.limit);
+        let first = offset / 20;
+        let last = (end - 1) / 20;
         for page in first..=last {
             let v: Value = self
                 .fetch_json(
@@ -499,8 +496,8 @@ impl Provider {
                 )
                 .await?;
             for (index, v) in array(&v["results"])?.iter().enumerate() {
-                let absolute = page * 20 + index as u32;
-                if absolute < q.offset || absolute >= q.offset + q.limit {
+                let absolute = page * 20 + index as u64;
+                if absolute < offset || absolute >= end {
                     continue;
                 }
                 let namespace = s(v, "namespace")?;
@@ -638,19 +635,13 @@ impl Provider {
         // Thunderstore's public endpoint uses fixed 20-item pages. Derive
         // page numbers locally; never follow provider-supplied URLs.
         const PAGE_SIZE: usize = 20;
-        const MAX_PAGES: usize = 512;
         let mut page = r.offset / PAGE_SIZE + 1;
         let mut absolute = page.saturating_sub(1) * PAGE_SIZE;
         let mut versions = Vec::with_capacity(r.limit);
         let mut seen = HashSet::new();
         let mut has_more = false;
-        let mut fetched_pages = 0;
 
         loop {
-            fetched_pages += 1;
-            if fetched_pages > MAX_PAGES {
-                return Err(AppError::Other("Thunderstore 版本分页超过安全上限".into()));
-            }
             let path = format!(
                 "https://thunderstore.io/api/cyberstorm/package/{namespace}/{name}/versions/"
             );
@@ -669,6 +660,7 @@ impl Provider {
                 .filter(|value| !value.is_empty())
                 .is_some();
 
+            let previous_count = seen.len();
             for version in results {
                 let summary = thunderstore_version_summary(version)?;
                 if !seen.insert(summary.version_id.clone()) {
@@ -692,7 +684,12 @@ impl Provider {
             if !next {
                 break;
             }
-            page = page.saturating_add(1);
+            if previous_count == seen.len() {
+                return Err(AppError::Other(
+                    "Thunderstore 返回了重复或空的版本分页".into(),
+                ));
+            }
+            page += 1;
         }
 
         let status = if r.game_version.is_some() || r.loader.is_some() {
@@ -792,43 +789,73 @@ impl Provider {
                 home,
             ));
         }
-        let files: Value = if let Some(file) = pinned {
-            let v: Value = self
+        let not_found = || AppError::NotFound("没有匹配的可下载 CurseForge 文件".into());
+        let matches = |file: &Value| {
+            file["isAvailable"] == true
+                && file["modId"]
+                    .as_u64()
+                    .is_some_and(|project| project.to_string() == id)
+                && r.game_version.as_ref().is_none_or(|v| {
+                    file["gameVersions"].as_array().is_some_and(|versions| {
+                        versions.iter().any(|version| version.as_str() == Some(v))
+                    })
+                })
+        };
+        let selected = if let Some(file_id) = pinned {
+            let mut v: Value = self
                 .fetch_json(self.get(format!(
-                    "https://api.curseforge.com/v1/mods/{id}/files/{file}"
+                    "https://api.curseforge.com/v1/mods/{id}/files/{file_id}"
                 )))
                 .await?;
-            if num(&v["data"], "id")? != file {
+            if num(&v["data"], "id")? != file_id {
                 return Err(AppError::Conflict(
                     "CurseForge 返回的文件 ID 与请求不符".into(),
                 ));
             }
-            json!([v["data"]])
-        } else {
-            let mut req = self
-                .get(format!("https://api.curseforge.com/v1/mods/{id}/files"))
-                .query(&[("pageSize", "50")]);
-            if let Some(version) = &r.game_version {
-                req = req.query(&[("gameVersion", version)]);
+            if !matches(&v["data"]) {
+                return Err(not_found());
             }
-            let v: Value = self.fetch_json(req).await?;
-            v["data"].clone()
+            v["data"].take()
+        } else {
+            let mut index = 0u64;
+            loop {
+                let mut req = self
+                    .get(format!("https://api.curseforge.com/v1/mods/{id}/files"))
+                    .query(&[("pageSize", 50u64), ("index", index)]);
+                if let Some(version) = &r.game_version {
+                    req = req.query(&[("gameVersion", version)]);
+                }
+                let response: Value = self.fetch_json(req).await?;
+                let files = array(&response["data"])?;
+                if let Some(file) = files
+                    .iter()
+                    .filter(|file| matches(file))
+                    .max_by_key(|file| file["fileDate"].as_str().unwrap_or_default())
+                {
+                    break file.clone();
+                }
+                let Some(paging) = response.get("pagination") else {
+                    return Err(not_found());
+                };
+                let count = files.len() as u64;
+                let invalid = || AppError::Other("CurseForge 返回的文件分页信息无效".into());
+                let total = paging["totalCount"].as_u64().ok_or_else(invalid)?;
+                if paging["index"].as_u64() != Some(index)
+                    || paging["resultCount"].as_u64() != Some(count)
+                    || count > 50
+                {
+                    return Err(invalid());
+                }
+                index = index.checked_add(count).ok_or_else(invalid)?;
+                if index >= total {
+                    return Err(not_found());
+                }
+                if count == 0 {
+                    return Err(invalid());
+                }
+            }
         };
-        let file = array(&files)?
-            .iter()
-            .filter(|f| {
-                f["isAvailable"] == true
-                    && f["modId"].as_u64().map(|n| n.to_string()).as_deref() == Some(id)
-            })
-            .filter(|f| {
-                r.game_version.as_ref().is_none_or(|v| {
-                    f["gameVersions"]
-                        .as_array()
-                        .is_some_and(|a| a.contains(&json!(v)))
-                })
-            })
-            .max_by_key(|f| f["fileDate"].as_str().unwrap_or_default())
-            .ok_or_else(|| AppError::NotFound("没有匹配的可下载 CurseForge 文件".into()))?;
+        let file = &selected;
         let fid = num(file, "id")?;
         let url = match opt(file, "downloadUrl") {
             Some(url) => url,
@@ -1096,11 +1123,12 @@ impl ModSource for Provider {
     async fn dependency_graph(
         &self,
         request: &DependencyGraphRequest,
+        cancel: &tokio_util::sync::CancellationToken,
     ) -> AppResult<DependencyGraph> {
         if self.id != "modrinth" {
             return Err(AppError::Unsupported("此来源不支持依赖图".into()));
         }
-        self.modrinth_graph(request).await
+        self.modrinth_graph(request, cancel).await
     }
 }
 

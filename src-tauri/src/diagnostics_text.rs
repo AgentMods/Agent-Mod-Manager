@@ -1,27 +1,35 @@
 //! Decode bounded byte prefixes without replacing malformed input.
+#[cfg(test)]
 use std::borrow::Cow;
 
+#[cfg(test)]
 use encoding_rs::{DecoderResult, Encoding, UTF_16BE, UTF_16LE};
 
+#[cfg(test)]
 use super::ReadStatus;
 
+#[cfg(test)]
 pub(super) struct Decoded<'a> {
     pub text: Cow<'a, str>,
     pub encoding: &'static str,
 }
 
+#[cfg(test)]
 type Failure = (ReadStatus, &'static str);
 
+#[cfg(test)]
 const INVALID_TEXT: Failure = (
     ReadStatus::UnknownEncoding,
     "文本编码无效或内容损坏；未用替换字符生成证据",
 );
+#[cfg(test)]
 const BINARY: Failure = (ReadStatus::Binary, "检测到二进制/控制内容，不返回文本");
 
-fn is_binary_byte(byte: u8) -> bool {
+pub(super) fn is_binary_byte(byte: u8) -> bool {
     byte < 0x20 && !matches!(byte, b'\t' | b'\r' | b'\n')
 }
 
+#[cfg(test)]
 fn utf8(bytes: &[u8], prefix: bool) -> Result<&str, Failure> {
     match std::str::from_utf8(bytes) {
         Ok(text) => Ok(text),
@@ -32,6 +40,7 @@ fn utf8(bytes: &[u8], prefix: bool) -> Result<&str, Failure> {
     }
 }
 
+#[cfg(test)]
 fn strict_decode(
     bytes: &[u8],
     prefix: bool,
@@ -60,6 +69,7 @@ fn strict_decode(
     })
 }
 
+#[cfg(test)]
 pub(super) fn decode<'a>(
     bytes: &'a [u8],
     prefix: bool,
@@ -98,6 +108,7 @@ pub(super) fn decode<'a>(
     }
 }
 
+#[cfg(test)]
 pub(super) fn physical_lines(mut text: &str) -> impl Iterator<Item = (&str, bool)> {
     std::iter::from_fn(move || {
         if text.is_empty() {

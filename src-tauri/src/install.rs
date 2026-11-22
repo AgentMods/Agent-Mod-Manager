@@ -21,7 +21,16 @@ use std::{
 mod replacement;
 pub(crate) use replacement::{validate_apply, validate_rollback};
 
-const MAX_FILES: usize = 100_000;
+#[path = "install_library.rs"]
+mod library;
+pub use library::{
+    match_library_install, match_library_install_cancellable, plan_library_install,
+    plan_library_install_cancellable, LibraryInstallMatch, LibraryInstallMode,
+    LibraryInstallRequest, LibraryMatchRequest, LibrarySourceKind,
+};
+pub(crate) use library::{validate_library_apply, LIBRARY_INSTALL_KIND};
+
+use tokio_util::sync::CancellationToken;
 type Payload = BTreeMap<String, PathBuf>;
 type MappedPayload = (Payload, Vec<String>);
 
@@ -204,8 +213,8 @@ fn logical_files(
             .replace('\\', "/");
         files.insert(name, staging.join(relative));
     }
-    if files.is_empty() || files.len() > MAX_FILES {
-        return Err(invalid("归档文件数量为空或超出上限"));
+    if files.is_empty() {
+        return Err(invalid("归档中没有可安装的文件"));
     }
     Ok(files)
 }
@@ -231,7 +240,7 @@ fn strip_wrapper(
 fn map_rule(
     rule: &ArchiveRule,
     files: &BTreeMap<String, PathBuf>,
-    request: &InstallRequest,
+    folder_name: Option<&str>,
 ) -> AppResult<Option<MappedPayload>> {
     match rule.layout {
         ArchiveLayout::StripPrefix => {
@@ -254,7 +263,7 @@ fn map_rule(
         }
         ArchiveLayout::ModDirectory => {
             if required(files, "", rule) {
-                let folder = request.folder_name.as_deref().ok_or_else(|| {
+                let folder = folder_name.ok_or_else(|| {
                     invalid("归档根部是模组内容，请指定 folderName 保留独立模组目录")
                 })?;
                 basename(folder)?;
@@ -294,6 +303,15 @@ fn artifact(engine: &FileEngine, request: &InstallRequest) -> AppResult<PathBuf>
     engine.paths.stable_directory(&engine.paths.downloads())?;
     engine.paths.stable_directory(&engine.paths.staging())?;
     engine.paths.guard(&request.artifact_path, &[])?;
+    // A retained transport copy has the same game binding as its library entry.
+    if let Some(verified) =
+        crate::mod_library::for_install_path(engine, &request.game_id, &request.artifact_path)?
+    {
+        return Err(invalid(format!(
+            "此归档已归入游戏 Mod 库，请使用 install_library_mod 和 artifactId {}",
+            verified.entry.id
+        )));
+    }
     let path = paths::ensure_within(
         &request.artifact_path,
         &[engine.paths.downloads(), engine.paths.staging()],
@@ -321,15 +339,47 @@ fn artifact(engine: &FileEngine, request: &InstallRequest) -> AppResult<PathBuf>
     Ok(path)
 }
 
+fn check_mapping_metadata(mappings: &[ManualMapping], cancel: &CancellationToken) -> AppResult<()> {
+    // Bound mapping memory independent of how many entries the archive has.
+    mappings.iter().try_fold(0usize, |bytes, mapping| {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        bytes
+            .checked_add(128)
+            .and_then(|bytes| bytes.checked_add(mapping.source.len()))
+            .and_then(|bytes| bytes.checked_add(mapping.destination.len()))
+            .filter(|bytes| *bytes <= 64 * 1024 * 1024)
+            .ok_or_else(|| invalid("安装文件映射超过元数据预算"))
+    })?;
+    Ok(())
+}
+
 /// Produces the exact deployment plan and saves its install manifest before
 /// execution, so a restart between filesystem commit and UI refresh is harmless.
 pub fn plan_install(engine: &FileEngine, request: &InstallRequest) -> AppResult<InstallPreview> {
+    plan_install_cancellable(engine, request, &CancellationToken::new())
+}
+
+pub(crate) fn plan_install_cancellable(
+    engine: &FileEngine,
+    request: &InstallRequest,
+    cancel: &CancellationToken,
+) -> AppResult<InstallPreview> {
+    let check_cancel = || {
+        if cancel.is_cancelled() {
+            Err(AppError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
+    check_cancel()?;
+    check_mapping_metadata(&request.mappings, cancel)?;
     basename(&request.filename)?;
     if request.name.trim().is_empty()
         || request.name.len() > 512
         || request.source.len() > 128
         || request.version.as_ref().is_some_and(|v| v.len() > 256)
-        || request.mappings.len() > MAX_FILES
     {
         return Err(invalid("模组元数据为空或超过限制"));
     }
@@ -352,7 +402,7 @@ pub fn plan_install(engine: &FileEngine, request: &InstallRequest) -> AppResult<
         &engine.roots()?,
     )?;
     let artifact = artifact(engine, request)?;
-    let artifact_sha256 = util::sha256_file(&artifact)?;
+    let artifact_sha256 = archive::hash_file_cancellable(&artifact, cancel)?;
     let catalog = artifacts::for_path(&engine.db, &artifact)?;
     if let Some(record) = &catalog {
         if record.artifact.path != artifact
@@ -454,6 +504,7 @@ pub fn plan_install(engine: &FileEngine, request: &InstallRequest) -> AppResult<
     let mut ignored_files = Vec::new();
     let payload: BTreeMap<String, PathBuf>;
     let staged_hashes;
+    let mut staging_cleanup = None;
     if let Some(rule) = single_file_rule.filter(|_| request.mappings.is_empty()) {
         let ext = Path::new(&request.filename)
             .extension()
@@ -464,7 +515,7 @@ pub fn plan_install(engine: &FileEngine, request: &InstallRequest) -> AppResult<
             return Err(invalid("载荷扩展名与模组类型不符"));
         }
         if ext == "jar" || ext == "zip" || !rule.required_files.is_empty() {
-            let listing = archive::list_verified_archive(&artifact, &artifact_sha256)?;
+            let listing = archive::list_verified_archive(&artifact, &artifact_sha256, cancel)?;
             let names: BTreeSet<_> = listing
                 .entries
                 .iter()
@@ -480,7 +531,13 @@ pub fn plan_install(engine: &FileEngine, request: &InstallRequest) -> AppResult<
     } else {
         let staging = engine.paths.staging().join(util::new_id("install"));
         engine.stable_path(&staging, true)?;
-        let extraction = archive::extract_verified_archive(&artifact, &staging, &artifact_sha256)?;
+        let extraction = archive::extract_verified_archive_cancellable(
+            &artifact,
+            &staging,
+            &artifact_sha256,
+            cancel,
+        )?;
+
         let automatic_mappings;
         let mappings = match request.fomod_selection {
             Some(FomodSelection::Automatic) => {
@@ -509,6 +566,7 @@ pub fn plan_install(engine: &FileEngine, request: &InstallRequest) -> AppResult<
             }
             None => request.mappings.as_slice(),
         };
+        staging_cleanup = Some(extraction.cleanup);
         let listing = extraction.listing;
         staged_hashes = Some(extraction.files);
         let files = logical_files(&listing, &staging)?;
@@ -516,6 +574,7 @@ pub fn plan_install(engine: &FileEngine, request: &InstallRequest) -> AppResult<
             let mut mapped = BTreeMap::new();
             let mut selected = BTreeSet::new();
             for mapping in mappings {
+                check_cancel()?;
                 plugins::validate_relative_path(&mapping.source, false)?;
                 plugins::validate_relative_path(&mapping.destination, false)?;
                 let src = files
@@ -556,7 +615,9 @@ pub fn plan_install(engine: &FileEngine, request: &InstallRequest) -> AppResult<
                 strip_wrapper(&files, listing.stripped_root.as_deref()),
             ] {
                 for rule in &rules {
-                    if let Some(result) = map_rule(rule, &candidate, request)? {
+                    if let Some(result) =
+                        map_rule(rule, &candidate, request.folder_name.as_deref())?
+                    {
                         mapped = Some(result);
                         break;
                     }
@@ -594,7 +655,9 @@ pub fn plan_install(engine: &FileEngine, request: &InstallRequest) -> AppResult<
         )?;
         ops.push(FileOp::Copy { src, dst });
     }
+    check_cancel()?;
     let guard = crate::transaction::write_lock();
+    check_cancel()?;
     let replacement = request
         .replace_install_id
         .as_deref()
@@ -639,14 +702,16 @@ pub fn plan_install(engine: &FileEngine, request: &InstallRequest) -> AppResult<
         .map(|draft| draft.operation.clone())
         .chain(ops)
         .collect();
+    check_cancel()?;
     let mut plan = engine.build_locked_plan(&guard, ops, summary, internal)?;
     plan.requires_review = true;
     validate_payload_sources(&plan, &artifact, &artifact_sha256, staged_hashes.as_ref())?;
+    require_install_space(&plan, &install_root, cancel)?;
     if let Some(replacement) = &replacement {
         replacement.inspect_plan(engine, &plan, None)?;
         warnings.push("这是明确选择的版本替换，不判断版本先后、加载器兼容性或依赖是否满足".into());
     }
-    if util::sha256_file(&artifact)? != artifact_sha256 {
+    if archive::hash_file_cancellable(&artifact, cancel)? != artifact_sha256 {
         return Err(AppError::Conflict(
             "生成预览时载荷已变化，请重新生成计划".into(),
         ));
@@ -686,7 +751,11 @@ pub fn plan_install(engine: &FileEngine, request: &InstallRequest) -> AppResult<
         "UPDATE file_transactions SET game_id=?1 WHERE id=?2",
         params![game.id, plan.id],
     )?;
+    check_cancel()?;
     tx.commit()?;
+    if let Some(cleanup) = &mut staging_cleanup {
+        cleanup.keep();
+    }
     Ok(InstallPreview {
         install_id: id,
         game_id: game.id,
@@ -699,6 +768,34 @@ pub fn plan_install(engine: &FileEngine, request: &InstallRequest) -> AppResult<
         ignored_files,
         requires_review: true,
     })
+}
+
+fn require_install_space(
+    plan: &FilePlan,
+    install_root: &Path,
+    cancel: &CancellationToken,
+) -> AppResult<()> {
+    // Advisory admission. The FileEngine still owns writes/backups and handles
+    // actual I/O errors and rollback if the available space changes after review.
+    let required_space = plan.entries.iter().try_fold(0u64, |total, entry| {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        let bytes = match (&entry.operation, &entry.source) {
+            (FileOp::Copy { .. }, Some(source)) => source.size.checked_add(4096),
+            _ => Some(0),
+        };
+        bytes
+            .and_then(|bytes| total.checked_add(bytes))
+            .ok_or_else(|| invalid("安装空间预算溢出"))
+    })?;
+    let mut volume_path = install_root;
+    while !volume_path.try_exists()? {
+        volume_path = volume_path
+            .parent()
+            .ok_or_else(|| invalid("无法检查安装卷可用空间"))?;
+    }
+    crate::safe_fs::DiskBudget::new(volume_path)?.require(required_space)
 }
 
 fn validate_payload_sources(
@@ -747,6 +844,7 @@ pub fn reconcile(db: &Db) -> AppResult<()> {
       WHERE EXISTS(SELECT 1 FROM install_transactions a WHERE a.install_id=installs.id);
       UPDATE games SET installed_mod_count=(SELECT count(*) FROM installs WHERE game_id=games.id AND status IN ('enabled','partially_restored')),
         enabled_mod_count=(SELECT count(*) FROM installs WHERE game_id=games.id AND status='enabled');"))?;
+    crate::mod_management::restore_membership(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -1081,58 +1179,188 @@ pub fn inspect_install(engine: &FileEngine, id: &str) -> AppResult<InstallInspec
     })
 }
 
+fn uninstall_sources(
+    engine: &FileEngine,
+    installed: &InstalledMod,
+) -> AppResult<BTreeMap<PathBuf, Fingerprint>> {
+    let conflict = |message: &str| AppError::Conflict(message.into());
+    if installed.status != "enabled" || installed.files.is_empty() {
+        return Err(conflict("安装状态已变化或清单为空，不能直接卸载"));
+    }
+    if installed.files.iter().any(|file| file.before.is_some()) {
+        return Err(conflict(
+            "此安装覆盖了既有文件，请使用安装事务回滚以恢复原文件",
+        ));
+    }
+    let game = games::get_game(&engine.db, &installed.game_id)?;
+    let mut scopes: Vec<_> = game_roots::registered_user_roots(&engine.db, &game.id)?
+        .into_values()
+        .collect();
+    scopes.push(PathBuf::from(game.root_path));
+    let root = &installed.install_root;
+    if engine.paths.overlaps_storage(root)
+        || engine.paths.guard(root, &scopes)? != *root
+        || !scopes.iter().any(|scope| root.starts_with(scope))
+    {
+        return Err(conflict("安装清单的根目录不在该游戏的登记范围内"));
+    }
+    let mut files = BTreeMap::new();
+    let mut owned = BTreeSet::new();
+    for file in &installed.files {
+        if file.path == *root
+            || !file.path.starts_with(root)
+            || engine.paths.guard(&file.path, &scopes)? != file.path
+            || !owned.insert(replacement::path_key(&file.path))
+        {
+            return Err(conflict("安装清单含链接、重复路径或超出安装根的文件"));
+        }
+        files.insert(
+            file.path.clone(),
+            Fingerprint {
+                kind: "file".into(),
+                size: file.size,
+                sha256: file.sha256.clone(),
+            },
+        );
+    }
+    replacement::verify_ownership(engine, &owned, (&installed.id, None), None)?;
+    Ok(files)
+}
+
+fn validate_uninstall_moves(
+    plan: &FilePlan,
+    mut sources: BTreeMap<PathBuf, Fingerprint>,
+    mut receipts: BTreeMap<PathBuf, PathBuf>,
+) -> AppResult<()> {
+    let conflict =
+        || AppError::Conflict("卸载操作不再与独占安装清单、原始文件指纹和回收站记录匹配".into());
+    for entry in &plan.entries {
+        let FileOp::Move { src, dst } = &entry.operation else {
+            return Err(conflict());
+        };
+        let expected = sources.remove(src).ok_or_else(conflict)?;
+        if entry.source.as_ref() != Some(&expected)
+            || entry.before.is_some()
+            || receipts.remove(src).as_ref() != Some(dst)
+        {
+            return Err(conflict());
+        }
+    }
+    if !sources.is_empty() || !receipts.is_empty() {
+        return Err(conflict());
+    }
+    Ok(())
+}
+
+/// FileEngine calls this under WRITE_LOCK before applying any tracked uninstall.
+/// It then checks the live fingerprints again before journaling and moving them.
+fn validate_uninstall_apply(engine: &FileEngine, plan: &FilePlan, id: &str) -> AppResult<()> {
+    let installed = get_install(engine, id)?;
+    let sources = uninstall_sources(engine, &installed)?;
+    let conn = engine.db.conn();
+    let mut stmt = conn.prepare("SELECT id,original_path,trash_path,game_id,is_dir FROM trash_items WHERE transaction_id=?1")?;
+    let mut rows = stmt.query([&plan.id])?;
+    let mut receipts = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let trash_id: String = row.get(0)?;
+        let src = PathBuf::from(row.get::<_, String>(1)?);
+        let dst = PathBuf::from(row.get::<_, String>(2)?);
+        let game: Option<String> = row.get(3)?;
+        let is_dir: bool = row.get(4)?;
+        if game.as_deref() != Some(installed.game_id.as_str())
+            || is_dir
+            || dst.parent().and_then(Path::parent) != Some(engine.paths.trash().as_path())
+            || dst != engine.paths.trash_entry(&trash_id).join("payload")
+            || receipts.insert(src, dst).is_some()
+        {
+            return Err(AppError::Conflict(
+                "卸载的回收站记录与登记游戏或文件范围不符".into(),
+            ));
+        }
+    }
+    validate_uninstall_moves(plan, sources, receipts)
+}
+
 /// Only remove the exact bytes this install owns. Modified/shared files need
 /// explicit conflict resolution; unknown configs or user files are never moved.
 pub fn plan_uninstall(engine: &FileEngine, id: &str) -> AppResult<FilePlan> {
+    let guard = crate::transaction::write_lock();
     let installed = get_install(engine, id)?;
-    if installed.status != "enabled" {
-        return Err(AppError::Conflict("模组当前不在已安装状态".into()));
-    }
-    if installed.files.iter().any(|f| f.before.is_some()) {
-        return Err(AppError::Conflict(
-            "此安装覆盖了既有文件，请使用安装事务回滚以还原原文件；不能仅移走替换文件".into(),
-        ));
-    }
-    let others = list_installs(engine, &installed.game_id)?;
-    for file in &installed.files {
-        if others
-            .iter()
-            .filter(|m| m.id != installed.id && m.status == "enabled")
-            .any(|m| m.files.iter().any(|f| f.path == file.path))
-        {
-            return Err(AppError::Conflict(format!(
-                "其他已装模组也引用 {}，请先解决覆盖关系",
-                paths::display_path(&file.path)
-            )));
-        }
-        let expected = Fingerprint {
-            kind: "file".into(),
-            size: file.size,
-            sha256: file.sha256.clone(),
-        };
-        if fingerprint(&file.path)? != Some(expected) {
-            return Err(AppError::Conflict(format!(
-                "安装后文件已修改或丢失，保留现场: {}",
-                paths::display_path(&file.path)
-            )));
-        }
-    }
-    let plan = trash::plan_trash(
+    let sources = uninstall_sources(engine, &installed)?;
+    let summary = format!("卸载 {}", installed.name);
+    let drafts = trash::prepare_trash(
         engine,
         &trash::TrashRequest {
-            paths: installed
-                .files
-                .iter()
-                .map(|f| f.path.to_string_lossy().into())
+            paths: sources
+                .keys()
+                .map(|path| path.to_string_lossy().into())
                 .collect(),
-            game_id: Some(installed.game_id),
-            reason: format!("卸载 {}", installed.name),
+            game_id: Some(installed.game_id.clone()),
+            reason: summary.clone(),
         },
     )?;
-    engine.db.conn().execute("INSERT INTO install_transactions(install_id,transaction_id,action,created_at) VALUES (?1,?2,'uninstall',?3)",params![id,plan.id,util::now()])?;
+    let ops: Vec<_> = drafts.iter().map(|draft| draft.operation.clone()).collect();
+    let receipts = ops
+        .iter()
+        .filter_map(|op| match op {
+            FileOp::Move { src, dst } => Some((src.clone(), dst.clone())),
+            _ => None,
+        })
+        .collect();
+    let mut plan = engine.build_locked_plan(&guard, ops, summary, true)?;
+    plan.requires_review = true;
+    validate_uninstall_moves(&plan, sources, receipts)?;
+    let mut conn = engine.db.conn();
+    let tx = conn.transaction()?;
+    FileEngine::persist_plan(&tx, &plan, true)?;
+    trash::record_prepared(engine, &tx, &plan.id, drafts)?;
+    tx.execute("INSERT INTO install_transactions(install_id,transaction_id,action,created_at) VALUES (?1,?2,'uninstall',?3)", params![id,plan.id,util::now()])?;
+    tx.execute(
+        "UPDATE file_transactions SET game_id=?1 WHERE id=?2",
+        params![installed.game_id, plan.id],
+    )?;
+    tx.commit()?;
     Ok(plan)
 }
 
 #[cfg(test)]
 #[path = "install_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    #[test]
+    fn installation_metadata_accepts_more_than_one_hundred_thousand_short_mappings() {
+        let mappings: Vec<_> = (0..100_001)
+            .map(|i| ManualMapping {
+                source: format!("source/{i}"),
+                destination: format!("mod/{i}"),
+            })
+            .collect();
+        assert!(check_mapping_metadata(&mappings, &CancellationToken::new()).is_ok());
+    }
+
+    #[test]
+    fn invalid_install_mapping_discards_temporary_stage_without_game_writes() {
+        let (_temp, engine, game) = tests::fixture("stardew-valley");
+        let stages = || {
+            std::fs::read_dir(engine.paths.staging())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<BTreeSet<_>>()
+        };
+        let before = stages();
+        let payload = tests::zip(&engine, &[("Example/data.txt", b"valid")]);
+        let mut request = tests::request(&game, payload, "smapi-mod", "Example.zip");
+        request.mappings.push(ManualMapping {
+            source: "missing.txt".into(),
+            destination: "data.txt".into(),
+        });
+        let error = plan_install(&engine, &request).unwrap_err();
+        assert!(error.to_string().contains("归档无此文件"), "{error}");
+        assert_eq!(stages(), before);
+        assert!(!Path::new(&game.root_path).join("Mods/data.txt").exists());
+    }
+}

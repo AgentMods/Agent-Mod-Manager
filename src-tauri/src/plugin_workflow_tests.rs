@@ -179,12 +179,43 @@ fn unsafe_slugs_system_skills_and_other_skill_owners_are_rejected() {
 }
 
 #[test]
-fn oversized_inputs_are_rejected_before_any_plan_or_draft_record() {
+fn reviewed_large_adapter_and_skill_install_reopen_and_upgrade_rollback() {
     let f = Fixture::new();
-    assert!(plan_write_draft(&f.engine, SLUG, &"x".repeat(ADAPTER_LIMIT + 1), "skill").is_err());
-    assert!(plan_write_draft(&f.engine, SLUG, "{}", &"x".repeat(SKILL_LIMIT + 1)).is_err());
-    assert_eq!(f.count("file_transactions"), 0);
-    assert_eq!(f.count("plugin_drafts"), 0);
+    let (adapter, skill) = content(SLUG, "1.0.0");
+    let mut adapter: Value = serde_json::from_str(&adapter).unwrap();
+    adapter["uninstallNotes"] = json!(["Notes 说明".repeat(32 * 1024)]);
+    let adapter = adapter.to_string();
+    let skill = format!("{skill}{}", "安装说明\n".repeat(96 * 1024));
+    let draft = plan_write_draft(&f.engine, SLUG, &adapter, &skill).unwrap();
+    assert!(draft.plan.requires_review);
+    assert!(f.engine.apply_file_ops(&draft.plan.id).is_err());
+    apply(&f.engine, &draft.plan);
+    assert!(validate_draft(&f.engine, &draft.draft.id).unwrap().valid);
+    let deployment = plan_install_plugin(&f.engine, &draft.draft.id).unwrap();
+    apply(&f.engine, &deployment.plan);
+    let engine = f.reopened();
+    reconcile_deployments(&engine).unwrap();
+    assert_eq!(
+        plugins::adapter_for(&engine.db, SLUG).unwrap().version,
+        "1.0.0"
+    );
+    assert_eq!(
+        crate::skills::get_skill(&engine, SLUG).unwrap().markdown,
+        skill
+    );
+    let upgrade = f.deployed("2.0.0");
+    engine.rollback_transaction(&upgrade.plan.id).unwrap();
+    reconcile_deployments(&engine).unwrap();
+    let path = install_path(&engine, SLUG).unwrap();
+    assert_eq!(
+        fs::read_to_string(path.join("adapter.json")).unwrap(),
+        adapter
+    );
+    assert_eq!(fs::read_to_string(path.join("SKILL.md")).unwrap(), skill);
+    assert_eq!(
+        plugins::adapter_for(&engine.db, SLUG).unwrap().version,
+        "1.0.0"
+    );
 }
 
 #[test]
@@ -876,6 +907,96 @@ fn failed_draft_deletion_keeps_draft_live_and_only_committed_moves_appear_in_tra
     delete_confirmed_draft(&reopened, &draft.id).unwrap();
     assert!(list_drafts(&reopened).unwrap().is_empty());
     assert_eq!(trash::list_trash(&reopened.db, false).unwrap().len(), 1);
+}
+
+#[test]
+fn agent_draft_cleanup_requires_exact_completed_use_and_respects_restore() {
+    let f = Fixture::new();
+    let engine = &f.engine;
+    let manual = f.draft("1.0.0").draft;
+    let agent = f.draft("1.0.0").draft;
+    let unused = f.draft("1.0.0").draft;
+    mark_agent_draft(engine, &agent.id).unwrap();
+    mark_agent_draft(engine, &unused.id).unwrap();
+    let install = plan_install_plugin(engine, &agent.id).unwrap();
+    engine.approve_plan(&install.plan.id).unwrap();
+    cleanup_consumed_agent_drafts(engine, None);
+    assert_eq!(list_drafts(engine).unwrap().len(), 3);
+    engine.apply_file_ops(&install.plan.id).unwrap();
+
+    // Restart between the durable install and cleanup. No chat history is needed.
+    let restarted = f.reopened();
+    reconcile_deployments(&restarted).unwrap();
+    cleanup_consumed_agent_drafts(&restarted, None);
+    cleanup_consumed_agent_drafts(&restarted, None);
+    assert!(!agent.path.exists());
+    assert!(manual.path.exists() && unused.path.exists());
+    assert_eq!(list_drafts(engine).unwrap().len(), 2);
+    assert_eq!(read_plugin_package(engine, SLUG).unwrap().version, "1.0.0");
+    let items = trash::list_trash(&engine.db, false).unwrap();
+    assert_eq!(items.len(), 1);
+    let restore = trash::plan_restore(engine, std::slice::from_ref(&items[0].id), false).unwrap();
+    apply(engine, &restore);
+    cleanup_consumed_agent_drafts(engine, None);
+    assert!(validate_draft(engine, &agent.id).unwrap().valid);
+}
+
+#[test]
+fn agent_draft_cleanup_preserves_modified_files_and_pending_consumers() {
+    let f = Fixture::new();
+    let engine = &f.engine;
+    let draft = f.draft("1.0.0").draft;
+    mark_agent_draft(engine, &draft.id).unwrap();
+    let install = plan_install_plugin(engine, &draft.id).unwrap();
+    let duplicate = plan_install_plugin(engine, &draft.id).unwrap();
+    apply(engine, &install.plan);
+    reconcile_after_apply(engine, &install.plan).unwrap();
+    assert!(draft.path.exists());
+
+    // The other reviewed plan can still run after undoing the first install.
+    engine.rollback_transaction(&install.plan.id).unwrap();
+    apply(engine, &duplicate.plan);
+    // The copies completed, but someone added a file before cleanup.
+    write(&draft.path.join("my-notes.txt"), "keep me");
+    reconcile_after_apply(engine, &duplicate.plan).unwrap();
+    assert!(draft.path.join("my-notes.txt").exists());
+    assert!(trash::list_trash(&engine.db, false).unwrap().is_empty());
+}
+
+#[test]
+fn agent_draft_cleanup_migration_only_trusts_matching_success_receipts() {
+    let f = Fixture::new();
+    let authored = f.draft("1.0.0").draft;
+    let imported = f.draft("1.0.0").draft;
+    let manual = f.draft("1.0.0").draft;
+    let receipt = |id: &str, plan: &str| {
+        json!({"status":"committed", "preview":{"draft":{"id":id}}, "plan":{"id":plan}}).to_string()
+    };
+    for (name, result) in [
+        ("write_plugin_draft", receipt(&authored.id, &authored.write_transaction_id)),
+        ("import_cloud_plugin", json!({"status":"committed","draftId":imported.id,"plan":{"id":imported.write_transaction_id}}).to_string()),
+        ("write_plugin_draft", receipt(&manual.id, &authored.write_transaction_id)),
+        ("write_plugin_draft", "old non-JSON receipt".into()),
+    ] {
+        f.engine.db.conn().execute("INSERT INTO tool_calls(id,conversation_id,name,status,result_json,started_at) VALUES (?1,'chat',?2,'done',?3,'now')", params![util::new_id("tool"),name,result]).unwrap();
+    }
+    f.engine
+        .db
+        .conn()
+        .pragma_update(None, "user_version", 15)
+        .unwrap();
+    let reopened = f.reopened();
+    let marked: Vec<String> = reopened
+        .db
+        .conn()
+        .prepare("SELECT draft_id FROM agent_plugin_drafts")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(marked.len(), 2);
+    assert!(marked.contains(&authored.id) && marked.contains(&imported.id));
 }
 
 #[test]

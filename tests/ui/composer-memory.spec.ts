@@ -4,13 +4,12 @@ import { installMockTauri } from "./mock-tauri";
 const settings = {
   base_url: "https://provider.example/v1",
   model: "fixture-thinking",
-  context_budget: 128000,
   permission_mode: "request_approval",
   api_key_ref: "model.api_key",
   onboarding_completed: true,
   models: [
-    {display_name: "fixture-thinking", id: "fixture-thinking", context_budget: 128000, reasoning_levels: ["low", "high", "ultra"]},
-    {display_name: "fixture-standard", id: "fixture-standard", context_budget: 64000, reasoning_levels: []},
+    {display_name: "fixture-thinking", id: "fixture-thinking", reasoning_levels: ["low", "high", "ultra"]},
+    {display_name: "fixture-standard", id: "fixture-standard", reasoning_levels: []},
   ],
 };
 

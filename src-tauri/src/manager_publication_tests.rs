@@ -3,7 +3,7 @@ use super::*;
 use crate::{db::Db, plugin_workflow, storage::AppPaths};
 use axum::{
     body::{Body, Bytes},
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -23,6 +23,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new(large: bool) -> Self {
+        Self::with_draft_origin(large, false)
+    }
+
+    fn with_draft_origin(large: bool, agent: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::new(temp.path().join("manager")).unwrap();
         let engine = FileEngine::new(Db::open(&paths.db_file()).unwrap(), paths);
@@ -32,10 +36,13 @@ impl Fixture {
         let mut adapter = serde_json::to_string_pretty(&input).unwrap();
         let mut skill = format!("---\r\nname: {SLUG}\r\ndescription: Publication test\r\n---\r\n\r\nExact text 适配\r\n");
         if large {
-            adapter.push_str(&"\t".repeat(provenance::ADAPTER_LIMIT - adapter.len()));
-            skill.push_str(&"\"".repeat(provenance::SKILL_LIMIT - skill.len()));
+            adapter.push_str(&"\t".repeat(640 * 1024));
+            skill.push_str(&"\"".repeat(1024 * 1024));
         }
         let draft = plugin_workflow::plan_write_draft(&engine, SLUG, &adapter, &skill).unwrap();
+        if agent {
+            plugin_workflow::mark_agent_draft(&engine, &draft.draft.id).unwrap();
+        }
         engine.approve_plan(&draft.plan.id).unwrap();
         engine.apply_file_ops(&draft.plan.id).unwrap();
         Self {
@@ -136,6 +143,7 @@ async fn local_transport(
     };
     let app = Router::new()
         .route("/api/v1/mcp", post(post_mcp))
+        .layer(DefaultBodyLimit::max(5 * 1024 * 1024))
         .with_state(mock.clone());
     let handle = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
     let transport = remote::Transport::connect_to(&url, KEY.into(), &CancellationToken::new())
@@ -145,8 +153,12 @@ async fn local_transport(
 }
 
 #[tokio::test]
-async fn real_mcp_first_publish_uses_only_publish_tool_and_preserves_max_files() {
-    let f = Fixture::new(true);
+async fn real_mcp_first_publish_consumes_agent_draft_and_preserves_large_approved_payload() {
+    let f = Fixture::with_draft_origin(true, true);
+    let sibling = plugin_workflow::plan_write_draft(&f.engine, SLUG, &f.adapter, &f.skill).unwrap();
+    plugin_workflow::mark_agent_draft(&f.engine, &sibling.draft.id).unwrap();
+    f.engine.approve_plan(&sibling.plan.id).unwrap();
+    f.engine.apply_file_ops(&sibling.plan.id).unwrap();
     let publication = f.approve(&f.prepare(PublicationTarget::First));
     let (transport, mock, server) = local_transport(
         json!({"structuredContent":{"plugin":receipt(9,40,false)}}),
@@ -165,10 +177,26 @@ async fn real_mcp_first_publish_uses_only_publish_tool_and_preserves_max_files()
     assert_eq!(done.state, PublicationState::Completed);
     assert_eq!(done.remote.as_ref().unwrap().release_id, 40);
     assert!(!done.remote.as_ref().unwrap().hidden);
+    assert!(!f.draft.draft.path.exists());
+    assert!(sibling.draft.path.is_dir());
+    let reopened = f.reopen();
+    assert_eq!(
+        plugin_workflow::list_drafts(&reopened)
+            .unwrap()
+            .into_iter()
+            .map(|draft| draft.id)
+            .collect::<Vec<_>>(),
+        vec![sibling.draft.id]
+    );
+    assert_eq!(get_publication(&reopened, &done.id).unwrap(), done);
+    assert_eq!(
+        list_publications(&reopened, None).unwrap(),
+        vec![done.clone()]
+    );
     // No second tools/call even if a caller submits the exact completed request.
     assert_eq!(
         publish_with(
-            &f.engine,
+            &reopened,
             &transport,
             &publication.id,
             &publication.preview.digest,
@@ -189,8 +217,9 @@ async fn real_mcp_first_publish_uses_only_publish_tool_and_preserves_max_files()
             }),
         "publish arguments must contain exactly the approved texts and tags"
     );
-    assert_eq!(f.adapter.len() + f.skill.len(), 384 * 1024);
-    assert!(*size > 700 * 1024);
+    assert!(f.adapter.len() > 256 * 1024);
+    assert!(f.skill.len() > 128 * 1024);
+    assert!(*size > 3 * 1024 * 1024);
     server.abort();
 }
 
@@ -339,7 +368,7 @@ impl Remote for Script {
 
 #[tokio::test]
 async fn unknown_reconciliation_requires_exact_bytes_owner_release_and_read_only_tools() {
-    let f = Fixture::new(false);
+    let f = Fixture::new(true);
     let approved = f.approve(&f.prepare(PublicationTarget::Release { plugin_id: 41 }));
     let cancel = CancellationToken::new();
     let write = Script {
@@ -471,7 +500,7 @@ async fn stale_and_legacy_approvals_are_rejected_before_remote_and_recovery_is_o
     .await
     .is_err());
     assert_eq!(
-        provenance::list_publications(&reopened).unwrap()[0].id,
+        provenance::list_publications(&reopened, None).unwrap()[0].id,
         legacy.id
     );
     let distinct = f.approve(&f.prepare(PublicationTarget::Release { plugin_id: 88 }));
@@ -520,7 +549,7 @@ async fn mcp_response_echo_never_persists_a_credential_or_becomes_a_receipt() {
 }
 
 #[tokio::test]
-async fn dropping_an_inflight_publish_marks_unknown_without_replaying() {
+async fn dropping_an_inflight_publish_preserves_agent_draft_until_verified_reconciliation() {
     struct InFlight(tokio::sync::Notify);
     #[async_trait::async_trait]
     impl Remote for InFlight {
@@ -530,7 +559,7 @@ async fn dropping_an_inflight_publish_marks_unknown_without_replaying() {
         }
     }
 
-    let f = Fixture::new(false);
+    let f = Fixture::with_draft_origin(false, true);
     let approved = f.approve(&f.prepare(PublicationTarget::First));
     let remote = InFlight(tokio::sync::Notify::new());
     let cancel = CancellationToken::new();
@@ -549,12 +578,12 @@ async fn dropping_an_inflight_publish_marks_unknown_without_replaying() {
         get_publication(&f.engine, &approved.id).unwrap().state,
         PublicationState::Pending
     );
+    assert!(f.draft.draft.path.is_dir());
     drop(send);
     let reopened = f.reopen();
-    assert_eq!(
-        get_publication(&reopened, &approved.id).unwrap().state,
-        PublicationState::Unknown
-    );
+    let unknown = get_publication(&reopened, &approved.id).unwrap();
+    assert_eq!(unknown.state, PublicationState::Unknown);
+    assert!(f.draft.draft.path.is_dir());
     assert!(publish_with(
         &reopened,
         &remote,
@@ -564,4 +593,97 @@ async fn dropping_an_inflight_publish_marks_unknown_without_replaying() {
     )
     .await
     .is_err());
+
+    let page = json!({"items":[receipt(41,55,false)]});
+    let texts = json!({"adapter":f.adapter,"skill":f.skill,"tags":["other","中文标签"]});
+    let verification = Script {
+        replies: Mutex::new([page.clone(), texts, page].into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        reconcile_with(&reopened, &verification, unknown, &cancel)
+            .await
+            .unwrap(),
+        ReconciliationOutcome::Verified
+    );
+    assert!(!f.draft.draft.path.exists());
+    let completed = get_publication(&f.engine, &approved.id).unwrap();
+    assert_eq!(completed.state, PublicationState::Completed);
+    assert_eq!(completed.preview, approved.preview);
+    assert_eq!(completed.remote.unwrap().release_id, 55);
+}
+
+#[tokio::test]
+async fn precommit_conflict_and_foreign_id_can_be_corrected_with_fresh_approval() {
+    let f = Fixture::new(false);
+    let cancel = CancellationToken::new();
+    for (target, message, is_conflict) in [
+        (
+            PublicationTarget::First,
+            "manager plugin slug or release version already exists",
+            true,
+        ),
+        (
+            PublicationTarget::Release { plugin_id: 90 },
+            "manager plugin not found",
+            false,
+        ),
+    ] {
+        let record = f.approve(&f.prepare(target));
+        let (transport, mock, server) = local_transport(
+            json!({"isError":true,"content":[{"type":"text","text":message}]}),
+            StatusCode::OK,
+        )
+        .await;
+        let rejected = publish_with(
+            &f.engine,
+            &transport,
+            &record.id,
+            &record.preview.digest,
+            &cancel,
+        )
+        .await;
+        if is_conflict {
+            assert!(
+                matches!(rejected, Err(AppError::Conflict(message)) if message.contains("新版本"))
+            );
+        } else {
+            assert!(
+                matches!(rejected, Err(AppError::NotFound(message)) if message.contains("插件 ID"))
+            );
+        }
+        assert_eq!(
+            get_publication(&f.engine, &record.id).unwrap().state,
+            PublicationState::Error
+        );
+        assert!(publish_with(
+            &f.engine,
+            &transport,
+            &record.id,
+            &record.preview.digest,
+            &cancel
+        )
+        .await
+        .is_err());
+        assert_eq!(mock.calls.lock().unwrap().len(), 3);
+        server.abort();
+    }
+    let amended = f.approve(&f.prepare(PublicationTarget::Release { plugin_id: 41 }));
+    let (transport, mock, server) = local_transport(
+        json!({"structuredContent":{"plugin":receipt(41,55,false)}}),
+        StatusCode::OK,
+    )
+    .await;
+    let done = publish_with(
+        &f.engine,
+        &transport,
+        &amended.id,
+        &amended.preview.digest,
+        &cancel,
+    )
+    .await
+    .unwrap();
+    assert_eq!(done.state, PublicationState::Completed);
+    assert_eq!(mock.calls.lock().unwrap().len(), 3);
+    server.abort();
 }

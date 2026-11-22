@@ -43,6 +43,21 @@ fn fixture() -> (tempfile::TempDir, FileEngine, DownloadArtifact, ResolvedMod) {
 }
 
 #[test]
+fn downloads_include_records_older_than_the_first_thousand() {
+    let (_temp, engine, artifact, source) = fixture();
+    record(&engine, &artifact, &source).unwrap();
+    let mut conn = engine.db.conn();
+    let tx = conn.transaction().unwrap();
+    for i in 0..1000 {
+        tx.execute("INSERT INTO download_artifacts (id,path,filename,artifact_json,source_id,project_id,version_id,name,version,created_at)
+           SELECT ?1,?1,filename,artifact_json,source_id,project_id,version_id,name,version,created_at FROM download_artifacts WHERE id=?2", params![format!("fixture-{i}"), artifact.id]).unwrap();
+    }
+    tx.commit().unwrap();
+    drop(conn);
+    assert_eq!(list(&engine.db).unwrap().len(), 1001);
+}
+
+#[test]
 fn exact_duplicate_preserves_catalog_data_and_ignores_request_urls() {
     let (_temp, engine, artifact, mut source) = fixture();
     record(&engine, &artifact, &source).unwrap();

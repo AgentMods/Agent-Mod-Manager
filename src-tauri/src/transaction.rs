@@ -9,8 +9,9 @@ use crate::{
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
+    ops::Bound::{Included, Unbounded},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
@@ -18,9 +19,45 @@ use std::{
 // Stored only by the native desktop Agent planner, never taken from tool input.
 const LOCAL_AGENT_FILES: &str = "local_agent_files";
 
+#[derive(Serialize, Deserialize)]
+struct ActiveJournal {
+    entry_count: usize,
+}
+
+// Path's ordering is by components, so descendants form one contiguous range.
+fn has_path_overlap(paths: &BTreeSet<PathBuf>, path: &Path) -> bool {
+    path.ancestors()
+        .skip(1)
+        .any(|parent| paths.contains(parent))
+        || paths
+            .range::<Path, _>((Included(path), Unbounded))
+            .next()
+            .is_some_and(|candidate| candidate.starts_with(path))
+}
+
 static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 pub(crate) fn write_lock() -> MutexGuard<'static, ()> {
     lock()
+}
+
+/// For cancellable read passes that must observe stable local files, avoid
+/// waiting uninterruptibly behind an unrelated filesystem transaction.
+pub(crate) fn write_lock_cancellable(
+    cancel: &tokio_util::sync::CancellationToken,
+) -> AppResult<MutexGuard<'static, ()>> {
+    let lock = WRITE_LOCK.get_or_init(|| Mutex::new(()));
+    loop {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
 }
 
 fn lock() -> MutexGuard<'static, ()> {
@@ -384,9 +421,10 @@ impl FileEngine {
             .map(|r| r.join(".amm-retained"))
             .collect();
         let conn = self.db.conn();
-        let mut stmt = conn.prepare("SELECT journal_json FROM file_transactions")?;
-        for json in stmt.query_map([], |r| r.get::<_, String>(0))? {
-            for j in serde_json::from_str::<Vec<JournalEntry>>(&json?)? {
+        let mut stmt = conn.prepare("SELECT id,journal_json FROM file_transactions")?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+            let (id, json) = row?;
+            for j in Self::decode_journal(&conn, &id, &json)? {
                 paths.push(j.undo);
                 paths.extend(j.source_park);
                 paths.extend(j.overwrite_park);
@@ -417,10 +455,18 @@ impl FileEngine {
     }
 
     fn guard(&self, path: &Path, internal: bool) -> AppResult<PathBuf> {
-        let roots = self.roots()?;
+        self.guard_with_roots(path, internal, &self.roots()?)
+    }
+
+    fn guard_with_roots(
+        &self,
+        path: &Path,
+        internal: bool,
+        roots: &[PathBuf],
+    ) -> AppResult<PathBuf> {
         let target = self
             .paths
-            .guard_file_path(path, &roots, self.local_agent_files)?;
+            .guard_file_path(path, roots, self.local_agent_files)?;
         if !internal
             && self.local_agent_files
             && !target.starts_with(&self.paths.root)
@@ -530,33 +576,52 @@ impl FileEngine {
         summary: String,
         internal: bool,
     ) -> AppResult<FilePlan> {
+        self.build_plan_with_sources(ops, summary, internal, None)
+    }
+
+    /// Only the library installer can authorize its verified copy sources. Its
+    /// destinations always use the ordinary, managed-only file policy.
+    pub(crate) fn build_locked_library_plan(
+        &self,
+        _guard: &MutexGuard<'static, ()>,
+        ops: Vec<FileOp>,
+        summary: String,
+        sources: &BTreeMap<PathBuf, String>,
+    ) -> AppResult<FilePlan> {
+        let engine = self.for_transaction(crate::install::LIBRARY_INSTALL_KIND)?;
+        engine.build_plan_with_sources(ops, summary, false, Some(sources))
+    }
+
+    fn build_plan_with_sources(
+        &self,
+        ops: Vec<FileOp>,
+        summary: String,
+        internal: bool,
+        library_sources: Option<&BTreeMap<PathBuf, String>>,
+    ) -> AppResult<FilePlan> {
         let interrupted:i64=self.db.conn().query_row("SELECT count(*) FROM file_transactions WHERE status IN ('applying','rolling_back','recovery_failed')",[],|r|r.get(0))?;
         if interrupted > 0 {
             return Err(AppError::Denied(
                 "存在待恢复的文件事务，请先恢复一致状态".into(),
             ));
         }
-        if ops.is_empty() || ops.len() > 100_000 {
-            return Err(AppError::Invalid(
-                "文件操作数量应在 1 到 100000 之间".into(),
-            ));
+        if ops.is_empty() {
+            return Err(AppError::Invalid("文件计划至少需要一项操作".into()));
         }
         let mut entries = Vec::new();
-        // Inline text is part of the immutable plan and journal, so bound the total,
-        // not just each entry. No staging file is written while planning.
-        let mut text_bytes = 0usize;
-        let mut total_bytes = 0;
-        let mut touched: Vec<PathBuf> = Vec::new();
+        entries
+            .try_reserve_exact(ops.len())
+            .map_err(|_| AppError::Invalid("没有足够内存生成文件计划".into()))?;
+        let roots = self.roots()?;
+        let mut total_bytes = 0u64;
+        let mut touched = BTreeSet::new();
+        let mut destinations = BTreeSet::new();
         for op in ops {
             let inline_source = if let FileOp::WriteText { content, .. } = &op {
                 if !self.local_agent_files || internal {
                     return Err(AppError::Denied(
                         "只有桌面 Agent 的通用文件计划支持 write_text".into(),
                     ));
-                }
-                text_bytes = text_bytes.saturating_add(content.len());
-                if text_bytes > 1024 * 1024 {
-                    return Err(AppError::Invalid("单个计划的文本内容不能超过 1 MiB".into()));
                 }
                 Some(Fingerprint {
                     kind: "file".into(),
@@ -566,8 +631,23 @@ impl FileEngine {
             } else {
                 None
             };
-            let dst = self.guard(op.dst(), internal)?;
-            let src = op.src().map(|p| self.guard(p, internal)).transpose()?;
+            let dst = self.guard_with_roots(op.dst(), internal, &roots)?;
+            let src = if let Some(sources) = library_sources {
+                let FileOp::Copy { src, .. } = &op else {
+                    return Err(AppError::Denied("模组库安装仅支持复制已验证文件".into()));
+                };
+                if !sources.contains_key(src)
+                    || !src.starts_with(self.paths.mod_library())
+                    || dst.as_path() != op.dst()
+                {
+                    return Err(AppError::Denied("模组库安装的来源或目标路径已变化".into()));
+                }
+                Some(self.stable_path(src, true)?)
+            } else {
+                op.src()
+                    .map(|p| self.guard_with_roots(p, internal, &roots))
+                    .transpose()?
+            };
             let before = fingerprint(&dst)?;
             let source = src
                 .as_ref()
@@ -603,13 +683,14 @@ impl FileEngine {
                 modified.extend(src.iter().cloned());
             }
             for p in &modified {
-                if touched.iter().any(|q| p.starts_with(q) || q.starts_with(p)) {
+                if has_path_overlap(&touched, p) {
                     return Err(AppError::Conflict(
                         "同一计划不能重复修改或包含另一个操作路径".into(),
                     ));
                 }
             }
             touched.extend(modified);
+            destinations.insert(dst.clone());
             let operation = match op {
                 FileOp::Copy { .. } => FileOp::Copy {
                     src: src.unwrap(),
@@ -622,7 +703,9 @@ impl FileEngine {
                 FileOp::Mkdir { .. } => FileOp::Mkdir { dst },
                 FileOp::WriteText { content, .. } => FileOp::WriteText { dst, content },
             };
-            total_bytes += source.as_ref().map_or(0, |s| s.size);
+            total_bytes = total_bytes
+                .checked_add(source.as_ref().map_or(0, |s| s.size))
+                .ok_or_else(|| AppError::Invalid("文件计划的总字节数无法表示".into()))?;
             let impact = if before.is_some() {
                 "overwrite"
             } else if matches!(operation, FileOp::Move { .. }) {
@@ -641,9 +724,7 @@ impl FileEngine {
         // A source may not be written by a different entry in the same plan.
         for entry in &entries {
             if let Some(src) = entry.operation.src() {
-                if entries.iter().any(|e| {
-                    e.operation.dst().starts_with(src) || src.starts_with(e.operation.dst())
-                }) {
+                if has_path_overlap(&destinations, src) {
                     return Err(AppError::Conflict("复制源不能同时被本计划修改".into()));
                 }
             }
@@ -671,7 +752,7 @@ impl FileEngine {
         Self::persist_plan_kind(conn, plan, if internal { "internal" } else { "files" })
     }
 
-    fn persist_plan_kind(
+    pub(crate) fn persist_plan_kind(
         conn: &rusqlite::Connection,
         plan: &FilePlan,
         kind: &str,
@@ -748,12 +829,16 @@ impl FileEngine {
         if status != "approved" {
             return Err(AppError::Denied("计划尚未批准，或已执行".into()));
         }
-        self.for_transaction(&kind)?
-            .apply_approved(id, kind == "internal")
+        self.for_transaction(&kind)?.apply_approved(id, &kind)
     }
 
-    fn apply_approved(&self, id: &str, internal: bool) -> AppResult<FilePlan> {
+    fn apply_approved(&self, id: &str, kind: &str) -> AppResult<FilePlan> {
         let plan = self.get_plan(id)?;
+        let internal = kind == "internal";
+        let library_install = kind == crate::install::LIBRARY_INSTALL_KIND;
+        if library_install {
+            crate::install::validate_library_apply(self, &plan)?;
+        }
         crate::install::validate_apply(self, &plan)?;
         crate::plugin_workflow::validate_deployment_source(self, &plan)?;
         let mut evidence = Vec::with_capacity(plan.entries.len());
@@ -771,8 +856,8 @@ impl FileEngine {
             }
             let mut source = None;
             if let Some(src) = e.operation.src() {
-                self.stable_path(src, internal)?;
-                if matches!(e.operation, FileOp::Move { .. }) {
+                self.stable_path(src, internal || library_install)?;
+                if library_install || matches!(e.operation, FileOp::Move { .. }) {
                     source = Some(require_identity(src)?);
                 }
                 if fingerprint(src)? != e.source {
@@ -786,6 +871,7 @@ impl FileEngine {
         let mut journal = self.prepare_journal(&plan)?;
         self.save_journal(id, "applying", &journal)?;
         for (index, (entry, evidence)) in journal.iter_mut().zip(&evidence).enumerate() {
+            let operation = &plan.entries[index].operation;
             entry.state = "intent".into();
             self.save_entry(id, index, entry)?;
             #[cfg(test)]
@@ -794,10 +880,10 @@ impl FileEngine {
                     "injected filesystem failure",
                 )))
             } else {
-                self.execute_entry(id, index, entry, evidence)
+                self.execute_entry(id, index, operation, entry, evidence)
             };
             #[cfg(not(test))]
-            let result = self.execute_entry(id, index, entry, evidence);
+            let result = self.execute_entry(id, index, operation, entry, evidence);
             match result {
                 Ok(()) => {
                     entry.state = "done".into();
@@ -834,7 +920,20 @@ impl FileEngine {
                     parent = p.parent();
                 }
                 Ok(JournalEntry {
-                    entry: e.clone(),
+                    // Recovery uses fingerprints and rename ownership, never the
+                    // source text. Keep authored text in the approved plan only.
+                    entry: match &e.operation {
+                        FileOp::WriteText { dst, .. } => PlannedEntry {
+                            operation: FileOp::WriteText {
+                                dst: dst.clone(),
+                                content: String::new(),
+                            },
+                            before: e.before.clone(),
+                            source: e.source.clone(),
+                            impact: e.impact.clone(),
+                        },
+                        _ => e.clone(),
+                    },
                     backup: self.paths.backup_dir(id).join(format!("{i}.original")),
                     undo: self.retention_location(e.operation.dst(), id, &format!("{i}-undone"))?,
                     source_park: if matches!(e.operation, FileOp::Move { .. }) {
@@ -865,10 +964,10 @@ impl FileEngine {
         &self,
         id: &str,
         index: usize,
+        op: &FileOp,
         journal: &mut JournalEntry,
         evidence: &ApplyEvidence,
     ) -> AppResult<()> {
-        let op = journal.entry.operation.clone();
         self.stable_path(op.dst(), true)?;
         self.stable_path(&journal.backup, true)?;
         self.stable_path(&journal.undo, true)?;
@@ -920,7 +1019,7 @@ impl FileEngine {
                 self.record_rename(id, index, journal, step, false)?;
             }
         }
-        if let FileOp::Move { src, dst } = &op {
+        if let FileOp::Move { src, dst } = op {
             let identity = evidence
                 .source
                 .clone()
@@ -933,7 +1032,21 @@ impl FileEngine {
             }
         }
         let staged = staging("payload")?;
-        match &op {
+        match op {
+            FileOp::Copy { src, .. } if evidence.source.is_some() => {
+                // Library copies must remain unlinked even at the actual open,
+                // not only during preflight. The staged digest is checked below.
+                let mut input = safe_fs::open_regular(src)?;
+                safe_fs::verify_regular_at(&input, src)?;
+                if safe_fs::identity(src)? != evidence.source {
+                    return Err(AppError::Conflict("模组库复制源已被替换".into()));
+                }
+                let mut output = safe_fs::create_new(&staged)?;
+                std::io::copy(&mut input, &mut output)?;
+                safe_fs::verify_regular_at(&input, src)?;
+                output.set_permissions(input.metadata()?.permissions())?;
+                output.sync_all()?;
+            }
             FileOp::Copy { src, .. } => util::atomic_copy(src, &staged)?,
             FileOp::Move { src, .. } if src.is_dir() => util::copy_dir(src, &staged)?,
             FileOp::Move { src, .. } => util::atomic_copy(src, &staged)?,
@@ -964,7 +1077,7 @@ impl FileEngine {
                 .ok_or_else(|| AppError::Invalid("缺少跨磁盘保留路径".into()))?;
             self.stable_path(&park, true)?;
             create_parent(&park)?;
-            check_fingerprint(&src, &journal.entry.source)?;
+            check_fingerprint(src, &journal.entry.source)?;
             let step = JournalRename::move_to(
                 src.clone(),
                 park,
@@ -1029,13 +1142,47 @@ impl FileEngine {
         }
     }
 
+    // Active journals store individual entries to avoid rewriting the complete
+    // journal before/after each filesystem mutation. Terminal journals keep the
+    // historical JSON format used by storage relocation. An old binary fails
+    // closed on the active marker rather than treating the journal as empty.
+    fn decode_journal(
+        conn: &rusqlite::Connection,
+        id: &str,
+        json: &str,
+    ) -> AppResult<Vec<JournalEntry>> {
+        if !json.starts_with('{') {
+            return Ok(serde_json::from_str(json)?);
+        }
+        let active: ActiveJournal = serde_json::from_str(json)?;
+        let mut stmt = conn.prepare("SELECT seq,entry_json FROM file_transaction_journal WHERE transaction_id=?1 ORDER BY seq")?;
+        let rows = stmt.query_map([id], |row| {
+            Ok((row.get::<_, usize>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut journal = Vec::new();
+        for row in rows {
+            let (seq, json) = row?;
+            if seq != journal.len() || seq >= active.entry_count {
+                return Err(AppError::Conflict("文件事务日志条目不一致".into()));
+            }
+            journal.push(serde_json::from_str(&json)?);
+        }
+        if journal.len() != active.entry_count || journal.is_empty() {
+            return Err(AppError::Conflict("文件事务日志缺少条目".into()));
+        }
+        Ok(journal)
+    }
+
     fn save_entry(&self, id: &str, index: usize, entry: &JournalEntry) -> AppResult<()> {
         let mut conn = self.db.conn();
         let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE file_transactions SET journal_json=json_set(journal_json,?1,json(?2)) WHERE id=?3",
-            params![format!("$[{index}]"), serde_json::to_string(entry)?, id],
+        let updated = tx.execute(
+            "UPDATE file_transaction_journal SET entry_json=?1 WHERE transaction_id=?2 AND seq=?3",
+            params![serde_json::to_string(entry)?, id, index as i64],
         )?;
+        if updated != 1 {
+            return Err(AppError::Conflict("文件事务日志缺少条目".into()));
+        }
         tx.execute(
             "UPDATE file_transaction_entries SET result=?1 WHERE transaction_id=?2 AND seq=?3",
             params![entry.state, id, index as i64],
@@ -1047,33 +1194,57 @@ impl FileEngine {
     fn save_journal(&self, id: &str, status: &str, journal: &[JournalEntry]) -> AppResult<()> {
         let mut conn = self.db.conn();
         let tx = conn.transaction()?;
+        let terminal = matches!(status, "committed" | "rolled_back");
+        let json = if terminal {
+            serde_json::to_string(journal)?
+        } else {
+            serde_json::to_string(&ActiveJournal {
+                entry_count: journal.len(),
+            })?
+        };
         tx.execute(
             "UPDATE file_transactions SET status=?1,journal_json=?2,finished_at=?3 WHERE id=?4",
-            params![
-                status,
-                serde_json::to_string(journal)?,
-                if matches!(status, "committed" | "rolled_back") {
-                    Some(util::now())
-                } else {
-                    None
-                },
-                id
-            ],
+            params![status, json, terminal.then(util::now), id],
         )?;
-        for (i, j) in journal.iter().enumerate() {
-            tx.execute(
-                "DELETE FROM file_transaction_entries WHERE transaction_id=?1 AND seq=?2",
-                params![id, i as i64],
-            )?;
-            tx.execute("INSERT INTO file_transaction_entries (transaction_id,seq,op,src,dst,backup_path,result) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                params![id,i as i64,j.entry.operation.name(),j.entry.operation.src().map(|p|p.display().to_string()),j.entry.operation.dst().display().to_string(),j.backup.display().to_string(),j.state])?;
+        tx.execute(
+            "DELETE FROM file_transaction_journal WHERE transaction_id=?1",
+            [id],
+        )?;
+        tx.execute(
+            "DELETE FROM file_transaction_entries WHERE transaction_id=?1",
+            [id],
+        )?;
+        {
+            let mut history = tx.prepare("INSERT INTO file_transaction_entries (transaction_id,seq,op,src,dst,backup_path,result) VALUES (?1,?2,?3,?4,?5,?6,?7)")?;
+            let mut active = tx.prepare("INSERT INTO file_transaction_journal (transaction_id,seq,entry_json) VALUES (?1,?2,?3)")?;
+            for (i, j) in journal.iter().enumerate() {
+                history.execute(params![
+                    id,
+                    i as i64,
+                    j.entry.operation.name(),
+                    j.entry.operation.src().map(|p| p.display().to_string()),
+                    j.entry.operation.dst().display().to_string(),
+                    j.backup.display().to_string(),
+                    j.state
+                ])?;
+                if !terminal {
+                    active.execute(params![id, i as i64, serde_json::to_string(j)?])?;
+                }
+            }
         }
         tx.commit()?;
         Ok(())
     }
 
     pub fn rollback_transaction(&self, id: &str) -> AppResult<()> {
-        let _guard = lock();
+        self.rollback_transaction_locked(&lock(), id)
+    }
+
+    pub(crate) fn rollback_transaction_locked(
+        &self,
+        _guard: &MutexGuard<'static, ()>,
+        id: &str,
+    ) -> AppResult<()> {
         let purged: bool = self.db.conn().query_row("SELECT EXISTS(SELECT 1 FROM trash_items t JOIN trash_purges p ON p.item_id=t.id WHERE t.transaction_id=?1)",[id],|r|r.get(0))?;
         if purged {
             return Err(AppError::Conflict(
@@ -1095,7 +1266,7 @@ impl FileEngine {
         ) {
             return Err(AppError::Conflict("此事务尚未开始执行".into()));
         }
-        let mut journal: Vec<JournalEntry> = serde_json::from_str(&json)?;
+        let mut journal = Self::decode_journal(&self.db.conn(), id, &json)?;
         if status == "committed" {
             if crate::install::validate_rollback(&engine, id)? {
                 engine.validate_replacement_rollback_payloads(&journal)?;
@@ -1276,6 +1447,70 @@ pub(crate) mod tests {
         let game = game.canonicalize().unwrap();
         db.conn().execute("INSERT INTO games (id,name,slug,root_path,created_at,updated_at) VALUES ('g','Game','game',?1,'now','now')",[game.display().to_string()]).unwrap();
         (dir, FileEngine::new(db, paths), game)
+    }
+
+    #[test]
+    fn path_overlap_matches_bidirectional_prefix_not_similar_names() {
+        let paths = BTreeSet::from([PathBuf::from("root/foo/child"), PathBuf::from("root/bar")]);
+        for overlaps in ["root", "root/foo", "root/foo/child", "root/bar/child"] {
+            assert!(has_path_overlap(&paths, Path::new(overlaps)), "{overlaps}");
+        }
+        for disjoint in ["other", "root/fo", "root/foo/childish", "root/ba"] {
+            assert!(!has_path_overlap(&paths, Path::new(disjoint)), "{disjoint}");
+        }
+    }
+
+    #[test]
+    fn plans_more_than_one_hundred_thousand_local_operations() {
+        let (_dir, engine, game) = setup();
+        let ops = (0..100_001)
+            .map(|index| FileOp::Mkdir {
+                dst: game.join(format!("folder-{index}")),
+            })
+            .collect();
+        let plan = engine
+            .plan_file_ops(ops, "large reviewed preview".into())
+            .unwrap();
+        assert_eq!(plan.entries.len(), 100_001);
+        assert_eq!(engine.get_plan(&plan.id).unwrap().entries.len(), 100_001);
+        assert!(!game.join("folder-100000").exists());
+    }
+
+    #[test]
+    fn local_agent_large_utf8_text_is_reviewed_applied_and_rolled_back() {
+        let (_dir, managed, game) = setup();
+        let engine = managed.for_local_agent();
+        let original = game.join("existing.txt");
+        let created = game.join("new.txt");
+        fs::write(&original, "original").unwrap();
+        let text = "文本变化\n".repeat(48 * 1024);
+        assert!(text.len() < 1024 * 1024 && text.len() * 2 > 1024 * 1024);
+        let ops = vec![
+            FileOp::WriteText {
+                dst: original.clone(),
+                content: text.clone(),
+            },
+            FileOp::WriteText {
+                dst: created.clone(),
+                content: text.clone(),
+            },
+        ];
+        assert!(managed
+            .plan_file_ops(ops.clone(), "not Agent".into())
+            .is_err());
+        let plan = engine.plan_file_ops(ops, "large texts".into()).unwrap();
+        assert!(plan.requires_review);
+        assert!(!created.exists());
+        assert!(engine.apply_file_ops(&plan.id).is_err());
+        engine.approve_plan(&plan.id).unwrap();
+        assert!(managed.apply_file_ops(&plan.id).is_err());
+        engine.apply_file_ops(&plan.id).unwrap();
+        assert_eq!(fs::read_to_string(&original).unwrap(), text);
+        assert_eq!(fs::read_to_string(&created).unwrap(), text);
+        assert!(managed.rollback_transaction(&plan.id).is_err());
+        engine.rollback_transaction(&plan.id).unwrap();
+        assert_eq!(fs::read_to_string(&original).unwrap(), "original");
+        assert!(!created.exists());
     }
 
     #[test]
@@ -1460,8 +1695,14 @@ pub(crate) mod tests {
             original: Some(require_identity(&dst).unwrap()),
             source: None,
         };
-        e.execute_entry(&p.id, 0, &mut journal[0], &evidence)
-            .unwrap();
+        e.execute_entry(
+            &p.id,
+            0,
+            &p.entries[0].operation,
+            &mut journal[0],
+            &evidence,
+        )
+        .unwrap();
         let restarted = FileEngine::new(
             Db::open(&e.paths.db_file()).unwrap(),
             e.paths.as_ref().clone(),

@@ -690,3 +690,38 @@ async fn archive_selection_is_not_an_agent_tool_and_import_plans_need_review() {
     assert!(PermissionMode::AutoApprove.needs_approval(prepared.effect));
     assert!(!preview.artifact_path.exists());
 }
+
+#[test]
+fn only_a_committed_picker_import_can_be_published_to_the_game_library() {
+    let (_temp, engine, source) = setup();
+    let game_root = source.parent().unwrap().join("Fixture game");
+    fs::create_dir(&game_root).unwrap();
+    let game = games::register_game(&engine.db, &game_root, None).unwrap();
+    let import = plan_import_archive(&engine, &source).unwrap();
+    assert!(register_imported_mod(&engine, &game.id, &import.plan.id).is_err());
+    engine.approve_plan(&import.plan.id).unwrap();
+    engine.apply_file_ops(&import.plan.id).unwrap();
+    let entry = register_imported_mod(&engine, &game.id, &import.plan.id).unwrap();
+    assert_eq!(entry.sha256, import.sha256);
+    assert_eq!(entry.filename, "Example.jar");
+    let archive = engine.paths.root.join(&entry.archive_relative_path);
+    assert_eq!(fs::read(&archive).unwrap(), fs::read(&source).unwrap());
+    assert_eq!(
+        register_imported_mod(&engine, &game.id, &import.plan.id)
+            .unwrap()
+            .id,
+        entry.id
+    );
+    let unrelated = engine
+        .plan_file_ops(
+            vec![FileOp::Copy {
+                src: import.artifact_path,
+                dst: engine.paths.staging().join("unrelated.jar"),
+            }],
+            "Import local archive Example.jar".into(),
+        )
+        .unwrap();
+    engine.approve_plan(&unrelated.id).unwrap();
+    engine.apply_file_ops(&unrelated.id).unwrap();
+    assert!(register_imported_mod(&engine, &game.id, &unrelated.id).is_err());
+}

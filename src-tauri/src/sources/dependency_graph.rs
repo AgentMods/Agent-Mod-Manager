@@ -1,23 +1,27 @@
-//! Bounded, advisory closure of required Modrinth version declarations.
-use super::{array, modrinth_dependencies, modrinth_matches, Provider};
+//! Advisory closure of required Modrinth version declarations with bounded work.
+use super::{array, http::graph_api_client, modrinth_matches, Provider};
 use crate::{
+    agent::sse::response_payload_capacity,
     error::{AppError, AppResult},
-    sources::{modrinth_id, DependencyType, ModDependency},
+    sources::{
+        modrinth_id, valid_modrinth_dependencies, DependencyType, ModDependency,
+        MAX_MODRINTH_DEPENDENCIES,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
+    future::Future,
     sync::Arc,
-    time::Duration,
 };
-use tokio::time::{timeout_at, Instant};
+use tokio_util::sync::CancellationToken;
 
-const MAX_NODES: usize = 32;
-const MAX_DEPTH: usize = 8;
-const MAX_EDGES: usize = 256;
-const MAX_LOOKUPS: usize = 48;
+// These limit representative evidence, not the graph traversal.
 const MAX_CHOICES: usize = 5;
-const DEADLINE: Duration = Duration::from_secs(25);
+const MAX_INCOMPATIBLE_WITNESSES: usize = 5;
+// The decoded version metadata is only part of live graph memory: traversal
+// also retains indices, edges, selected IDs, and a serializable result.
+const PROJECTION_OVERHEAD: usize = 4;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -33,9 +37,6 @@ pub struct DependencyGraphRequest {
 
 impl DependencyGraphRequest {
     pub(in crate::sources) fn validate_pins(&self) -> AppResult<()> {
-        if self.project_pins.len() > MAX_NODES {
-            return Err(AppError::Invalid("依赖图指定版本数量超出上限".into()));
-        }
         for (project, version) in &self.project_pins {
             modrinth_id(project)?;
             modrinth_id(version)?;
@@ -125,6 +126,7 @@ enum GraphIssue {
     DeclaredIncompatible {
         from_version_id: String,
         version_ids: Vec<String>,
+        match_count: usize,
     },
 }
 
@@ -133,6 +135,27 @@ struct VersionMetadata {
     version_id: String,
     compatible: bool,
     declarations: Option<Vec<ModDependency>>,
+}
+
+impl VersionMetadata {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.project_id.len()
+            + self.version_id.len()
+            + self.declarations.as_ref().map_or(0, |rows| {
+                rows.capacity() * std::mem::size_of::<ModDependency>()
+                    + rows
+                        .iter()
+                        .map(|row| {
+                            [&row.project_id, &row.version_id, &row.file_name]
+                                .into_iter()
+                                .flatten()
+                                .map(String::capacity)
+                                .sum::<usize>()
+                        })
+                        .sum::<usize>()
+            })
+    }
 }
 
 #[derive(Clone)]
@@ -144,12 +167,13 @@ struct ProjectChoices {
 struct GraphBuilder<'a> {
     provider: &'a Provider,
     request: &'a DependencyGraphRequest,
-    deadline: Instant,
-    lookups: usize,
+    client: reqwest::Client,
+    cancel: &'a CancellationToken,
+    metadata_bytes_left: usize,
     truncated: bool,
     exact_cache: HashMap<String, Result<Arc<VersionMetadata>, EdgeState>>,
     choice_cache: HashMap<String, Result<ProjectChoices, EdgeState>>,
-    selected: Vec<(Arc<VersionMetadata>, usize)>,
+    selected: Vec<Arc<VersionMetadata>>,
     index: HashMap<String, usize>,
     edges: Vec<DependencyEdge>,
 }
@@ -158,11 +182,28 @@ impl Provider {
     pub(super) async fn modrinth_graph(
         &self,
         request: &DependencyGraphRequest,
+        cancel: &CancellationToken,
     ) -> AppResult<DependencyGraph> {
-        let deadline = Instant::now() + DEADLINE;
-        let root = timeout_at(deadline, self.graph_version(request, &request.version_id))
-            .await
-            .map_err(|_| AppError::Other("获取根版本依赖元数据超时".into()))??;
+        self.modrinth_graph_with_budget(
+            request,
+            cancel,
+            response_payload_capacity() / PROJECTION_OVERHEAD,
+        )
+        .await
+    }
+
+    pub(in crate::sources) async fn modrinth_graph_with_budget(
+        &self,
+        request: &DependencyGraphRequest,
+        cancel: &CancellationToken,
+        metadata_budget: usize,
+    ) -> AppResult<DependencyGraph> {
+        let client = graph_api_client()?;
+        let root = cancellable(
+            cancel,
+            self.graph_version(&client, request, &request.version_id),
+        )
+        .await?;
         if !root.compatible
             || request
                 .project_id
@@ -173,30 +214,42 @@ impl Provider {
                 "根版本与项目 ID 或所选 Minecraft 版本和加载器不符".into(),
             ));
         }
+        let mut root = root;
+        let root_bytes = root.retained_bytes();
+        let truncated = root_bytes > metadata_budget;
+        if truncated {
+            root.declarations = None;
+        }
+        let metadata_bytes_left = metadata_budget.saturating_sub(root_bytes);
         let root_id = root.version_id.clone();
         let root = Arc::new(root);
         let mut builder = GraphBuilder {
             provider: self,
             request,
-            deadline,
-            lookups: 1,
-            truncated: false,
+            client,
+            cancel,
+            metadata_bytes_left,
+            truncated,
             exact_cache: HashMap::from([(root_id.clone(), Ok(root.clone()))]),
             choice_cache: HashMap::new(),
-            selected: vec![(root, 0)],
+            selected: vec![root],
             index: HashMap::from([(root_id, 0)]),
             edges: Vec::new(),
         };
-        builder.walk().await;
-        Ok(builder.finish())
+        builder.walk().await?;
+        builder.finish().await
     }
 
     async fn graph_version(
         &self,
+        client: &reqwest::Client,
         request: &DependencyGraphRequest,
         version_id: &str,
     ) -> AppResult<VersionMetadata> {
-        let version = self.modrinth_exact_version(version_id).await?;
+        let version_id = modrinth_id(version_id)?;
+        let version = self
+            .fetch_json(client.get(format!("https://api.modrinth.com/v2/version/{version_id}")))
+            .await?;
         if version["id"].as_str() != Some(version_id) {
             return Err(AppError::Other("Modrinth 返回的版本 ID 与查询不符".into()));
         }
@@ -205,17 +258,38 @@ impl Provider {
             project_id: project_id.into(),
             version_id: version_id.into(),
             compatible: graph_compatibility(&version, request)?,
-            declarations: modrinth_dependencies(&version),
+            declarations: version.get("dependencies").and_then(|value| {
+                let rows = Vec::<ModDependency>::deserialize(value).ok()?;
+                // Reuse direct-dependency item validation without imposing the
+                // direct tool's per-input list quota on a provider response.
+                rows.chunks(MAX_MODRINTH_DEPENDENCIES)
+                    .all(valid_modrinth_dependencies)
+                    .then_some(rows)
+            }),
         })
     }
 
     async fn graph_choices(
         &self,
+        client: &reqwest::Client,
         request: &DependencyGraphRequest,
         project: &str,
     ) -> AppResult<ProjectChoices> {
+        let version_filters = [
+            (
+                "game_versions",
+                serde_json::to_string(&[&request.game_version])?,
+            ),
+            ("loaders", serde_json::to_string(&[&request.loader])?),
+        ];
         let list = self
-            .modrinth_project_versions(project, Some(&request.game_version), Some(&request.loader))
+            .fetch_json(
+                client
+                    .get(format!(
+                        "https://api.modrinth.com/v2/project/{project}/version"
+                    ))
+                    .query(&version_filters),
+            )
             .await?;
         let mut seen = HashMap::new();
         let mut candidates = Vec::new();
@@ -248,13 +322,43 @@ impl Provider {
     }
 }
 
+fn check_cancel(cancel: &CancellationToken) -> AppResult<()> {
+    if cancel.is_cancelled() {
+        Err(AppError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+async fn checkpoint(cancel: &CancellationToken, step: usize) -> AppResult<()> {
+    if step.is_multiple_of(256) {
+        tokio::task::yield_now().await;
+        check_cancel(cancel)?;
+    }
+    Ok(())
+}
+
+async fn cancellable<T>(
+    cancel: &CancellationToken,
+    work: impl Future<Output = AppResult<T>>,
+) -> AppResult<T> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(AppError::Cancelled),
+        result = work => {
+            check_cancel(cancel)?;
+            result
+        },
+    }
+}
+
 fn graph_compatibility(
     version: &serde_json::Value,
     request: &DependencyGraphRequest,
 ) -> AppResult<bool> {
     for key in ["game_versions", "loaders"] {
         let filters = array(&version[key])?;
-        if filters.len() > 1024 || filters.iter().any(|value| !value.is_string()) {
+        if filters.iter().any(|value| !value.is_string()) {
             return Err(AppError::Other("Modrinth 版本的兼容声明无效".into()));
         }
     }
@@ -266,15 +370,24 @@ fn graph_compatibility(
 }
 
 impl GraphBuilder<'_> {
-    async fn walk(&mut self) {
-        // Nodes are appended in discovery order, so a shared node is visited at its shortest depth.
+    async fn walk(&mut self) -> AppResult<()> {
+        // The append-only node list also acts as a FIFO. Each exact version
+        // enters it once, regardless of diamonds or cycles in declarations.
         let mut cursor = 0;
-        while let Some((node, depth)) = self.selected.get(cursor).cloned() {
+        while let Some(node) = self.selected.get(cursor).cloned() {
             cursor += 1;
+            let mut seen = HashSet::new();
             for declaration in node.declarations.iter().flatten() {
-                if self.edges.len() == MAX_EDGES {
-                    self.truncated = true;
-                    return;
+                // Keep the cached/CPU-only path cooperatively cancellable too.
+                tokio::task::yield_now().await;
+                check_cancel(self.cancel)?;
+                if !seen.insert((
+                    declaration.dependency_type as u8,
+                    &declaration.project_id,
+                    &declaration.version_id,
+                    &declaration.file_name,
+                )) {
+                    continue;
                 }
                 let mut edge = DependencyEdge {
                     from_version_id: node.version_id.clone(),
@@ -284,17 +397,24 @@ impl GraphBuilder<'_> {
                     candidates: Vec::new(),
                 };
                 if declaration.dependency_type == DependencyType::Required {
-                    edge.state = match self.follow(&mut edge, depth + 1).await {
+                    edge.state = match self.follow(&mut edge).await {
                         Ok(()) => EdgeState::Selected,
-                        Err(state) => state,
+                        Err(state) => {
+                            check_cancel(self.cancel)?;
+                            state
+                        }
                     };
                 }
                 self.edges.push(edge);
+                if self.truncated {
+                    return Ok(());
+                }
             }
         }
+        check_cancel(self.cancel)
     }
 
-    async fn follow(&mut self, edge: &mut DependencyEdge, depth: usize) -> Result<(), EdgeState> {
+    async fn follow(&mut self, edge: &mut DependencyEdge) -> Result<(), EdgeState> {
         let project = edge.declaration.project_id.as_deref();
         let pin = edge
             .declaration
@@ -304,9 +424,6 @@ impl GraphBuilder<'_> {
         let version = if let Some(version) = pin {
             version.clone()
         } else if let Some(project) = project {
-            if !self.choice_cache.contains_key(project) {
-                self.check_room(depth)?;
-            }
             let choices = self.choices(project).await?;
             edge.candidates = choices.candidates;
             if edge.candidates.is_empty() {
@@ -320,40 +437,19 @@ impl GraphBuilder<'_> {
             return Err(EdgeState::ReferenceOnly);
         };
 
-        let version_metadata = if let Some(index) = self.index.get(&version) {
-            self.selected[*index].0.clone()
-        } else {
-            self.check_room(depth)?;
-            self.lookup(&version).await?
-        };
+        let version_metadata = self.lookup(&version).await?;
         if project.is_some_and(|id| id != version_metadata.project_id) {
             return Err(EdgeState::ProjectMismatch);
         }
         if !version_metadata.compatible {
             return Err(EdgeState::IncompatibleVersion);
         }
-        if !self.index.contains_key(&version) {
-            self.index.insert(version.clone(), self.selected.len());
-            self.selected.push((version_metadata, depth));
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.index.entry(version.clone())
+        {
+            entry.insert(self.selected.len());
+            self.selected.push(version_metadata);
         }
         edge.selected_version_id = Some(version);
-        Ok(())
-    }
-
-    fn check_room(&mut self, depth: usize) -> Result<(), EdgeState> {
-        if depth > MAX_DEPTH || self.selected.len() == MAX_NODES {
-            self.truncated = true;
-            return Err(EdgeState::LimitReached);
-        }
-        Ok(())
-    }
-
-    fn begin_lookup(&mut self) -> Result<(), EdgeState> {
-        if self.lookups == MAX_LOOKUPS || Instant::now() >= self.deadline {
-            self.truncated = true;
-            return Err(EdgeState::LimitReached);
-        }
-        self.lookups += 1;
         Ok(())
     }
 
@@ -361,19 +457,26 @@ impl GraphBuilder<'_> {
         if let Some(cached) = self.exact_cache.get(version) {
             return cached.clone();
         }
-        self.begin_lookup()?;
-        let result = match timeout_at(
-            self.deadline,
-            self.provider.graph_version(self.request, version),
+        let result = match cancellable(
+            self.cancel,
+            self.provider
+                .graph_version(&self.client, self.request, version),
         )
         .await
         {
-            Ok(Ok(metadata)) => Ok(Arc::new(metadata)),
-            Ok(Err(_)) => Err(EdgeState::MetadataUnavailable),
-            Err(_) => {
-                self.truncated = true;
-                Err(EdgeState::LimitReached)
+            Ok(metadata) => {
+                if let Some(left) = self
+                    .metadata_bytes_left
+                    .checked_sub(metadata.retained_bytes())
+                {
+                    self.metadata_bytes_left = left;
+                    Ok(Arc::new(metadata))
+                } else {
+                    self.truncated = true;
+                    Err(EdgeState::LimitReached)
+                }
             }
+            Err(_) => Err(EdgeState::MetadataUnavailable),
         };
         self.exact_cache.insert(version.into(), result.clone());
         result
@@ -383,35 +486,29 @@ impl GraphBuilder<'_> {
         if let Some(cached) = self.choice_cache.get(project) {
             return cached.clone();
         }
-        self.begin_lookup()?;
-        let result = match timeout_at(
-            self.deadline,
-            self.provider.graph_choices(self.request, project),
+        let result = cancellable(
+            self.cancel,
+            self.provider
+                .graph_choices(&self.client, self.request, project),
         )
         .await
-        {
-            Ok(Ok(choices)) => Ok(choices),
-            Ok(Err(_)) => Err(EdgeState::MetadataUnavailable),
-            Err(_) => {
-                self.truncated = true;
-                Err(EdgeState::LimitReached)
-            }
-        };
+        .map_err(|_| EdgeState::MetadataUnavailable);
         self.choice_cache.insert(project.into(), result.clone());
         result
     }
 
-    fn finish(self) -> DependencyGraph {
-        let nodes: Vec<_> = self
-            .selected
-            .iter()
-            .map(|(version, _)| DependencyNode {
+    async fn finish(self) -> AppResult<DependencyGraph> {
+        let mut nodes = Vec::with_capacity(self.selected.len());
+        for (step, version) in self.selected.iter().enumerate() {
+            checkpoint(self.cancel, step).await?;
+            nodes.push(DependencyNode {
                 project_id: version.project_id.clone(),
                 version_id: version.version_id.clone(),
                 declarations_known: version.declarations.is_some(),
-            })
-            .collect();
-        let issues = graph_issues(&nodes, &self.edges, &self.index);
+            });
+        }
+        let issues = graph_issues(&nodes, &self.edges, &self.index, self.cancel).await?;
+        check_cancel(self.cancel)?;
         let complete = !self.truncated
             && issues.is_empty()
             && nodes.iter().all(|node| node.declarations_known)
@@ -419,101 +516,176 @@ impl GraphBuilder<'_> {
                 edge.declaration.dependency_type != DependencyType::Required
                     || edge.state == EdgeState::Selected
             });
-        DependencyGraph {
+        Ok(DependencyGraph {
             root_version_id: self.request.version_id.clone(),
             complete,
             truncated: self.truncated,
             nodes,
             edges: self.edges,
             issues,
-        }
+        })
     }
 }
 
-fn graph_issues(
+async fn graph_issues(
     nodes: &[DependencyNode],
     edges: &[DependencyEdge],
     index: &HashMap<String, usize>,
-) -> Vec<GraphIssue> {
+    cancel: &CancellationToken,
+) -> AppResult<Vec<GraphIssue>> {
     let mut issues = Vec::new();
     let mut by_project: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for node in nodes {
+    for (step, node) in nodes.iter().enumerate() {
+        checkpoint(cancel, step).await?;
         by_project
             .entry(&node.project_id)
             .or_default()
             .push(node.version_id.clone());
     }
-    for (project_id, version_ids) in by_project {
+    for (step, (&project_id, version_ids)) in by_project.iter().enumerate() {
+        checkpoint(cancel, step).await?;
         if version_ids.len() > 1 {
             issues.push(GraphIssue::ConflictingVersions {
                 project_id: project_id.into(),
-                version_ids,
+                version_ids: version_ids.clone(),
             });
         }
     }
 
     let mut adjacency = vec![Vec::new(); nodes.len()];
-    for edge in edges {
+    let mut distinct = HashSet::new();
+    for (step, edge) in edges.iter().enumerate() {
+        checkpoint(cancel, step).await?;
         if let Some(to) = &edge.selected_version_id {
-            let destinations = &mut adjacency[index[&edge.from_version_id]];
-            if !destinations.contains(&index[to]) {
-                destinations.push(index[to]);
+            let pair = (index[&edge.from_version_id], index[to]);
+            if distinct.insert(pair) {
+                adjacency[pair.0].push(pair.1);
             }
         } else if edge.declaration.dependency_type == DependencyType::Incompatible {
             let project = edge.declaration.project_id.as_deref();
             let version = edge.declaration.version_id.as_deref();
-            if project.is_none() && version.is_none() {
+            let (version_ids, match_count) = if let Some(id) = version {
+                let Some(&node) = index.get(id) else { continue };
+                if project.is_some_and(|project| project != nodes[node].project_id) {
+                    continue;
+                }
+                (vec![id.into()], 1)
+            } else if let Some(versions) = project.and_then(|id| by_project.get(id)) {
+                (
+                    versions
+                        .iter()
+                        .take(MAX_INCOMPATIBLE_WITNESSES)
+                        .cloned()
+                        .collect(),
+                    versions.len(),
+                )
+            } else {
                 continue;
-            }
-            let version_ids: Vec<_> = nodes
-                .iter()
-                .filter(|node| {
-                    project.is_none_or(|id| id == node.project_id)
-                        && version.is_none_or(|id| id == node.version_id)
-                })
-                .map(|node| node.version_id.clone())
-                .collect();
-            if !version_ids.is_empty() {
-                issues.push(GraphIssue::DeclaredIncompatible {
-                    from_version_id: edge.from_version_id.clone(),
-                    version_ids,
-                });
-            }
+            };
+            issues.push(GraphIssue::DeclaredIncompatible {
+                from_version_id: edge.from_version_id.clone(),
+                version_ids,
+                match_count,
+            });
         }
     }
 
-    // DFS on at most MAX_NODES; a back edge points into the active path, not merely a shared child.
-    fn visit(
-        node: usize,
-        adjacency: &[Vec<usize>],
-        active: &mut Vec<usize>,
-        visited: &mut [bool],
-        nodes: &[DependencyNode],
-        issues: &mut Vec<GraphIssue>,
-    ) {
-        visited[node] = true;
-        active.push(node);
-        for &next in &adjacency[node] {
-            if let Some(start) = active.iter().position(|&ancestor| ancestor == next) {
-                let version_ids = active[start..]
-                    .iter()
-                    .chain(std::iter::once(&next))
-                    .map(|&id| nodes[id].version_id.clone())
-                    .collect();
-                issues.push(GraphIssue::Cycle { version_ids });
-            } else if !visited[next] {
-                visit(next, adjacency, active, visited, nodes, issues);
+    // Enumerating closed paths in a dense cyclic graph would amplify the
+    // result. A closed witness is sufficient; all observed edges remain in
+    // the graph. Mark the active path separately from already explored nodes
+    // so a shared child in a DAG is not a cycle.
+    if let Some(cycle) = cycle_witness(&adjacency, cancel).await? {
+        issues.push(GraphIssue::Cycle {
+            version_ids: cycle
+                .into_iter()
+                .map(|id| nodes[id].version_id.clone())
+                .collect(),
+        });
+    }
+    Ok(issues)
+}
+
+async fn cycle_witness(
+    adjacency: &[Vec<usize>],
+    cancel: &CancellationToken,
+) -> AppResult<Option<Vec<usize>>> {
+    let mut visited = vec![false; adjacency.len()];
+    let mut active = vec![None; adjacency.len()];
+    let mut stack = Vec::new();
+    let mut step = 0;
+    for start in 0..adjacency.len() {
+        checkpoint(cancel, start).await?;
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        active[start] = Some(0);
+        stack.push((start, adjacency[start].iter()));
+        while let Some((node, neighbors)) = stack.last_mut() {
+            checkpoint(cancel, step).await?;
+            step += 1;
+            if let Some(&next) = neighbors.next() {
+                if let Some(position) = active[next] {
+                    return Ok(Some(
+                        stack[position..]
+                            .iter()
+                            .map(|(node, _)| *node)
+                            .chain(std::iter::once(next))
+                            .collect(),
+                    ));
+                }
+                if !visited[next] {
+                    visited[next] = true;
+                    active[next] = Some(stack.len());
+                    stack.push((next, adjacency[next].iter()));
+                }
+            } else {
+                active[*node] = None;
+                stack.pop();
             }
         }
-        active.pop();
     }
-    visit(
-        0,
-        &adjacency,
-        &mut Vec::new(),
-        &mut vec![false; nodes.len()],
-        nodes,
-        &mut issues,
-    );
-    issues
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_stalled_lookup_is_dropped_when_the_user_cancels() {
+        struct OnDrop<'a>(&'a std::cell::Cell<bool>);
+        impl Drop for OnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let dropped = std::cell::Cell::new(false);
+        let guard = OnDrop(&dropped);
+        let cancel = CancellationToken::new();
+        let stalled = async {
+            let _guard = guard;
+            let sent = cancel.clone();
+            tokio::spawn(async move { sent.cancel() });
+            std::future::pending::<AppResult<()>>().await
+        };
+        assert!(matches!(
+            cancellable(&cancel, stalled).await,
+            Err(AppError::Cancelled)
+        ));
+        assert!(dropped.get());
+    }
+
+    #[tokio::test]
+    async fn cycle_analysis_is_iterative_even_for_long_paths() {
+        let cancel = CancellationToken::new();
+        let count = 30_000;
+        let mut chain: Vec<Vec<usize>> = (1..count).map(|next| vec![next]).collect();
+        chain.push(vec![]);
+        assert!(cycle_witness(&chain, &cancel).await.unwrap().is_none());
+        chain[count - 1].push(0);
+        let witness = cycle_witness(&chain, &cancel).await.unwrap().unwrap();
+        assert_eq!(witness.len(), count + 1);
+        assert_eq!(witness.first(), witness.last());
+    }
 }

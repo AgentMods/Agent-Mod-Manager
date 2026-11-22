@@ -119,7 +119,7 @@ impl Provider {
     async fn three_dm_page(
         &self,
         q: &SearchQuery,
-        page: u32,
+        page: u64,
         game: Option<u64>,
     ) -> AppResult<Vec<ModSummary>> {
         let mut request = self.get(format!("{API}/mods")).query(&[
@@ -132,8 +132,7 @@ impl Provider {
             request = request.query(&[("gameId", game)]);
         }
         let data = self.three_dm_data(request).await?;
-        if data["page"].as_u64() != Some(page as u64)
-            || data["pageSize"].as_u64() != Some(q.limit as u64)
+        if data["page"].as_u64() != Some(page) || data["pageSize"].as_u64() != Some(q.limit as u64)
         {
             return Err(invalid());
         }
@@ -167,9 +166,9 @@ impl Provider {
     }
 
     pub(super) async fn three_dm_search(&self, q: &SearchQuery) -> AppResult<SearchResult> {
-        if q.query.chars().count() > 100 || q.limit == 0 || q.limit > 100 || q.offset > 10_000 {
+        if q.query.chars().count() > 100 || q.limit == 0 || q.limit > 100 {
             return Err(AppError::Invalid(
-                "3DM 搜索最多 100 字，limit 1..100，offset <=10000".into(),
+                "3DM 搜索最多 100 字，limit 1..100".into(),
             ));
         }
         let game = q.game_ids.get("3dm").map(|g| request_id(g)).transpose()?;
@@ -179,7 +178,7 @@ impl Provider {
                 "3DM 未提供可核验的游戏版本/加载器筛选；请移除筛选后人工核对兼容性",
             ));
         }
-        let page = q.offset / q.limit + 1;
+        let page = u64::from(q.offset / q.limit) + 1;
         let skip = (q.offset % q.limit) as usize;
         let rows = self.three_dm_page(q, page, game).await?;
         let full_page = rows.len() == q.limit as usize;

@@ -3,6 +3,7 @@ use crate::{
     error::{AppError, AppResult},
     plugin_publish::{self as provenance, PublicationFile, PublicationSource},
     plugins,
+    publication_copy::PublicationListing,
     settings::Settings,
     transaction::FileEngine,
     util,
@@ -14,6 +15,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use tokio_util::sync::CancellationToken;
 
+#[path = "manager_publication_auto.rs"]
+mod automatic;
 #[path = "manager_publication_remote.rs"]
 mod remote;
 #[cfg(test)]
@@ -21,8 +24,10 @@ mod remote;
 mod tests;
 
 pub use crate::plugin_publish_remote::ReconciliationOutcome;
+pub use automatic::prepare_automatic;
+#[cfg(test)]
+pub(crate) use automatic::{prepare_automatic_with, publish_automatic_with};
 
-const MAX_PREVIEW_BYTES: usize = 3 * 1024 * 1024;
 const PAGE_LIMIT: u32 = 100;
 const RECONCILE_PAGES: u32 = 5;
 const MAX_SAFE_ID: i64 = 9_007_199_254_740_991;
@@ -59,6 +64,14 @@ pub struct PublicationPreview {
     pub files: [PublicationFile; 2],
     pub destination: String,
     pub digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing: Option<PublicationListing>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    snapshot: Option<automatic::Snapshot>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -106,6 +119,7 @@ pub struct PublicationRecord {
     pub updated_at: String,
 }
 
+#[cfg(test)]
 pub fn prepare_draft(
     engine: &FileEngine,
     draft_id: &str,
@@ -113,10 +127,11 @@ pub fn prepare_draft(
     tags: Vec<String>,
 ) -> AppResult<PublicationRecord> {
     provenance::with_draft_source(engine, draft_id, |source, slug, files| {
-        create(engine, preview(source, slug, files, target, tags)?)
+        create(engine, &preview(source, slug, files, target, tags)?)
     })
 }
 
+#[cfg(test)]
 pub fn prepare_installed(
     engine: &FileEngine,
     slug: &str,
@@ -124,7 +139,7 @@ pub fn prepare_installed(
     tags: Vec<String>,
 ) -> AppResult<PublicationRecord> {
     provenance::with_installed_source(engine, slug, |source, slug, files| {
-        create(engine, preview(source, slug, files, target, tags)?)
+        create(engine, &preview(source, slug, files, target, tags)?)
     })
 }
 
@@ -163,6 +178,7 @@ fn unavailable() -> AppError {
     AppError::Other("无法核实 Mod 客栈管理器插件响应".into())
 }
 
+#[cfg(test)]
 fn preview(
     source: PublicationSource,
     slug: &str,
@@ -170,71 +186,90 @@ fn preview(
     target: PublicationTarget,
     tags: Vec<String>,
 ) -> AppResult<PublicationPreview> {
-    if target.plugin_id().is_some_and(|id| !valid_id(id)) || tags_set(&tags).is_none() {
-        return Err(invalid("管理器插件 ID 或标签无效"));
-    }
-    if tags.iter().map(String::len).sum::<usize>() > 64 * 1024 {
-        return Err(invalid("管理器插件标签总大小超过限制"));
-    }
-    for ((file, name), limit) in files
-        .iter()
-        .zip(["adapter.json", "SKILL.md"])
-        .zip([provenance::ADAPTER_LIMIT, provenance::SKILL_LIMIT])
-    {
-        if file.name != name
-            || file.size != file.text.len() as u64
-            || file.text.len() > limit
-            || file.sha256 != hex::encode(Sha256::digest(file.text.as_bytes()))
-        {
-            return Err(stale());
-        }
-    }
     let version = plugins::parse_package(slug, &files[0].text, &files[1].text)?
         .adapter
         .version;
-    let destination = provenance::DESTINATION.to_owned();
-    let mut hash = Sha256::new();
-    hash.update(b"amm.manager-plugin-publication.v1\0");
-    hash.update(serde_json::to_vec(&(
-        &source,
-        target,
-        slug,
-        &version,
-        &tags,
-        &files,
-        &destination,
-    ))?);
-    Ok(PublicationPreview {
+    let mut preview = PublicationPreview {
         source,
         target,
         slug: slug.into(),
         version,
         tags,
         files,
-        destination,
-        digest: hex::encode(hash.finalize()),
-    })
+        destination: provenance::DESTINATION.into(),
+        digest: String::new(),
+        listing: None,
+        original_version: None,
+        remote_version: None,
+        snapshot: None,
+    };
+    preview.digest = preview.checked_digest()?;
+    Ok(preview)
 }
 
-fn with_current_source<T>(
-    engine: &FileEngine,
-    observed: &PublicationRecord,
-    f: impl FnOnce() -> AppResult<T>,
-) -> AppResult<T> {
-    let check = |source, slug: &str, files| {
-        let fresh = preview(
-            source,
-            slug,
-            files,
-            observed.preview.target,
-            observed.preview.tags.clone(),
-        )?;
-        if fresh != observed.preview {
+impl PublicationPreview {
+    fn checked_digest(&self) -> AppResult<String> {
+        if self.target.plugin_id().is_some_and(|id| !valid_id(id))
+            || tags_set(&self.tags).is_none()
+            || self.tags.iter().map(String::len).sum::<usize>() > 64 * 1024
+        {
+            return Err(invalid("管理器插件 ID 或标签无效"));
+        }
+        for (file, name) in self.files.iter().zip(["adapter.json", "SKILL.md"]) {
+            if file.name != name
+                || file.size != file.text.len() as u64
+                || file.sha256 != hex::encode(Sha256::digest(file.text.as_bytes()))
+            {
+                return Err(stale());
+            }
+        }
+        let package = plugins::parse_package(&self.slug, &self.files[0].text, &self.files[1].text)?;
+        if package.adapter.version != self.version || self.destination != provenance::DESTINATION {
             return Err(stale());
         }
-        f()
-    };
-    match &observed.preview.source {
+        let mut hash = Sha256::new();
+        let base = (
+            &self.source,
+            self.target,
+            &self.slug,
+            &self.version,
+            &self.tags,
+            &self.files,
+            &self.destination,
+        );
+        if let Some(snapshot) = &self.snapshot {
+            snapshot.validate(self)?;
+            hash.update(b"amm.manager-plugin-publication.v2\0");
+            serde_json::to_writer(
+                &mut hash,
+                &(
+                    base,
+                    &self.listing,
+                    &self.original_version,
+                    &self.remote_version,
+                    snapshot,
+                ),
+            )?;
+        } else {
+            if self.listing.is_some()
+                || self.original_version.is_some()
+                || self.remote_version.is_some()
+            {
+                return Err(stale());
+            }
+            hash.update(b"amm.manager-plugin-publication.v1\0");
+            serde_json::to_writer(&mut hash, &base)?;
+        }
+        Ok(hex::encode(hash.finalize()))
+    }
+}
+
+fn with_source<T>(
+    engine: &FileEngine,
+    source: &PublicationSource,
+    check: impl FnOnce(PublicationSource, &str, [PublicationFile; 2]) -> AppResult<T>,
+) -> AppResult<T> {
+    match source {
         PublicationSource::Draft { draft_id, .. } => {
             provenance::with_draft_source(engine, draft_id, check)
         }
@@ -242,6 +277,26 @@ fn with_current_source<T>(
             provenance::with_installed_source(engine, slug, check)
         }
     }
+}
+
+fn with_current_source<T>(
+    engine: &FileEngine,
+    preview: &PublicationPreview,
+    f: impl FnOnce() -> AppResult<T>,
+) -> AppResult<T> {
+    with_source(engine, &preview.source, |source, slug, files| {
+        if source != preview.source || slug != preview.slug {
+            return Err(stale());
+        }
+        let matches = match &preview.snapshot {
+            Some(snapshot) => snapshot.matches_files(&files),
+            None => files == preview.files,
+        };
+        if !matches {
+            return Err(stale());
+        }
+        f()
+    })
 }
 
 pub fn migrate(conn: &Connection) -> AppResult<()> {
@@ -290,12 +345,12 @@ fn load(conn: &Connection, id: &str) -> AppResult<PublicationRecord> {
         updated_at,
     ) = conn
         .query_row(
-            "SELECT CASE WHEN length(CAST(preview_json AS BLOB))<=?2 THEN preview_json ELSE '' END,
+            "SELECT preview_json,
                 digest,slug,version,target_plugin_id,approved_digest,state,
                 CASE WHEN length(CAST(remote_json AS BLOB))<=524288 THEN remote_json
                      WHEN remote_json IS NULL THEN NULL ELSE '' END,created_at,updated_at
            FROM manager_publications WHERE id=?1",
-            params![id, MAX_PREVIEW_BYTES],
+            [id],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -314,20 +369,13 @@ fn load(conn: &Connection, id: &str) -> AppResult<PublicationRecord> {
         .optional()?
         .ok_or_else(|| AppError::NotFound("管理器插件发布记录".into()))?;
     let stored: PublicationPreview = serde_json::from_str(&raw).map_err(|_| stale())?;
-    let rebuilt = preview(
-        stored.source.clone(),
-        &stored.slug,
-        stored.files.clone(),
-        stored.target,
-        stored.tags.clone(),
-    )?;
     let state: PublicationState =
         serde_json::from_value(Value::String(state)).map_err(|_| stale())?;
     let remote: Option<PublishedPlugin> = remote
         .map(|json| serde_json::from_str(&json))
         .transpose()
         .map_err(|_| stale())?;
-    if stored != rebuilt
+    if stored.digest != stored.checked_digest()?
         || stored.digest != digest
         || stored.slug != slug
         || stored.version != version
@@ -354,11 +402,8 @@ fn load(conn: &Connection, id: &str) -> AppResult<PublicationRecord> {
     })
 }
 
-fn create(engine: &FileEngine, preview: PublicationPreview) -> AppResult<PublicationRecord> {
-    let raw = serde_json::to_string(&preview)?;
-    if raw.len() > MAX_PREVIEW_BYTES {
-        return Err(invalid("管理器插件发布预览超过大小限制"));
-    }
+fn create(engine: &FileEngine, preview: &PublicationPreview) -> AppResult<PublicationRecord> {
+    let raw = serde_json::to_string(preview)?;
     let mut conn = engine.db.conn();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let existing: Option<String> = tx.query_row(
@@ -374,7 +419,7 @@ fn create(engine: &FileEngine, preview: PublicationPreview) -> AppResult<Publica
         id
     };
     let record = load(&tx, &id)?;
-    if record.preview != preview {
+    if record.preview != *preview {
         return Err(stale());
     }
     tx.commit()?;
@@ -385,12 +430,18 @@ pub fn get_publication(engine: &FileEngine, id: &str) -> AppResult<PublicationRe
     load(&engine.db.conn(), id)
 }
 
-pub fn list_publications(engine: &FileEngine) -> AppResult<Vec<PublicationRecord>> {
+pub fn list_publications(
+    engine: &FileEngine,
+    before: Option<&str>,
+) -> AppResult<Vec<PublicationRecord>> {
     let conn = engine.db.conn();
-    let mut stmt =
-        conn.prepare("SELECT id FROM manager_publications ORDER BY rowid DESC LIMIT 50")?;
+    let mut stmt = conn.prepare(
+        "SELECT id FROM manager_publications
+        WHERE ?1 IS NULL OR rowid < (SELECT rowid FROM manager_publications WHERE id=?1)
+        ORDER BY rowid DESC LIMIT 50",
+    )?;
     let ids = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
+        .query_map([before], |r| r.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     ids.iter().map(|id| load(&conn, id)).collect()
 }
@@ -405,7 +456,7 @@ pub fn approve_publication(
     if record.state != PublicationState::Intended || digest != record.preview.digest {
         return Err(stale());
     }
-    with_current_source(engine, &record, || {
+    with_current_source(engine, &record.preview, || {
         let mut conn = engine.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if load(&tx, id)? != record {
@@ -423,27 +474,39 @@ pub fn approve_publication(
     })
 }
 
-fn claim(engine: &FileEngine, record: &PublicationRecord) -> AppResult<PublicationRecord> {
-    with_current_source(engine, record, || {
+fn claim_checked(
+    engine: &FileEngine,
+    record: &PublicationRecord,
+    check: impl FnOnce() -> AppResult<()>,
+) -> AppResult<PublicationRecord> {
+    with_current_source(engine, &record.preview, || {
+        check()?;
         let mut conn = engine.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if load(&tx, &record.id)? != *record {
             return Err(stale());
         }
         // No differently-tagged preview, alternate source, or First/Release
-        // switch may resend the same ambiguous release. An uncertain first
-        // publication also blocks a second First attempt at any version.
+        // switch may send while a matching account's write for this slug is
+        // unconfirmed. v1 uncertain writes have no provable owner, so they
+        // block any automatic send for this slug until reconciled; completed
+        // v1 writes cannot override the present owner lookup.
         let blocked: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM manager_publications
             WHERE id<>?1 AND slug=?2 AND (
-                (state IN ('pending','unknown') AND (version=?3 OR target_plugin_id IS NULL OR ?4 IS NULL OR target_plugin_id=?4))
+                (state IN ('pending','unknown') AND (?5 IS NOT NULL OR version=?3 OR target_plugin_id IS NULL OR ?4 IS NULL OR target_plugin_id=?4))
                 OR (state='completed' AND (version=?3 OR ?4 IS NULL))
+            ) AND (
+                ?5 IS NULL
+                OR json_extract(preview_json,'$.snapshot.credentialBinding')=?5
+                OR (state IN ('pending','unknown') AND json_extract(preview_json,'$.snapshot.credentialBinding') IS NULL)
             ))",
             params![
                 record.id,
                 record.preview.slug,
                 record.preview.version,
-                record.preview.target.plugin_id()
+                record.preview.target.plugin_id(),
+                record.preview.snapshot.as_ref().map(automatic::Snapshot::credential_fingerprint)
             ],
             |r| r.get(0),
         )?;
@@ -460,6 +523,11 @@ fn claim(engine: &FileEngine, record: &PublicationRecord) -> AppResult<Publicati
         tx.commit()?;
         Ok(pending)
     })
+}
+
+#[cfg(test)]
+fn claim(engine: &FileEngine, record: &PublicationRecord) -> AppResult<PublicationRecord> {
+    claim_checked(engine, record, || Ok(()))
 }
 
 fn transition(
@@ -484,6 +552,14 @@ fn transition(
     )?;
     let record = load(&tx, &observed.id)?;
     tx.commit()?;
+    drop(conn);
+
+    // A receipt is durable before the independent, best-effort draft cleanup.
+    if record.state == PublicationState::Completed {
+        if let PublicationSource::Draft { draft_id, .. } = &record.preview.source {
+            crate::plugin_workflow::cleanup_consumed_agent_drafts(engine, Some(draft_id));
+        }
+    }
     Ok(record)
 }
 
@@ -508,7 +584,8 @@ impl Drop for UnknownOnDrop<'_> {
 #[async_trait::async_trait]
 pub(crate) trait Remote: Send + Sync {
     /// The returned value is the tool's parsed data, not the MCP wrapper.
-    /// `Denied` is reserved for a definitive pre-mutation authorization rejection.
+    /// `Denied`, `NotFound`, `Conflict`, and `Invalid` are reserved for
+    /// definitive pre-commit rejections, not transport or decoding errors.
     async fn call(&self, name: &str, args: Value, cancel: &CancellationToken) -> AppResult<Value>;
 }
 
@@ -529,6 +606,14 @@ fn matches_preview(plugin: &PublishedPlugin, preview: &PublicationPreview) -> bo
         && plugin.version == preview.version
         && preview.target.plugin_id().is_none_or(|id| id == plugin.id)
         && same_tags(&plugin.tags, &preview.tags)
+        && preview
+            .listing
+            .as_ref()
+            .is_none_or(|listing| plugin.name == listing.title)
+        && preview
+            .snapshot
+            .as_ref()
+            .is_none_or(|snapshot| snapshot.previous_release_id() != Some(plugin.release_id))
 }
 
 fn approved(engine: &FileEngine, id: &str, digest: &str) -> AppResult<PublicationRecord> {
@@ -558,12 +643,13 @@ pub async fn publish_approved(
     if record.state == PublicationState::Completed {
         return Ok(record);
     }
-    // Detect changed sources before credential access as well as after the handshake.
-    with_current_source(engine, &record, || Ok(()))?;
-    let remote = remote::Transport::connect(settings, cancel).await?;
-    publish_with(engine, &remote, id, digest, cancel).await
+    let binding = automatic::CredentialBinding::for_preview(&record.preview)?;
+    with_current_source(engine, &record.preview, || Ok(()))?;
+    let remote = binding.connect(settings, cancel).await?;
+    automatic::publish_with(engine, settings, &remote, &record, cancel).await
 }
 
+#[cfg(test)]
 pub(crate) async fn publish_with(
     engine: &FileEngine,
     remote: &dyn Remote,
@@ -578,6 +664,22 @@ pub(crate) async fn publish_with(
     if record.state == PublicationState::Completed {
         return Ok(record);
     }
+    if record.preview.snapshot.is_some() {
+        return Err(stale());
+    }
+    send(engine, remote, &record, cancel, || Ok(())).await
+}
+
+async fn send(
+    engine: &FileEngine,
+    remote: &dyn Remote,
+    record: &PublicationRecord,
+    cancel: &CancellationToken,
+    check: impl FnOnce() -> AppResult<()>,
+) -> AppResult<PublicationRecord> {
+    if cancel.is_cancelled() {
+        return Err(AppError::Cancelled);
+    }
     let p = &record.preview;
     let mut args = json!({"adapter":p.files[0].text,"skill":p.files[1].text,"tags":p.tags});
     let tool = match p.target {
@@ -587,7 +689,7 @@ pub(crate) async fn publish_with(
             "publish_manager_plugin_release"
         }
     };
-    let pending = claim(engine, &record)?;
+    let pending = claim_checked(engine, record, check)?;
     let mut guard = UnknownOnDrop {
         engine,
         pending: &pending,
@@ -605,15 +707,21 @@ pub(crate) async fn publish_with(
             }
             _ => transition(engine, &pending, "unknown", None),
         },
-        Err(error @ AppError::Denied(_)) => {
+        Err(
+            error @ (AppError::Denied(_)
+            | AppError::NotFound(_)
+            | AppError::Conflict(_)
+            | AppError::Invalid(_)),
+        ) => {
             transition(engine, &pending, "error", None)?;
-            Err(error)
+            guard.armed = false;
+            return Err(error);
         }
         // Timeouts, session/server failures, cancellation, and unverified
         // responses are never retried. Return a durable record for UI/Agent.
         Err(_) => transition(engine, &pending, "unknown", None),
     };
-    if result.is_ok() || matches!(result, Err(AppError::Denied(_))) {
+    if result.is_ok() {
         guard.armed = false;
     }
     result
@@ -654,6 +762,7 @@ async fn own_page(
 async fn own_texts(
     remote: &dyn Remote,
     plugin_id: i64,
+    direct_read: bool,
     cancel: &CancellationToken,
 ) -> AppResult<OwnPluginTexts> {
     let texts: OwnPluginTexts = serde_json::from_value(
@@ -666,8 +775,12 @@ async fn own_texts(
             .await?,
     )
     .map_err(|_| unavailable())?;
-    if texts.adapter.len() > provenance::ADAPTER_LIMIT
-        || texts.skill.len() > provenance::SKILL_LIMIT
+    // Unsolicited remote text keeps the catalog limits. Reconciliation may
+    // compare larger text only against the exact approved local snapshot;
+    // the MCP transport's independent inbound response cap still applies.
+    if (direct_read
+        && (texts.adapter.len() > crate::plugin_workflow::ADAPTER_LIMIT
+            || texts.skill.len() > crate::plugin_workflow::SKILL_LIMIT))
         || tags_set(&texts.tags).is_none()
     {
         return Err(unavailable());
@@ -704,6 +817,7 @@ pub async fn get_own_plugin_texts(
     own_texts(
         &remote::Transport::connect(settings, cancel).await?,
         plugin_id,
+        true,
         cancel,
     )
     .await
@@ -720,6 +834,11 @@ pub async fn reconcile_publication(
         PublicationState::Completed => return Ok(ReconciliationOutcome::Verified),
         PublicationState::Unknown => {}
         _ => return Ok(ReconciliationOutcome::Unconfirmed),
+    }
+    if record.preview.snapshot.is_some() {
+        let binding = automatic::CredentialBinding::for_preview(&record.preview)?;
+        let transport = binding.connect(settings, cancel).await?;
+        return automatic::reconcile_with(engine, settings, &transport, &record, cancel).await;
     }
     let transport = remote::Transport::connect(settings, cancel).await?;
     reconcile_with(engine, &transport, record, cancel).await
@@ -764,7 +883,7 @@ async fn reconcile_with(
     let Some((expected, offset)) = candidate.filter(|_| exhausted) else {
         return Ok(Unconfirmed);
     };
-    let texts = own_texts(remote, expected.id, cancel).await?;
+    let texts = own_texts(remote, expected.id, false, cancel).await?;
     if texts.adapter != p.files[0].text
         || texts.skill != p.files[1].text
         || !same_tags(&texts.tags, &p.tags)

@@ -19,11 +19,13 @@ async function openIdentity(page: Page) {
 
 test('built-in Bing identity search needs no API key or configurable Playwright MCP connection', async ({page}, info) => {
   const modal = await openIdentity(page);
+  const publicQuery = 'Public game edition '.repeat(100) + 'official site';
+  const confirmedName = '已确认游戏名称 '.repeat(90) + '完整版';
   await expect(modal.getByText('Bing（应用内置搜索）', {exact: true})).toBeVisible();
   await expect(modal.getByRole('button', {name: '搜索候选', exact: true})).toBeDisabled();
   expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => ['search_game_identity', 'confirm_game_identity', 'register_game'].includes(call.command)))).toHaveLength(0);
   await modal.getByLabel('同意发送公开搜索词', {exact: true}).check();
-  await modal.getByLabel('公开搜索词', {exact: true}).fill('Public Fixture game executable');
+  await modal.getByLabel('公开搜索词', {exact: true}).fill(publicQuery);
   await expect(modal.getByLabel('同意发送公开搜索词', {exact: true})).not.toBeChecked();
   await modal.getByLabel('同意发送公开搜索词', {exact: true}).check();
   await modal.getByRole('button', {name: '搜索候选', exact: true}).click();
@@ -32,7 +34,7 @@ test('built-in Bing identity search needs no API key or configurable Playwright 
   await modal.getByRole('radio').first().check();
   await expect(modal.getByLabel('确认的游戏名称', {exact: true})).toHaveValue('Fixture Game');
   await modal.getByLabel('确认添加', {exact: true}).check();
-  await modal.getByLabel('确认的游戏名称', {exact: true}).fill('Confirmed Fixture Game');
+  await modal.getByLabel('确认的游戏名称', {exact: true}).fill(confirmedName);
   await expect(modal.getByLabel('确认添加', {exact: true})).not.toBeChecked();
   await modal.getByLabel('确认添加', {exact: true}).check();
   for (const theme of ['light', 'dark']) {
@@ -49,18 +51,18 @@ test('built-in Bing identity search needs no API key or configurable Playwright 
   await expect(modal).not.toBeVisible();
   const discovery = page.getByRole('dialog', {name: '扫描游戏', exact: true});
   await expect(discovery).toBeVisible();
-  await expect(page.getByText('已将「Confirmed Fixture Game」添加到游戏库', {exact: true})).toBeVisible();
+  await expect(page.getByText(`已将「${confirmedName}」添加到游戏库`, {exact: true})).toBeVisible();
   const candidate = discovery.locator('[data-slot="item"]').filter({has: page.getByText('/sandbox/unknown-game', {exact: true})});
   await expect(candidate.getByRole('button', {name: '管理中', exact: true})).toBeDisabled();
   const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
   expect(calls.filter((call: any) => call.command === 'register_game')).toHaveLength(0);
-  expect(calls.find((call: any) => call.command === 'search_game_identity').args).toEqual({directory: '/sandbox/unknown-game', expectedFingerprint: 'e'.repeat(64), publicQuery: 'Public Fixture game executable', confirmation: 'SEARCH_GAME_IDENTITY'});
+  expect(calls.find((call: any) => call.command === 'search_game_identity').args).toEqual({directory: '/sandbox/unknown-game', expectedFingerprint: 'e'.repeat(64), publicQuery, confirmation: 'SEARCH_GAME_IDENTITY'});
   expect(calls.filter((call: any) => call.command === 'set_secret' && call.args.key === 'sources.brave')).toHaveLength(0);
   expect(calls.filter((call: any) => call.command === 'mcp_connect')).toHaveLength(0);
-  expect(calls.find((call: any) => call.command === 'confirm_game_identity').args).toEqual({searchId: 'identity-search-fixture', candidateIndex: 0, name: 'Confirmed Fixture Game', confirmation: 'CONFIRM_GAME_IDENTITY'});
+  expect(calls.find((call: any) => call.command === 'confirm_game_identity').args).toEqual({searchId: 'identity-search-fixture', candidateIndex: 0, name: confirmedName, confirmation: 'CONFIRM_GAME_IDENTITY'});
   await page.keyboard.press('Escape');
   await expect(discovery).toBeHidden();
-  await expect(page.getByTestId('library-page').getByRole('heading', {name: 'Confirmed Fixture Game', exact: true})).toBeVisible();
+  await expect(page.getByTestId('library-page').getByRole('heading', {name: confirmedName, exact: true})).toBeVisible();
 });
 
 test('changed queries and reopened identity dialogs discard earlier consent', async ({page}) => {

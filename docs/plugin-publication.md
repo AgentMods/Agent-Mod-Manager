@@ -6,16 +6,20 @@ The desktop plugin center, library, and local Agent use the public Mod客栈 man
 
 ## Publish a manager plugin
 
-Use a Mod客栈 creator API key in the built-in Mod客栈 MCP settings. An approved creator with `manager_plugins.publish` can publish a first release or enter the numeric ID of their existing plugin to publish a new version. Grant `manager_plugins.read` to select a plugin from the author's list or to reconcile an uncertain result. The public catalog requires no key.
+Select **发布插件** on a committed draft or a verified installed package. Preparation reads the current creator's plugin list and asks the configured Agent model to generate a title, short introduction, detailed description, tags and cover design. The preview shows the exact publication version and whether the current account will create a plugin or update an existing one. The **发布** button submits the reviewed release.
 
-| Operation | MCP tool | Arguments |
-| --- | --- | --- |
-| First release | `publish_manager_plugin` | `adapter`, `skill`, optional `tags` |
-| Subsequent release | `publish_manager_plugin_release` | `plugin_id`, both original texts, and the full tag set for the new version |
-| List author's plugins | `list_my_manager_plugins` | `offset`, `limit` |
-| Read author's current release texts | `get_my_manager_plugin_texts` | `plugin_id` |
+Configure an approved creator's Mod客栈 key with both `manager_plugins.read` (match the account's own list) and `manager_plugins.publish` (submit the release). Matching uses the package slug across the author's paginated list, including hidden plugins. A failed or ambiguous lookup leaves the publication unsent. The public catalog still works anonymously.
 
-The approval covers the publication target, original UTF-8 texts, source provenance and tags. Reviewers can compare the complete two files. After approval the app checks its source again and records the intent before sending a write. A successful release records both plugin ID and release ID. Moderation applies to subsequent releases too. When the provider reports that a plugin is hidden, the app identifies that state separately from a publicly visible release. An uncertain submission is reconciled with read-only tools. A timeout does not trigger a second submission.
+| Content | Stored in the cloud release |
+| --- | --- |
+| Title and version | `name` and `version` in the published copy of `adapter.json` |
+| Short introduction | `description` in the `SKILL.md` frontmatter |
+| Full description and generated cover | A display section in `SKILL.md` containing the description and an embedded PNG |
+| Tags | The manager-plugin MCP `tags` parameter |
+
+Publishing sends the prepared copies with `publish_manager_plugin` or `publish_manager_plugin_release`. Local source and installation rules are preserved. The desktop cloud catalog can retrieve the artwork and detailed description by immutable release ID. The website's own listing controls how much of that content it displays. Newer releases of a hidden plugin keep their moderation status. Uncertain writes are checked with `list_my_manager_plugins` and `get_my_manager_plugin_texts` before any further publication.
+
+The automatic path validates that its final copies, including the generated artwork, fit the desktop catalog read limits (256 KiB for the manifest and 128 KiB for the Skill). The current website v1 parser does not accept `mcpServers`; a package with non-empty service declarations is reported as unsupported rather than silently publishing it without its tools.
 
 ## Earlier ordinary-work publication records
 
@@ -43,8 +47,8 @@ Publication is permitted for either:
 
 Schema validation reuses the package parser and draft provenance validator.
 Sources must contain exactly `adapter.json` and `SKILL.md`; links, redirected
-parents, extra files, special files, invalid UTF-8 and oversized files fail
-closed. File reads are bounded to 256 KiB and 128 KiB respectively. On Unix,
+parents, extra files, special files and invalid UTF-8 fail validation. Local file
+reads use the authorized transaction and the available resources. On Unix,
 opened file device/inode identities are also checked. The manager file lock
 serializes reads against its own transactions. This is not an OS sandbox
 against another process changing the manager's database or files; trusted
@@ -74,7 +78,7 @@ in the user confirmation view. Raw Skill instructions remain untrusted text.
 
 The ZIP is constructed entirely in memory using Stored compression, the fixed
 default ZIP timestamp, fixed Unix permissions 0644, and exactly these ordered,
-relative entries: `adapter.json`, `SKILL.md`. It must not exceed 1 MiB. Repeated
+relative entries: `adapter.json`, `SKILL.md`. Repeated
 preparation with identical source and metadata yields identical bytes and hash.
 
 Metadata is not silently trimmed, rewritten or deduplicated:

@@ -227,3 +227,79 @@ async fn inspect_install_is_read_only_and_checks_game_scope() {
     );
     assert_eq!(report["files"][0]["state"], "modified");
 }
+
+#[tokio::test]
+async fn scoped_uninstall_restores_the_preinstall_bytes_only_for_the_reviewed_game_and_transaction()
+{
+    use std::io::Write;
+    let (temp, engine, game) = setup();
+    let original = temp.path().canonicalize().unwrap().join("release.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&original).unwrap());
+    zip.start_file("patch.dat", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(b"patch").unwrap();
+    zip.finish().unwrap();
+    let imported = crate::imports::plan_import_archive(&engine, &original).unwrap();
+    engine.approve_plan(&imported.plan.id).unwrap();
+    engine.apply_file_ops(&imported.plan.id).unwrap();
+    let entry = crate::imports::register_imported_mod(&engine, "g", &imported.plan.id).unwrap();
+    let target = game.join("original.dat");
+    std::fs::write(&target, b"original").unwrap();
+    let request = serde_json::from_value(json!({
+        "gameId":"g", "artifactId":entry.id, "mode":"approvedMappings", "sourceKind":"archive",
+        "mappings":[{"source":"patch.dat", "destination":"original.dat"}]
+    }))
+    .unwrap();
+    let installed = install::plan_library_install(&engine, &request).unwrap();
+    engine.approve_plan(&installed.plan.id).unwrap();
+    engine.apply_file_ops(&installed.plan.id).unwrap();
+    let registry = ToolRegistry::default();
+    register(&registry).unwrap();
+    let context = ToolContext {
+        engine,
+        cancel: CancellationToken::new(),
+        progress: None,
+        resolution_scope: crate::sources::resolutions::ResolutionScope::Desktop,
+    };
+    let rollback = registry.get("rollback_transaction").unwrap();
+    let args = json!({"game_id":"g", "install_id":installed.install_id, "transaction_id":installed.plan.id});
+    assert!(rollback.prepare(&context, &json!({"game_id":"elsewhere", "install_id":installed.install_id,"transaction_id":installed.plan.id})).await.is_err());
+    assert!(rollback.prepare(&context, &json!({"game_id":"g", "install_id":installed.install_id,"transaction_id":imported.plan.id})).await.is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"patch");
+    let review = rollback.prepare(&context, &args).await.unwrap();
+    std::fs::write(&target, b"player edit").unwrap();
+    assert!(rollback
+        .execute(&context, args.clone(), review)
+        .await
+        .is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"player edit");
+    std::fs::write(&target, b"patch").unwrap();
+    let review = rollback.prepare(&context, &args).await.unwrap();
+    let outcome = rollback.execute(&context, args, review).await.unwrap();
+    assert_eq!(outcome["status"], "rolled_back");
+    assert_eq!(std::fs::read(target).unwrap(), b"original");
+    assert!(context
+        .engine
+        .paths
+        .root
+        .join(entry.archive_relative_path)
+        .is_file());
+    let forget = registry.get("forget_uninstalled_mod").unwrap();
+    assert!(forget
+        .prepare(
+            &context,
+            &json!({"game_id":"wrong-game","install_id":installed.install_id})
+        )
+        .await
+        .is_err());
+    let args = json!({"game_id":"g","install_id":installed.install_id});
+    let approved = forget.prepare(&context, &args).await.unwrap();
+    assert_eq!(approved.effect, Effect::ManagerWrite);
+    let receipt = forget.execute(&context, args, approved).await.unwrap();
+    assert_eq!(receipt["status"], "removed");
+    assert!(
+        crate::mod_management::visible_installs(&context.engine, "g")
+            .unwrap()
+            .is_empty()
+    );
+}

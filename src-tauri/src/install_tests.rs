@@ -2,7 +2,7 @@ use super::*;
 use crate::{plugins, storage::AppPaths};
 use std::io::Write;
 
-fn fixture(slug: &str) -> (tempfile::TempDir, FileEngine, games::Game) {
+pub(super) fn fixture(slug: &str) -> (tempfile::TempDir, FileEngine, games::Game) {
     let temp = tempfile::tempdir().unwrap();
     let data = AppPaths::new(temp.path().join("data")).unwrap();
     let engine = FileEngine::new(Db::open(&data.db_file()).unwrap(), data);
@@ -22,7 +22,7 @@ fn fixture(slug: &str) -> (tempfile::TempDir, FileEngine, games::Game) {
     let game = games::register_game(&engine.db, &root, Some(slug)).unwrap();
     (temp, engine, game)
 }
-fn zip(engine: &FileEngine, entries: &[(&str, &[u8])]) -> PathBuf {
+pub(super) fn zip(engine: &FileEngine, entries: &[(&str, &[u8])]) -> PathBuf {
     let file = engine
         .paths
         .downloads()
@@ -37,7 +37,12 @@ fn zip(engine: &FileEngine, entries: &[(&str, &[u8])]) -> PathBuf {
     writer.finish().unwrap();
     file
 }
-fn request(game: &games::Game, path: PathBuf, ty: &str, filename: &str) -> InstallRequest {
+pub(super) fn request(
+    game: &games::Game,
+    path: PathBuf,
+    ty: &str,
+    filename: &str,
+) -> InstallRequest {
     InstallRequest {
         game_id: game.id.clone(),
         artifact_path: path,
@@ -54,7 +59,7 @@ fn request(game: &games::Game, path: PathBuf, ty: &str, filename: &str) -> Insta
         replace_install_id: None,
     }
 }
-fn apply(engine: &FileEngine, plan: &FilePlan) {
+pub(super) fn apply(engine: &FileEngine, plan: &FilePlan) {
     engine.approve_plan(&plan.id).unwrap();
     engine.apply_file_ops(&plan.id).unwrap();
 }
@@ -89,7 +94,7 @@ fn install_preview_cannot_use_changed_or_relocated_extracted_payloads() {
     assert!(matches!(validate(&file), Err(AppError::Conflict(_))));
 }
 
-fn release(
+pub(super) fn release(
     engine: &FileEngine,
     game: &games::Game,
     project: &str,
@@ -101,13 +106,16 @@ fn release(
     let path = engine.paths.downloads().join(format!("{id}-{filename}"));
     std::fs::rename(zip(engine, entries), &path).unwrap();
     let hash = util::sha256_file(&path).unwrap();
+    let sha512 = hex::encode(<sha2::Sha512 as sha2::Digest>::digest(
+        std::fs::read(&path).unwrap(),
+    ));
     let artifact = crate::download::DownloadArtifact {
         id,
         path: path.clone(),
         filename: filename.clone(),
         size: std::fs::metadata(&path).unwrap().len(),
         sha256: hash.clone(),
-        sha512: String::new(),
+        sha512,
         integrity_verified: false,
         requires_review: true,
         auto_install_allowed: false,
@@ -1623,4 +1631,61 @@ fn partial_downloads_cannot_be_deployed_through_raw_file_tools() {
     .unwrap();
     apply(&engine, &trash);
     assert!(!rejected.exists());
+}
+
+#[test]
+fn tracked_uninstall_rejects_late_identical_owner_at_apply() {
+    let (_temp, engine, game) = fixture("stardew-valley");
+    let archive = zip(&engine, &[("Example/manifest.json", b"identical")]);
+    let request = request(&game, archive, "smapi-mod", "example.zip");
+    let first = plan_install(&engine, &request).unwrap();
+    apply(&engine, &first.plan);
+    let uninstall = plan_uninstall(&engine, &first.install_id).unwrap();
+    let installed_file = Path::new(&game.root_path).join("Mods/Example/manifest.json");
+
+    let overlap = plan_install(&engine, &request).unwrap();
+    apply(&engine, &overlap.plan);
+    assert_eq!(
+        fingerprint(&installed_file).unwrap(),
+        uninstall.entries[0].source
+    );
+    engine.approve_plan(&uninstall.id).unwrap();
+    assert!(
+        matches!(engine.apply_file_ops(&uninstall.id), Err(AppError::Conflict(message)) if message.contains("其他已安装"))
+    );
+    assert_eq!(std::fs::read(&installed_file).unwrap(), b"identical");
+    assert!(!uninstall.entries[0].operation.dst().exists());
+    assert_eq!(
+        get_install(&engine, &first.install_id).unwrap().status,
+        "enabled"
+    );
+}
+
+#[test]
+fn tracked_uninstall_cannot_apply_a_plan_fingerprint_that_disagrees_with_manifest() {
+    let (_temp, engine, game) = fixture("stardew-valley");
+    let archive = zip(&engine, &[("Example/manifest.json", b"original")]);
+    let request = request(&game, archive, "smapi-mod", "example.zip");
+    let preview = plan_install(&engine, &request).unwrap();
+    apply(&engine, &preview.plan);
+    let mut uninstall = plan_uninstall(&engine, &preview.install_id).unwrap();
+    let installed = Path::new(&game.root_path).join("Mods/Example/manifest.json");
+    std::fs::write(&installed, b"modified").unwrap();
+    // Simulate a persisted stale/mismatched plan whose snapshot was taken
+    // after the file changed. Ordinary fingerprint validation alone passes.
+    uninstall.entries[0].source = fingerprint(&installed).unwrap();
+    engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE file_transactions SET plan_json=?1 WHERE id=?2",
+            params![serde_json::to_string(&uninstall).unwrap(), uninstall.id],
+        )
+        .unwrap();
+    engine.approve_plan(&uninstall.id).unwrap();
+    assert!(
+        matches!(engine.apply_file_ops(&uninstall.id), Err(AppError::Conflict(message)) if message.contains("原始文件指纹"))
+    );
+    assert_eq!(std::fs::read(&installed).unwrap(), b"modified");
+    assert!(!uninstall.entries[0].operation.dst().exists());
 }

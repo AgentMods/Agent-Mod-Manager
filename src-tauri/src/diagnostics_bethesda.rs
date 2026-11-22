@@ -7,11 +7,19 @@
 //! late-listed masters; the order remains evidence from `Plugins.txt`, not a
 //! claim about the effective loader order.
 
-use super::{Context, DiagnosticFile, ReadOptions};
-use crate::{error::AppError, plugins::validate_relative_path, safe_fs};
+use super::ReadOptions;
+use super::{Context, DiagnosticFile};
+use crate::{
+    error::{AppError, AppResult},
+    plugins::validate_relative_path,
+    safe_fs,
+};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     io::{Read, Seek, SeekFrom},
     path::Path,
 };
@@ -21,6 +29,7 @@ const SUBRECORD_HEADER_BYTES: usize = 6;
 const MAX_HEADER_BYTES: usize = 256 * 1024;
 const MAX_HEADER_DATA_BYTES: usize = 128 * 1024;
 const MAX_TOTAL_HEADER_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(test)]
 const MAX_PLUGINS: usize = 64;
 const MAX_MASTERS: usize = 256;
 const MAX_SUBRECORDS: usize = 4096;
@@ -113,14 +122,14 @@ struct ListedPlugin {
     load_order: usize,
 }
 
-/// Inspect valid, enabled entries from the already-read Plugins.txt. The
-/// caller remains responsible for the ordinary list-entry checks and evidence.
+/// Inspect valid, enabled entries from Plugins.txt, consulting the complete
+/// (or explicitly partial) list index rather than only the visible page.
+#[cfg(test)]
 pub(super) fn inspect(
     ctx: &Context,
     options: &ReadOptions,
     file: &DiagnosticFile,
 ) -> (BethesdaEvidence, Vec<BethesdaFinding>) {
-    let mut findings = Vec::new();
     let entries = listed_plugins(file);
     let mut listed = BTreeMap::new();
     for entry in &entries {
@@ -128,7 +137,41 @@ pub(super) fn inspect(
             .entry(entry.name.to_ascii_lowercase())
             .or_insert_with(|| entry.clone());
     }
+    let limited = entries.len() > MAX_PLUGINS;
+    let (mut evidence, findings) = inspect_batch(
+        ctx,
+        file,
+        entries
+            .into_iter()
+            .filter(|entry| entry.enabled)
+            .take(MAX_PLUGINS),
+        |key| {
+            Ok(listed
+                .get(key)
+                .map(|entry| (entry.enabled, entry.load_order)))
+        },
+        options.max_total_bytes.min(MAX_TOTAL_HEADER_BYTES),
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .unwrap();
+    if limited {
+        evidence.status = BethesdaScanStatus::Partial;
+        evidence.notes.push(format!(
+            "有效插件条目超过 {MAX_PLUGINS} 项；剩余条目未读取插件头。"
+        ));
+    }
+    (evidence, findings)
+}
 
+fn inspect_batch(
+    ctx: &Context,
+    file: &DiagnosticFile,
+    entries: impl Iterator<Item = ListedPlugin>,
+    mut listed: impl FnMut(&str) -> AppResult<Option<(bool, usize)>>,
+    mut budget: usize,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> AppResult<(BethesdaEvidence, Vec<BethesdaFinding>)> {
+    let mut findings = Vec::new();
     let mut evidence = BethesdaEvidence {
         status: if file.truncated {
             BethesdaScanStatus::Partial
@@ -145,30 +188,19 @@ pub(super) fn inspect(
             .notes
             .push("Plugins.txt 读取不完整；仅对已结束的物理行尝试解析。".into());
     }
-    if entries.len() > MAX_PLUGINS {
-        evidence.status = BethesdaScanStatus::Partial;
-        evidence.notes.push(format!(
-            "有效插件条目超过 {MAX_PLUGINS} 项；剩余条目未读取插件头。"
-        ));
-    }
-
     let data = match ctx.root("data") {
         Ok(path) => path,
         Err(error) => {
             evidence.status = BethesdaScanStatus::Unavailable;
             evidence.notes.push(format!("无法确认 Data 根: {error}"));
-            return (evidence, findings);
+            return Ok((evidence, findings));
         }
     };
-    let mut budget = options.max_total_bytes.min(MAX_TOTAL_HEADER_BYTES);
     let mut seen_paths = BTreeSet::new();
-    let enabled_count = entries.iter().filter(|entry| entry.enabled).count();
-
-    for entry in entries
-        .into_iter()
-        .filter(|entry| entry.enabled)
-        .take(MAX_PLUGINS)
-    {
+    for entry in entries {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
         let key = entry.name.to_ascii_lowercase();
         if !seen_paths.insert(key) {
             continue;
@@ -203,15 +235,13 @@ pub(super) fn inspect(
                 row.masters = header.masters;
                 for master in &row.masters {
                     let normalized = master.to_ascii_lowercase();
-                    match listed.get(&normalized) {
-                        None => row.unlisted_masters.push(master.clone()),
-                        Some(listed_master) if !listed_master.enabled => {
-                            row.disabled_masters.push(master.clone())
-                        }
-                        Some(listed_master) if listed_master.load_order > entry.load_order => {
+                    match listed(&normalized)? {
+                        None if !file.truncated => row.unlisted_masters.push(master.clone()),
+                        Some((false, _)) => row.disabled_masters.push(master.clone()),
+                        Some((true, load_order)) if load_order > entry.load_order => {
                             row.masters_after_plugin.push(master.clone())
                         }
-                        Some(_) => {}
+                        _ => {}
                     }
                     let master_path = data.join(master);
                     match ctx
@@ -289,13 +319,12 @@ pub(super) fn inspect(
         }
         evidence.plugins.push(row);
     }
-    if evidence.plugins.len() < enabled_count.min(MAX_PLUGINS) {
-        evidence.status = BethesdaScanStatus::Partial;
-    }
-    (evidence, findings)
+    Ok((evidence, findings))
 }
 
-#[derive(Debug)]
+pub(super) type CapturedEvidence = (BethesdaEvidence, Vec<BethesdaFinding>);
+
+#[derive(Debug, Clone)]
 pub(super) enum BethesdaFinding {
     MissingMaster {
         list_file: String,
@@ -384,40 +413,134 @@ impl BethesdaFinding {
     }
 }
 
+#[cfg(test)]
 fn listed_plugins(file: &DiagnosticFile) -> Vec<ListedPlugin> {
     let mut load_order = 0;
     file.lines
         .iter()
-        .filter(|line| !line.truncated)
-        .filter_map(|line| {
-            let text = line.text.trim();
-            if text.is_empty() || text.starts_with('#') {
-                return None;
-            }
-            let enabled = text.starts_with('*');
-            let name = text.strip_prefix('*').unwrap_or(text).trim();
-            let ext = Path::new(name)
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if validate_relative_path(name, false).is_err()
-                || name.contains('/')
-                || !["esp", "esm", "esl"].contains(&ext.as_str())
-            {
-                return None;
-            }
-            if enabled {
-                load_order += 1;
-            }
-            Some(ListedPlugin {
-                name: name.to_string(),
-                enabled,
-                line: line.number,
-                load_order: if enabled { load_order } else { 0 },
-            })
-        })
+        .filter_map(|line| parse_plugin(line, &mut load_order))
         .collect()
+}
+
+fn parse_plugin(line: &super::LogLine, load_order: &mut usize) -> Option<ListedPlugin> {
+    let text = line.text.trim();
+    if line.truncated || text.is_empty() || text.starts_with('#') {
+        return None;
+    }
+    let enabled = text.starts_with('*');
+    let name = text.strip_prefix('*').unwrap_or(text).trim();
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if validate_relative_path(name, false).is_err()
+        || name.contains('/')
+        || !["esp", "esm", "esl"].contains(&ext.as_str())
+    {
+        return None;
+    }
+    if enabled {
+        *load_order += 1;
+    }
+    Some(ListedPlugin {
+        name: name.into(),
+        enabled,
+        line: line.number,
+        load_order: if enabled { *load_order } else { 0 },
+    })
+}
+
+pub(super) struct Capture {
+    spool: rusqlite::Connection,
+    _temp: tempfile::TempDir,
+    load_order: usize,
+    partial: bool,
+}
+
+impl Capture {
+    pub fn new() -> AppResult<Self> {
+        let temp = tempfile::tempdir()?;
+        let spool = rusqlite::Connection::open(temp.path().join("plugins.sqlite"))?;
+        spool.execute_batch("PRAGMA journal_mode=OFF; PRAGMA cache_size=-1024;
+            CREATE TABLE plugins(line INTEGER PRIMARY KEY,key TEXT NOT NULL,name TEXT NOT NULL,enabled INTEGER NOT NULL,ord INTEGER NOT NULL);
+            CREATE INDEX plugin_key ON plugins(key,line); BEGIN;")?;
+        Ok(Self {
+            spool,
+            _temp: temp,
+            load_order: 0,
+            partial: false,
+        })
+    }
+
+    pub fn observe(&mut self, line: &super::LogLine) -> AppResult<()> {
+        self.partial |= line.truncated;
+        if let Some(entry) = parse_plugin(line, &mut self.load_order) {
+            self.spool.execute(
+                "INSERT INTO plugins VALUES(?1,?2,?3,?4,?5)",
+                rusqlite::params![
+                    entry.line,
+                    entry.name.to_ascii_lowercase(),
+                    entry.name,
+                    entry.enabled,
+                    entry.load_order
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn batches(
+        self,
+        ctx: &Context,
+        file: &DiagnosticFile,
+        cancel: &tokio_util::sync::CancellationToken,
+        mut emit: impl FnMut(BethesdaEvidence, Vec<BethesdaFinding>) -> AppResult<()>,
+    ) -> AppResult<(BethesdaEvidence, Vec<BethesdaFinding>)> {
+        let mut file = file.clone();
+        file.lines.clear();
+        file.truncated = self.partial;
+        let mut enabled = self.spool.prepare("SELECT name,line,ord FROM plugins AS p WHERE enabled AND line=(SELECT MIN(line) FROM plugins WHERE key=p.key AND enabled) ORDER BY line")?;
+        let mut listed = self
+            .spool
+            .prepare("SELECT enabled,ord FROM plugins WHERE key=?1 ORDER BY line LIMIT 1")?;
+        let mut rows = enabled
+            .query_map([], |row| {
+                Ok(ListedPlugin {
+                    name: row.get(0)?,
+                    line: row.get(1)?,
+                    load_order: row.get(2)?,
+                    enabled: true,
+                })
+            })?
+            .peekable();
+        loop {
+            if cancel.is_cancelled() {
+                return Err(AppError::Cancelled);
+            }
+            // TES4 per-header limits ensure every plugin fits in its batch.
+            let entries = rows
+                .by_ref()
+                .take(MAX_TOTAL_HEADER_BYTES / MAX_HEADER_BYTES)
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let (evidence, findings) = inspect_batch(
+                ctx,
+                &file,
+                entries.into_iter(),
+                |key| {
+                    Ok(listed
+                        .query_row([key], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .optional()?)
+                },
+                MAX_TOTAL_HEADER_BYTES,
+                cancel,
+            )?;
+            if rows.peek().is_none() {
+                return Ok((evidence, findings));
+            }
+            emit(evidence, findings)?;
+        }
+    }
 }
 
 fn read_header(

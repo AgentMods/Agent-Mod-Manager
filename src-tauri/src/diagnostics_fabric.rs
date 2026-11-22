@@ -3,12 +3,15 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::{DiagnosticFile, FileKind, ReadStatus};
+use super::{DiagnosticFile, FileKind, LogLine, ReadStatus};
 
 #[path = "diagnostics_fabric_failure.rs"]
 mod failure;
-pub(super) use failure::dependency_details;
+use failure::dependency_details;
+#[cfg(test)]
+pub(super) use failure::dependency_details as legacy_dependency_details;
 
+#[cfg(test)]
 const MAX_MODS: usize = 100;
 const MAX_DECLARED: usize = 4096;
 const MAX_VERSION: usize = 128;
@@ -58,7 +61,7 @@ pub struct FabricMod {
 }
 
 impl FabricEvidence {
-    fn empty(file: &DiagnosticFile, status: FabricStatus) -> Self {
+    pub(super) fn empty(file: &DiagnosticFile, status: FabricStatus) -> Self {
         Self {
             status,
             file: "logs/latest.log".into(),
@@ -75,7 +78,12 @@ impl FabricEvidence {
     }
 }
 
+#[cfg(test)]
 pub(super) fn inspect(file: &DiagnosticFile) -> FabricEvidence {
+    inspect_selection_prefix(file, MAX_MODS)
+}
+
+fn inspect_selection_prefix(file: &DiagnosticFile, retained_rows: usize) -> FabricEvidence {
     if file.status != ReadStatus::Read || file.kind != FileKind::Log {
         return FabricEvidence::empty(file, FabricStatus::Unavailable);
     }
@@ -143,12 +151,98 @@ pub(super) fn inspect(file: &DiagnosticFile) -> FabricEvidence {
                 evidence.selection_line = Some(line.number);
                 evidence.declared_count = count;
                 if let Some(count) = count {
-                    inspect_selection(file, index, count, &mut evidence);
+                    inspect_selection(file, index, count, &mut evidence, retained_rows);
                 }
             }
         }
     }
     evidence
+}
+
+/// Retain only loader records and the declared contiguous block, independent
+/// of the visible log page. The grammar's row/field ceilings bound this state.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Capture {
+    relevant: Vec<LogLine>,
+    tail: usize,
+    startups: u8,
+    headers: u8,
+}
+pub(super) type CapturedEvidence = (FabricEvidence, Option<(LogLine, Vec<(LogLine, String)>)>);
+
+impl Capture {
+    pub fn observe(&mut self, line: &LogLine) {
+        let record = Record::parse(&line.text);
+        let startup = record.as_ref().is_some_and(|record| {
+            record.is("INFO", "FabricLoader/GameProvider")
+                && startup_marker(record.message, line.truncated)
+        });
+        let selection = record.as_ref().filter(|record| {
+            self.startups > 0
+                && record.is("INFO", "FabricLoader")
+                && selection_marker(record.message, line.truncated)
+        });
+        let failed = record.as_ref().is_some_and(|record| {
+            self.startups > 0
+                && record.is("WARN", "FabricLoader/Resolution")
+                && (record.message == FAILURE
+                    || (line.truncated
+                        && record.message.starts_with("Mod resolution")
+                        && FAILURE.starts_with(record.message)))
+        });
+        if startup {
+            self.startups = self.startups.saturating_add(1);
+        }
+        if selection.is_some() || failed {
+            self.headers = self.headers.saturating_add(1);
+        }
+        if self.startups > 2 || self.headers > 2 {
+            return;
+        }
+        if startup || selection.is_some() || failed || self.tail > 0 {
+            let mut saved = line.clone();
+            if saved.text.len() > 1024 {
+                let mut end = 1024;
+                while !saved.text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                saved.text.truncate(end);
+                saved.truncated = true;
+            }
+            self.relevant.push(saved);
+        }
+        if self.headers == 1 && (selection.is_some() || failed) {
+            self.tail = if failed {
+                64
+            } else {
+                selection
+                    .and_then(|record| selection_count(record.message))
+                    .unwrap_or_default()
+                    + 1
+            };
+        } else {
+            self.tail = self.tail.saturating_sub(1);
+        }
+    }
+
+    pub fn finish(self, file: &DiagnosticFile) -> CapturedEvidence {
+        let mut input = file.clone();
+        input.truncated = false;
+        input.continues = false;
+        input.lines = self.relevant;
+        let evidence = inspect_selection_prefix(&input, MAX_DECLARED);
+        let failure = evidence.failure_line.and_then(|number| {
+            let line = input
+                .lines
+                .iter()
+                .find(|line| line.number == number && !line.truncated)?;
+            Some((
+                line.clone(),
+                dependency_details(&input, number).unwrap_or_default(),
+            ))
+        });
+        (evidence, failure)
+    }
 }
 
 enum Header {
@@ -282,6 +376,7 @@ fn inspect_selection(
     header_index: usize,
     count: usize,
     evidence: &mut FabricEvidence,
+    retained_rows: usize,
 ) {
     let mut previous = file.lines[header_index].number;
     let mut next = file.lines[header_index + 1..].iter();
@@ -299,7 +394,7 @@ fn inspect_selection(
             return;
         }
         repeated_id |= !ids.insert(id);
-        if seen < MAX_MODS {
+        if seen < retained_rows {
             evidence.mods.push(FabricMod {
                 id: id.into(),
                 version: version.into(),
@@ -320,7 +415,7 @@ fn inspect_selection(
                 && previous.checked_add(1) == Some(line.number)
                 && (line.text.is_empty() || Record::parse(&line.text).is_some())
         }
-        None => !file.truncated,
+        None => !file.truncated && !file.continues,
     };
     // Keep duplicate rows in their original order, but their count cannot
     // establish that the distinct selection was fully reported.
@@ -404,7 +499,11 @@ mod tests {
                 })
                 .collect(),
             notes: Vec::new(),
+            continued: false,
+            continues: false,
             bg3: None,
+            fabric: None,
+            bethesda: None,
         }
     }
 

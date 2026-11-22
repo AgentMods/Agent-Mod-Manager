@@ -172,11 +172,13 @@ impl PublicationMcp {
         &self,
         name: &str,
         args: Value,
-        max_request: usize,
+        max_request: Option<usize>,
         cancel: &CancellationToken,
     ) -> AppResult<Value> {
-        if serde_json::to_vec(&args)?.len() > max_request {
-            return Err(failed());
+        if let Some(limit) = max_request {
+            if serde_json::to_vec(&args)?.len() > limit {
+                return Err(failed());
+            }
         }
         let arguments = match args {
             Value::Object(map) => map,
@@ -230,7 +232,10 @@ impl Transport {
         ) {
             return Err(AppError::Denied("发布流程不能调用其它远程工具".into()));
         }
-        let raw = self.mcp.call_tool(name, args, 256 * 1024, cancel).await?;
+        let raw = self
+            .mcp
+            .call_tool(name, args, Some(256 * 1024), cancel)
+            .await?;
         parse_result(raw, &self.mcp.key)
     }
 

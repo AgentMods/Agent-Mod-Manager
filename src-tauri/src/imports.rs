@@ -487,6 +487,12 @@ fn plan_import(engine: &FileEngine, path: &Path, _hooks: &mut Hooks) -> AppResul
             "Import scratch or destination changed before planning".into(),
         ));
     }
+    // Bind the desktop picker snapshot to its reviewed transaction. A generic
+    // copy plan with similar paths does not produce an import receipt.
+    engine.db.conn().execute(
+        "INSERT INTO desktop_archive_imports(transaction_id, artifact_id, filename, size, sha256) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![plan.id, id, filename, size, sha256],
+    )?;
     Ok(ImportPreview {
         filename,
         source_path: path.into(),
@@ -499,6 +505,46 @@ fn plan_import(engine: &FileEngine, path: &Path, _hooks: &mut Hooks) -> AppResul
             "SHA-256 proves snapshot integrity, not archive safety or compatibility. Nothing was extracted or executed. Failed and cancelled scratch files are retained.".into(),
         ],
     })
+}
+
+/// Only the applied, picker-originated snapshot can be published by this IPC.
+/// Deriving the source from its UUID also survives storage relocation.
+pub fn register_imported_mod(
+    engine: &FileEngine,
+    game_id: &str,
+    transaction_id: &str,
+) -> AppResult<crate::mod_library::LibraryEntry> {
+    use rusqlite::OptionalExtension;
+    let (artifact_id, name, size, hash): (String, String, u64, String) = engine
+        .db
+        .conn()
+        .query_row(
+            "SELECT i.artifact_id,i.filename,i.size,i.sha256 FROM desktop_archive_imports i
+         JOIN file_transactions t ON t.id=i.transaction_id WHERE t.id=?1 AND t.status='committed'",
+            [transaction_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| denied("仅能归类由桌面文件选择器导入且已提交的归档"))?;
+    let game = crate::games::get_game(&engine.db, game_id)?;
+    let archive = engine
+        .paths
+        .staging()
+        .join("imports")
+        .join(&artifact_id)
+        .join(&name);
+    crate::mod_library::ingest_import(
+        engine,
+        &crate::mod_library::ApprovedArtifact {
+            artifact_id: &artifact_id,
+            path: &archive,
+            filename: &name,
+            size,
+            sha256: &hash,
+        },
+        &game.name,
+        Some(game_id),
+    )
 }
 
 #[cfg(test)]

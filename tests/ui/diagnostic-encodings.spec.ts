@@ -96,9 +96,9 @@ test('log fallback is optional, clears old evidence, and reports the actual sour
   await run.click();
   await expect(page.getByText('旧版日志编码无法确认。', { exact: true })).toBeVisible();
   expect(await page.evaluate(start => (window as any).__AMM_TEST__.calls.slice(start), before)).toEqual([
-    { command: 'diagnose_game', args: { gameId: 'game-fixture', options: null } },
-    { command: 'diagnose_game', args: { gameId: 'game-fixture', options: { legacyLogEncoding: 'gbk' } } },
-    { command: 'diagnose_game', args: { gameId: 'game-fixture', options: null } },
+    { command: 'diagnose_game', args: { gameId: 'game-fixture', options: { page: { requestId: expect.any(String) } } } },
+    { command: 'diagnose_game', args: { gameId: 'game-fixture', options: { legacyLogEncoding: 'gbk', page: { requestId: expect.any(String) } } } },
+    { command: 'diagnose_game', args: { gameId: 'game-fixture', options: { page: { requestId: expect.any(String) } } } },
   ]);
 });
 
@@ -122,8 +122,8 @@ test('pending diagnosis locks the option and cannot populate another game', asyn
   await expect(page.getByText('原游戏的延迟诊断。', { exact: true })).toHaveCount(0);
   await expect(page.getByText('此游戏没有可用日志。', { exact: true })).toBeVisible();
   await expect(page.getByText(/^文件读取状态/)).toHaveCount(0);
-  expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: { command: string }) => call.command === 'diagnose_game').map((call: { args: unknown }) => call.args))).toEqual([
-    { gameId: 'game-fixture', options: { legacyLogEncoding: 'shift_jis' } },
-    { gameId: 'other-game', options: null },
+  expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: { command: string; args: { options?: { page?: { cancel?: boolean } } } }) => call.command === 'diagnose_game' && !call.args.options?.page?.cancel).map((call: { args: unknown }) => call.args))).toEqual([
+    { gameId: 'game-fixture', options: { legacyLogEncoding: 'shift_jis', page: { requestId: expect.any(String) } } },
+    { gameId: 'other-game', options: { page: { requestId: expect.any(String) } } },
   ]);
 });

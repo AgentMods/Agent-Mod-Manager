@@ -54,10 +54,27 @@ pub async fn download_mod(
     agent: State<'_, AgentRuntime>,
     app: tauri::AppHandle,
     task_id: String,
-    resolution_id: String,
-) -> AppResult<crate::download::DownloadArtifact> {
+    resolution_id: Option<String>,
+    artifact_id: Option<String>,
+    classification: Option<crate::download_tasks::ClassificationInput>,
+) -> AppResult<crate::download_tasks::LibraryDownloadReceipt> {
     use tauri::Emitter;
-    let resolution_id = parse_resolution_id(&resolution_id)?;
+    let classification = classification.unwrap_or_default();
+    let resolution_id = match (resolution_id, artifact_id) {
+        (Some(id), None) => parse_resolution_id(&id)?,
+        (None, Some(id)) => {
+            return state
+                .downloads
+                .retry(&state.engine, &id, classification)
+                .await
+                .map(crate::download_tasks::LibraryDownloadReceipt::into_user_paths);
+        }
+        _ => {
+            return Err(AppError::Invalid(
+                "请提供下载解析 ID 或已保存的下载回执 ID，不能同时提供".into(),
+            ))
+        }
+    };
     let event_id = task_id.clone();
     state
         .downloads
@@ -66,6 +83,7 @@ pub async fn download_mod(
             &agent.resolutions,
             task_id,
             resolution_id,
+            classification,
             std::sync::Arc::new(move |progress| {
                 let _ = app.emit(
                     "download://progress",
@@ -74,7 +92,7 @@ pub async fn download_mod(
             }),
         )
         .await
-        .map(crate::download::DownloadArtifact::into_user_paths)
+        .map(crate::download_tasks::LibraryDownloadReceipt::into_user_paths)
 }
 #[tauri::command]
 pub fn cancel_download(state: State<'_, AppServices>, task_id: String) -> AppResult<()> {
@@ -228,7 +246,13 @@ pub async fn read_logs(
     options: Option<crate::diagnostics::ReadOptions>,
 ) -> AppResult<crate::diagnostics::LogReport> {
     blocking(state.engine.clone(), move |e| {
-        crate::diagnostics::read_logs(&e, &game_id, &options.unwrap_or_default())
+        crate::diagnostics::read_logs_page(
+            &e,
+            game_id,
+            options.unwrap_or_default(),
+            "desktop",
+            &tokio_util::sync::CancellationToken::new(),
+        )
     })
     .await
 }
@@ -240,7 +264,13 @@ pub async fn diagnose_game(
     options: Option<crate::diagnostics::ReadOptions>,
 ) -> AppResult<crate::diagnostics::Diagnosis> {
     blocking(state.engine.clone(), move |e| {
-        crate::diagnostics::diagnose_game(&e, &game_id, &options.unwrap_or_default())
+        crate::diagnostics::diagnose_game_page(
+            &e,
+            game_id,
+            options.unwrap_or_default(),
+            "desktop",
+            &tokio_util::sync::CancellationToken::new(),
+        )
     })
     .await
 }
@@ -272,11 +302,22 @@ pub async fn list_mod_versions(request: VersionListRequest) -> AppResult<Version
 }
 #[tauri::command]
 pub async fn resolve_modrinth_dependency_graph(
+    state: State<'_, AppServices>,
     request: DependencyGraphRequest,
+    operation_id: Option<uuid::Uuid>,
 ) -> AppResult<DependencyGraph> {
+    let operation = state.dependency_operations.start(operation_id)?;
     Sources::new(SourceKeys::default())?
-        .modrinth_dependency_graph(&request)
+        .modrinth_dependency_graph(&request, &operation.cancel)
         .await
+}
+
+#[tauri::command]
+pub fn cancel_modrinth_dependency_graph(
+    state: State<'_, AppServices>,
+    operation_id: uuid::Uuid,
+) -> bool {
+    state.dependency_operations.cancel(operation_id)
 }
 use crate::{
     agent::{
@@ -471,7 +512,7 @@ pub async fn get_agent_model_metadata(
     base_url: String,
     model_ids: Vec<String>,
 ) -> AppResult<Vec<crate::agent::model_catalog::ModelMetadata>> {
-    crate::agent::model_catalog::metadata(&base_url, &model_ids).await
+    crate::agent::model_catalog::reasoning_metadata(&base_url, &model_ids).await
 }
 
 #[tauri::command]
@@ -572,7 +613,12 @@ pub async fn scan_games(
     options: games::ScanOptions,
 ) -> AppResult<games::ScanReport> {
     blocking(state.engine.clone(), move |e| {
-        games::scan_games(&e.db, &options)
+        games::scan_games_page(
+            &e.db,
+            options,
+            "desktop",
+            &tokio_util::sync::CancellationToken::new(),
+        )
     })
     .await
 }
@@ -915,19 +961,36 @@ pub async fn prepare_manager_plugin_import(
 }
 
 #[tauri::command]
-pub async fn prepare_manager_publication(
+pub async fn get_manager_plugin_display(
+    release_id: String,
+) -> AppResult<Option<crate::manager_catalog::ReleaseDisplay>> {
+    crate::manager_catalog::release_display(&release_id).await
+}
+
+#[tauri::command]
+pub async fn prepare_auto_manager_publication(
     state: State<'_, AppServices>,
+    agent: State<'_, AgentRuntime>,
     draft_id: Option<String>,
     slug: Option<String>,
-    target: crate::manager_publication::PublicationTarget,
-    tags: Vec<String>,
 ) -> AppResult<crate::manager_publication::PublicationRecord> {
-    blocking(state.engine.clone(), move |engine| match (draft_id, slug) {
-        (Some(id), None) => crate::manager_publication::prepare_draft(&engine, &id, target, tags),
-        (None, Some(slug)) => {
-            crate::manager_publication::prepare_installed(&engine, &slug, target, tags)
-        }
-        _ => Err(AppError::Invalid("请选择一个草稿或已安装适配包".into())),
+    crate::manager_publication::prepare_automatic(
+        &state.engine,
+        &agent.settings,
+        draft_id,
+        slug,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn get_manager_publication(
+    state: State<'_, AppServices>,
+    id: String,
+) -> AppResult<crate::manager_publication::PublicationRecord> {
+    blocking(state.engine.clone(), move |engine| {
+        crate::manager_publication::get_publication(&engine, &id)
     })
     .await
 }
@@ -935,9 +998,10 @@ pub async fn prepare_manager_publication(
 #[tauri::command]
 pub async fn list_manager_publications(
     state: State<'_, AppServices>,
+    before: Option<String>,
 ) -> AppResult<Vec<crate::manager_publication::PublicationRecord>> {
-    blocking(state.engine.clone(), |engine| {
-        crate::manager_publication::list_publications(&engine)
+    blocking(state.engine.clone(), move |engine| {
+        crate::manager_publication::list_publications(&engine, before.as_deref())
     })
     .await
 }
@@ -973,11 +1037,23 @@ pub async fn reconcile_manager_publication(
 }
 
 #[tauri::command]
+pub async fn get_plugin_publication(
+    state: State<'_, AppServices>,
+    id: String,
+) -> AppResult<crate::plugin_publish::PublicationRecord> {
+    blocking(state.engine.clone(), move |engine| {
+        crate::plugin_publish::get_publication(&engine, &id)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn list_plugin_publications(
     state: State<'_, AppServices>,
+    before: Option<String>,
 ) -> AppResult<Vec<crate::plugin_publish::PublicationRecord>> {
-    blocking(state.engine.clone(), |engine| {
-        crate::plugin_publish::list_publications(&engine)
+    blocking(state.engine.clone(), move |engine| {
+        crate::plugin_publish::list_publications(&engine, before.as_deref())
     })
     .await
 }
@@ -1083,6 +1159,53 @@ pub async fn plan_import_archive(
 }
 
 #[tauri::command]
+pub async fn register_imported_mod(
+    state: State<'_, AppServices>,
+    game_id: String,
+    transaction_id: String,
+) -> AppResult<crate::mod_library::LibraryEntry> {
+    blocking(state.engine.clone(), move |engine| {
+        crate::imports::register_imported_mod(&engine, &game_id, &transaction_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn bind_mod_library_entry(
+    state: State<'_, AppServices>,
+    game_id: String,
+    artifact_id: String,
+) -> AppResult<crate::mod_library::LibraryEntry> {
+    blocking(state.engine.clone(), move |engine| {
+        crate::mod_library::bind_entry(&engine, &game_id, &artifact_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn remove_managed_mod(
+    state: State<'_, AppServices>,
+    game_id: String,
+    target: crate::mod_management::Target,
+) -> AppResult<()> {
+    blocking(state.engine.clone(), move |engine| {
+        crate::mod_management::remove(&engine, &game_id, &target)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn list_mod_library(
+    state: State<'_, AppServices>,
+    game_id: String,
+) -> AppResult<Vec<crate::mod_library::LibraryEntry>> {
+    blocking(state.engine.clone(), move |engine| {
+        crate::mod_library::list_for_game(&engine.db, &game_id)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn preview_fomod(
     state: State<'_, AppServices>,
     artifact_path: std::path::PathBuf,
@@ -1135,7 +1258,7 @@ pub async fn apply_plan(state: State<'_, AppServices>, plan_id: String) -> AppRe
         e.approve_plan(&plan_id)?;
         let result = e.apply_file_ops(&plan_id)?;
         crate::install::reconcile(&e.db)?;
-        crate::plugin_workflow::reconcile_deployments(&e)?;
+        crate::plugin_workflow::reconcile_after_apply(&e, &result)?;
         crate::skills::reconcile_deployments(&e)?;
         Ok(result)
     })
@@ -1160,7 +1283,7 @@ pub async fn list_installs(
     game_id: String,
 ) -> AppResult<Vec<crate::install::InstalledMod>> {
     blocking(state.engine.clone(), move |e| {
-        crate::install::list_installs(&e, &game_id)
+        crate::mod_management::visible_installs(&e, &game_id)
     })
     .await
     .map(|items| {
@@ -1186,9 +1309,12 @@ pub async fn inspect_install(
 pub async fn check_modrinth_dependencies(
     state: State<'_, AppServices>,
     request: crate::install_dependencies::CheckRequest,
+    operation_id: Option<uuid::Uuid>,
 ) -> AppResult<crate::install_dependencies::DependencyReport> {
+    let operation = state.dependency_operations.start(operation_id)?;
+    let cancel = operation.cancel.clone();
     blocking(state.engine.clone(), move |e| {
-        crate::install_dependencies::check(&e, &request)
+        crate::install_dependencies::check_with_cancel(&e, &request, &cancel)
     })
     .await
 }
@@ -1197,9 +1323,17 @@ pub async fn check_modrinth_dependencies(
 pub async fn review_modrinth_dependency_graph(
     state: State<'_, AppServices>,
     request: crate::install_dependencies::GraphReviewRequest,
+    operation_id: Option<uuid::Uuid>,
 ) -> AppResult<crate::install_dependencies::GraphReview> {
+    let operation = state.dependency_operations.start(operation_id)?;
     let sources = Sources::new(SourceKeys::default())?;
-    crate::install_dependencies::review_graph(state.engine.clone(), &sources, request).await
+    crate::install_dependencies::review_graph(
+        state.engine.clone(),
+        &sources,
+        request,
+        &operation.cancel,
+    )
+    .await
 }
 
 #[tauri::command]

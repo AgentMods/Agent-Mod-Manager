@@ -60,8 +60,8 @@ async function fixtureSession(context, page, respond, events = []) {
   };
 }
 
-function fixtureSearch(respond, events = [], options = {}) {
-  return searchBing(input, {
+function fixtureSearch(respond, events = [], { request = input, ...options } = {}) {
+  return searchBing(request, {
     ...options,
     newSession: (context, page) => fixtureSession(context, page, respond, events),
   });
@@ -108,6 +108,7 @@ test('isolated Chromium reads visible organic results in Bing order; no result o
   });
   assert.equal(result.results[1].url, 'https://docs.fabricmc.net/');
   assert.equal(result.results[1].title, 'Fabric 文档');
+  assert.deepEqual(result.next, { first: 1, row_offset: 7 });
   assert.match(result.results[1].snippet, /^你好 😀+$/u);
   assert(Buffer.byteLength(result.results[1].snippet) <= 1536);
   assert.deepEqual(events.filter(event => event.allowed).map(event => event.url), [search.href, css]);
@@ -155,6 +156,78 @@ for (const [label, fixture, expected] of [
   });
 }
 
+function pageUrl(term, first = 1) {
+  const url = new URL('https://www.bing.com/search');
+  url.searchParams.set('q', term.trim());
+  if (first !== 1) url.searchParams.set('first', String(first));
+  return url.href;
+}
+
+function nextLink(url) {
+  return `<li class="b_pag"><nav><a class="sb_pagN" href="${url.replaceAll('&', '&amp;')}">Next</a></nav></li>`;
+}
+
+test('forwards long public terms unchanged, resumes row chunks, and follows only advertised positions', { timeout: 30000 }, async () => {
+  const term = 'multiplayer mods '.repeat(600) + '& final'; // >8 KiB, >512 chars, >75 words.
+  const initialUrl = pageUrl(term);
+  const followingUrl = pageUrl(term, 31);
+  const rows = Array.from({ length: 30 }, (_, i) => card(`https://example.org/${i}`, 'a'.repeat(500), 's'.repeat(1500)));
+  const respond = url => {
+    if (url === initialUrl) return { body: list(...rows, nextLink(`${followingUrl}&FORM=PERE&tracking=discard`)) };
+    if (url === followingUrl) return { body: list(card(first, 'Last')) };
+  };
+  const events = [];
+  const request = { query: term, count: 200 };
+  const initial = await fixtureSearch(respond, events, { request });
+  assert.equal(initial.status, 'available');
+  assert.equal(initial.results.length, 24);
+  assert(Buffer.byteLength(JSON.stringify(initial)) > 32 * 1024);
+  assert.deepEqual(initial.next, { first: 1, row_offset: 24 });
+  const rest = await fixtureSearch(respond, events, { request: { ...request, position: initial.next } });
+  assert.deepEqual(rest.results.map(hit => hit.url), Array.from({ length: 6 }, (_, i) => `https://example.org/${i + 24}`));
+  assert.deepEqual(rest.next, { first: 31, row_offset: 0 });
+  const last = await fixtureSearch(respond, events, { request: { ...request, position: rest.next } });
+  assert.deepEqual(last, { status: 'available', truncated: false, results: [{ title: 'Last', url: first, snippet: '' }] });
+  assert.deepEqual(events.filter(event => event.allowed).map(event => event.url), [initialUrl, initialUrl, followingUrl]);
+});
+
+for (const [label, href] of [
+  ['off-domain', pageUrl(query, 11).replace('www.bing.com', 'www.bing.com.example.net')],
+  ['query substitution', pageUrl('another search', 11)],
+  ['duplicate position parameter', `${pageUrl(query, 11)}&first=21`],
+  ['backward or looping position', pageUrl(query)],
+]) {
+  test(`does not follow a ${label} next link`, { timeout: 30000 }, async () => {
+    const events = [];
+    const result = await fixtureSearch(url => url === search.href ? { body: list(card(first, 'Safe hit'), nextLink(href)) } : undefined, events);
+    assert.equal(result.status, 'available');
+    assert.equal(result.results.length, 1);
+    assert.equal(result.reason, 'invalid_pagination');
+    assert.equal(result.next, undefined);
+    assert.deepEqual(events.filter(event => event.allowed).map(event => event.url), [search.href]);
+  });
+}
+
+test('blocks a redirect that attempts to replace the advertised page position', { timeout: 30000 }, async () => {
+  const events = [];
+  const expected = pageUrl(query, 11);
+  const redirect = pageUrl(query, 31);
+  const result = await fixtureSearch(url => url === expected ? { status: 302, headers: { Location: redirect } } : undefined, events, {
+    request: { ...input, position: { first: 11, row_offset: 0 } },
+  });
+  assert.deepEqual(result, empty('unavailable'));
+  assert.deepEqual(events, [{ url: expected, allowed: true }, { url: redirect, allowed: false }]);
+});
+
+test('honestly reports Bing or gateway rejection without shortening the query', { timeout: 30000 }, async () => {
+  const term = 'lots of terms '.repeat(100);
+  const expected = pageUrl(term);
+  const events = [];
+  const result = await fixtureSearch(url => url === expected ? { status: 414 } : undefined, events, { request: { query: term, count: 20 } });
+  assert.deepEqual(result, { ...empty('unavailable'), reason: 'query_rejected' });
+  assert.deepEqual(events.filter(event => event.allowed).map(event => event.url), [expected]);
+});
+
 function worker(t, args) {
   const child = spawn(process.execPath, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   const closed = once(child, 'close');
@@ -184,6 +257,15 @@ test('CLI keeps stdin open during work, writes one JSON line, and exits', { time
   child.stdin.write(line.subarray(split));
   const result = await output();
   assert.deepEqual(result, { json: empty('needs_configuration'), stderr: '' });
+});
+
+test('CLI transports and preserves a long query above the former bridge limit', { timeout: 30000 }, async t => {
+  const code = `const { runCli } = require(${JSON.stringify(require.resolve('./bing-search.cjs'))});
+    runCli(request => ({ length: request.query.length, count: request.count, last: request.query.slice(-6) }));`;
+  const { child, output } = worker(t, ['-e', code]);
+  const term = 'minecraft '.repeat(1200) + 'lithium';
+  child.stdin.write(`${JSON.stringify({ query: term, count: 1500 })}\n`);
+  assert.deepEqual((await output()).json, { length: term.length, count: 1500, last: 'ithium' });
 });
 
 test('CLI EOF cancels a live, paused navigation and disconnects the browser before exit', { timeout: 30000 }, async t => {

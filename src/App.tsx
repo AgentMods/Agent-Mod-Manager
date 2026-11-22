@@ -2,7 +2,8 @@ import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Gamepad2Icon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { backendAvailable, useBackendQuery } from "./lib/api";
-import { syncAgentEvents } from "./lib/agent-store";
+import { subscribeAgentToolResults, syncAgentEvents } from "./lib/agent-store";
+import { invalidateAgentModQueries } from "./lib/agent-mod-cache";
 import { useUI } from "./lib/store";
 import { t } from "./lib/i18n";
 import type { BootstrapState, PageName } from "./lib/types";
@@ -35,7 +36,7 @@ const navigation = [
 ] as const;
 const settingsItem = { id: "settings", label: "设置", icon: SettingsIcon } as const;
 const APP_VERSION = "v0.1.0";
-const pages = { library: LibraryPage, detail: GameDetailPage, agent: AgentPage, plugins: PluginsPage, trash: TrashPage, history: HistoryPage, settings: SettingsPage, onboarding: OnboardingPage };
+const pages = { library: LibraryPage, detail: GameDetailPage, agent: AgentPage, plugins: PluginsPage, trash: TrashPage, history: HistoryPage, settings: SettingsPage };
 
 /** The navigation rail collapses to icons below this width so content keeps its room. */
 const WIDE_QUERY = "(min-width: 1100px)";
@@ -86,6 +87,15 @@ export default function App() {
     const timer = setTimeout(() => root.classList.remove("theme-switching"), 400);
     return () => { clearTimeout(timer); root.classList.remove("theme-switching"); };
   }, [theme]);
+  useEffect(() => subscribeAgentToolResults((results) => {
+    // The draft list and badge share this cache. Read back the backend state
+    // as soon as the tool finishes; the Agent may keep working in this turn.
+    if (results.some(({ payload: { name, status, result } }) => status === "done" &&
+      (name === "install_plugin" || (name === "publish_plugin" && result &&
+        typeof result === "object" && "state" in result && result.state === "completed")))) {
+      void client.invalidateQueries({ queryKey: ["plugin-drafts"] });
+    }
+  }), [client]);
   useEffect(() => syncAgentEvents(visibleConversation, (id, events) => {
     void client.invalidateQueries({ queryKey: ["conversation", id] });
     void client.invalidateQueries({ queryKey: ["conversations"] });
@@ -100,16 +110,20 @@ export default function App() {
       void client.invalidateQueries({ queryKey: ["games"] });
       for (const gameId of boundGameIds) {
         void client.invalidateQueries({ queryKey: ["game", gameId] });
-        void client.invalidateQueries({ queryKey: ["game-adapter", gameId] });
+        void client.invalidateQueries({ queryKey: ["mod-library", gameId] });
       }
     }
-    if (events.some((event) => event.kind === "tool-result" && event.payload.status === "done" &&
-      ["write_plugin_draft", "import_cloud_plugin", "install_plugin"].includes(String(event.payload.name)))) {
-      for (const key of ["plugin-drafts", "plugins", "game-adapter", "skills"]) {
+    const successfulTools = new Set(events.filter(event => event.kind === "tool-result" && event.payload.status === "done")
+      .map(event => event.payload.name));
+    const createdDraft = successfulTools.has("write_plugin_draft") || successfulTools.has("import_cloud_plugin");
+    if (createdDraft) void client.invalidateQueries({ queryKey: ["plugin-drafts"] });
+    if (createdDraft || successfulTools.has("install_plugin")) {
+      for (const key of ["plugins", "skills"]) {
         void client.invalidateQueries({ queryKey: [key] });
       }
     }
-    if (events.some(event => event.kind === "tool-result" && event.payload.name === "publish_plugin" && event.payload.status === "done")) {
+    invalidateAgentModQueries(client, events);
+    if (successfulTools.has("publish_plugin")) {
       for (const key of ["manager-publications", "manager-plugin-games"]) {
         void client.invalidateQueries({ queryKey: [key] });
       }
@@ -124,12 +138,13 @@ export default function App() {
   const automaticOnboarding = !!(bootstrap.data?.isFirstRun || bootstrap.data?.resumeOnboarding);
   if (backendAvailable && bootstrap.data && (view === "onboarding" || automaticOnboarding)) {
     return <Suspense fallback={<main className="flex min-h-dvh items-center justify-center bg-background"><Loading>正在加载引导…</Loading></main>}>
-      <OnboardingPage automatic={automaticOnboarding} recoveryError={bootstrap.data.recoveryError} />
+      <OnboardingPage automatic={automaticOnboarding} bootstrap={bootstrap.data} />
     </Suspense>;
   }
 
-  const Page = pages[view];
-  const current = view === "detail" ? "游戏详情" : [...navigation, settingsItem].find((item) => item.id === view)?.label;
+  const shellView = view === "onboarding" ? "settings" : view;
+  const Page = pages[shellView];
+  const current = shellView === "detail" ? "游戏详情" : [...navigation, settingsItem].find((item) => item.id === shellView)?.label;
   const macos = backendAvailable && navigator.platform.startsWith("Mac");
   return <SidebarProvider open={railOpen ?? wide} onOpenChange={changeRail} className="h-dvh min-h-0 overflow-hidden" style={{ "--sidebar-width": "13.5rem" } as React.CSSProperties}>
     <Sidebar collapsible="icon" className="[&_[data-slot=sidebar-inner]]:bg-sidebar">

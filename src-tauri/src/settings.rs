@@ -19,16 +19,12 @@ const PUBLIC_KEYS: &[&str] = &[
     "base_url",
     "model",
     "models",
-    "context_budget",
     "permission_mode",
     "api_key_ref",
     "onboarding_completed",
 ];
 
 const COMPOSER_PREFERENCES_KEY: &str = "composer_preferences";
-
-pub(crate) const MAX_CONTEXT_BUDGET: usize = 16_777_216;
-pub(crate) const MAX_CONFIGURED_MODELS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -48,7 +44,6 @@ pub enum ReasoningEffort {
 pub struct AgentModelSettings {
     pub display_name: String,
     pub id: String,
-    pub context_budget: usize,
     pub reasoning_levels: Vec<ReasoningEffort>,
 }
 
@@ -57,7 +52,9 @@ pub struct AgentModelSettings {
 struct StoredAgentModelSettings {
     display_name: Option<String>,
     id: String,
-    context_budget: usize,
+    // Older rows may contain any JSON value; never use it as model metadata.
+    #[serde(rename = "context_budget")]
+    _legacy_context_budget: Option<serde::de::IgnoredAny>,
     reasoning_levels: Option<Vec<ReasoningEffort>>,
     reasoning_effort: Option<ReasoningEffort>,
 }
@@ -70,7 +67,6 @@ impl From<StoredAgentModelSettings> for AgentModelSettings {
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| stored.id.clone()),
             id: stored.id,
-            context_budget: stored.context_budget,
             reasoning_levels: stored
                 .reasoning_levels
                 .unwrap_or_else(|| stored.reasoning_effort.into_iter().collect()),
@@ -96,8 +92,6 @@ pub struct AppSettings {
     pub base_url: String,
     pub model: String,
     pub models: Vec<AgentModelSettings>,
-    /// Maximum input-context tokens retained by the Agent.
-    pub context_budget: usize,
     pub permission_mode: String,
     pub api_key_ref: Option<String>,
     pub onboarding_completed: bool,
@@ -109,7 +103,6 @@ impl Default for AppSettings {
             base_url: "https://one.gloscai.com/v1".into(),
             model: String::new(),
             models: Vec::new(),
-            context_budget: 32_768,
             permission_mode: "request_approval".into(),
             api_key_ref: None,
             onboarding_completed: false,
@@ -300,12 +293,14 @@ impl Settings {
         }
         // Validate in isolation: a single-key update never rewrites other fields.
         let mut candidate = serde_json::to_value(AppSettings::default())?;
-        candidate[key] = value.clone();
-        validate_settings(&serde_json::from_value(candidate)?)?;
+        candidate[key] = value;
+        let candidate = serde_json::from_value(candidate)?;
+        validate_settings(&candidate)?;
+        let value = serde_json::to_value(candidate)?;
         self.db.conn().execute(
             "INSERT INTO settings(key,value) VALUES(?1,?2)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![key, serde_json::to_string(&value)?],
+            params![key, serde_json::to_string(&value[key])?],
         )?;
         Ok(())
     }
@@ -376,21 +371,11 @@ fn validate_settings(settings: &AppSettings) -> AppResult<()> {
     if settings.model.len() > 256 || settings.model.chars().any(char::is_control) {
         return Err(AppError::Invalid("无效的模型名称".into()));
     }
-    if !(1..=MAX_CONTEXT_BUDGET).contains(&settings.context_budget) {
-        return Err(AppError::Invalid("context_budget 超出范围".into()));
-    }
     let mut ids = HashSet::new();
-    if settings.models.len() > MAX_CONFIGURED_MODELS
-        || settings.models.iter().any(|model| {
-            !valid_model_id(&model.display_name)
-                || !valid_model_id(&model.id)
-                || !ids.insert(&model.id)
-                || !(1..=MAX_CONTEXT_BUDGET).contains(&model.context_budget)
-        })
-    {
-        return Err(AppError::Invalid(
-            "模型列表含有重复名称或无效配置，最多可添加 64 个模型".into(),
-        ));
+    if settings.models.iter().any(|model| {
+        !valid_model_id(&model.display_name) || !valid_model_id(&model.id) || !ids.insert(&model.id)
+    }) {
+        return Err(AppError::Invalid("模型列表含有重复 ID 或无效配置".into()));
     }
     for model in &settings.models {
         let mut levels = BTreeSet::new();
@@ -464,10 +449,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("settings.sqlite")).unwrap();
         let settings = Settings::with_secret_store(db, Arc::new(MockSecrets::default()));
-        settings.set("models", json!([
+        let legacy_models = json!([
             {"id":"old", "context_budget":32768, "reasoning_effort":"high"},
-            {"id":"cleared", "display_name":"Custom label", "context_budget":32768, "reasoning_effort":"low", "reasoning_levels":[]}
-        ])).unwrap();
+            {"id":"cleared", "display_name":"Custom label", "context_budget":{"invalid":true}, "reasoning_effort":"low", "reasoning_levels":[]},
+            {"id":"no-budget", "reasoning_levels":[]}
+        ]);
+        settings.db.conn().execute(
+            "INSERT INTO settings(key,value) VALUES ('models',?1), ('context_budget','bad JSON')",
+            [legacy_models.to_string()],
+        ).unwrap();
         let loaded = settings.load().unwrap();
         assert_eq!(
             loaded.models[0].reasoning_levels,
@@ -476,12 +466,54 @@ mod tests {
         assert_eq!(loaded.models[0].display_name, "old");
         assert_eq!(loaded.models[1].display_name, "Custom label");
         assert!(loaded.models[1].reasoning_levels.is_empty());
+        assert_eq!(loaded.models[2].id, "no-budget");
+        assert!(serde_json::to_value(&loaded)
+            .unwrap()
+            .get("context_budget")
+            .is_none());
         settings.save(&loaded).unwrap();
         let persisted = settings.get("models").unwrap().unwrap();
         assert_eq!(persisted[0]["reasoning_levels"], json!(["high"]));
         assert!(persisted[0].get("reasoning_effort").is_none());
         assert_eq!(persisted[1]["reasoning_levels"], json!([]));
         assert_eq!(persisted[1]["display_name"], "Custom label");
+        assert!(persisted
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|model| model.get("context_budget").is_none()));
+        assert!(settings.get("context_budget").is_err());
+    }
+
+    #[test]
+    fn model_settings_persist_all_rows_in_order_above_old_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.sqlite");
+        let open = || {
+            Settings::with_secret_store(Db::open(&path).unwrap(), Arc::new(MockSecrets::default()))
+        };
+        let models: Vec<_> = (0..100)
+            .map(|index| AgentModelSettings {
+                display_name: format!("模型 {index}"),
+                id: format!("provider/model-{index}"),
+                reasoning_levels: vec![ReasoningEffort::Medium],
+            })
+            .collect();
+        let config = AppSettings {
+            model: models[99].id.clone(),
+            models: models.clone(),
+            ..AppSettings::default()
+        };
+        open().save(&config).unwrap();
+        let loaded = open().load().unwrap();
+        assert_eq!(loaded.models, models);
+        assert_eq!(loaded.model, config.model);
+        let mut invalid = config;
+        invalid.models[99].id = models[0].id.clone();
+        assert!(open().save(&invalid).is_err());
+        let reversed: Vec<_> = models.into_iter().rev().collect();
+        open().set("models", json!(reversed)).unwrap();
+        assert_eq!(open().load().unwrap().models, reversed);
     }
 
     #[test]
@@ -612,7 +644,7 @@ mod tests {
         settings.save(&original).unwrap();
         let mut invalid = original.clone();
         invalid.model = "changed-model".into();
-        invalid.context_budget = 0;
+        invalid.permission_mode = "invalid".into();
         assert!(settings.save(&invalid).is_err());
         assert_eq!(settings.load().unwrap(), original);
         for url in [

@@ -4,12 +4,15 @@ const { STATUS_CODES } = require('node:http');
 const { isAbsolute } = require('node:path');
 
 const ENDPOINT = 'https://www.bing.com/search';
-const MAX_REQUEST_BYTES = 8 * 1024;
-const MAX_OUTPUT_BYTES = 32 * 1024;
+// Bridging and extraction bounds, not limits on Bing's total results.
+const MAX_REQUEST_BYTES = 256 * 1024;
+const MAX_ENCODED_URL = 6 * MAX_REQUEST_BYTES;
+const MAX_SCAN_ROWS = 24;
 const LAUNCH_TIMEOUT_MS = 2500;
 const NAVIGATION_TIMEOUT_MS = 12000;
 const RESULTS_TIMEOUT_MS = 3500;
 const SEARCH_TIMEOUT_MS = 25000;
+const queryRejectionStatuses = new Set([400, 414, 431]);
 const decodeUtf8 = new TextDecoder('utf-8', { fatal: true });
 const resultSelector = '#b_results > li.b_algo h2 a[href], #b_results > .b_no';
 const documentPolicy = [
@@ -63,16 +66,28 @@ function isBingUrl(url) {
     /^(?:[a-z\d-]+\.)?bing\.com$/i.test(url.hostname);
 }
 
-async function restrictRequests(cdp, searchUrl) {
+function searchPosition(url, query) {
+  if (!isBingUrl(url) || url.pathname !== '/search' ||
+      url.searchParams.getAll('q').length !== 1 || url.searchParams.get('q') !== query) return null;
+  const first = url.searchParams.getAll('first');
+  if (!first.length) return 1;
+  if (first.length !== 1 || !/^[1-9][0-9]*$/.test(first[0])) return null;
+  const position = Number(first[0]);
+  return Number.isSafeInteger(position) ? position : null;
+}
+
+async function restrictRequests(cdp, searchUrl, query, first) {
   const { frameTree } = await cdp.send('Page.getFrameTree');
   const mainFrame = frameTree.frame.id;
   const navigations = new Set();
+  let rejected = false;
   // Unlike Playwright route.continue(), CDP pauses *every* HTTP redirect hop.
   // An allowed URL can never implicitly grant permission to its Location target.
   cdp.on('Fetch.requestPaused', async event => {
     const { requestId, request, frameId, resourceType, redirectedRequestId } = event;
     if (event.responseStatusCode !== undefined) {
       const { responseStatusCode, responseStatusText, responseHeaders = [] } = event;
+      if (navigations.has(requestId) && queryRejectionStatuses.has(responseStatusCode)) rejected = true;
       const replaces = /^(?:connection-allowlist(?:-report-only)?|link|refresh|referrer-policy|x-dns-prefetch-control|report-to|reporting-endpoints|nel)$/i;
       // Retain the live body and status. Strip header resource hints and constrain
       // renderer connections (including speculative preconnect outside Fetch).
@@ -95,8 +110,7 @@ async function restrictRequests(cdp, searchUrl) {
       if (resourceType === 'Document') {
         const initial = navigations.size === 0 && url.href === searchUrl.href;
         const regional = navigations.has(redirectedRequestId) && navigations.size < 5 &&
-          url.pathname === '/search' && url.searchParams.getAll('q').length === 1 &&
-          url.searchParams.get('q') === searchUrl.searchParams.get('q');
+          searchPosition(url, query) === first;
         allow = initial || regional;
         if (allow) navigations.add(requestId);
       } else if (resourceType === 'Stylesheet') {
@@ -107,6 +121,7 @@ async function restrictRequests(cdp, searchUrl) {
       allow ? { requestId, interceptResponse: resourceType === 'Document' } : { requestId, errorReason: 'BlockedByClient' }).catch(() => {});
   });
   await cdp.send('Fetch.enable', { patterns: [{ requestStage: 'Request', urlPattern: '*' }] });
+  return () => rejected;
 }
 
 function resultUrl(raw, pageUrl) {
@@ -151,8 +166,8 @@ function boundedText(raw, max) {
   return [output.trimEnd(), true];
 }
 
-async function readResults(page, count) {
-  const observation = await page.evaluate(({ challengeSelector }) => {
+async function readResults(page, query, position, count) {
+  const observation = await page.evaluate(({ challengeSelector, maxRows, rowOffset, nextLinkLimit }) => {
     if (document.querySelector(challengeSelector) ||
         /^(?:one last step|just a moment|verify (?:that )?you are human|access denied|service unavailable)(?:[.!…\s]|$)/i.test(document.title.trim())) return null;
     const visible = element => element?.checkVisibility({ visibilityProperty: true }) &&
@@ -161,37 +176,72 @@ async function readResults(page, count) {
     const list = document.querySelector('#b_results');
     if (!visible(list)) return null;
     const hits = [];
-    for (const row of list.querySelectorAll(':scope > li.b_algo:not(.b_ad)')) {
-      if (hits.length === 100) break;
-      if (!visible(row)) continue;
-      const link = row.querySelector('h2 a[href]');
-      const snippet = row.querySelector('.b_caption p, .b_snippet, p[class*="b_lineclamp"]');
-      hits.push({ href: link?.getAttribute('href')?.slice(0, 8193), title: text(link), snippet: text(snippet) });
+    let rowCount = 0;
+    let moreRows = false;
+    let noResults = false;
+    let nextLink;
+    let ambiguous = false;
+    for (const row of list.children) {
+      if (row.matches('li.b_algo:not(.b_ad)')) {
+        if (rowCount++ < rowOffset) continue;
+        if (hits.length === maxRows) {
+          moreRows = true;
+          break;
+        }
+        if (!visible(row)) {
+          hits.push(null); // Offset is measured in raw organic rows, not accepted hits.
+          continue;
+        }
+        const link = row.querySelector('h2 a[href]');
+        const snippet = row.querySelector('.b_caption p, .b_snippet, p[class*="b_lineclamp"]');
+        hits.push({ href: link?.getAttribute('href')?.slice(0, 8193), title: text(link), snippet: text(snippet) });
+      } else if (row.matches('.b_no') && visible(row)) {
+        noResults = true;
+      } else if (row.matches('.b_pag') && visible(row)) {
+        for (const link of row.getElementsByClassName('sb_pagN')) {
+          if (!link.matches('a[href]') || !visible(link)) continue;
+          const href = link.getAttribute('href');
+          if (!href || href.length > nextLinkLimit || (nextLink !== undefined && nextLink !== href)) ambiguous = true;
+          else nextLink = href;
+        }
+      }
     }
-    return { hits, noResults: [...list.querySelectorAll(':scope > .b_no')].some(visible) };
-  }, { challengeSelector });
-  if (!observation) return empty();
+    return { hits, rowCount, moreRows, noResults, nextLink, ambiguous };
+  }, { challengeSelector, maxRows: MAX_SCAN_ROWS, rowOffset: position.row_offset, nextLinkLimit: MAX_ENCODED_URL });
+  if (!observation || (observation.rowCount === 0 && !observation.noResults) ||
+      position.row_offset > observation.rowCount) return empty();
   const output = empty('available');
   const seen = new Set();
+  let scanned = position.row_offset;
   for (const hit of observation.hits) {
+    if (!hit) {
+      ++scanned;
+      continue;
+    }
     const url = resultUrl(hit.href, page.url());
     const [title, titleCut] = boundedText(hit.title, 512);
-    if (!url || !title) continue;
-    const key = url.split('#', 1)[0];
-    if (seen.has(key)) continue;
-    if (output.results.length === count) {
-      output.truncated = true;
-      break;
+    const key = url?.split('#', 1)[0];
+    if (!url || !title || seen.has(key)) {
+      ++scanned;
+      continue;
     }
+    if (output.results.length === count) break;
+    ++scanned;
     seen.add(key);
     const [snippet, snippetCut] = boundedText(hit.snippet, 1536);
     output.truncated ||= titleCut || snippetCut;
     output.results.push({ title, url, snippet });
   }
-  if (!output.results.length && (!observation.noResults || observation.hits.length)) return empty();
-  while (Buffer.byteLength(JSON.stringify(output)) > MAX_OUTPUT_BYTES) {
-    output.results.pop();
-    output.truncated = true;
+  if (observation.moreRows || scanned < position.row_offset + observation.hits.length) {
+    output.next = { first: position.first, row_offset: scanned };
+  } else if (observation.nextLink !== undefined || observation.ambiguous) {
+    const next = observation.nextLink;
+    const first = next && !/[\r\n\\]/u.test(next) && searchPosition(URL.parse(next, page.url()), query);
+    if (!observation.ambiguous && first > position.first) {
+      output.next = { first, row_offset: 0 };
+    } else {
+      output.reason = 'invalid_pagination';
+    }
   }
   return output;
 }
@@ -205,13 +255,21 @@ async function searchBing(input, {
   // The caller enforces public-query policy. Here only check the wire shape and bounds.
   const query = input?.query;
   const count = input?.count;
-  if (typeof query !== 'string' || !query.trim() || [...query].length > 512 ||
-      !Number.isInteger(count) || count < 1 || count > 10 || signal.aborted) return empty();
+  const position = input?.position ?? { first: 1, row_offset: 0 };
+  if (typeof query !== 'string' || !query.trim() || Buffer.byteLength(query) > MAX_REQUEST_BYTES ||
+      !Number.isSafeInteger(count) || count < 1 || signal.aborted ||
+      !Number.isSafeInteger(position.first) || position.first < 1 ||
+      !Number.isSafeInteger(position.row_offset) || position.row_offset < 0) return empty();
   const work = AbortSignal.any([signal, AbortSignal.timeout(SEARCH_TIMEOUT_MS)]);
   const url = new URL(ENDPOINT);
-  url.searchParams.set('q', query.trim());
+  const term = query.trim();
+  url.searchParams.set('q', term);
+  // Never navigate to a URL copied from the DOM. Rebuild it from the approved
+  // query and the strictly advancing result position that Bing advertised.
+  if (position.first !== 1) url.searchParams.set('first', String(position.first));
   let browser;
   let closing;
+  let queryRejected;
   const closeBrowser = () => closing ??= browser.close().catch(() => {});
   try {
     try {
@@ -227,15 +285,20 @@ async function searchBing(input, {
       serviceWorkers: 'block',
     });
     const page = await context.newPage();
-    await restrictRequests(await newSession(context, page), url);
+    queryRejected = await restrictRequests(await newSession(context, page), url, term, position.first);
     const response = await page.goto(url.href, { waitUntil: 'domcontentloaded', timeout: NAVIGATION_TIMEOUT_MS });
+    if (queryRejected() || queryRejectionStatuses.has(response?.status())) return { ...empty(), reason: 'query_rejected' };
     if (response?.status() !== 200 || !/^text\/html\b/i.test(response.headers()['content-type'] ?? '') ||
-        !isBingUrl(URL.parse(page.url()))) return empty();
+        searchPosition(URL.parse(page.url()), term) !== position.first) return empty();
     await page.locator(`${resultSelector}, ${challengeSelector}`).first()
       .waitFor({ state: 'attached', timeout: RESULTS_TIMEOUT_MS }).catch(() => {});
-    return await readResults(page, count);
+    const result = await readResults(page, term, position, count);
+    if (input.position === undefined && result.next) result.truncated = true;
+    return result;
   } catch {
-    return empty();
+    // Chromium may reject navigation before handing us a Response (e.g. an
+    // empty 414 response), but the guard still observed its HTTP status.
+    return queryRejected?.() ? { ...empty(), reason: 'query_rejected' } : empty();
   } finally {
     work.removeEventListener('abort', closeBrowser);
     if (browser) await closeBrowser();

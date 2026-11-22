@@ -97,6 +97,13 @@ assert.equal(load('playwright-core/package.json').version, process.argv[2]);
 assert.equal(typeof load('playwright-core').chromium.launch, 'function');
 console.log('bing-helper-playwright-ok');
 ''', '--', helper, playwright_version], 'bing-helper-playwright-ok')
+    # Check the shipped CLI, including the browser registry, without downloading a browser.
+    cli = bin_dir / 'node_modules/playwright-core/cli.js'
+    run([*node_flags, cli, 'mcp', '--help'], 'Usage: npx playwright mcp [options]')
+    plan = subprocess.check_output([*node_flags, cli, 'install', '--dry-run', '--no-shell', 'chromium'],
+                                   cwd=work, env=env, text=True, timeout=15)
+    if 'chromium' not in plan or 'Install location:' not in plan:
+        raise RuntimeError('Packaged Playwright CLI could not resolve its Chromium build')
     # uvx's version may also display its upstream build commit and date.
     version = subprocess.check_output([uvx, '--version'], cwd=work, env=env, text=True, timeout=15).strip()
     if version.split()[:2] != ['uvx', lock['uv']['version']]:

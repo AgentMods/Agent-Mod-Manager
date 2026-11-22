@@ -89,21 +89,49 @@ async fn approved_mod_inn_file_is_signed_once_and_saved_without_exposing_the_url
     .unwrap();
     // Inject the fixture client directly; production dispatch requires the official HTTPS endpoint.
     let tool = GlossModDownload::new(client.clone(), "test_tool".into());
-    let args = json!({"work_id":42,"file_id":103});
+    let args = json!({"work_id":42,"file_id":103,"gameName":"Example Game","author":"Public Author","projectPage":"https://example.com/project"});
+    let mut bad_metadata = args.clone();
+    bad_metadata["projectPage"] = json!("https://example.com/project?signature=private-input");
+    assert_eq!(
+        tool.history_arguments(&bad_metadata.to_string()).as_deref(),
+        Some("{}")
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            &tool.history_arguments(&args.to_string()).unwrap()
+        )
+        .unwrap(),
+        args,
+    );
     assert!(tool.prepare(&ctx, &args).await.is_err());
     ctx.resolution_scope = ResolutionScope::Agent("test".into());
     let first = tool.prepare(&ctx, &args).await.unwrap();
     assert_eq!(first.effect, Effect::UncatalogedDownload);
-    assert!(tool
-        .execute(&ctx, json!({"work_id":42,"file_id":104}), first)
-        .await
-        .is_err());
+    let mut changed = args.clone();
+    changed["file_id"] = json!(104);
+    assert!(tool.execute(&ctx, changed, first).await.is_err());
     assert!(tool
         .prepare(&ctx, &json!({"work_id":42,"file_id":103,"url":"forged"}))
         .await
         .is_err());
+    let cancelled = tool.prepare(&ctx, &args).await.unwrap();
+    let mut cancelled_ctx = ctx.clone();
+    cancelled_ctx.cancel = CancellationToken::new();
+    cancelled_ctx.cancel.cancel();
+    assert!(matches!(
+        tool.execute(&cancelled_ctx, args.clone(), cancelled).await,
+        Err(AppError::Cancelled)
+    ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(tool
+        .prepare(&ctx, &json!({"work_id":42,"file_id":103}))
+        .await
+        .is_err());
     let approved = tool.prepare(&ctx, &args).await.unwrap();
+    assert_eq!(
+        approved.preview["classification"]["gameName"],
+        "Example Game"
+    );
     let receipt = tool.execute(&ctx, args, approved).await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(receipt["cataloged"], true);
@@ -115,9 +143,31 @@ async fn approved_mod_inn_file_is_signed_once_and_saved_without_exposing_the_url
         std::fs::read(receipt["artifact"]["path"].as_str().unwrap()).unwrap(),
         zip
     );
+    let root = ctx.engine.paths.mod_library().canonicalize().unwrap();
+    let library_path = std::path::Path::new(receipt["artifact"]["path"].as_str().unwrap());
+    assert_eq!(
+        receipt["artifact"]["projectPage"],
+        "https://example.com/project"
+    );
+    assert_eq!(receipt["artifact"]["authorHint"], "Public Author");
+    assert!(library_path.canonicalize().unwrap().starts_with(root));
     let records = artifacts::list(&ctx.engine.db).unwrap();
     assert_eq!(records.len(), 1);
     let record = &records[0];
+    assert_eq!(receipt["artifactId"], record.artifact.id);
+    assert_eq!(record.artifact.path, library_path.canonicalize().unwrap());
+    let persisted = record.native_library_intent().unwrap();
+    assert_eq!(
+        persisted.project_page.as_deref(),
+        Some("https://example.com/project")
+    );
+    assert_eq!(persisted.author_hint.as_deref(), Some("Public Author"));
+    let (page, author): (String, String) = ctx.engine.db.conn().query_row(
+        "SELECT project_page,author_hint FROM mod_library_entries WHERE id=?1 AND state='ready'",
+        [&record.artifact.id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert_eq!(page, "https://example.com/project");
+    assert_eq!(author, "Public Author");
     assert_eq!(record.source_id, "glossmod_http");
     assert_eq!(record.project_id, "42");
     assert_eq!(record.version_id, "103");

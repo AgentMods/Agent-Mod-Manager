@@ -70,11 +70,12 @@ async fn search_requires_review_and_does_not_register_the_root() {
 
 #[tokio::test]
 async fn invalid_fields_private_queries_and_cancellation_never_store_evidence() {
-    let (_temp, context, tool, args) = fixture();
+    let (_temp, context, tool, mut args) = fixture();
+    let public = "Public game edition ".repeat(80) + "official site";
+    args["public_query"] = json!(public);
     for change in [
         json!({"unknown":true}),
         json!({"public_query":"/Users/alice/private.txt"}),
-        json!({"public_query":"x".repeat(513)}),
         json!({"confirmation":"SEARCH_GAME_IDENTITY"}),
     ] {
         let mut invalid = args.clone();
@@ -84,7 +85,24 @@ async fn invalid_fields_private_queries_and_cancellation_never_store_evidence() 
             .extend(change.as_object().unwrap().clone());
         assert!(tool.prepare(&context, &invalid).await.is_err());
     }
+    for suffix in [
+        r" C:\Users\alice\private.txt",
+        " https://localhost/private",
+        " https://user:secret@example.org/",
+    ] {
+        let mut private = args.clone();
+        private["public_query"] = json!(format!("{public}{suffix}"));
+        assert!(matches!(
+            tool.prepare(&context, &private).await,
+            Err(AppError::Denied(_))
+        ));
+    }
+    let schema = &tool.definition().parameters["properties"]["public_query"];
+    assert_eq!(schema["minLength"], 1);
+    assert!(schema.get("maxLength").is_none());
     let prepared = tool.prepare(&context, &args).await.unwrap();
+    assert_eq!(prepared.effect, Effect::Publish);
+    assert_eq!(prepared.preview["arguments"]["public_query"], public);
     context.cancel.cancel();
     assert!(matches!(
         tool.execute(&context, args.clone(), prepared).await,

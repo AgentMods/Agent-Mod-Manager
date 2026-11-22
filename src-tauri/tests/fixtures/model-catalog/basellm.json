@@ -1,0 +1,10 @@
+{
+  "first": {"api":"https://first.example", "models": {
+    "shared": {"limit":{"context":128000,"input":96000},"reasoning_options":[{"type":"effort","values":["low","high","unknown"]}]},
+    "input-only": {"limit":{"input":120000,"output":8000}},
+    "unique": {"limit":{"context":128000}}
+  }},
+  "second": {"api":"https://second.example/v1", "models": {
+    "shared": {"limit":{"context":32000},"reasoning_options":[{"type":"toggle"},{"type":"budget_tokens","max":10000}]}
+  }}
+}

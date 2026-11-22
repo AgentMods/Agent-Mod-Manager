@@ -95,8 +95,8 @@ pub(super) fn abbreviate_committed_drafts(messages: &mut [Value]) -> bool {
             };
             let abbreviated = json!({
                 "slug": receipt["slug"],
-                "adapter_json": "[原文已保存到回执 draftPath 下的 adapter.json]",
-                "skill_markdown": "[原文已保存到回执 draftPath 下的 SKILL.md]",
+                "adapter_json": "[原文见回执 draftPath 下的 adapter.json；安装后用 read_plugin_package 读取]",
+                "skill_markdown": "[原文见回执 draftPath 下的 SKILL.md；安装后用 read_plugin_package 读取]",
             })
             .to_string();
             if call["function"]["arguments"] != abbreviated {
@@ -133,7 +133,7 @@ impl AgentTool for PluginTool {
                 Effect::Read,
             ),
             "write_plugin_draft" => (
-                "提交完整 adapter.json 和含 frontmatter 的 SKILL.md 供审查。slug 须与 adapter.slug、Skill name 一致。可声明 HTTPS coverUrl 和 mcpServers。",
+                "提交完整 adapter.json 和含 frontmatter 的 SKILL.md 供审查。slug 须与 adapter.slug、Skill name 一致。可声明 HTTPS coverUrl 和 mcpServers。此临时草稿在安装或发布完成后自动移入回收站。",
                 json!({
                     "slug":{"type":"string"},
                     "adapter_json":{"type":"string"},
@@ -175,6 +175,7 @@ impl AgentTool for PluginTool {
             let (preview, plan) = match name {
                 "write_plugin_draft" => {
                     let draft = plugin_workflow::plan_write_draft(&engine, text(&args, "slug")?, text(&args, "adapter_json")?, text(&args, "skill_markdown")?)?;
+                    plugin_workflow::mark_agent_draft(&engine, &draft.draft.id)?;
                     let mut preview = serde_json::to_value(&draft)?;
                     preview["adapterJson"] = args["adapter_json"].clone();
                     preview["skillMarkdown"] = args["skill_markdown"].clone();
@@ -209,7 +210,7 @@ impl AgentTool for PluginTool {
             if let Some(plan) = prepared.plan {
                 engine.approve_plan(&plan.id)?;
                 engine.apply_file_ops(&plan.id)?;
-                let reconciliation = plugin_workflow::reconcile_deployments(&engine)?;
+                let reconciliation = plugin_workflow::reconcile_after_apply(&engine, &plan)?;
                 crate::skills::reconcile_deployments(&engine)?;
                 return Ok(json!({"status":"committed","plan":plan.into_user_paths(),"preview":prepared.preview,"reconciliation":reconciliation}));
             }
@@ -308,6 +309,9 @@ mod tests {
             plugins::list_plugins(&context.engine.db).unwrap()[0].slug,
             "test-game"
         );
+        assert!(plugin_workflow::list_drafts(&context.engine)
+            .unwrap()
+            .is_empty());
         let detail = crate::skills::get_skill(&context.engine, "test-game").unwrap();
         assert!(detail.skill.enabled && detail.skill.valid);
     }

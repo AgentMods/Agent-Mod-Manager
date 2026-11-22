@@ -53,6 +53,11 @@ fn fixture() -> (tempfile::TempDir, McpServers, Settings, ToolContext) {
     (dir, servers, settings, context)
 }
 
+const LEGACY_PLAYWRIGHT_COMMAND: &str = if cfg!(windows) { "npx.cmd" } else { "npx" };
+const LEGACY_PLAYWRIGHT_DESCRIPTION: &str = "在独立的浏览器会话中打开、浏览和操作网页。";
+const EXPECTED_PLAYWRIGHT_DESCRIPTION: &str =
+    "在独立的浏览器会话中打开、浏览和操作网页。首次连接时自动下载 Chromium（若尚未安装），后续复用。";
+
 fn playwright_v2_args() -> Vec<String> {
     [
         "--yes",
@@ -80,20 +85,37 @@ fn playwright_v11_args() -> Vec<String> {
     args.into_iter().map(str::to_owned).collect()
 }
 
-fn expected_playwright_args() -> Vec<String> {
+fn expected_playwright_output() -> String {
     let base = dirs::download_dir()
         .or_else(dirs::data_local_dir)
         .or_else(dirs::home_dir)
         .unwrap_or_else(std::env::temp_dir);
     let output_dir = base.join("Agent Mod Manager").join("Playwright");
     assert!(output_dir.is_absolute());
+    output_dir.to_str().unwrap().into()
+}
+
+fn playwright_v12_args() -> Vec<String> {
     let mut args = playwright_v11_args();
     args.extend([
         "--file-paths=absolute".into(),
         "--output-dir".into(),
-        output_dir.to_str().unwrap().into(),
+        expected_playwright_output(),
     ]);
     args
+}
+
+fn expected_playwright_args() -> Vec<String> {
+    vec![
+        "--browser=chromium".into(),
+        "--headless".into(),
+        "--sandbox".into(),
+        "--isolated".into(),
+        "--no-webmcp".into(),
+        "--file-paths=absolute".into(),
+        "--output-dir".into(),
+        expected_playwright_output(),
+    ]
 }
 
 fn markitdown_args() -> Vec<String> {
@@ -301,6 +323,10 @@ fn v10_upgrade_unpins_stock_packages_and_preserves_user_launch_settings() {
             );
         }
         expected_stock.push(stock.clone());
+        if id == "playwright" {
+            stock.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
+            stock.description = Some(LEGACY_PLAYWRIGHT_DESCRIPTION.into());
+        }
         stock.args = old_args;
         servers.update(&stock).unwrap();
         servers.remember_start(&stock).unwrap();
@@ -917,11 +943,12 @@ fn microsoft_mcp_presets_are_credential_free_and_preserve_existing_config() {
 
     let mut playwright = servers.get("playwright").unwrap();
     assert_eq!(playwright.transport, McpTransport::Stdio);
-    assert_eq!(
-        playwright.command.as_deref(),
-        Some(if cfg!(windows) { "npx.cmd" } else { "npx" })
-    );
+    assert_eq!(playwright.command.as_deref(), Some("amm-playwright"));
     assert_eq!(playwright.args, expected_playwright_args());
+    assert_eq!(
+        playwright.description.as_deref(),
+        Some(EXPECTED_PLAYWRIGHT_DESCRIPTION)
+    );
     assert!(playwright.env_secret_refs.is_empty() && playwright.bearer_secret_ref.is_none());
     assert!(!playwright.enabled && playwright.builtin);
     assert!(ConnectionConsent::after_user_confirmation(&playwright, false).is_err());
@@ -1094,25 +1121,36 @@ fn playwright_output_dir_prefers_downloads_and_never_creates_directories() {
 }
 
 #[test]
-fn playwright_v11_migration_does_not_use_v12_download_flags() {
+fn playwright_v10_through_v12_migrations_keep_historical_launcher() {
     let (_dir, servers, _, _) = fixture();
     servers.seed_presets().unwrap();
     let mut legacy = servers.get("playwright").unwrap();
+    legacy.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
     legacy.args = playwright_v11_args();
     legacy.args[1] = "@playwright/mcp@0.0.85".into();
+    legacy.enabled = true;
+    legacy.description = None;
     servers.update(&legacy).unwrap();
+    config::migrate_descriptions(&servers.db.conn()).unwrap();
+    legacy.description = Some(LEGACY_PLAYWRIGHT_DESCRIPTION.into());
+    assert_eq!(servers.get("playwright").unwrap(), legacy);
     config::migrate_unpinned_presets(&servers.db.conn()).unwrap();
-    assert_eq!(
-        servers.get("playwright").unwrap().args,
-        playwright_v11_args()
-    );
+    legacy.args = playwright_v11_args();
+    assert_eq!(servers.get("playwright").unwrap(), legacy);
+
+    servers.remember_start(&legacy).unwrap();
+    config::migrate_playwright_downloads(&servers.db.conn()).unwrap();
+    legacy.args = playwright_v12_args();
+    assert_eq!(servers.get("playwright").unwrap(), legacy);
+    assert!(servers.startup_digest("playwright").unwrap().is_none());
 }
 
 #[test]
-fn playwright_v12_upgrade_changes_stock_args_and_revokes_old_consent_once() {
+fn playwright_v11_database_upgrades_through_v12_to_bundled_launcher() {
     let (_dir, servers, _, context) = fixture();
     servers.seed_presets().unwrap();
     let mut legacy = servers.get("playwright").unwrap();
+    legacy.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
     legacy.args = playwright_v11_args();
     legacy.enabled = true;
     legacy.description = Some("My browser description".into());
@@ -1131,6 +1169,7 @@ fn playwright_v12_upgrade_changes_stock_args_and_revokes_old_consent_once() {
 
     let upgraded = McpServers::new(Db::open(&path).unwrap());
     let mut expected = legacy.clone();
+    expected.command = Some("amm-playwright".into());
     expected.args = expected_playwright_args();
     assert_eq!(upgraded.get("playwright").unwrap(), expected);
     assert!(upgraded.startup_digest("playwright").unwrap().is_none());
@@ -1155,6 +1194,7 @@ fn playwright_v12_upgrade_preserves_custom_launch_settings_and_consent() {
         let servers = McpServers::new(Db::open(&path).unwrap());
         servers.seed_presets().unwrap();
         let mut customized = servers.get("playwright").unwrap();
+        customized.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
         customized.args = playwright_v11_args();
         match customization {
             "name" => customized.name = "My Playwright".into(),
@@ -1196,12 +1236,160 @@ fn playwright_v12_upgrade_preserves_custom_launch_settings_and_consent() {
 }
 
 #[test]
+fn playwright_v17_migrates_stock_v12_once_and_requires_new_start_consent() {
+    for (enabled, legacy_description, expected_description) in [
+        (
+            false,
+            Some(LEGACY_PLAYWRIGHT_DESCRIPTION),
+            Some(EXPECTED_PLAYWRIGHT_DESCRIPTION),
+        ),
+        (
+            true,
+            Some("My browser description"),
+            Some("My browser description"),
+        ),
+        (true, None, None),
+    ] {
+        let (_dir, servers, _, context) = fixture();
+        servers.seed_presets().unwrap();
+        let mut legacy = servers.get("playwright").unwrap();
+        legacy.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
+        legacy.args = playwright_v12_args();
+        legacy.description = legacy_description.map(str::to_owned);
+        legacy.enabled = enabled;
+        servers.update(&legacy).unwrap();
+        if enabled {
+            servers.remember_start(&legacy).unwrap();
+            assert!(ConnectionConsent::from_remembered(&servers, &legacy).is_ok());
+        }
+        assert_eq!(config::playwright_receipt_dir(&servers.db).unwrap(), None);
+        servers
+            .db
+            .conn()
+            .pragma_update(None, "user_version", 16)
+            .unwrap();
+
+        let path = context.engine.paths.db_file();
+        let upgraded = McpServers::new(Db::open(&path).unwrap());
+        let mut expected = legacy.clone();
+        expected.command = Some("amm-playwright".into());
+        expected.args = expected_playwright_args();
+        expected.description = expected_description.map(str::to_owned);
+        assert_eq!(upgraded.get("playwright").unwrap(), expected);
+        assert!(upgraded.startup_requests().unwrap().is_empty());
+        assert!(upgraded.startup_digest("playwright").unwrap().is_none());
+        assert!(ConnectionConsent::from_remembered(&upgraded, &expected).is_err());
+        assert_eq!(
+            config::playwright_receipt_dir(&upgraded.db).unwrap(),
+            Some(std::path::PathBuf::from(expected_playwright_output()))
+        );
+
+        if enabled {
+            upgraded.remember_start(&expected).unwrap();
+            assert!(ConnectionConsent::from_remembered(&upgraded, &expected).is_ok());
+
+            // An explicit restoration of the exact v12 launch is not overwritten on reopen.
+            upgraded.update(&legacy).unwrap();
+            upgraded.remember_start(&legacy).unwrap();
+            let reopened = McpServers::new(Db::open(&path).unwrap());
+            reopened.seed_presets().unwrap();
+            assert_eq!(reopened.get("playwright").unwrap(), legacy);
+            assert!(ConnectionConsent::from_remembered(&reopened, &legacy).is_ok());
+            assert_eq!(config::playwright_receipt_dir(&reopened.db).unwrap(), None);
+        }
+    }
+}
+
+#[test]
+fn playwright_v17_preserves_non_stock_launch_settings_and_consent() {
+    for customization in [
+        "name",
+        "command",
+        "browser",
+        "output",
+        "env",
+        "credential_url",
+        "transport",
+        "non_builtin",
+        "plugin_owner",
+    ] {
+        let (dir, servers, _, context) = fixture();
+        servers.seed_presets().unwrap();
+        let mut legacy = servers.get("playwright").unwrap();
+        legacy.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
+        legacy.args = playwright_v12_args();
+        legacy.enabled = true;
+        legacy.description = Some(LEGACY_PLAYWRIGHT_DESCRIPTION.into());
+        match customization {
+            "name" => legacy.name = "My browser".into(),
+            "command" => legacy.command = Some("custom-npx.cmd".into()),
+            "browser" => legacy.args.push("--browser=firefox".into()),
+            "output" => *legacy.args.last_mut().unwrap() = dir.path().to_str().unwrap().into(),
+            "env" => {
+                legacy
+                    .env_secret_refs
+                    .insert("BROWSER_API_KEY".into(), "mcp.personal.browser".into());
+            }
+            "credential_url" => legacy.credential_url = Some("https://example.test/keys".into()),
+            "transport" => {
+                legacy.transport = McpTransport::StreamableHttp;
+                legacy.command = None;
+                legacy.args.clear();
+                legacy.url = Some("https://example.test/mcp".into());
+            }
+            "non_builtin" | "plugin_owner" => {}
+            _ => unreachable!(),
+        }
+        servers.update(&legacy).unwrap();
+        if customization == "non_builtin" {
+            servers
+                .db
+                .conn()
+                .execute("UPDATE mcp_servers SET builtin=0 WHERE id='playwright'", [])
+                .unwrap();
+            legacy.builtin = false;
+        }
+        if customization == "plugin_owner" {
+            register_test_plugin(&servers, "browser-fixture", true, true);
+            servers
+                .db
+                .conn()
+                .execute(
+                    "UPDATE mcp_servers SET plugin_slug='browser-fixture' WHERE id='playwright'",
+                    [],
+                )
+                .unwrap();
+            legacy.plugin_slug = Some("browser-fixture".into());
+        }
+        servers.remember_start(&legacy).unwrap();
+        let digest = servers.startup_digest("playwright").unwrap().unwrap();
+        servers
+            .db
+            .conn()
+            .pragma_update(None, "user_version", 16)
+            .unwrap();
+
+        let upgraded = McpServers::new(Db::open(&context.engine.paths.db_file()).unwrap());
+        upgraded.seed_presets().unwrap();
+        assert_eq!(
+            upgraded.get("playwright").unwrap(),
+            legacy,
+            "{customization}"
+        );
+        assert_eq!(upgraded.startup_digest("playwright").unwrap(), Some(digest));
+        assert_eq!(upgraded.startup_requests().unwrap(), ["playwright"]);
+        assert!(ConnectionConsent::from_remembered(&upgraded, &legacy).is_ok());
+    }
+}
+
+#[test]
 fn playwright_v2_upgrade_selects_platform_defaults_and_respects_subsequent_edits() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("playwright-v2.sqlite");
     let servers = McpServers::new(Db::open(&path).unwrap());
     servers.seed_presets().unwrap();
     let mut legacy = servers.get("playwright").unwrap();
+    legacy.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
     legacy.args = playwright_v2_args();
     legacy.enabled = true;
     servers.update(&legacy).unwrap();
@@ -1215,13 +1403,15 @@ fn playwright_v2_upgrade_selects_platform_defaults_and_respects_subsequent_edits
 
     let servers = McpServers::new(Db::open(&path).unwrap());
     let reopened = servers.get("playwright").unwrap();
+    assert_eq!(reopened.command.as_deref(), Some("amm-playwright"));
     assert_eq!(reopened.args, expected_playwright_args());
     assert!(reopened.enabled && reopened.builtin);
     assert!(servers.startup_requests().unwrap().is_empty());
     assert!(ConnectionConsent::from_remembered(&servers, &reopened).is_err());
 
-    // After the one-time migration, an explicit return to the old arguments is respected.
+    // After the one-time migration, an explicit return to the old launch is respected.
     let mut opted_out = reopened;
+    opted_out.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
     opted_out.args = playwright_v2_args();
     servers.update(&opted_out).unwrap();
     servers.remember_start(&opted_out).unwrap();
@@ -1242,6 +1432,7 @@ fn playwright_upgrades_preserve_edits_but_only_custom_launchers_retain_consent()
         let servers = McpServers::new(Db::open(&path).unwrap());
         servers.seed_presets().unwrap();
         let mut customized = servers.get("playwright").unwrap();
+        customized.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
         customized.args = playwright_v2_args();
         match customization {
             "name" => customized.name = "My Playwright".into(),
@@ -1300,6 +1491,13 @@ fn unsafe_plaintext_configuration_and_namespace_collisions_are_rejected() {
 }
 
 pub(crate) async fn mock_http(mode: &'static str) -> (String, CancellationToken, Arc<AtomicBool>) {
+    observed_mock_http(mode, None).await
+}
+
+async fn observed_mock_http(
+    mode: &'static str,
+    reached_second_page: Option<Arc<tokio::sync::Notify>>,
+) -> (String, CancellationToken, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     let stop = CancellationToken::new();
@@ -1313,6 +1511,7 @@ pub(crate) async fn mock_http(mode: &'static str) -> (String, CancellationToken,
             let Ok((mut socket, _)) = accepted else { break };
             let auth = seen_auth.clone();
             let cancel = stop_task.clone();
+            let reached_second_page = reached_second_page.clone();
             tokio::spawn(async move {
                 let mut request = Vec::new();
                 let header_end = loop {
@@ -1372,35 +1571,120 @@ pub(crate) async fn mock_http(mode: &'static str) -> (String, CancellationToken,
                                 } else if mode == "credential_schema" {
                                     tool["inputSchema"]["description"] = json!("mock-secret-value");
                                 }
-                                if mode == "duplicate" {
-                                    json!({"tools":[tool.clone(),tool]})
-                                } else if mode == "two" {
-                                    let mut other = tool.clone();
-                                    other["name"] = json!("other");
-                                    json!({"tools":[tool,other]})
-                                } else if mode == "cursor" {
-                                    json!({"tools":[],"nextCursor":"same"})
-                                } else if mode == "count" {
-                                    let tools: Vec<Value> = (0..=super::client::MAX_TOOLS)
-                                        .map(|i| {
-                                            let mut tool = tool.clone();
-                                            tool["name"] = json!(format!("tool_{i}"));
-                                            tool
-                                        })
-                                        .collect();
-                                    json!({"tools":tools})
-                                } else if mode == "schema" {
-                                    let mut tool = tool;
-                                    tool["inputSchema"]["description"] =
-                                        json!("x".repeat(super::client::MAX_SCHEMA_BYTES + 1));
-                                    json!({"tools":[tool]})
-                                } else {
-                                    json!({"tools":[tool]})
+                                let cursor = req["params"]["cursor"].as_str();
+                                let index =
+                                    cursor.and_then(|c| c.parse::<usize>().ok()).unwrap_or(0);
+                                match mode {
+                                    "duplicate" => json!({"tools":[tool.clone(),tool]}),
+                                    "two" => {
+                                        let mut other = tool.clone();
+                                        other["name"] = json!("other");
+                                        json!({"tools":[tool,other]})
+                                    }
+                                    "page_duplicate" => {
+                                        if cursor.is_none() {
+                                            json!({"tools":[tool],"nextCursor":"1"})
+                                        } else {
+                                            json!({"tools":[tool]})
+                                        }
+                                    }
+                                    "cursor_cycle" => {
+                                        tool["name"] = json!(format!("tool_{index}"));
+                                        json!({"tools":[tool],"nextCursor":if index == 1 {"2"} else {"1"}})
+                                    }
+                                    "no_progress" if cursor.is_some() => {
+                                        json!({"tools":[],"nextCursor":"fresh"})
+                                    }
+                                    "no_progress" | "slow_page" | "page_error"
+                                        if cursor.is_none() =>
+                                    {
+                                        json!({"tools":[tool],"nextCursor":"1"})
+                                    }
+                                    "slow_page" => {
+                                        reached_second_page.as_ref().unwrap().notify_one();
+                                        cancel.cancelled().await;
+                                        return;
+                                    }
+                                    "page_error" => {
+                                        let body = json!({"jsonrpc":"2.0","id":req["id"],
+                                            "error":{"code":-32603,"message":"private page failure"}}).to_string();
+                                        let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                                        let _ = socket.write_all(response.as_bytes()).await;
+                                        return;
+                                    }
+                                    "empty_cursor" => json!({"tools":[tool],"nextCursor":""}),
+                                    "empty_list" => json!({"tools":[]}),
+                                    "single_large_list" | "many_pages" => {
+                                        let (first, last) = if mode == "single_large_list" {
+                                            (0, 300)
+                                        } else {
+                                            // 12 useful pages; the terminal empty page has no cursor.
+                                            tool["description"] = json!("d".repeat(8 * 1024));
+                                            (index * 25, ((index + 1) * 25).min(300))
+                                        };
+                                        let tools: Vec<_> = (first..last)
+                                            .map(|i| {
+                                                let mut t = tool.clone();
+                                                t["name"] = json!(format!("tool_{i}"));
+                                                t
+                                            })
+                                            .collect();
+                                        if mode == "many_pages" && !tools.is_empty() {
+                                            json!({"tools":tools,"nextCursor":(index+1).to_string()})
+                                        } else {
+                                            json!({"tools":tools})
+                                        }
+                                    }
+                                    "oversized_page" => {
+                                        // rmcp's non-configurable JSON collector caps bodies
+                                        // at 16 MiB, independent of the application's SSE cap.
+                                        let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16777217\r\nConnection: close\r\n\r\n").await;
+                                        return;
+                                    }
+                                    "wide_schema" => {
+                                        let size = 96 * 1024;
+                                        tool["inputSchema"]["description"] =
+                                            json!("x".repeat(size));
+                                        json!({"tools":[tool]})
+                                    }
+                                    _ => json!({"tools":[tool]}),
                                 }
                             }
                             "tools/call" => {
                                 if mode == "slow" {
+                                    if let Some(started) = &reached_second_page {
+                                        started.notify_one();
+                                    }
                                     tokio::select! {_=cancel.cancelled()=>return,_=tokio::time::sleep(Duration::from_secs(60))=>{}}
+                                }
+                                if mode == "oversized_result" {
+                                    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 16777217\r\nConnection: close\r\n\r\n").await;
+                                    return;
+                                }
+                                if mode == "oversized_sse" {
+                                    if socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: ").await.is_err() {
+                                        return;
+                                    }
+                                    let payload = [b'x'; 16 * 1024];
+                                    for _ in 0..=1024 {
+                                        if socket.write_all(&payload).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    // An oversized event must fail without a delimiter or EOF.
+                                    cancel.cancelled().await;
+                                    return;
+                                }
+                                if mode == "long_call" {
+                                    tokio::time::sleep(Duration::from_secs(31)).await;
+                                }
+                                if mode == "result_eof" {
+                                    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{").await;
+                                    return;
+                                }
+                                if mode == "sse_eof" {
+                                    let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 10\r\nConnection: close\r\n\r\n: closed\n\n").await;
+                                    return;
                                 }
                                 if mode == "rpc_error" {
                                     let body = json!({
@@ -1412,9 +1696,9 @@ pub(crate) async fn mock_http(mode: &'static str) -> (String, CancellationToken,
                                     return;
                                 }
                                 let text = if mode == "large" {
-                                    "x".repeat(super::client::MAX_RESULT_BYTES + 1)
+                                    "x".repeat(3 * 1024 * 1024)
                                 } else if mode == "expansion" {
-                                    "x".repeat(super::client::MAX_RESULT_BYTES / 2)
+                                    "x".repeat(2 * 1024 * 1024)
                                 } else if matches!(mode, "credential_echo" | "tool_error") {
                                     "Bearer mock-secret-value; ordinary output".into()
                                 } else {
@@ -1643,7 +1927,10 @@ async fn redaction_expansion_cannot_bypass_result_size_limit() {
         .call_tool("echo", json!({}), &context.cancel)
         .await
         .unwrap_err();
-    assert!(error.to_string().contains("exceeds limits"));
+    assert!(
+        error.to_string().contains("脱敏后的工具结果超过"),
+        "{error}"
+    );
     client.disconnect_and_wait().await.unwrap();
     stop.cancel();
 }
@@ -1690,32 +1977,378 @@ async fn credential_backend_errors_do_not_expose_provider_details() {
 }
 
 #[tokio::test]
-async fn bounds_duplicate_pagination_cancellation_and_large_results() {
+async fn listing_rejects_bad_pages_atomically_and_omits_remote_errors() {
     let (_dir, servers, settings, context) = fixture();
-    for mode in ["duplicate", "cursor", "count", "schema", "large", "slow"] {
+    for (mode, diagnostic) in [
+        ("duplicate", "名称无效或重复"),
+        ("page_duplicate", "名称无效或重复"),
+        ("cursor_cycle", "游标无效或循环"),
+        ("no_progress", "未取得进展"),
+        ("empty_cursor", "游标无效或循环"),
+        ("page_error", "remote details suppressed"),
+        ("oversized_page", "SDK 传输上限"),
+    ] {
         let (url, stop, _) = mock_http(mode).await;
+        let _stop = stop.drop_guard();
         let client = connect_http(&servers, &settings, &url, mode).await;
-        if matches!(mode, "duplicate" | "cursor" | "count" | "schema") {
-            assert!(client.list_tools(&context.cancel).await.is_err());
-        } else if mode == "large" {
-            assert!(client
-                .call_tool("echo", json!({}), &context.cancel)
-                .await
-                .is_err());
+        let registry = ToolRegistry::default();
+        let error = client
+            .register_tools(&registry, &context.cancel)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(diagnostic), "{mode}: {error}");
+        assert!(!error.to_string().contains("private page failure"));
+        assert!(registry.definitions().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn listing_accepts_more_than_128_tools_on_one_page_and_empty_catalogs() {
+    let (_dir, servers, settings, context) = fixture();
+    for (mode, len) in [("single_large_list", 300), ("empty_list", 0)] {
+        let (url, stop, _) = mock_http(mode).await;
+        let _stop = stop.drop_guard();
+        let client = connect_http(&servers, &settings, &url, mode).await;
+        assert_eq!(client.list_tools(&context.cancel).await.unwrap().len(), len);
+    }
+}
+
+#[tokio::test]
+async fn ordinary_tools_accept_large_schemas_arguments_and_results() {
+    let (_dir, servers, settings, context) = fixture();
+    for mode in ["wide_schema", "large"] {
+        let (url, stop, _) = mock_http(mode).await;
+        let _stop = stop.drop_guard();
+        let client = connect_http(&servers, &settings, &url, mode).await;
+        let registry = ToolRegistry::default();
+        let names = client
+            .register_tools(&registry, &context.cancel)
+            .await
+            .unwrap();
+        let tool = registry.get(&names[0]).unwrap();
+        let args = json!({"text":"a".repeat(300 * 1024)});
+        if mode == "wide_schema" {
+            assert_eq!(
+                tool.definition().parameters["description"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                96 * 1024
+            );
+        }
+        let prepared = tool.prepare(&context, &args).await.unwrap();
+        let result = tool
+            .execute(&context, args.clone(), prepared)
+            .await
+            .unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        if mode == "large" {
+            assert_eq!(text.len(), 3 * 1024 * 1024);
         } else {
-            let cancel = CancellationToken::new();
+            assert_eq!(serde_json::from_str::<Value>(text).unwrap(), args);
+        }
+    }
+}
+
+#[tokio::test]
+async fn oversized_http_replies_fail_with_the_real_transport_reason() {
+    let (_dir, servers, settings, context) = fixture();
+    for (mode, diagnostic) in [
+        ("oversized_result", "SDK 传输上限（16777216 字节）"),
+        ("oversized_sse", "HTTP SSE 事件超过本连接的传输上限"),
+    ] {
+        let (url, stop, _) = mock_http(mode).await;
+        let _stop = stop.drop_guard();
+        let client = connect_http(&servers, &settings, &url, mode).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.call_tool("echo", json!({}), &context.cancel),
+        )
+        .await
+        .expect("oversize response must not leave the call waiting")
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(diagnostic), "{mode}: {error}");
+        assert!(!error.contains("mock-secret-value"));
+    }
+}
+
+#[tokio::test]
+async fn dedicated_attachment_call_uses_the_connection_budget_and_cancels_each_request() {
+    // Exercise the shared transport through the dedicated request helper. The
+    // desktop entry point separately requires the confirmed builtin stdio server.
+    let (dir, servers, settings, _) = fixture();
+    let file = tempfile::NamedTempFile::new_in(dir.path().canonicalize().unwrap())
+        .unwrap()
+        .into_temp_path();
+    let (url, stop, _) = mock_http("large").await;
+    let _stop = stop.drop_guard();
+    let client = connect_http(&servers, &settings, &url, "attachment_large").await;
+    let result = client
+        .call_attachment_converter(&file, &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        result["content"][0]["text"].as_str().unwrap().len(),
+        3 * 1024 * 1024
+    );
+    client.disconnect();
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let (url, stop, _) = observed_mock_http("slow", Some(started.clone())).await;
+    let _stop = stop.drop_guard();
+    let client = connect_http(&servers, &settings, &url, "attachment_stopped").await;
+    let active_cancel = CancellationToken::new();
+    let active = client.call_attachment_converter(&file, &active_cancel);
+    tokio::pin!(active);
+    tokio::select! {
+        _ = started.notified() => {},
+        result = &mut active => panic!("conversion ended before it could be stopped: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("converter was not called"),
+    }
+    let queued_cancel = CancellationToken::new();
+    let queued = client.call_attachment_converter(&file, &queued_cancel);
+    tokio::pin!(queued);
+    // A second conversion must wait for the first instead of dispatching more local work.
+    assert!(futures_util::poll!(&mut queued).is_pending());
+    queued_cancel.cancel();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), queued)
+            .await
+            .unwrap(),
+        Err(AppError::Cancelled)
+    ));
+    assert!(
+        !client.is_closed(),
+        "cancelling queued work must not stop the active call"
+    );
+    active_cancel.cancel();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), active)
+            .await
+            .unwrap(),
+        Err(AppError::Cancelled)
+    ));
+    assert!(client.is_closed());
+}
+
+#[tokio::test]
+async fn markitdown_cancellation_stops_the_real_stdio_child_and_preserves_authorized_retry() {
+    // Offline stdio fixture; Windows/macOS/Linux frontend CI already supplies Node.
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let (dir, servers, settings, _) = fixture();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let marker = dir.path().join("allow-start");
+    let script = r#"
+const fs = require('node:fs');
+const socket = require('node:net').connect(Number(process.argv[1]), '127.0.0.1');
+const input = require('node:readline').createInterface({input: process.stdin});
+const ready = fs.existsSync(process.argv[2]);
+input.on('line', line => {
+    const message = JSON.parse(line);
+    if (!ready || message.id === undefined) return;
+    let result;
+    if (message.method === 'initialize') {
+        result = {protocolVersion:message.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}};
+    } else if (message.method === 'tools/list') {
+        result = {tools:[{name:'convert_to_markdown',inputSchema:{type:'object'}}]};
+    } else if (message.method === 'tools/call') {
+        socket.write('C');
+        const text = fs.readFileSync(new URL(message.params.arguments.uri), 'utf8');
+        if (text === 'hang') {
+            require('node:child_process').spawn(process.execPath, ['-e', 'require("node:net").connect(Number(process.argv[1]), "127.0.0.1"); setTimeout(() => process.exit(), 11000);', '--', process.argv[1]], {stdio:'ignore'});
+            return;
+        }
+        result = {content:[{type:'text',text}]};
+    } else { result = {}; }
+    console.log(JSON.stringify({jsonrpc:'2.0',id:message.id,result}));
+});
+"#.lines().collect::<Vec<_>>().join(" ");
+    servers.seed_presets().unwrap();
+    let mut config = servers.get(super::config::MARKITDOWN_ID).unwrap();
+    config.command = Some("node".into());
+    config.args = vec![
+        "-e".into(),
+        script,
+        "--".into(),
+        listener.local_addr().unwrap().port().to_string(),
+        marker.to_string_lossy().into_owned(),
+    ];
+    config.enabled = true;
+    servers.update(&config).unwrap();
+    servers.remember_start(&config).unwrap();
+    let registry = ToolRegistry::default();
+    let connections = crate::mcp_connections::McpConnections::default();
+    let cancelled_launch = CancellationToken::new();
+    let launch = connections.markitdown_client(&settings, &registry, &cancelled_launch);
+    tokio::pin!(launch);
+
+    async fn expect_closed(socket: &mut tokio::net::TcpStream) {
+        match socket.read(&mut [0]).await {
+            Ok(0) => (),
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => (),
+            other => panic!("cancelled converter process did not close its socket: {other:?}"),
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let (mut child, _) = tokio::select! {
+            result = &mut launch => panic!("hung handshake completed prematurely: {:?}", result.err()),
+            socket = listener.accept() => socket.unwrap(),
+        };
+        cancelled_launch.cancel();
+        assert!(matches!(launch.await, Err(AppError::Cancelled)));
+        expect_closed(&mut child).await;
+
+        // The old startup slot must be removed, but its confirmed config must remain.
+        std::fs::write(&marker, b"ready").unwrap();
+        let cancel = CancellationToken::new();
+        let (client, child) = tokio::join!(connections.markitdown_client(&settings, &registry, &cancel), listener.accept());
+        let client = client.unwrap();
+        let (mut child, _) = child.unwrap();
+        let upload = |content: &[u8]| {
+            let mut file = tempfile::NamedTempFile::new_in(dir.path().canonicalize().unwrap()).unwrap();
+            std::io::Write::write_all(&mut file, content).unwrap();
+            file.into_temp_path()
+        };
+        let hang = upload(b"hang");
+        let mut descendant;
+        {
+            let in_flight = client.call_attachment_converter(&hang, &cancel);
+            tokio::pin!(in_flight);
+            descendant = tokio::select! {
+                result = &mut in_flight => panic!("hung conversion completed prematurely: {result:?}"),
+                result = listener.accept() => result.unwrap().0,
+            };
+            let mut called = [0];
+            child.read_exact(&mut called).await.unwrap();
+            assert_eq!(called, [b'C']);
+            cancel.cancel();
+            assert!(matches!(in_flight.await, Err(AppError::Cancelled)));
+        }
+        expect_closed(&mut child).await;
+        tokio::time::timeout(Duration::from_secs(3), expect_closed(&mut descendant)).await
+            .expect("converter descendant survived cancellation");
+        hang.close().unwrap();
+
+        let retry = CancellationToken::new();
+        let new_client = connections.markitdown_client(&settings, &registry, &retry).await.unwrap();
+        let result = new_client.call_attachment_converter(&upload(b"retry okay"), &retry).await.unwrap();
+        assert_eq!(result["content"][0]["text"], "retry okay");
+        assert_eq!(registry.definitions().len(), 1);
+        assert!(servers.startup_digest(&config.id).unwrap().is_some());
+        connections.disconnect(&registry, &servers, &config.id).await.unwrap();
+    }).await.expect("stdio cancellation and retry must complete promptly");
+}
+
+#[tokio::test]
+async fn ordinary_tool_call_uses_cancellation_or_transport_end() {
+    let (_dir, servers, settings, context) = fixture();
+    for mode in ["result_eof", "sse_eof", "slow"] {
+        let (url, stop, _) = mock_http(mode).await;
+        let _stop = stop.drop_guard();
+        let client = connect_http(&servers, &settings, &url, mode).await;
+        let cancel = context.cancel.child_token();
+        if mode == "slow" {
             let trigger = cancel.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 trigger.cancel();
             });
-            assert!(matches!(
-                client.call_tool("echo", json!({}), &cancel).await,
-                Err(AppError::Cancelled)
-            ));
         }
-        stop.cancel();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_tool("echo", json!({}), &cancel),
+        )
+        .await
+        .expect("connection end or caller cancellation must unblock the call");
+        if mode == "slow" {
+            assert!(matches!(result, Err(AppError::Cancelled)));
+        } else {
+            assert!(matches!(result, Err(AppError::Other(_))));
+        }
     }
+}
+
+#[tokio::test]
+async fn ordinary_http_tool_call_can_finish_after_30_seconds() {
+    let (_dir, servers, settings, context) = fixture();
+    let (url, stop, _) = mock_http("long_call").await;
+    let _stop = stop.drop_guard();
+    let client = connect_http(&servers, &settings, &url, "long_call").await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(40),
+        client.call_tool("echo", json!({}), &context.cancel),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result["content"][0]["text"], "{}");
+}
+
+#[tokio::test]
+async fn stopping_during_pagination_does_not_publish_the_first_page() {
+    let (_dir, servers, settings, _) = fixture();
+    let second_page = Arc::new(tokio::sync::Notify::new());
+    let (url, stop, _) = observed_mock_http("slow_page", Some(second_page.clone())).await;
+    let _stop = stop.drop_guard();
+    let mut config = ServerConfig::http("slow_page", "Mock", &url);
+    config.enabled = true;
+    servers.create(&config).unwrap();
+    let registry = ToolRegistry::default();
+    let connections = crate::mcp_connections::McpConnections::default();
+    let connect = connections.connect(settings, &registry, config, false);
+    tokio::pin!(connect);
+    tokio::select! {
+        _ = second_page.notified() => {},
+        _ = &mut connect => panic!("connection completed before the second page"),
+        _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("second page was not requested"),
+    }
+    assert!(registry.definitions().is_empty());
+    connections
+        .disconnect(&registry, &servers, "slow_page")
+        .await
+        .unwrap();
+    assert!(matches!(connect.await, Err(AppError::Cancelled)));
+    assert!(registry.definitions().is_empty());
+    assert!(connections.list().await.is_empty());
+    assert!(servers.startup_digest("slow_page").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn connection_registers_300_tools_across_more_than_8_pages_and_unregisters_them() {
+    let (_dir, servers, settings, _) = fixture();
+    let (url, stop, _) = mock_http("many_pages").await;
+    let _stop = stop.drop_guard();
+    let mut config = ServerConfig::http("many_pages", "Mock", &url);
+    config.enabled = true;
+    servers.create(&config).unwrap();
+    let registry = ToolRegistry::default();
+    let connections = crate::mcp_connections::McpConnections::default();
+    let info = connections
+        .connect(settings, &registry, config, false)
+        .await
+        .unwrap();
+    assert_eq!(info.tools.len(), 300);
+    assert_eq!(registry.definitions().len(), 300);
+    // These 8 KiB descriptions total more than the old two-MiB listing allowance.
+    assert_eq!(
+        info.tools[299],
+        client::namespaced_tool_name("many_pages", "tool_299")
+    );
+    assert!(info.tools.iter().all(|name| registry.get(name).is_ok()));
+    connections
+        .disconnect(&registry, &servers, "many_pages")
+        .await
+        .unwrap();
+    assert!(registry.definitions().is_empty());
+    assert!(connections.list().await.is_empty());
 }
 
 #[tokio::test]
@@ -1753,7 +2386,7 @@ async fn disabled_and_stale_confirmations_cannot_connect() {
 }
 
 #[tokio::test]
-async fn batch_registration_capacity_failure_leaves_no_mcp_namespace() {
+async fn batch_registration_conflict_leaves_existing_entry_and_no_partial_batch() {
     struct Existing(String);
     #[async_trait::async_trait]
     impl AgentTool for Existing {
@@ -1773,21 +2406,18 @@ async fn batch_registration_capacity_failure_leaves_no_mcp_namespace() {
     let (url, stop, _) = mock_http("two").await;
     let client = connect_http(&servers, &settings, &url, "atomic").await;
     let registry = ToolRegistry::default();
-    for i in 0..255 {
-        registry
-            .register(Arc::new(Existing(format!("existing_{i}"))))
-            .unwrap();
-    }
-    assert!(client
-        .register_tools(&registry, &context.cancel)
-        .await
+    let conflict = client::namespaced_tool_name("atomic", "other");
+    let existing: Arc<dyn AgentTool> = Arc::new(Existing(conflict.clone()));
+    registry.register(existing.clone()).unwrap();
+    assert!(matches!(
+        client.register_tools(&registry, &context.cancel).await,
+        Err(AppError::Conflict(_))
+    ));
+    assert_eq!(registry.definitions().len(), 1);
+    assert!(Arc::ptr_eq(&registry.get(&conflict).unwrap(), &existing));
+    assert!(registry
+        .get(&client::namespaced_tool_name("atomic", "echo"))
         .is_err());
-    assert_eq!(registry.definitions().len(), 255);
-    for remote in ["echo", "other"] {
-        assert!(registry
-            .get(&super::client::namespaced_tool_name("atomic", remote))
-            .is_err());
-    }
     client.disconnect_and_wait().await.unwrap();
     stop.cancel();
 }

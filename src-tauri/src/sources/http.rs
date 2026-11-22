@@ -10,6 +10,9 @@ use url::Url;
 #[path = "http_cache.rs"]
 mod cache;
 
+#[path = "download_dns.rs"]
+mod download_dns;
+
 pub const USER_AGENT: &str = concat!("AgentModManager/", env!("CARGO_PKG_VERSION"));
 
 fn public_v4(ip: Ipv4Addr) -> bool {
@@ -40,10 +43,6 @@ fn public_v6(ip: Ipv6Addr) -> bool {
 }
 
 fn public_ip(ip: IpAddr) -> bool {
-    #[cfg(test)]
-    if ip.is_loopback() {
-        return true;
-    }
     match ip {
         IpAddr::V4(ip) => public_v4(ip),
         IpAddr::V6(ip) => public_v6(ip),
@@ -73,28 +72,31 @@ pub fn validate_download_url(raw: &str) -> AppResult<Url> {
             "下载 URL 必须使用 HTTPS，且不得包含用户凭据或 fragment".into(),
         ));
     }
-    let host = url.host_str().unwrap().trim_matches(['[', ']']);
+    let host = url
+        .host_str()
+        .unwrap()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.');
     if host.eq_ignore_ascii_case("localhost")
         || host.ends_with(".localhost")
         || host.ends_with(".local")
         || !host.contains('.') && !host.contains(':')
-        || host.parse::<IpAddr>().is_ok_and(|ip| !public_ip(ip))
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| !public_ip(ip) && !(cfg!(test) && ip.is_loopback()))
     {
         return Err(AppError::Denied("拒绝非公网下载地址".into()));
     }
     Ok(url)
 }
 
-pub(crate) async fn pinned_download_client(url: &Url, timeout: Duration) -> AppResult<Client> {
+pub(crate) async fn pinned_download_client(
+    url: &Url,
+    read_idle_timeout: Duration,
+) -> AppResult<Client> {
     let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
     let port = url.port_or_known_default().unwrap_or(443);
-    let addresses: Vec<_> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|_| AppError::Other("下载主机解析失败".into()))?
-        .collect();
-    if addresses.is_empty() || addresses.iter().any(|a| !public_ip(a.ip())) {
-        return Err(AppError::Denied("下载主机解析到非公网地址".into()));
-    }
+    let addresses = download_dns::resolve(host, port).await?;
     Client::builder()
         .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::none())
@@ -102,7 +104,8 @@ pub(crate) async fn pinned_download_client(url: &Url, timeout: Duration) -> AppR
         .no_gzip()
         .no_brotli()
         .connect_timeout(Duration::from_secs(15))
-        .timeout(timeout)
+        // A progressing body may take longer than the read-idle interval.
+        .read_timeout(read_idle_timeout)
         .resolve_to_addrs(host, &addresses)
         .build()
         .map_err(|_| AppError::Other("无法创建下载客户端".into()))
@@ -118,6 +121,22 @@ pub fn api_client() -> AppResult<Client> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| AppError::Other("无法创建来源客户端".into()))
+}
+
+/// Traversals may make progress indefinitely, but each connect and each
+/// response read has its own idle limit. Shared cache/admission policy remains.
+pub(super) fn graph_api_client() -> AppResult<Client> {
+    graph_client_with_idle_timeout(Duration::from_secs(30))
+}
+
+fn graph_client_with_idle_timeout(idle_timeout: Duration) -> AppResult<Client> {
+    Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(15))
+        .read_timeout(idle_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| AppError::Other("无法创建依赖图来源客户端".into()))
 }
 
 pub fn secret_header(secret: Option<String>) -> AppResult<Option<header::HeaderValue>> {

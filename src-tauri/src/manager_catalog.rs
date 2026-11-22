@@ -81,6 +81,22 @@ pub struct CatalogSearch {
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ReleaseDisplay {
+    pub description: String,
+    pub cover_png: String,
+}
+
+impl ReleaseDisplay {
+    fn from_skill(skill: &str) -> Option<Self> {
+        crate::publication_copy::read_display(skill).map(|(description, cover_png)| Self {
+            description,
+            cover_png,
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CatalogPreview {
     pub game_name: String,
     pub plugin: CatalogPlugin,
@@ -90,6 +106,7 @@ pub struct CatalogPreview {
     pub hashes: PackageHashes,
     pub mcp_servers: Vec<PluginMcpServer>,
     pub installed_version: Option<String>,
+    pub display: Option<ReleaseDisplay>,
 }
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -401,6 +418,7 @@ impl CatalogClient {
             plugin,
             source: SOURCE,
             hashes: PackageHashes::of(&adapter_json, &skill_markdown),
+            display: ReleaseDisplay::from_skill(&skill_markdown),
             adapter_json,
             skill_markdown,
             mcp_servers: adapter.mcp_servers,
@@ -436,6 +454,22 @@ impl CatalogClient {
 pub async fn search(query: &str) -> AppResult<CatalogSearch> {
     CatalogClient::new()?.search(query).await
 }
+/// Immutable, anonymous same-origin release files. Hidden releases are checked by the provider.
+pub async fn release_display(release_id: &str) -> AppResult<Option<ReleaseDisplay>> {
+    if !positive_id(release_id) {
+        return Err(AppError::Invalid("云插件版本 ID 必须是正整数".into()));
+    }
+    let client = CatalogClient::new()?;
+    let skill = client
+        .get(
+            &release_path(release_id, "SKILL.md"),
+            plugin_workflow::SKILL_LIMIT,
+            "text/markdown, text/plain",
+        )
+        .await?;
+    Ok(ReleaseDisplay::from_skill(&skill))
+}
+
 pub async fn preview(
     engine: &FileEngine,
     plugin_id: &str,

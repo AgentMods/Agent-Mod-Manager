@@ -337,6 +337,7 @@ async fn tools_are_allowlisted_and_real_reads_reuse_desktop_file_guards() {
         "read_file",
         "plan_file_ops",
         "download_web_mod",
+        "retry_mod_library_download",
         "set_game_adapter",
     ]);
     let count = Arc::new(AtomicUsize::new(0));
@@ -381,6 +382,7 @@ async fn tools_are_allowlisted_and_real_reads_reuse_desktop_file_guards() {
         "start_process",
         "amm_approve",
         "download_web_mod",
+        "retry_mod_library_download",
         "set_game_adapter",
     ] {
         assert_eq!(
@@ -576,14 +578,33 @@ async fn download_mod_rejects_forged_unknown_and_desktop_resolutions_before_appr
         .registry
         .get("download_mod")
         .unwrap()
-        .definition();
+        .inbound_definition();
     assert_eq!(
         tool.input_schema.as_ref(),
         definition.parameters.as_object().unwrap()
     );
     assert_eq!(
-        definition.parameters["properties"],
-        json!({"resolution_id":{"type":"string","format":"uuid"}})
+        definition.parameters["properties"]["resolution_id"],
+        json!({"type":"string","format":"uuid"})
+    );
+    assert_eq!(
+        definition.parameters["properties"]["gameId"]["type"],
+        "string"
+    );
+    assert_eq!(
+        definition.parameters["properties"]["gameName"]["type"],
+        "string"
+    );
+    assert_eq!(
+        definition.parameters["properties"]
+            .as_object()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        definition.parameters["not"]["required"],
+        json!(["gameId", "gameName"])
     );
     assert_eq!(definition.parameters["required"], json!(["resolution_id"]));
     assert_eq!(definition.parameters["additionalProperties"], false);
@@ -596,6 +617,10 @@ async fn download_mod_rejects_forged_unknown_and_desktop_resolutions_before_appr
         }}),
         json!({"resolution_id":"00000000-0000-4000-8000-000000000000"}),
         json!({"resolution_id":desktop_id}),
+        json!({"resolution_id":desktop_id,"gameName":"Other Game"}),
+        json!({"resolution_id":desktop_id,"gameName":"Other Game","gameId":"g"}),
+        json!({"resolution_id":desktop_id,"gameId":null}),
+        json!({"resolution_id":desktop_id,"gameName":"https://example.com/private?signature=token"}),
     ] {
         assert_eq!(
             call(&client, "download_mod", args).await.is_error,
@@ -621,6 +646,167 @@ async fn download_mod_rejects_forged_unknown_and_desktop_resolutions_before_appr
 
     client.cancel().await.unwrap();
     server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn inbound_download_mod_preserves_legacy_and_reviews_explicit_mods_classification() {
+    use crate::download::DownloadArtifact;
+    use axum::{routing::get, Router};
+    const BYTES: &[u8] = b"inert inbound archive bytes";
+    let mut fixture = fixture_with_native_tools(&["download_mod"]);
+    set_mode(&fixture.runtime, "request_approval");
+    let root = fixture._dir.path().join("registered-game");
+    std::fs::create_dir(&root).unwrap();
+    let game = crate::games::register_game(&fixture.runtime.engine.db, &root, None).unwrap();
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let download_url = format!(
+        "http://{}/fixture.jar?ticket=fixture-private",
+        listener.local_addr().unwrap()
+    );
+    let hits = Arc::new(AtomicUsize::new(0));
+    let count = hits.clone();
+    let asset_server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/fixture.jar",
+                get(move || {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    async { BYTES }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let server = LocalMcpServer::new(fixture.runtime.clone());
+    server.start().await.unwrap();
+    let client = connect(&server, &fixture.runtime).await;
+    let session = call(&client, "amm_session", json!({}))
+        .await
+        .structured_content
+        .unwrap();
+    let conversation = session["conversationId"].as_str().unwrap();
+    let paths = &fixture.runtime.engine.paths;
+    for (n, classification) in [
+        json!({}),
+        json!({"gameName":"Unregistered Game"}),
+        json!({"gameId":game.id}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = fixture
+            .runtime
+            .resolutions
+            .publish(
+                ResolutionScope::Mcp(conversation.into()),
+                ResolveResult {
+                    status: SourceStatus::new("modrinth", SourceState::Available, "OK"),
+                    download: Some(ResolvedMod {
+                        source_id: "modrinth".into(),
+                        project_id: "fixture-project".into(),
+                        version_id: format!("v{n}"),
+                        name: "Fixture Mod".into(),
+                        version: format!("{n}"),
+                        download_url: download_url.clone(),
+                        filename: "fixture.jar".into(),
+                        size: Some(BYTES.len() as u64),
+                        hashes: FileHashes::default(),
+                        homepage_url: None,
+                        warnings: Vec::new(),
+                    }),
+                    homepage_url: None,
+                    dependencies: None,
+                },
+            )
+            .unwrap()
+            .download
+            .unwrap()
+            .resolution_id;
+        let mut args = classification.clone();
+        args["resolution_id"] = json!(id);
+        let peer = client.peer().clone();
+        let job = tokio::spawn(async move {
+            peer.call_tool(
+                CallToolRequestParams::new("download_mod")
+                    .with_arguments(args.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap()
+        });
+        let approval = next_event(&mut fixture.events, "approval-request").await;
+        assert_eq!(approval.conversation_id, conversation);
+        let preview = &approval.payload["preview"];
+        assert_eq!(preview["resolution_id"], json!(id));
+        assert!(!preview.to_string().contains("fixture-private"));
+        if n == 0 {
+            assert!(
+                preview.get("classification").is_none() && preview.get("destination").is_none()
+            );
+        } else {
+            assert_eq!(preview["destination"], "Mods/");
+            if n == 1 {
+                assert_eq!(preview["classification"]["gameName"], "Unregistered Game");
+            } else {
+                assert_eq!(preview["classification"]["gameId"], game.id);
+                assert_eq!(preview["classification"]["gameName"], game.name);
+            }
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), n);
+        assert!(!job.is_finished());
+        fixture
+            .runtime
+            .respond_approval(
+                conversation,
+                approval.payload["approvalId"].as_str().unwrap(),
+                ApprovalResponse {
+                    approved: true,
+                    // Approval answers may not modify a transfer or a game selection.
+                    answer: json!({"gameName":"Wrong Game","resolution_id":uuid::Uuid::new_v4()}),
+                },
+            )
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), job)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.is_error, Some(false), "{result:?}");
+        let receipt = result.structured_content.unwrap()["result"].clone();
+        let artifact: DownloadArtifact = serde_json::from_value(receipt.clone()).unwrap();
+        let path = artifact.path.canonicalize().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), BYTES);
+        assert_eq!(hits.load(Ordering::SeqCst), n + 1);
+        let saved = crate::artifacts::for_id(&fixture.runtime.engine.db, &artifact.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.artifact.path, path);
+        if n == 0 {
+            assert_eq!(
+                receipt,
+                json!(artifact),
+                "legacy callers must get exactly the old receipt shape"
+            );
+            assert!(path.starts_with(paths.downloads()));
+            assert!(saved.native_library_intent().is_none());
+        } else {
+            assert!(path.starts_with(paths.mod_library()));
+            assert_eq!(receipt["artifactId"], artifact.id);
+            assert_eq!(receipt["gameName"], preview["classification"]["gameName"]);
+            assert_eq!(receipt["gameId"], preview["classification"]["gameId"]);
+            assert!(saved.native_library_intent().is_some());
+        }
+    }
+    assert_eq!(
+        std::fs::read_dir(&root).unwrap().count(),
+        0,
+        "download must not install into the game"
+    );
+    client.cancel().await.unwrap();
+    server.stop().await.unwrap();
+    asset_server.abort();
 }
 
 #[tokio::test]
@@ -1390,4 +1576,74 @@ async fn failure_to_save_local_intent_rolls_back_the_agent_and_listener() {
         servers.get(LOCAL_SERVER_ID),
         Err(AppError::NotFound(_))
     ));
+}
+
+#[tokio::test]
+async fn modrinth_dependency_graph_mcp_request_cancels_an_active_read() {
+    struct GraphRead(Arc<Notify>);
+    #[async_trait::async_trait]
+    impl AgentTool for GraphRead {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "resolve_modrinth_dependency_graph".into(),
+                description: "Cancellable graph test fixture".into(),
+                parameters: json!({"type":"object"}),
+                effect: Effect::Read,
+            }
+        }
+
+        async fn prepare(&self, _: &ToolContext, _: &Value) -> AppResult<PreparedTool> {
+            Ok(PreparedTool {
+                preview: json!({}),
+                effect: Effect::Read,
+                plan: None,
+            })
+        }
+
+        async fn execute(
+            &self,
+            context: &ToolContext,
+            _: Value,
+            _: PreparedTool,
+        ) -> AppResult<Value> {
+            self.0.notify_one();
+            context.cancel.cancelled().await;
+            Err(AppError::Cancelled)
+        }
+    }
+
+    let mut fixture = fixture_with_native_tools(&[]);
+    let started = Arc::new(Notify::new());
+    let graph = GraphRead(started.clone());
+    let name = graph.definition().name;
+    fixture.runtime.registry.register(Arc::new(graph)).unwrap();
+    let server = LocalMcpServer::new(fixture.runtime.clone());
+    server.start().await.unwrap();
+    let client = connect(&server, &fixture.runtime).await;
+    let request = client
+        .peer()
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(Request::new(CallToolRequestParams::new(name))),
+            PeerRequestOptions::no_options(),
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    request
+        .cancel(Some("cancel graph fixture".into()))
+        .await
+        .unwrap();
+    next_event(&mut fixture.events, "done").await;
+    let status: String = fixture
+        .runtime
+        .engine
+        .db
+        .conn()
+        .query_row("SELECT status FROM tool_calls", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(status, "cancelled");
+    client.cancel().await.unwrap();
+    server.stop().await.unwrap();
 }

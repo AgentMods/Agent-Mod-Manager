@@ -55,13 +55,13 @@ export function displayToolArguments(name: unknown, value: unknown): unknown {
 const directPlanTools = new Set<unknown>(["apply_file_ops", "trash_paths", "restore_trash", "snapshot_create", "uninstall_mod"]);
 
 export function isFilePlanApproval(name: unknown): boolean {
-  return directPlanTools.has(name) || name === "install_mod" || name === "write_plugin_draft" || name === "install_plugin";
+  return directPlanTools.has(name) || name === "install_library_mod" || name === "install_mod" || name === "write_plugin_draft" || name === "install_plugin";
 }
 
 export function displayApprovalPreview(name: unknown, value: unknown): unknown {
   if (directPlanTools.has(name)) return filePlan(value);
   switch (name) {
-    case "install_mod": return installPreview(value);
+    case "install_library_mod": case "install_mod": return installPreview(value);
     case "write_plugin_draft": return fields(value, { draft, plan: filePlan });
     case "install_plugin": return fields(value, { deployment });
     case "rollback_transaction": return fields(value, { originalPlan: filePlan });
@@ -88,7 +88,7 @@ export function displayToolResult(name: unknown, value: unknown): unknown {
     });
     case "preview_fomod": return fields(value, { artifactPath: path });
     case "plan_install": return installPreview(value);
-    case "install_mod": case "write_plugin_draft": case "install_plugin":
+    case "install_library_mod": case "install_mod": case "write_plugin_draft": case "install_plugin":
       return fields(value, { plan: filePlan, preview: (preview) => displayApprovalPreview(name, preview) });
     case "list_plugin_drafts": return array(draft)(value);
     case "validate_plugin": return fields(value, { draft });

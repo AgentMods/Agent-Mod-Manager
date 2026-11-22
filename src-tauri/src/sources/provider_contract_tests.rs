@@ -955,6 +955,30 @@ async fn curseforge_resolve_filters_project_availability_and_game_version_then_s
 }
 
 #[tokio::test]
+async fn curseforge_resolve_continues_after_an_unavailable_first_page() {
+    let mut file = value(CF_FILES)["data"][4].clone();
+    file["isAvailable"] = json!(false);
+    let first = json!({"data":vec![file.clone(); 50],"pagination":{"index":0,"resultCount":50,"totalCount":51}});
+    file["isAvailable"] = json!(true);
+    let second = json!({"data":[file],"pagination":{"index":50,"resultCount":1,"totalCount":51}});
+    let (p, mock) = provider(
+        "curseforge",
+        vec![
+            Step::ok("/v1/mods/67217", CF_PROJECT),
+            Step::ok("/v1/mods/67217/files", first.to_string()),
+            Step::ok("/v1/mods/67217/files", second.to_string()),
+        ],
+    );
+    let found = p
+        .resolve(&resolve("curseforge", "67217", "432"))
+        .await
+        .unwrap();
+    assert_eq!(found.download.unwrap().project_id, "67217");
+    assert_eq!(mock.params(2)["index"], "50");
+    mock.assert_finished(3);
+}
+
+#[tokio::test]
 async fn curseforge_hash_algo_mapping_is_independent_of_order_or_missing_algorithm() {
     for (raw, expected) in [
         (

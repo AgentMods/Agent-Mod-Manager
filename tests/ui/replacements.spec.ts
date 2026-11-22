@@ -64,7 +64,7 @@ async function setup(page: Page, theme: 'light' | 'dark') {
 async function openGameMods(page: Page) {
   await page.getByRole('button', { name: '游戏库', exact: true }).click();
   await page.getByRole('button').filter({ hasText: 'Minecraft Java Edition' }).click();
-  await page.getByRole('tab', { name: '已装 Mod', exact: true }).click();
+  await page.getByRole('tab', {name: 'Mod 管理', exact: true}).click();
 }
 
 async function calls(page: Page, command: string) {
@@ -88,7 +88,7 @@ test('rollback reads the original replacement, then confirms separately and refr
   const replacement = page.getByRole('row').filter({ hasText: '新版 Fixture' });
   const openRollback = replacement.getByRole('button', { name: '预览回滚替换', exact: true });
   await expect(old).toContainText('已被替换');
-  await expect(old.getByRole('button', { name: '预览卸载', exact: true })).toBeDisabled();
+  await expect(old.getByRole('button', { name: '使用 Agent 卸载', exact: true })).toBeDisabled();
   await expect(page.getByRole('button', { name: '预览回滚替换', exact: true })).toHaveCount(1);
   await openRollback.click();
 
@@ -114,7 +114,7 @@ test('rollback reads the original replacement, then confirms separately and refr
   await page.evaluate(() => { (window as any).__AMM_TEST__.replacements.failRollback = false; });
   await confirm.click();
   await expect(rollback).toBeHidden();
-  await expect(old).toContainText('已启用');
+  await expect(old).toContainText('已安装');
   await expect(replacement).toContainText('已回滚');
   await expect(openRollback).toHaveCount(0);
   expect(await calls(page, 'rollback_transaction')).toEqual([{ transactionId: 'txn-replacement-fixture' }, { transactionId: 'txn-replacement-fixture' }]);

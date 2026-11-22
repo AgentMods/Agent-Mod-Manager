@@ -12,10 +12,34 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 pub fn register(registry: &ToolRegistry, settings: Settings) -> AppResult<()> {
-    registry.register(Arc::new(PublishPlugin { settings }))
+    registry.register(Arc::new(PublishPlugin {
+        settings,
+        #[cfg(test)]
+        test_preparation: None,
+    }))
 }
 struct PublishPlugin {
     settings: Settings,
+    #[cfg(test)]
+    test_preparation: Option<TestPreparation>,
+}
+
+#[cfg(test)]
+struct TestPreparation {
+    remote: Arc<dyn manager_publication::Remote>,
+    listing: crate::publication_copy::PublicationListing,
+}
+
+#[cfg(test)]
+pub(crate) fn test_tool(
+    settings: Settings,
+    remote: Arc<dyn manager_publication::Remote>,
+    listing: crate::publication_copy::PublicationListing,
+) -> Arc<dyn AgentTool> {
+    Arc::new(PublishPlugin {
+        settings,
+        test_preparation: Some(TestPreparation { remote, listing }),
+    })
 }
 
 #[derive(Deserialize)]
@@ -23,10 +47,6 @@ struct PublishPlugin {
 struct PublishArgs {
     draft_id: Option<String>,
     slug: Option<String>,
-    #[serde(default)]
-    plugin_id: Option<i64>,
-    #[serde(default)]
-    tags: Vec<String>,
 }
 
 #[async_trait::async_trait]
@@ -34,8 +54,8 @@ impl AgentTool for PublishPlugin {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "publish_plugin".into(),
-            description: "发布到 Mod客栈。已提交草稿 draft_id 与已验证安装包 slug 二选一。首发省略 plugin_id，新版提供本人目标 ID 和完整标签。审批核对目标、两份原文及摘要。".into(),
-            parameters: json!({"type":"object","properties":{"draft_id":{"type":"string"},"slug":{"type":"string"},"plugin_id":{"type":"integer","minimum":1},"tags":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}),
+            description: "准备发布到 Mod客栈。只提供 draft_id 或 slug 中的一项；先核对自动生成的发布信息和完整文件原文，再确认发布。".into(),
+            parameters: json!({"type":"object","properties":{"draft_id":{"type":"string","minLength":1},"slug":{"type":"string","minLength":1}},"oneOf":[{"required":["draft_id"]},{"required":["slug"]}],"additionalProperties":false}),
             effect: Effect::Publish,
         }
     }
@@ -43,23 +63,51 @@ impl AgentTool for PublishPlugin {
         if context.cancel.is_cancelled() {
             return Err(AppError::Cancelled);
         }
-        let args: PublishArgs = serde_json::from_value(args.clone()).map_err(|_| {
-            AppError::Invalid("请选择 draft_id 或 slug，可另附 plugin_id 与 tags".into())
-        })?;
-        let target = match args.plugin_id {
-            Some(plugin_id) => manager_publication::PublicationTarget::Release { plugin_id },
-            None => manager_publication::PublicationTarget::First,
-        };
-        let engine = context.engine.clone();
-        let record = tokio::task::spawn_blocking(move || match (args.draft_id, args.slug) {
-            (Some(id), None) => manager_publication::prepare_draft(&engine, &id, target, args.tags),
-            (None, Some(slug)) => {
-                manager_publication::prepare_installed(&engine, &slug, target, args.tags)
+        let args: PublishArgs = serde_json::from_value(args.clone())
+            .map_err(|_| AppError::Invalid("请只提供 draft_id 或 slug 中的一项".into()))?;
+        let (draft_id, slug) = match (args.draft_id, args.slug) {
+            (Some(id), None) if !id.trim().is_empty() => (Some(id), None),
+            (None, Some(slug)) if !slug.trim().is_empty() => (None, Some(slug)),
+            _ => {
+                return Err(AppError::Invalid(
+                    "请只提供 draft_id 或 slug 中的一项".into(),
+                ))
             }
-            _ => Err(AppError::Invalid("请选择一个草稿或已安装适配包".into())),
-        })
-        .await
-        .map_err(|_| AppError::Other("准备发布失败".into()))??;
+        };
+        #[cfg(test)]
+        let record = match &self.test_preparation {
+            Some(test) => {
+                manager_publication::prepare_automatic_with(
+                    &context.engine,
+                    &self.settings,
+                    test.remote.as_ref(),
+                    draft_id,
+                    slug,
+                    test.listing.clone(),
+                    &context.cancel,
+                )
+                .await?
+            }
+            None => {
+                manager_publication::prepare_automatic(
+                    &context.engine,
+                    &self.settings,
+                    draft_id,
+                    slug,
+                    &context.cancel,
+                )
+                .await?
+            }
+        };
+        #[cfg(not(test))]
+        let record = manager_publication::prepare_automatic(
+            &context.engine,
+            &self.settings,
+            draft_id,
+            slug,
+            &context.cancel,
+        )
+        .await?;
         Ok(PreparedTool {
             preview: json!(record),
             effect: Effect::Publish,
@@ -104,4 +152,4 @@ impl AgentTool for PublishPlugin {
 
 #[cfg(test)]
 #[path = "publication_tool_tests.rs"]
-mod tests;
+pub(crate) mod tests;

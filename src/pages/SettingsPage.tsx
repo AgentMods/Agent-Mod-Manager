@@ -1,15 +1,11 @@
-import { appendPathLeaf, displayPath } from "@/lib/paths";
 import { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { open } from "@tauri-apps/plugin-dialog";
-import { FolderOpenIcon } from "lucide-react";
 import { BoxIcon, DownloadIcon, FileTextIcon, MoonIcon, PlusIcon, RotateCcwIcon, SearchIcon, SunIcon, Trash2Icon } from "lucide-react";
 import { api, backendAvailable, useBackendQuery } from "@/lib/api";
 import { useUI } from "@/lib/store";
 import type { FilePlan } from "@/lib/types";
 import { AgentConfiguration } from "@/components/AgentConfiguration";
-import { Badge, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, PathText } from "@/components/ui";
-import { AlertDialog, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
+import { Badge, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader } from "@/components/ui";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -21,6 +17,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { McpTools } from "@/components/McpTools";
+import { StorageDirectory } from "@/components/StorageDirectory";
 
 const sections = [["model", "AI 与模型"], ["mcp", "工具"], ["skills", "Skills"], ["appearance", "外观与存储"]] as const;
 
@@ -51,32 +48,6 @@ function AppearanceSettings() {
   const theme = useUI((s) => s.theme);
   const toggleTheme = useUI((s) => s.toggleTheme);
   const navigate = useUI((s) => s.navigate);
-  const bootstrap = useBackendQuery<{ dataRoot: string; storageMigrationError?: string }>(["bootstrap"], "get_bootstrap_state");
-  const [destination, setDestination] = useState<{ parent: string; path: string } | null>(null);
-  const [restarting, setRestarting] = useState(false);
-  const [storageError, setStorageError] = useState<unknown>(null);
-
-  async function chooseStorage() {
-    setStorageError(null);
-    try {
-      const parent = await open({ directory: true, multiple: false, title: "选择存储位置" });
-      if (typeof parent === "string" && parent) setDestination({ parent, path: appendPathLeaf(parent, "Agent Mod Manager") });
-    } catch (error) {
-      setStorageError(error);
-    }
-  }
-
-  async function migrateStorage() {
-    if (!destination || restarting) return;
-    setRestarting(true);
-    setStorageError(null);
-    try {
-      await api("migrate_storage", { parent: destination.parent });
-    } catch (error) {
-      setStorageError(error);
-      setRestarting(false);
-    }
-  }
   return <div className="flex flex-col gap-6">
     <Card>
       <CardHeader><CardTitle>外观</CardTitle><CardDescription>选择界面主题，设置会保存在本机。</CardDescription></CardHeader>
@@ -89,31 +60,9 @@ function AppearanceSettings() {
     </Card>
     <Card>
       <CardHeader><CardTitle>存储</CardTitle><CardDescription>管理器数据（数据库、快照、回收站、下载）所在目录。</CardDescription></CardHeader>
-      <CardContent className="flex flex-col items-start gap-4">
-        <PathText>{bootstrap.data?.dataRoot ? displayPath(bootstrap.data.dataRoot) : "未连接桌面服务"}</PathText>
-        <div className="flex flex-wrap gap-2">
-          <Button variant="outline" disabled={!backendAvailable || !bootstrap.data || restarting} onClick={chooseStorage}><FolderOpenIcon data-icon="inline-start" />更改存储目录</Button>
-          <Button variant="outline" disabled={!backendAvailable || !bootstrap.data || restarting} onClick={() => navigate("onboarding")}><RotateCcwIcon data-icon="inline-start" />重新查看新手引导</Button>
-        </div>
-        <ErrorState error={bootstrap.error || (bootstrap.data?.storageMigrationError && `迁移失败，仍在使用原目录。${bootstrap.data.storageMigrationError}`) || (!destination && storageError)} />
+      <CardContent>
+        <StorageDirectory renderExtraActions={(disabled) => <Button variant="outline" disabled={disabled} onClick={() => navigate("onboarding")}><RotateCcwIcon data-icon="inline-start" />重新查看新手引导</Button>} />
       </CardContent>
-      <AlertDialog open={destination !== null} onOpenChange={(open) => { if (!open && !restarting) setDestination(null); }}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>迁移存储目录</AlertDialogTitle>
-            <AlertDialogDescription>应用将重启并把管理器数据复制到下方的新目录。原目录会保留为备份。</AlertDialogDescription>
-          </AlertDialogHeader>
-          {destination && <PathText>{displayPath(destination.path)}</PathText>}
-          <ErrorState error={storageError} />
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={restarting}>取消</AlertDialogCancel>
-            <Button disabled={restarting} onClick={migrateStorage}>
-              {restarting && <Spinner data-icon="inline-start" />}
-              {restarting ? "正在重启…" : "迁移并重启"}
-            </Button>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </Card>
   </div>;
 }

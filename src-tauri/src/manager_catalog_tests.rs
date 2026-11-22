@@ -452,7 +452,9 @@ async fn reviewed_agent_import_preserves_exact_bytes_after_server_disappears_the
     let install = plugin_workflow::plan_install_plugin(&ctx.engine, id).unwrap();
     assert!(install.plan.entries.iter().all(|e| e.before.is_some()));
     apply(&ctx.engine, &install.plan);
-    plugin_workflow::reconcile_deployments(&ctx.engine).unwrap();
+    plugin_workflow::reconcile_after_apply(&ctx.engine, &install.plan).unwrap();
+    assert!(!validation.draft.path.exists());
+    assert_eq!(plugin_workflow::list_drafts(&ctx.engine).unwrap().len(), 1);
     assert_eq!(
         fs::read(install.install_path.join("SKILL.md")).unwrap(),
         skill.as_bytes()

@@ -64,7 +64,7 @@ test("扫描候选合并旧路径别名，UNC 与 Unix 大小写不合并，发�
   await expect(discovery).toBeVisible();
   await expect(discovery.getByRole("status").filter({ hasText: "已检查" })).toContainText("已检查 9 个目录、9 个条目");
   await expect(row("已登记")).toBeVisible();
-  expect(await argsFor(page, "scan_games")).toEqual([{ options: { userRoots: [], includeCommonRoots: true } }]);
+  expect(await argsFor(page, "scan_games")).toEqual([{ options: { userRoots: [], includeCommonRoots: true, page: { requestId: expect.any(String) } } }]);
   await page.keyboard.press("Escape");
   await expect(discovery).toBeHidden();
   await expect(library).toBeVisible();
@@ -72,8 +72,8 @@ test("扫描候选合并旧路径别名，UNC 与 Unix 大小写不合并，发�
   await expect(discovery).toBeVisible();
   await expect.poll(async () => (await argsFor(page, "scan_games")).length).toBe(2);
   expect(await argsFor(page, "scan_games")).toEqual([
-    { options: { userRoots: [], includeCommonRoots: true } },
-    { options: { userRoots: [], includeCommonRoots: true } },
+    { options: { userRoots: [], includeCommonRoots: true, page: { requestId: expect.any(String) } } },
+    { options: { userRoots: [], includeCommonRoots: true, page: { requestId: expect.any(String) } } },
   ]);
   await expect(row("已登记").getByRole("button", { name: "管理中" })).toBeDisabled();
   await expect(row("已登记").getByText(ordinaryUnc, { exact: true })).toBeVisible();
@@ -87,7 +87,7 @@ test("扫描候选合并旧路径别名，UNC 与 Unix 大小写不合并，发�
   await expect(discovery.getByLabel("游戏目录", { exact: true })).toHaveValue(verbatimUnc);
   await expect(discovery.getByRole("status").filter({ hasText: "扫描目录：" })).toContainText(`扫描目录：${ordinaryUnc}`);
   await expect(discovery.getByRole("status").filter({ hasText: "检查路径" })).toContainText(`${ordinaryUnc}：检查路径`);
-  expect((await argsFor(page, "scan_games")).at(-1)).toEqual({ options: { userRoots: [verbatimUnc], includeCommonRoots: false } });
+  expect((await argsFor(page, "scan_games")).at(-1)).toEqual({ options: { userRoots: [verbatimUnc], includeCommonRoots: false, page: { requestId: expect.any(String) } } });
 
   await discovery.getByLabel("游戏目录", { exact: true }).fill(unix);
   await discovery.getByRole("button", { name: "检查单个游戏", exact: true }).click();
@@ -98,7 +98,7 @@ test("扫描候选合并旧路径别名，UNC 与 Unix 大小写不合并，发�
   await expect(page.getByText("已将「从扫描添加」添加到游戏库", { exact: true })).toBeVisible();
   await expect(discovery).toBeVisible();
   await expect(row("从扫描添加").getByRole("button", { name: "管理中", exact: true })).toBeDisabled();
-  expect((await argsFor(page, "scan_games")).at(-1)).toEqual({ options: { userRoots: [unix], includeCommonRoots: false } });
+  expect((await argsFor(page, "scan_games")).at(-1)).toEqual({ options: { userRoots: [unix], includeCommonRoots: false, page: { requestId: expect.any(String) } } });
   expect(await argsFor(page, "register_game")).toEqual([{ directory: verbatimDrive, adapterSlug: null, fromDiscovery: true }]);
   await page.keyboard.press("Escape");
   await expect(discovery).toBeHidden();
@@ -109,6 +109,12 @@ test("新手引导合并别名并保持原始注册路径", async ({ page }) => 
   await installMockTauri(page, { onboarding: true, onboardingStarted: true, gameRootPath: verbatimUnc });
   await page.goto("/");
   await installDiscoveryResponses(page);
+  await page.getByRole("button", { name: "下一步", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "配置 AI 模型服务", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "跳过配置", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "启用可用工具", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "下一步", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "扫描游戏列表", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "扫描已安装游戏", exact: true }).click();
   const row = (name: string) => page.getByRole("listitem").filter({ has: page.getByText(name, { exact: true }) });
   await expect(row("已登记").getByText("管理中", { exact: true })).toBeVisible();
@@ -250,34 +256,27 @@ test("Agent 审批和工具详情只转换原生结构化路径，不改文本�
   expect(original.entries[0].operation).toEqual({ op: "move", src: verbatimDrive, dst });
 });
 
-test("归档预览和安装提交保留归档路径与原文件名", async ({ page }) => {
-  await openLibrary(page, undefined, true);
-  const filename = " Map\\Pack.zip ";
-  const artifactPath = `/sandbox/data/staging/${filename}`;
-  await page.evaluate(() => {
+test("本地归档导入保留原生选择的路径", async ({ page }) => {
+  await openLibrary(page);
+  const path = verbatimUnc + "\\ Map Pack.zip ";
+  await page.evaluate((selected) => {
     const target = window as any;
     const invoke = target.__TAURI_INTERNALS__.invoke;
     target.__TAURI_INTERNALS__.invoke = async (command: string, args: any) => {
-      if (command === "preview_fomod" || command === "plan_install") {
+      if (command === "plugin:dialog|open") return selected;
+      if (command === "plan_import_archive") {
         target.__AMM_TEST__.calls.push({ command, args });
         throw new Error("仅校验请求参数");
       }
       return invoke(command, args);
     };
-  });
+  }, path);
   await page.getByRole("button").filter({ has: page.getByRole("heading", { name: "Minecraft Java Edition", exact: true }) }).click();
-  await page.getByRole("button", { name: "安装归档", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "归档安装预览", exact: true });
-  await dialog.getByLabel("管理器内归档路径").fill(artifactPath);
-  await dialog.getByRole("button", { name: "扫描 FOMOD 配置", exact: true }).click();
-  await expect(dialog.getByRole("alert")).toContainText("仅校验请求参数");
-  expect(await argsFor(page, "preview_fomod")).toEqual([{ artifactPath }]);
-  await dialog.getByLabel("原始文件名").fill(filename);
-  await dialog.getByLabel("Mod 名称", { exact: true }).fill("测试归档");
-  await dialog.getByLabel("适配包 Mod 类型").selectOption("java-mod");
-  await dialog.getByRole("button", { name: "生成变更预览", exact: true }).click();
-  await expect(dialog.getByRole("alert")).toContainText("仅校验请求参数");
-  expect((await argsFor(page, "plan_install"))[0].request).toMatchObject({ artifactPath, filename });
+  await page.getByRole("button", { name: "导入本地归档", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("仅校验请求参数");
+  expect(await argsFor(page, "plan_import_archive")).toEqual([{ path }]);
+  expect(await argsFor(page, "register_imported_mod")).toHaveLength(0);
+  expect(await argsFor(page, "start_turn")).toHaveLength(0);
 });
 
 test("启动程序输入框显示普通路径，未编辑的已有值和选择值按原样提交", async ({ page }) => {

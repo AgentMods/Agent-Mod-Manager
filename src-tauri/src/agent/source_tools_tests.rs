@@ -85,17 +85,36 @@ async fn download_cannot_swap_resolutions_after_preview() {
             .resolution_id
     });
     let prepared = tool
-        .prepare(&context, &json!({"resolution_id":ids[0]}))
+        .prepare(
+            &context,
+            &json!({"resolution_id":ids[0],"gameName":"Example Game"}),
+        )
         .await
         .unwrap();
     assert_eq!(prepared.preview["filename"], "mod.jar");
     assert_eq!(prepared.preview["version_id"], "Version1");
     assert!(!prepared.preview.to_string().contains("secret"));
     assert!(matches!(
-        tool.execute(&context, json!({"resolution_id":ids[1]}), prepared)
-            .await,
+        tool.execute(
+            &context,
+            json!({"resolution_id":ids[1],"gameName":"Example Game"}),
+            prepared
+        )
+        .await,
         Err(AppError::Denied(_))
     ));
+    let args = json!({"resolution_id":ids[0],"gameName":"Example Game"});
+    let prepared = tool.prepare(&context, &args).await.unwrap();
+    let mut changed = args;
+    changed["gameName"] = json!("Other Game");
+    assert!(matches!(
+        tool.execute(&context, changed, prepared).await,
+        Err(AppError::Denied(_))
+    ));
+    assert!(tool
+        .prepare(&context, &json!({"resolution_id":ids[0]}))
+        .await
+        .is_err());
     for id in ids {
         assert!(store.preview(&context.resolution_scope, id).is_ok());
     }
@@ -187,6 +206,10 @@ async fn dependency_graph_rejects_local_fields_and_never_needs_source_secrets() 
     let registry = ToolRegistry::default();
     register(&registry, settings, Resolutions::default()).unwrap();
     let tool = registry.get("resolve_modrinth_dependency_graph").unwrap();
+    let definition = tool.definition();
+    let pins = &definition.parameters["properties"]["project_pins"];
+    assert!(pins.get("maxProperties").is_none());
+    assert_eq!(pins["propertyNames"]["pattern"], "^[A-Za-z0-9]{1,32}$");
     for args in [
         json!({"version_id":"abcd1234","loader":"fabric"}),
         json!({"version_id":"abcd1234","game_version":"1.21","loader":"fabric","game_id":"local"}),
@@ -270,7 +293,7 @@ async fn version_list_enforces_flat_arguments_and_honors_cancellation() {
                 "game_id":{"type":["string","null"]},
                 "game_version":{"type":["string","null"]},
                 "loader":{"type":["string","null"]},
-                "offset":{"type":"integer","minimum":0,"maximum":10000,"default":0},
+                "offset":{"type":"integer","minimum":0,"default":0},
                 "limit":{"type":"integer","minimum":1,"maximum":50,"default":20}
             },
             "required":["source_id","project_id"],
@@ -289,7 +312,6 @@ async fn version_list_enforces_flat_arguments_and_honors_cancellation() {
         ("game_version", json!(1.21)),
         ("loader", json!(["fabric"])),
         ("offset", json!(-1)),
-        ("offset", json!(10001)),
         ("limit", json!(0)),
         ("limit", json!(51)),
         ("limit", json!(1.5)),
@@ -341,4 +363,127 @@ async fn cancellation_and_malformed_arguments_never_read_source_secrets() {
         Err(AppError::Cancelled)
     ));
     assert_eq!(secrets.reads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn local_download_retry_is_single_receipt_bound_and_legacy_cannot_be_adopted() {
+    use crate::{
+        artifacts,
+        download::DownloadArtifact,
+        mod_library::{DownloadMetadata, NativeDownloadIntent},
+    };
+    use sha2::{Digest, Sha256, Sha512};
+    use std::fs;
+
+    let (_dir, settings, mut context, secret_store) = fixture();
+    let registry = ToolRegistry::default();
+    register(&registry, settings, Resolutions::default()).unwrap();
+    let tool = registry.get(RETRY).unwrap();
+    assert_eq!(tool.definition().effect, Effect::ManagerWrite);
+    assert!(PermissionMode::RequestApproval.needs_approval(tool.definition().effect));
+    assert!(PermissionMode::AutoApprove.needs_approval(tool.definition().effect));
+    assert_eq!(
+        tool.definition().parameters["required"],
+        json!(["artifactId"])
+    );
+    let cache = context.engine.paths.downloads().join("0".repeat(64));
+    fs::create_dir(&cache).unwrap();
+    let bytes = b"fixture transport bytes";
+    let create_artifact = || {
+        let id = uuid::Uuid::new_v4().to_string();
+        let filename = "mod.zip".to_string();
+        let path = cache.join(format!("{id}-{filename}"));
+        fs::write(&path, bytes).unwrap();
+        DownloadArtifact {
+            id,
+            path,
+            filename,
+            size: bytes.len() as u64,
+            sha256: hex::encode(Sha256::digest(bytes)),
+            sha512: hex::encode(Sha512::digest(bytes)),
+            integrity_verified: false,
+            requires_review: true,
+            auto_install_allowed: false,
+            warnings: Vec::new(),
+        }
+    };
+    let original = create_artifact();
+    let other = create_artifact();
+    let legacy = create_artifact();
+    let intent = NativeDownloadIntent::new(
+        "Saved Game",
+        None,
+        DownloadMetadata {
+            project_page: Some("https://example.com/author-project"),
+            author_hint: Some("Public Author"),
+        },
+    )
+    .unwrap();
+    for saved in [&original, &other] {
+        artifacts::record_web_with_library_intent(&context.engine, saved, &intent).unwrap();
+    }
+    artifacts::record_web(&context.engine, &legacy).unwrap();
+    let args = json!({"artifactId":original.id,"gameName":"Saved Game"});
+    for invalid in [
+        json!({"artifactId":original.id}),
+        json!({"artifactId":original.id,"gameName":"Wrong Game"}),
+        json!({"artifactId":legacy.id,"gameName":"Saved Game"}),
+        json!({"artifactId":[original.id,other.id],"gameName":"Saved Game"}),
+        json!({"artifactId":original.id,"gameName":"Saved Game","projectPage":"https://example.com/replacement"}),
+    ] {
+        assert!(tool.prepare(&context, &invalid).await.is_err(), "{invalid}");
+    }
+    let mut mcp = context.clone();
+    mcp.resolution_scope = ResolutionScope::Mcp("fixture".into());
+    assert!(tool.prepare(&mcp, &args).await.is_err());
+    let approved = tool.prepare(&context, &args).await.unwrap();
+    assert_eq!(approved.preview["artifactId"], original.id);
+    assert_eq!(approved.preview["sha256"], original.sha256);
+    assert!(matches!(
+        tool.execute(
+            &context,
+            json!({"artifactId":other.id,"gameName":"Saved Game"}),
+            approved
+        )
+        .await,
+        Err(AppError::Denied(_))
+    ));
+    let approved = tool.prepare(&context, &args).await.unwrap();
+    context.cancel.cancel();
+    assert!(matches!(
+        tool.execute(&context, args.clone(), approved).await,
+        Err(AppError::Cancelled)
+    ));
+    assert!(original.path.exists());
+    assert_eq!(
+        fs::read_dir(context.engine.paths.mod_library())
+            .unwrap()
+            .count(),
+        0
+    );
+    context.cancel = CancellationToken::new();
+    let approved = tool.prepare(&context, &args).await.unwrap();
+    fs::write(&original.path, vec![b'x'; bytes.len()]).unwrap();
+    assert!(tool
+        .execute(&context, args.clone(), approved)
+        .await
+        .is_err());
+    fs::write(&original.path, bytes).unwrap();
+    let approved = tool.prepare(&context, &args).await.unwrap();
+    let result = tool
+        .execute(&context, args.clone(), approved)
+        .await
+        .unwrap();
+    let library_file = std::path::Path::new(result["path"].as_str().unwrap());
+    assert!(library_file
+        .canonicalize()
+        .unwrap()
+        .starts_with(context.engine.paths.mod_library()));
+    assert_eq!(fs::read(library_file).unwrap(), bytes);
+    assert!(!original.path.exists());
+    assert!(other.path.exists() && legacy.path.exists());
+    assert_eq!(result["artifactId"], original.id);
+    assert_eq!(result["projectPage"], "https://example.com/author-project");
+    assert_eq!(result["authorHint"], "Public Author");
+    assert_eq!(secret_store.reads.load(Ordering::SeqCst), 0);
 }

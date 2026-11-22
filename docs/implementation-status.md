@@ -1,7 +1,86 @@
 # Agent Mod Manager implementation status
 
-Updated: 2026-11-21. The full project goal remains active. This is an
+Updated: 2026-11-22. The full project goal remains active. This is an
 implementation and verification snapshot, not a release-completion claim.
+
+**Managed Playwright browser (Windows, 2026-11-22).** The stock MCP no longer
+requires system Edge or Chrome. The packaged CLI downloaded Chromium into an
+empty cache. With the downloader proxy then set to an unreachable address, the
+native MCP connection reused that build, opened a local fixture page and saved
+the expected file bytes in its configured output folder. No live mod site or
+account was used in this test.
+
+**Installed, uninstalled and removed Mods (2026-11-22).** Game details distinguishes
+uninstalling from removing list membership. The desktop can hide unused archives,
+uninstalled records, or individually cancelled previews. Deleting a deployed Mod
+runs its scoped Agent uninstall/rollback before the removal step. SQLite retains
+ownership and transaction history for restoration. Ordinary uninstall keeps both
+the record and its library entry.
+
+**Game-classified Mod library and Agent installation (2026-11-22).** New downloads
+are filed under the active storage root's `Mods` folder. Each game category can
+be used before its installation directory is registered. The Agent checks local
+layout, README and FOMOD evidence before reading the author's project description.
+Game Details starts an Agent turn for the selected artifact or installation. The
+library installer uses FileEngine copy plans with a persistent per-file manifest;
+uninstall uses that manifest and the recorded overwrite or replacement backup.
+Existing download folders are not automatically imported.
+
+Windows verification passed 934 Rust library tests with 13 ignored, strict
+all-target Clippy, the formatting check and the frontend production build. Four
+loopback Agent flows cover local install/uninstall/reinstall, cancelled approval,
+author information from the source MCP and fallback to a Playwright MCP fixture.
+The focused UI run passed 63 cases across three viewport sizes. The full UI run
+passed 556 cases, skipped two and failed nine. Six failures require the hidden
+History navigation item and three expect an 80-character game display-name limit.
+
+**Long-running Agent tasks (2026-11-22, Windows).** The model/tool loop continues to a final
+reply or cancellation. Regression fixtures completed 41 tool rounds in one turn and
+stopped a different turn during its 33rd tool execution. Streaming and buffered
+completions accept more than 64 calls; the registry can install more than 256 tools.
+MCP discovery follows advancing cursors and reports malformed, repeated or stalled
+pages. Model retries use cancellable backoff for interrupted transports, and context
+overflows may retry a progressively smaller prompt. File reads, scans, diagnostic
+logs, web search results and publication history provide access to later pages.
+The integrated Windows run passed 941 Rust tests, with 13 explicitly ignored.
+The related browser suite passed all 117 cases across three viewport sizes.
+
+**Runtime boundaries for long tasks (2026-11-22).**
+
+| Operation | What can still end or limit a request |
+| --- | --- |
+| Model and MCP | The selected provider controls its context window and its request and output limits. Memory for model response buffers, MCP catalogs and frames depends on free memory and active requests. The rmcp HTTP JSON collector accepts at most 16 MiB per response and 64 KiB per HTTP error body. An MCP that has no pagination must fit its result into one transport message. Each discovery page has a 30-second response deadline; ordinary tool execution is cancellable. |
+| Search | A browser-helper query uses a 256 KiB request envelope. A web search page returns at most 64 KiB, and a cursor continues results from the same query. Upstream empty or repeating pages terminate traversal. |
+| Files and diagnostics | Text and directory tools read in pages. Cursors for long scans expire when idle. Particular binary and XML parsers may mark oversized metadata or individual records as limited. |
+| Downloads and archives | Transfers and extraction require disk headroom and check cancellation. The default HTTP read-idle interval is 30 minutes. ZIP index metadata and 7z headers/dictionaries have parser bounds. A solid 7z stream needs its earlier dictionary state to resume. |
+| Approvals and local writes | Plans still require the permission mode's approval and use validated paths, reversible filesystem transactions and backups. Local drafts and text plans can exceed the old 1 MiB threshold; inbound MCP and remote publication endpoints have their own transport and validation rules. |
+
+**Agent directory reads and long conversations (2026-11-22, Windows).** The desktop Agent's
+`read_file` returns a directory preview when given a folder, including child paths
+that it can read next. Text files still return numbered lines. Old model budgets are
+ignored. The runtime resolves the selected model's window and requests a remote
+summary at 80% occupancy, including during a single turn with many tool calls.
+The latest provider prompt count, when available within a turn, is combined with
+an estimate for newly added messages. The estimate includes tools on a fresh request.
+A provider-reported context overflow can also trigger compression when the window is
+unknown. Long inputs are summarized in chunks using the selected model. SQLite stores
+the summary and cutoff together so later turns resume from the checkpoint while the
+full original transcript remains available. Editing or rewinding invalidates affected history.
+Windows verification passed 809 Rust library tests with 12 ignored, strict Clippy,
+formatting and the frontend production build. Loopback model tests covered prompt
+compression, tool results, attachments, model switching and retry after a provider
+context rejection. The settings and workflow Playwright run passed 129 cases;
+six existing history-navigation cases could not find the History button.
+
+**Native Agent file paging (2026-11-22).** `read_file` accepts a 1-based
+`start_line` or a 0-based `byte_offset`, and returns `next_byte_offset` when
+another text page exists. Each page remains capped at 2,000 rows and 256 KiB
+of source bytes. Long lines keep their absolute line number across fragments;
+page boundaries do not split UTF-8 characters or CRLF. For directories, use
+`offset` and `limit` with either tool and follow `next_offset` (make a fresh
+first-page request if the contents change). A path-only `read_dir` returns an array
+for a complete listing, or a page with `next_offset` for a longer directory.
+Inbound MCP and desktop IPC keep their original schemas and results.
 
 **Installation rule research (2026-11-21, Windows).** When creating or changing
 installation rules, the desktop Agent uses connected Mod-source MCP tools to select
@@ -20,8 +99,8 @@ metadata. Archive contents are covered by local fixtures. The public 3DM MCP
 advertised its tools but returned a service error for the game and Mod queries.
 
 A loopback Agent and MCP fixture covers discovery, sample previews, draft creation
-and validation with a 32K GPT-family context budget. The conservative unknown-model
-token estimate can exceed the same budget during a multi-sample turn.
+and validation. Under the former 32K budget, the conservative unknown-model
+token estimate could exceed the budget during a multi-sample turn.
 
 **Bing web search (2026-11-21, Windows).** The packaged Playwright helper
 returned web results for `Minecraft official website` through the Rust search
@@ -59,10 +138,15 @@ can create, validate, install and bind an external package in one turn. The
 game ID in a general chat. It shares the library's disk-marker and pending-task
 checks and revalidates the reviewed binding at commit. Full Trust can complete
 the operation directly. The other permission modes request approval in chat.
-Successful tool results refresh the library and game detail when the turn ends.
+The authoring chat prefills the game library display name. When the user edits it,
+the binding tool accepts the requested name in `game_name`, previews both names,
+and saves the name and binding in one transaction. Successful tool results refresh
+the library and game detail when the turn ends.
 A loopback model fixture covered the full authoring flow under the default
 context budget, and approval tests covered applying an existing package and
-rejecting the change. Nine Playwright cases passed across three viewport sizes.
+rejecting the change. Twelve additional Playwright cases across three viewport sizes
+covered the name field, validation, approval text and library refresh. The Windows
+Rust library suite passed 789 tests with 12 ignored.
 
 **User-visible filesystem paths (2026-11-21).** Game discovery, registered games,
 file browsing, storage settings and native tool previews display ordinary Windows
@@ -176,8 +260,9 @@ Windows and Linux smoke scripts use the new identity for future package runs.
 - Trash moves/restores use the transaction engine. Manifest and DB metadata are
   recorded before mutation. Restored visibility is derived from committed
   restore transactions, so rollback restores visibility as well as files.
-- Only `trash::purge_trash` permanently removes files. The desktop-only IPC
-  requires explicit `PURGE_TRASH` confirmation; no Agent/MCP tool exposes it.
+- Only `trash::purge_trash` permanently removes files. Turning on the confirmation switch
+  enables the desktop dialog’s delete button. Clicking it sends the selected IDs
+  and the required `PURGE_TRASH` confirmation over desktop-only IPC.
   Durable purge tombstones preserve uninstall state and prevent invalid rollback.
 - Cross-volume moves copy and verify before retaining the source on its own
   volume. Transaction-owned files live in `<game>/.amm-retained/<txn>/` or
@@ -188,13 +273,17 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   and rollback of snapshot restoration. Snapshot planning rejects redirected
   registration paths, uses identity-checked directory listings and file reads,
   and checks that the proposed transaction agrees with the inventory and manifest.
-- ZIP/7z/tar.gz safety checks: path traversal, links/devices, 4 GiB entry limit,
-  exact total 100:1 ratio, actual stream byte limits, exclusive staging targets.
+- ZIP/7z/tar.gz checks validate paths, reject links/devices and enforce declared
+  versus streamed lengths and actual staging space. Large entries and high ratios
+  are not rejected solely on size or ratio. ZIP metadata, tar PAX and padding, and
+  encoded 7z headers and dictionary memory retain separate safety budgets. Failed
+  extraction cleans its owned stage when its directory identity is unchanged.
   Preflight and extraction share one open artifact, verify its hash through
   that handle, and compare entry lists. On macOS/Linux and Windows, the extractor
   holds a staging directory handle for entry writes. The install preview
-  requires exact staged source paths and hashes; failed staging is retained
-  for inspection or later trashing.
+  requires exact staged source paths and hashes. If directory identity changes,
+  cleanup does not delete the replacement. Staging referenced by a committed
+  plan is kept for the transaction engine.
 - Game adapters are installed externally through the draft and reviewed deployment
   workflow. Schema validation covers identity, versions, relative paths,
   references and Skill frontmatter.
@@ -218,8 +307,14 @@ Windows and Linux smoke scripts use the new identity for future package runs.
 - In the package center, deleting a draft moves only the selected draft ID's
   directory to the manager's Trash after confirmation. Restoring it makes the
   same draft available again. Installed packages and publication history are kept.
-- Settings shows three embedded system Skills for adapter authoring, web search
-  and Mod downloads, plus manually installed Skills in their own section.
+- Agent-authored and Agent-imported drafts move to Trash automatically after
+  successful installation or confirmed publication, unless another installation
+  or publication still needs that exact draft. Validation alone does not consume
+  it. Startup retries missed cleanup; older drafts are eligible only when a
+  successful Agent receipt identifies their draft and write transaction. Manual,
+  modified and restored drafts are left alone.
+- Settings shows five embedded system Skills for adapter authoring, web search,
+  Mod downloads, installation and uninstallation, plus manually installed Skills in their own section.
   Game Skills are available from their package details. The Agent can read the
   active system Skills and the selected game's package Skill.
 - Desktop Settings uses the 工具 and Skills tabs as the entry points for Mod provider
@@ -237,19 +332,18 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   Other candidates use the launcher or directory name. Adding a scan result
   attaches an adapter only if a fresh directory check confirms the same suggestion.
   A unique full adapter match is labeled “已适配” with a green check.
-- First-run onboarding: desktop-only bootstrap detection with persisted
-  `onboarding_completed`, explicit scan-candidate registration, Agent settings
-  setup with encrypted API-key storage, and a feature tour. Saving or skipping
-  the model configuration opens an optional MCP tools panel within the Agent
-  stage. It shares connection status, credential entry and start/stop actions
-  with Settings. Both pages can start every stopped external connection. Settings
-  can also stop all running connections and cancel remembered automatic starts.
-  Each connection reports its own failure and can be retried. Users can continue
-  to the tour with all tools stopped. The
-  onboarding UI uses local React shadcn/ui-compatible Button/Card/Badge/
-  Progress/Tabs/Alert/Dialog components, supports light/dark themes and a
-  narrow 390px layout, and can be reopened from Settings. Browser preview keeps
-  its existing disconnected behavior and never fabricates scan results.
+- First-run onboarding has five steps. Users select a data directory, configure
+  the AI model service, enable MCP tools, scan for games and review their setup
+  before entering the library. The storage step shares the Settings directory
+  picker and migration confirmation. After a migration restart, the guide opens
+  at model configuration when the active root has changed, or returns to the
+  storage step to show a migration error. Model setup, tool activation and game
+  scanning can be deferred. Adding a discovered game requires explicit selection.
+  The completion screen shows the current directory, default model, running tool
+  services and library count. The guide supports light and dark themes, a compact
+  progress indicator on narrow screens, and reopening from Settings.
+  Windows verification on 2026-11-22 passed the production build, 141 Playwright
+  cases across three viewport sizes, and five Rust storage/onboarding tests.
   `get_bootstrap_state` reports `onboardingCompleted`, `isFirstRun` (not
   completed and no registered games) and `resumeOnboarding`. The first
   registration inside automatic onboarding records a private in-progress marker
@@ -267,7 +361,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   position. The Ultra position gives the slider an animated blue-violet glow
   and drifting stars, with a static version for reduced motion. Each turn
   validates its model and reasoning level against the configured list and uses
-  the selected model's context budget. Selecting a
+  the selected model's context window for automatic compression. Selecting a
   model in the composer leaves the saved default intact. Legacy single-level
   settings load as one enabled option.
 - The composer remembers the last model, reasoning level and permission policy
@@ -295,7 +389,12 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   the user approves or rejects it. After a decision the tool trace shows the
   outcome. A header shortcut opens a chat with a pending background approval.
 - Agent `ask_user` requests open a questionnaire in the bottom message composer.
-  Each step supports single-choice options or free text, back/next, and skip.
+  Each step accepts a single choice, multiple choices (`multiSelect: true`), or
+  free text. Players can select preset options alongside a custom answer,
+  revisit earlier steps, or skip a question. Multi-select replies preserve the
+  selected labels in option order, followed by any custom answer. Older
+  option lists with a standalone `可多选` hint also use checkboxes unless
+  the question explicitly sets `multiSelect: false`.
   Long questions scroll above the step controls. Live questions retain the
   stop-generation action. The approval transport preserves skipped steps as
   `null`. Legacy single questions render as a one-step text card.
@@ -306,6 +405,15 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   offer a full-size **重新回答** button. It opens the same bottom panel and sends
   the answers as a new turn in the original chat. Submitting or cancelling
   restores the composer with its draft text and attachments.
+- Composer messages and history edits/retries no longer apply fixed text byte,
+  attachment count, per-image, document upload, Markdown or combined attachment
+  quotas. Only user-selected bytes take this path. The existing image formats
+  and file validation still apply. Historical images count against a context
+  retention budget; the current turn's images are not removed to meet it.
+  UTF-8 TXT/Markdown attachments reuse their text directly. Other formats use
+  the approved local MarkItDown MCP one file at a time. Its conversion result must
+  fit one response in the negotiated local MCP transport. The model provider's
+  context window, vision support and request limits still apply.
 - Conversation rows show just a color-coded status icon at the right, with its
   label available on hover, keyboard focus, and to assistive technology. **进行中** marks
   an active turn; an outstanding questionnaire shows **等待回答** and an operation
@@ -322,8 +430,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   listing, not extraction or installation. Inbound MCP keeps its existing scope.
 - The desktop Agent's native `plan_file_ops` accepts `write_text` (`dst` and
   full UTF-8 `content`) to create or overwrite a file through `apply_file_ops`.
-  Planning fingerprints the inline text without writing the destination. The
-  combined `content` byte length across the plan is limited to 1 MiB. A plan
+  Planning fingerprints the inline text without writing the destination. A plan
   with `write_text` requires review under `auto_approve`, even for registered
   game paths. Inbound MCP and other generic planners reject this operation.
 - Adapter-driven install previews and installed-file manifests. JAR/ZIP payloads
@@ -366,7 +473,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   and plugin operations; file-changing commands produce plans before apply.
 - Rust Agent runtime: OpenAI-compatible chat completions SSE, incremental UTF-8
   and tool-call assembly, complete-stream gate before tool execution, bounded
-  completion/frame sizes, tool loop, single active turn per conversation,
+  memory-aware model transport, a cancellable tool loop, one active turn per conversation,
   cancellation during HTTP streaming and approvals, usage and progress events.
   The desktop Rust task owns each turn; the app shell follows active conversations
   across navigation and replays missing events through the final sequence number.
@@ -392,13 +499,6 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   the same durable journal, backups, rollback, and recovery. The desktop
   transaction-history command and local Agent can roll back external file
   transactions in their recorded scope; inbound MCP cannot, even with an ID.
-- Context compression summarizes old turns without removing original messages.
-  The current task's complete tool groups stay intact. Budget accounting now
-  includes serialized messages, the complete registered tool schema, chat/tool
-  framing overhead, model-family-specific text heuristics, and a larger safety
-  margin for unknown OpenAI-compatible models. Exact provider tokenizers remain
-  unavailable, so the estimator intentionally favors early compression over an
-  over-budget request.
 - Conversation persistence, archive/restore, streaming updates and tool state;
   settings validation and encrypted Tauri Store credentials with SQLite references only.
 - Source trait and aggregator: Modrinth/Thunderstore search/resolve, CurseForge
@@ -491,7 +591,22 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   completed artifacts. Agent download completion uses the same artifact catalog.
 - The Agent's separate `download_web_mod` tool fills the uncataloged direct-link
   fallback: explicit approval in all permission modes, public HTTPS with
-  independently validated redirects, 1 GiB cap and archive signature check.
+  independently validated redirects, disk-space admission and archive signature check.
+  Known-length downloads and extracted bytes are admitted against current free
+  space with headroom; unannounced response bodies use at most half their starting
+  space budget. Cancelled downloads retain only usable, strong-ETag fragments.
+  Downloads have connect and read-idle timeouts, not an overall transfer deadline.
+  Archive and SHA-256 streaming do not have an overall time limit: they check
+  cancellation between chunks and bound the physical input, repeated reads,
+  declared and measured expanded bytes, metadata and disk usage. The opaque 7z
+  header parser alone keeps a cooperative one-hour guard and a 16 MiB compressed
+  metadata read budget. Solid 7z state and CRC verification are not checkpointed
+  for restart. ZIP64 is supported, but split or ambiguous ZIP metadata is refused.
+  7z uses bounded single-thread decoding
+  (4 MiB encoded-header allowance, 128 MiB data-dictionary budget shared by a
+  block's LZMA-family decoders); unusual codec stacks and oversized dictionaries
+  are not retried without those guards. TAR.xz and sparse TAR remain unsupported.
+  The bounded 7z reader requires Rust 1.93 or newer.
   It retains rejected bytes and records valid bytes as unverified `web` artifacts
   without catalog identifiers. It never installs and is not exported by inbound
   MCP. Completed-download promotion uses checked exclusive renames on native
@@ -517,7 +632,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   It never extracts or executes a JAR. See [diagnostic limits](diagnostics.md).
 - The read-only `web_search` Agent tool uses the bundled Node and Playwright
   runtime to open Bing and extract ranked titles, destination URLs and snippets.
-  Queries accept 1..512 characters, up to 75 words and 1..10 hits. Local paths
+  Queries use the browser request envelope, and search results can continue across pages. Local paths
   and URLs with embedded credentials are rejected. Returned links must be public
   HTTP(S) URLs. The tool marks excerpts untrusted and bounds serialized results
   to 32 KiB. Missing browser setup reports `needs_configuration`; search failures
@@ -550,7 +665,10 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   (npmmirror or Tsinghua). Explicit executable paths retain their own configuration.
   Schema v11 updates the six stock npm/PyPI launch commands to fetch current
   releases from the configured package index. Users can still pin a version in
-  their own launch arguments. The Windows Playwright preset selects installed Edge. MarkItDown inherits the bundled
+  their own launch arguments. Schema v17 switches the stock Playwright MCP preset to the bundled Node and
+  Playwright CLI. Connecting installs the matching Chromium build if needed and
+  reuses it from the per-user Playwright cache. Existing stock connections need
+  one Start in Settings to authorize the new command. MarkItDown inherits the bundled
   uvx index. Schema v6 removes the redundant index flag and URL from the unedited
   historical preset and expires its old startup consent. Custom configurations are preserved.
   Schema v4 clears prior auto-start consent for bare aliases.
@@ -610,13 +728,19 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   registry also includes the bounded web search and reviewed plugin-publication
   operations described above.
 - The plugin center, library and Agent can discover anonymous Mod客栈 catalog releases. A selected release's exact two source files pass the local validator and reviewed draft/install workflow. Library binding retains the registered game's marker checks.
-- New manager plugin publications use the dedicated MCP first-release and subsequent-release tools. Each preview binds the exact files, tags and target to the user's consent. Ambiguous writes use read-only reconciliation. Earlier ordinary-work publications retain separate history and reconciliation. See [the publication contract](plugin-publication.md).
+- Publishing from a draft or installed external plugin generates a review with a model-written title, summary, description, tags and PNG cover. The authenticated author's complete plugin list determines first release versus update by exact slug. The final click sends the reviewed release copies; the local adapter and installation rules stay intact. Missing read permission, ambiguous ownership or a changed target blocks the write. The public catalog reads cover artwork lazily from the release Skill. See [the publication contract](plugin-publication.md).
 - The frontend has eight lazy-loaded views (including game detail), light/dark
   themes, Skill management, plugin draft/validate/install/enable controls, and
   publication preview/history. These implemented surfaces are not evidence of
   cross-platform or release acceptance.
 
 ## Verification
+
+On Windows with the Mihomo tunnel active, system DNS returned both IPv4 and IPv6
+benchmark addresses for Mod Inn and Modrinth. The native downloader recovered the
+public addresses via HTTPS DNS, reached the Mod Inn site with verified TLS, and
+downloaded the 1,297,415-byte public Modrinth smoke-test archive with its expected
+SHA-256. The Mod Inn signed attachment path has separate offline regression coverage.
 
 The Windows desktop client discovered the official Mod 客栈 attachment tool as a
 public guest. A loopback MCP and file server exercised an approved ZIP transfer
@@ -991,9 +1115,7 @@ distribution acceptance, and it does not repeat the earlier game workflow.
   by game and does not replace based on older bare numeric IDs.
   Partial-restoration state is implemented; complex restoration/update workflows
   still need coverage and reconciliation.
-- Authenticated live Mod 客栈 upload, publication and read-only reconciliation
-  verification. Early upload steps, missing IDs and inconclusive provider
-  evidence still require manual inspection; none authorize retrying a write.
+- Authenticated live Mod客栈 manager-plugin publication and owner-scoped reconciliation still need a creator-authorized acceptance run. Offline tests cover first publication, subsequent and hidden releases, permission errors, uncertain results and the publish → public catalog → byte-exact install round trip. Legacy ordinary-work uploads retain their historical recovery rules.
 - Game-specific effective load order, PAK/BA2/BSA and non-loose plugin
   dependencies, further legacy log formats, and actual game-launch
   verification. Bethesda diagnosis now reads bounded TES4 `MAST` declarations
@@ -1060,3 +1182,24 @@ All requirements in the original approved plan remain in scope.
 - Agent 对话：消息浮入、空状态图标浮动与光环、处理中三点跳动、会话列表行滑入、运行中会话的脉冲环、工具与思考完成时的勾选弹出（只在状态变化时播放，历史记录不重播）、发送与停止按钮切换弹出。
 - 所有效果都通过 `motion-safe:` 或 `prefers-reduced-motion: no-preference` 保护，系统开启减少动画时全部关闭；侧边栏指示条属于状态，减少动画下仍显示。`tests/ui/motion.spec.ts` 覆盖默认播放、减少动画关闭、指示条、导航依次进入、主题渐变清理和 `stagger` 取值。
 - 2026-11-21 验证：`yarn typecheck`、`vite build` 与 `motion.spec.ts`（3 个视口 21 个用例）通过。整套 `yarn test:ui` 在并行负载下有偶发超时，相关文件单独重复运行通过；`workflows.spec.ts` 中依赖已隐藏的「历史对话」导航项的 2 个用例在改动前就失败。`yarn build` 当前被他人未提交的 `SettingsPage.tsx` 中未使用的 `SecretField` 阻断（TS6133），与动画无关。
+
+### Resumable discovery and diagnosis
+
+- Installed-game discovery has no fixed depth/directory/entry ceiling for
+  explicitly selected trees; `maxDepth`, `maxDirectories`, and `maxEntries`
+  remain available to specify intentionally smaller scopes. Automatic discovery
+  stays targeted at launcher metadata, known instance paths and the shallow
+  common Epic fallback. The desktop library and onboarding page through
+  candidates and cancel the read without registering anything.
+- Desktop IPC, the desktop Agent and loopback MCP use the same session cursors.
+  Diagnostic pages carry absolute line numbers and separate file continuation
+  flags. Fabric selections/JARs and Bethesda headers are delivered in batches;
+  the BG3 UUID check runs against complete parser-safe XML rather than a
+  visible text page. Enabled install observations and failed transaction rows
+  are continued instead of capped globally. Temporary indices are deleted with
+  their workers; safe file/path checks and per-object parser bounds remain.
+
+  The full-size filesystem stress test is opt-in: `node scripts/test-rust.mjs
+  --lib selected_scan_paginates_more_than_old_depth_and_directory_entry_limits
+  -- --ignored`. Normal regression tests cover depth, cursor/cancellation,
+  filesystem guards and cross-page specialist evidence.

@@ -48,6 +48,59 @@ fn single_text(reply: &Value) -> Option<&str> {
         .flatten()
 }
 
+// Documented pre-commit failures in the provider's managerplugins store and
+// author scope gate. Never return untrusted text, even for a known rejection.
+fn explicit_rejection(tool: &str, message: &str) -> Option<AppError> {
+    let publishing = matches!(
+        tool,
+        "publish_manager_plugin" | "publish_manager_plugin_release"
+    );
+    let scope = if publishing {
+        "manager_plugins.publish"
+    } else {
+        "manager_plugins.read"
+    };
+    Some(match message {
+        "this api key does not have the required scope" => {
+            AppError::Denied(format!("Mod 客栈 API Key 缺少 {scope} 权限"))
+        }
+        "manager plugin action forbidden" if publishing => {
+            AppError::Denied("Mod 客栈拒绝发布，请确认创作者身份已审核且有效".into())
+        }
+        "manager plugin not found"
+            if matches!(
+                tool,
+                "publish_manager_plugin_release" | "get_my_manager_plugin_texts"
+            ) =>
+        {
+            AppError::NotFound("该管理器插件不存在或不属于当前账号，请核对本人插件 ID".into())
+        }
+        "manager plugin slug or release version already exists" if publishing => {
+            AppError::Conflict("该插件或版本已存在：请选择本人已有插件并提交未发布的新版本".into())
+        }
+        "invalid manager plugin input: cannot change a plugin slug" if publishing => {
+            AppError::Invalid(
+                "新版 adapter.json 的 slug 必须与目标插件保持一致，请核对目标和原文".into(),
+            )
+        }
+        "invalid manager plugin input"
+        | "invalid manager plugin input: 标签必须采用 UTF-8 编码且不能包含空字符（NUL）"
+            if publishing =>
+        {
+            AppError::Invalid("Mod 客栈拒绝插件输入，请核对插件 ID、原文及标签后重新预览".into())
+        }
+        message
+            if publishing
+                && (message.starts_with("adapter.json：") || message.starts_with("SKILL.md：")) =>
+        {
+            AppError::Invalid(
+                "Mod 客栈未通过插件文件校验，请检查 adapter.json 与 SKILL.md 后重新预览".into(),
+            )
+        }
+        _ => return None,
+    })
+}
+
 #[async_trait::async_trait]
 impl Remote for Transport {
     async fn call(&self, name: &str, args: Value, cancel: &CancellationToken) -> AppResult<Value> {
@@ -65,30 +118,19 @@ impl Remote for Transport {
                 "拒绝将 Mod 客栈凭据作为插件正文或标签发送".into(),
             ));
         }
-        let reply = self.0.call_tool(name, args, MAX_REQUEST, cancel).await?;
+        // Only the already approved local text upload can exceed the old
+        // request budget; incoming MCP responses retain their wire limit.
+        let limit = (!matches!(
+            name,
+            "publish_manager_plugin" | "publish_manager_plugin_release"
+        ))
+        .then_some(MAX_REQUEST);
+        let reply = self.0.call_tool(name, args, limit, cancel).await?;
         if reply["isError"] == true {
-            // These exact early refusals come from the scope/creator guards,
-            // before any mutation can occur. Any other failure is ambiguous.
-            if reply.get("structuredContent").is_none()
-                && matches!(
-                    single_text(&reply),
-                    Some(
-                        "this api key does not have the required scope"
-                            | "manager plugin action forbidden"
-                    )
-                )
-            {
-                let scope = if matches!(
-                    name,
-                    "list_my_manager_plugins" | "get_my_manager_plugin_texts"
-                ) {
-                    "manager_plugins.read"
-                } else {
-                    "manager_plugins.publish"
-                };
-                return Err(AppError::Denied(format!(
-                    "Mod 客栈拒绝该请求，请检查 {scope} 权限或创作者审核状态"
-                )));
+            if let (None, Some(message)) = (reply.get("structuredContent"), single_text(&reply)) {
+                if let Some(error) = explicit_rejection(name, message) {
+                    return Err(error);
+                }
             }
             return Err(unavailable());
         }

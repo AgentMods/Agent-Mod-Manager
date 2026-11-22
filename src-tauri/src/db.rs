@@ -124,6 +124,49 @@ impl Db {
             if version < 12 {
                 crate::mcp::config::migrate_playwright_downloads(&tx)?;
             }
+            if version < 13 {
+                let has_context_checkpoint: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='context_summary_through_message_id')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if !has_context_checkpoint {
+                    tx.execute(
+                        "ALTER TABLE conversations ADD COLUMN context_summary_through_message_id TEXT",
+                        [],
+                    )?;
+                }
+                tx.execute_batch(CONTEXT_CHECKPOINT_SCHEMA)?;
+            }
+            if version < 15 {
+                let has_author_hint: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('mod_library_entries') WHERE name='author_hint')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if !has_author_hint {
+                    tx.execute(
+                        "ALTER TABLE mod_library_entries ADD COLUMN author_hint TEXT",
+                        [],
+                    )?;
+                }
+            }
+            if version < 16 {
+                // Desktop and Agent used the same draft writer. Only a successful
+                // Agent receipt matching both the draft ID and write plan proves origin.
+                tx.execute_batch("WITH receipts(name, payload) AS (
+                      SELECT name, CASE WHEN json_valid(result_json) THEN result_json END
+                      FROM tool_calls WHERE status='done' AND name IN ('write_plugin_draft','import_cloud_plugin')
+                    ) INSERT OR IGNORE INTO agent_plugin_drafts(draft_id)
+                    SELECT d.id FROM receipts r JOIN plugin_drafts d ON d.id = CASE r.name
+                      WHEN 'write_plugin_draft' THEN json_extract(r.payload,'$.preview.draft.id')
+                      WHEN 'import_cloud_plugin' THEN json_extract(r.payload,'$.draftId') END
+                    WHERE json_extract(r.payload,'$.status')='committed'
+                      AND json_extract(r.payload,'$.plan.id')=d.write_transaction_id;")?;
+            }
+            if version < 17 {
+                crate::mcp::config::migrate_bundled_playwright(&tx)?;
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
@@ -136,7 +179,39 @@ impl Db {
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 17;
+
+// SQLite appends rowid to the index key: these indexes bound scans to the
+// conversation's insertion-order suffix and the most recent retained user.
+// Invalidate a covered prefix on edits/deletions even when the runtime writes
+// messages directly rather than using History's update methods. Attachment
+// edits go through History's rewind, which clears the checkpoint explicitly.
+const CONTEXT_CHECKPOINT_SCHEMA: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_messages_conv_rowid ON messages(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_messages_conv_users ON messages(conversation_id) WHERE role='user';
+
+CREATE TRIGGER IF NOT EXISTS invalidate_context_checkpoint_on_message_update
+AFTER UPDATE OF role, content, tool_calls_json, tool_call_id ON messages
+WHEN OLD.role IS NOT NEW.role OR OLD.content IS NOT NEW.content
+  OR OLD.tool_calls_json IS NOT NEW.tool_calls_json OR OLD.tool_call_id IS NOT NEW.tool_call_id
+BEGIN
+  UPDATE conversations SET task_summary=NULL, context_summary_through_message_id=NULL
+  WHERE id=OLD.conversation_id AND EXISTS (
+    SELECT 1 FROM messages WHERE id=context_summary_through_message_id
+      AND conversation_id=OLD.conversation_id AND rowid>=OLD.rowid
+  );
+END;
+
+CREATE TRIGGER IF NOT EXISTS invalidate_context_checkpoint_on_message_delete
+BEFORE DELETE ON messages
+BEGIN
+  UPDATE conversations SET task_summary=NULL, context_summary_through_message_id=NULL
+  WHERE id=OLD.conversation_id AND EXISTS (
+    SELECT 1 FROM messages WHERE id=context_summary_through_message_id
+      AND conversation_id=OLD.conversation_id AND rowid>=OLD.rowid
+  );
+END;
+"#;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS games (
@@ -201,6 +276,38 @@ CREATE TABLE IF NOT EXISTS download_artifacts (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS mod_library_categories (
+  key TEXT PRIMARY KEY,
+  directory TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS mod_library_entries (
+  id TEXT PRIMARY KEY,
+  category_key TEXT NOT NULL REFERENCES mod_library_categories(key),
+  game_name TEXT NOT NULL,
+  game_name_key TEXT NOT NULL,
+  -- Keep the binding even after unregistering a game (not an unbound candidate).
+  game_id TEXT,
+  name TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  archive_relative_path TEXT NOT NULL UNIQUE,
+  payload_relative_path TEXT NOT NULL UNIQUE,
+  size INTEGER NOT NULL CHECK(size >= 0),
+  sha256 TEXT NOT NULL,
+  sha512 TEXT,
+  source_id TEXT NOT NULL,
+  project_id TEXT,
+  version_id TEXT,
+  version TEXT NOT NULL,
+  integrity_verified INTEGER NOT NULL,
+  project_page TEXT,
+  author_hint TEXT,
+  created_at TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN ('pending','ready')),
+  CHECK((project_id IS NULL) = (version_id IS NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_mod_library_game ON mod_library_entries(game_id,state);
+CREATE INDEX IF NOT EXISTS idx_mod_library_game_name ON mod_library_entries(game_name_key,state) WHERE game_id IS NULL;
+
 CREATE TABLE IF NOT EXISTS installs (
   id TEXT PRIMARY KEY,
   game_id TEXT NOT NULL,
@@ -218,6 +325,13 @@ CREATE TABLE IF NOT EXISTS installs (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_installs_game ON installs(game_id);
+-- List membership is separate from file ownership and rollback history.
+CREATE TABLE IF NOT EXISTS removed_mod_items (
+  game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('install','archive')),
+  item_id TEXT NOT NULL,
+  PRIMARY KEY(game_id,kind,item_id)
+);
 CREATE TABLE IF NOT EXISTS install_transactions (
   install_id TEXT NOT NULL,
   transaction_id TEXT NOT NULL UNIQUE,
@@ -254,6 +368,14 @@ CREATE TABLE IF NOT EXISTS file_transactions (
   error TEXT
 );
 
+CREATE TABLE IF NOT EXISTS desktop_archive_imports (
+  transaction_id TEXT PRIMARY KEY REFERENCES file_transactions(id) ON DELETE CASCADE,
+  artifact_id TEXT NOT NULL UNIQUE,
+  filename TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  sha256 TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS file_transaction_entries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   transaction_id TEXT NOT NULL,
@@ -267,6 +389,14 @@ CREATE TABLE IF NOT EXISTS file_transaction_entries (
   FOREIGN KEY(transaction_id) REFERENCES file_transactions(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_ftx_entries ON file_transaction_entries(transaction_id, seq);
+
+CREATE TABLE IF NOT EXISTS file_transaction_journal (
+  transaction_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  entry_json TEXT NOT NULL,
+  PRIMARY KEY (transaction_id, seq),
+  FOREIGN KEY(transaction_id) REFERENCES file_transactions(id) ON DELETE CASCADE
+);
 
 CREATE TABLE IF NOT EXISTS trash_items (
   id TEXT PRIMARY KEY,
@@ -341,6 +471,9 @@ CREATE TABLE IF NOT EXISTS plugin_drafts (
   write_transaction_id TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS agent_plugin_drafts (
+  draft_id TEXT PRIMARY KEY REFERENCES plugin_drafts(id)
+);
 CREATE TABLE IF NOT EXISTS plugin_draft_deletions (
   draft_id TEXT NOT NULL REFERENCES plugin_drafts(id),
   transaction_id TEXT PRIMARY KEY REFERENCES file_transactions(id),
@@ -389,6 +522,7 @@ CREATE TABLE IF NOT EXISTS conversations (
   auto_title_pending INTEGER NOT NULL DEFAULT 0,
   game_id TEXT,
   task_summary TEXT,
+  context_summary_through_message_id TEXT,
   archived INTEGER NOT NULL DEFAULT 0,
   pinned INTEGER NOT NULL DEFAULT 0,
   message_count INTEGER NOT NULL DEFAULT 0,

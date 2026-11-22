@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Agent-driven cross-platform game mod manager"
 authors = ["Agent Mod Manager"]
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.93"
 
 [lib]
 name = "agent_mod_manager_lib"
@@ -37,7 +37,7 @@ anyhow = "1"
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli"] }
 zip = { version = "2", default-features = false, features = ["deflate", "bzip2", "zstd", "time"] }
-sevenz-rust = "0.6"
+sevenz-rust2 = { version = "=0.25.0", default-features = false, features = ["bzip2"] }
 flate2 = "1"
 bzip2 = "0.5"
 tar = "0.4"
@@ -77,9 +77,11 @@ libc = "0.2"
 plist = "1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
+winreg = "0.56"
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
+sevenz-rust2 = { version = "=0.25.0", default-features = false, features = ["compress"] }
 tauri = { version = "2", features = ["test"] }
 
 [features]

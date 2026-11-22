@@ -9,12 +9,11 @@ import { Badge, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, Pat
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Field, FieldLabel } from "@/components/ui/field";
-import { Input } from "@/components/ui/input";
 import { InputGroup, InputGroupAddon, InputGroupInput } from "@/components/ui/input-group";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { stagger } from "@/lib/motion";
 
@@ -32,7 +31,6 @@ export default function TrashPage() {
   const [error, setError] = useState<unknown>(null);
   const [purgeItems, setPurgeItems] = useState<TrashItem[] | null>(null);
   const [purgeAcknowledged, setPurgeAcknowledged] = useState(false);
-  const [purgeText, setPurgeText] = useState("");
   const [purgeError, setPurgeError] = useState<unknown>(null);
 
   const items = trash.data ?? [];
@@ -93,7 +91,6 @@ export default function TrashPage() {
     // Freeze the targets so a refresh cannot change what the user confirms.
     setPurgeItems([...selectedItems]);
     setPurgeAcknowledged(false);
-    setPurgeText("");
     setPurgeError(null);
   }
 
@@ -102,8 +99,7 @@ export default function TrashPage() {
   }
 
   async function purge() {
-    if (!backendAvailable || !purgeItems?.length || !purgeAcknowledged ||
-      purgeText !== "PURGE_TRASH" || operationPending.current) return;
+    if (!backendAvailable || !purgeItems?.length || !purgeAcknowledged || operationPending.current) return;
     const ids = purgeItems.map((item) => item.id);
     operationPending.current = true;
     setBusy("purge");
@@ -189,7 +185,7 @@ export default function TrashPage() {
 
     {purgeItems && <Modal title="永久删除回收站文件" onClose={closePurge} className="sm:max-w-xl" actions={<>
       <Button variant="outline" disabled={!!busy} onClick={closePurge}>取消</Button>
-      <Button variant="destructive" disabled={!backendAvailable || !!busy || !purgeAcknowledged || purgeText !== "PURGE_TRASH"} onClick={() => {void purge();}}>
+      <Button variant="destructive" disabled={!backendAvailable || !!busy || !purgeAcknowledged} onClick={() => {void purge();}}>
         {busy === "purge" ? <Spinner data-icon="inline-start"/> : <Trash2Icon data-icon="inline-start"/>}永久删除
       </Button>
     </>}>
@@ -203,14 +199,10 @@ export default function TrashPage() {
       <ul className="flex max-h-44 list-disc flex-col gap-2 overflow-y-auto pl-5 text-sm break-all">
         {purgeItems.map((item) => <li key={item.id}>{item.label || displayPath(item.original_path)}<PathText className="block">{displayPath(item.original_path)}</PathText></li>)}
       </ul>
-      <Label className="items-start font-normal">
-        <Checkbox checked={purgeAcknowledged} disabled={!!busy} onCheckedChange={(checked) => setPurgeAcknowledged(checked === true)}/>
+      <Label className="font-normal">
+        <Switch checked={purgeAcknowledged} disabled={!!busy} onCheckedChange={setPurgeAcknowledged}/>
         <span>我确认永久删除以上文件，且无法再从回收站恢复。</span>
       </Label>
-      <Field>
-        <FieldLabel htmlFor="purge-confirm">输入 PURGE_TRASH 确认</FieldLabel>
-        <Input id="purge-confirm" aria-label="永久删除确认文本" value={purgeText} disabled={!!busy} autoComplete="off" spellCheck={false} onChange={(event) => setPurgeText(event.target.value)}/>
-      </Field>
       <ErrorState error={purgeError}/>
     </Modal>}
   </Page>;

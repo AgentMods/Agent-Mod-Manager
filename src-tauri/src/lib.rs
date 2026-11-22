@@ -28,11 +28,14 @@ pub mod manager_publication;
 pub mod mcp;
 pub mod mcp_connections;
 pub mod mcp_server;
+pub mod mod_library;
+mod mod_management;
 pub mod paths;
 pub mod plugin_publish;
 pub mod plugin_publish_remote;
 pub mod plugin_workflow;
 pub mod plugins;
+pub(crate) mod publication_copy;
 mod safe_fs;
 pub mod settings;
 pub mod skills;
@@ -57,6 +60,16 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
+        .manage(agent_attachment::AttachmentConversions::default())
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                if let Some(conversions) =
+                    window.try_state::<agent_attachment::AttachmentConversions>()
+                {
+                    conversions.cancel_window(window.label());
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
             commands::migrate_storage,
@@ -65,6 +78,10 @@ pub fn run() {
             commands::list_plugins,
             commands::get_game_adapter,
             commands::plan_import_archive,
+            commands::register_imported_mod,
+            commands::list_mod_library,
+            commands::remove_managed_mod,
+            commands::bind_mod_library_entry,
             commands::preview_fomod,
             commands::set_plugin_enabled,
             commands::write_plugin_draft,
@@ -74,13 +91,16 @@ pub fn run() {
             commands::install_plugin,
             commands::list_manager_plugin_games,
             commands::preview_manager_plugin,
+            commands::get_manager_plugin_display,
             commands::prepare_manager_plugin_import,
             commands::list_manager_publications,
-            commands::prepare_manager_publication,
+            commands::get_manager_publication,
+            commands::prepare_auto_manager_publication,
             commands::publish_manager_publication,
             commands::reconcile_manager_publication,
             commands::list_my_manager_plugins,
             commands::list_plugin_publications,
+            commands::get_plugin_publication,
             commands::reconcile_plugin_publication,
             commands::list_skills,
             commands::get_skill,
@@ -121,7 +141,9 @@ pub fn run() {
             commands::review_modrinth_dependency_graph,
             commands::plan_uninstall,
             commands::rollback_transaction,
+            agent_attachment::begin_agent_attachment,
             agent_attachment::convert_agent_attachment,
+            agent_attachment::cancel_agent_attachment,
             commands::start_turn,
             commands::restart_turn,
             commands::cancel_turn,
@@ -146,6 +168,7 @@ pub fn run() {
             commands::resolve_mod,
             commands::list_mod_versions,
             commands::resolve_modrinth_dependency_graph,
+            commands::cancel_modrinth_dependency_graph,
             commands::read_logs,
             commands::diagnose_game,
             commands::mcp_list,

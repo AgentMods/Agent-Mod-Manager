@@ -1,6 +1,14 @@
 use super::*;
 use DependencyStatus::*;
 
+fn compare(dependency: &ModDependency, records: &[InstallMatch]) -> DependencyCheck {
+    let mut index = MatchIndex::new(std::slice::from_ref(dependency));
+    for record in records {
+        index.observe(record);
+    }
+    index.compare(dependency)
+}
+
 fn record(project: &str, version: &str, status: &str) -> InstallMatch {
     InstallMatch {
         install_id: format!("install_{project}_{version}"),
@@ -95,10 +103,18 @@ fn partial_duplicate_and_inconsistent_matches_are_not_positive_matches() {
 
 #[test]
 fn ambiguous_match_list_is_bounded_without_hiding_total_count() {
-    let entries = vec![record("abc", "123", "enabled"); 30];
+    let entries: Vec<_> = (0..30)
+        .rev()
+        .map(|id| InstallMatch {
+            install_id: format!("install{id:02}"),
+            ..record("abc", "123", "enabled")
+        })
+        .collect();
     let check = compare(&declaration(Some("abc"), None), &entries);
     assert_eq!(check.match_count, 30);
     assert_eq!(check.matches.len(), MAX_MATCHES_PER_DECLARATION);
+    assert_eq!(check.matches[0].install_id, "install00");
+    assert_eq!(check.matches[3].install_id, "install03");
     assert_eq!(check.status, Unconfirmed);
 }
 
@@ -111,4 +127,40 @@ fn dependency_payload_distinguishes_explicit_null_from_omission() {
         serde_json::from_str(r#"{"gameId":"game","dependencies":[]}"#).unwrap();
     assert!(unknown.dependencies.is_none());
     assert!(empty.dependencies.unwrap().is_empty());
+}
+
+#[test]
+fn interrupted_journal_scan_does_not_return_an_absence_claim() {
+    let connection = Connection::open_in_memory().unwrap();
+    let declarations = [declaration(Some("abc"), None)];
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    assert!(matches!(
+        scan_checks(&connection, "game", &declarations, None, &cancel),
+        Err(AppError::Cancelled)
+    ));
+}
+
+#[test]
+fn desktop_operation_cancel_is_scoped_and_registration_is_released() {
+    let registry = DesktopDependencyOperations::default();
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    let first = registry.start(Some(first_id)).unwrap();
+    let second = registry.start(Some(second_id)).unwrap();
+    assert!(matches!(
+        registry.start(Some(first_id)),
+        Err(AppError::Conflict(_))
+    ));
+    assert!(!registry.cancel(Uuid::new_v4()));
+    assert!(registry.cancel(first_id));
+    assert!(first.cancel.is_cancelled());
+    assert!(!second.cancel.is_cancelled());
+    drop(first);
+    assert!(!registry.cancel(first_id));
+    let restarted = registry.start(Some(first_id)).unwrap();
+    assert!(!restarted.cancel.is_cancelled());
+    let running = restarted.cancel.clone();
+    drop(restarted);
+    assert!(running.is_cancelled());
 }

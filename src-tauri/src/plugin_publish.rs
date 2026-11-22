@@ -12,16 +12,12 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs,
-    io::{Cursor, Read, Write},
+    io::{Cursor, Write},
     path::{Component, Path},
     sync::MutexGuard,
 };
 
 pub const DESTINATION: &str = "https://www.glossmod.com/api/v1/mcp";
-pub const MAX_ARCHIVE_BYTES: usize = 1024 * 1024;
-pub(crate) const ADAPTER_LIMIT: usize = 256 * 1024;
-pub(crate) const SKILL_LIMIT: usize = 128 * 1024;
-const PREVIEW_LIMIT: usize = 3 * 1024 * 1024;
 
 fn invalid(message: &str) -> AppError {
     AppError::Invalid(message.into())
@@ -202,39 +198,11 @@ fn checked_path(engine: &FileEngine, path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-fn read_text(engine: &FileEngine, path: &Path, limit: usize) -> AppResult<String> {
+fn read_text(engine: &FileEngine, path: &Path) -> AppResult<String> {
     checked_path(engine, path)?;
-    let before = fs::symlink_metadata(path)?;
-    if !before.is_file() || before.len() > limit as u64 {
-        return Err(invalid(
-            "Publication files must be size-limited regular UTF-8 files",
-        ));
-    }
-    let file = fs::File::open(path)?;
-    let opened = file.metadata()?;
+    let text = plugins::read_local_text(path, None)?;
     checked_path(engine, path)?;
-    let after = fs::symlink_metadata(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if before.dev() != opened.dev()
-            || before.ino() != opened.ino()
-            || after.dev() != opened.dev()
-            || after.ino() != opened.ino()
-        {
-            return Err(conflict("Publication source changed while opening"));
-        }
-    }
-    if !opened.is_file() || opened.len() != before.len() || opened.len() != after.len() {
-        return Err(conflict("Publication source changed while opening"));
-    }
-    let mut bytes = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    checked_path(engine, path)?;
-    if bytes.len() > limit {
-        return Err(invalid("Publication file exceeds its read limit"));
-    }
-    String::from_utf8(bytes).map_err(|_| invalid("Publication file is not UTF-8"))
+    Ok(text)
 }
 
 fn read_files(engine: &FileEngine, directory: &Path) -> AppResult<[PublicationFile; 2]> {
@@ -254,8 +222,8 @@ fn read_files(engine: &FileEngine, directory: &Path) -> AppResult<[PublicationFi
             "Publication package must contain exactly adapter.json and SKILL.md".into(),
         ));
     }
-    let file = |name: &str, limit| -> AppResult<PublicationFile> {
-        let text = read_text(engine, &directory.join(name), limit)?;
+    let file = |name: &str| -> AppResult<PublicationFile> {
+        let text = read_text(engine, &directory.join(name))?;
         Ok(PublicationFile {
             name: name.into(),
             size: text.len() as u64,
@@ -263,40 +231,38 @@ fn read_files(engine: &FileEngine, directory: &Path) -> AppResult<[PublicationFi
             text,
         })
     };
-    Ok([
-        file("adapter.json", ADAPTER_LIMIT)?,
-        file("SKILL.md", SKILL_LIMIT)?,
-    ])
+    Ok([file("adapter.json")?, file("SKILL.md")?])
 }
 
 fn archive(files: &[PublicationFile; 2]) -> AppResult<PackageBytes> {
-    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    // Stored entries have a known total size. Reserve the real input size plus
+    // the fixed overhead of two ZIP entries (including ZIP64 headers), never
+    // a remote size claim. Surface insufficient memory as a local error.
+    let expected = files
+        .iter()
+        .try_fold(1024usize, |total, file| total.checked_add(file.text.len()))
+        .ok_or_else(|| invalid("Publication ZIP size overflow"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(expected)
+        .map_err(|_| invalid("Buffer unavailable for publication ZIP"))?;
+    let mut writer = zip::ZipWriter::new(Cursor::new(bytes));
     let options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Stored)
         .last_modified_time(zip::DateTime::default())
         .unix_permissions(0o644);
     for (index, name) in ["adapter.json", "SKILL.md"].iter().enumerate() {
         let file = &files[index];
-        let limit = if index == 0 {
-            ADAPTER_LIMIT
-        } else {
-            SKILL_LIMIT
-        };
         if file.name != *name
-            || file.text.len() > limit
             || file.size != file.text.len() as u64
             || file.sha256 != sha256(file.text.as_bytes())
         {
             return Err(invalid("Publication file name, size or digest is invalid"));
         }
-        writer.start_file(*name, options)?;
+        writer.start_file(*name, options.large_file(file.size >= u64::from(u32::MAX)))?;
         writer.write_all(file.text.as_bytes())?;
     }
-    let bytes = writer.finish()?.into_inner();
-    if bytes.len() > MAX_ARCHIVE_BYTES {
-        return Err(invalid("Publication ZIP exceeds 1 MiB"));
-    }
-    Ok(PackageBytes(bytes))
+    Ok(PackageBytes(writer.finish()?.into_inner()))
 }
 
 fn build_preview(
@@ -331,7 +297,7 @@ fn build_preview(
     };
     let mut digest = Sha256::new();
     digest.update(b"amm.plugin-publication.v1\0");
-    digest.update(serde_json::to_vec(&(&source, &package))?);
+    serde_json::to_writer(&mut digest, &(&source, &package))?;
     Ok((
         PublicationPreview {
             package,
@@ -457,15 +423,20 @@ fn installed_provenance(
         schema_version: u32,
         content: Content,
     }
-    let rows: Vec<(String, String)> = {
+    let ids: Vec<String> = {
         let conn = engine.db.conn();
-        let mut stmt = conn.prepare("SELECT p.transaction_id,p.package_json FROM plugin_deployments p JOIN file_transactions f ON f.id=p.transaction_id WHERE p.slug=?1 AND p.install_path=?2 AND f.status='committed' AND length(CAST(p.package_json AS BLOB))<=1048576 ORDER BY p.rowid DESC")?;
-        let rows = stmt.query_map(params![slug, target.to_string_lossy()], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?;
+        let mut stmt = conn.prepare("SELECT p.transaction_id FROM plugin_deployments p JOIN file_transactions f ON f.id=p.transaction_id WHERE p.slug=?1 AND p.install_path=?2 AND f.status='committed' ORDER BY p.rowid DESC")?;
+        let rows = stmt.query_map(params![slug, target.to_string_lossy()], |r| r.get(0))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    for (id, json) in rows {
+    // Decode only one committed candidate at a time; local history can contain
+    // multiple independently large versions.
+    for id in ids {
+        let json: String = engine.db.conn().query_row(
+            "SELECT package_json FROM plugin_deployments WHERE transaction_id=?1",
+            [&id],
+            |r| r.get(0),
+        )?;
         let record: Deployment = serde_json::from_str(&json)?;
         if record.schema_version != 1
             || record.content.adapter_json != files[0].text
@@ -546,9 +517,15 @@ pub(crate) fn with_installed_source<T>(
     plugins::validate_slug(slug)?;
     let _files = crate::transaction::write_lock();
     let target = engine.paths.plugins().join("games").join(slug);
-    let row: Option<(String, bool, String, String, String)> = engine.db.conn().query_row(
-        "SELECT source,validated,install_path,CASE WHEN length(CAST(adapter_json AS BLOB))<=262144 THEN adapter_json ELSE '' END,version FROM plugins WHERE slug=?1", [slug],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).optional()?;
+    let row: Option<(String, bool, String, String, String)> = engine
+        .db
+        .conn()
+        .query_row(
+            "SELECT source,validated,install_path,adapter_json,version FROM plugins WHERE slug=?1",
+            [slug],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .optional()?;
     let (source, validated, path, adapter, version) =
         row.ok_or_else(|| AppError::NotFound("Installed package".into()))?;
     if !validated || Path::new(&path) != target || source != "external" {
@@ -733,7 +710,7 @@ fn decode<T: serde::de::DeserializeOwned>(s: String) -> AppResult<T> {
 }
 fn load(conn: &Connection, id: &str) -> AppResult<PublicationRecord> {
     validate_id(id, "publish")?;
-    let row = conn.query_row("SELECT CASE WHEN length(CAST(preview_json AS BLOB))<=?2 THEN preview_json ELSE '' END,approved_digest,state,phase,last_step,file_id,work_id,created_at,updated_at,digest FROM plugin_publications WHERE id=?1", params![id,PREVIEW_LIMIT], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?))).optional()?.ok_or_else(|| AppError::NotFound("Publication record".into()))?;
+    let row = conn.query_row("SELECT preview_json,approved_digest,state,phase,last_step,file_id,work_id,created_at,updated_at,digest FROM plugin_publications WHERE id=?1", [id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<i64>>(5)?,r.get::<_,Option<i64>>(6)?,r.get::<_,String>(7)?,r.get::<_,String>(8)?,r.get::<_,String>(9)?))).optional()?.ok_or_else(|| AppError::NotFound("Publication record".into()))?;
     let preview: PublicationPreview = serde_json::from_str(&row.0)?;
     verify_preview(&preview)?;
     if preview.digest != row.9 || row.1.as_ref().is_some_and(|s| *s != preview.digest) {
@@ -853,9 +830,6 @@ pub fn create_publication(
 ) -> AppResult<PublicationRecord> {
     fresh_preview(engine, preview)?;
     let json = serde_json::to_string(preview)?;
-    if json.len() > PREVIEW_LIMIT {
-        return Err(invalid("Publication preview is too large"));
-    }
     let _files = lock_live_draft_source(engine, &preview.source)?;
     let mut conn = engine.db.conn();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -895,13 +869,18 @@ pub fn create_publication(
 pub fn get_publication(engine: &FileEngine, id: &str) -> AppResult<PublicationRecord> {
     load(&engine.db.conn(), id)
 }
-pub fn list_publications(engine: &FileEngine) -> AppResult<Vec<PublicationRecord>> {
+pub fn list_publications(
+    engine: &FileEngine,
+    before: Option<&str>,
+) -> AppResult<Vec<PublicationRecord>> {
     let conn = engine.db.conn();
     let mut stmt = conn.prepare(
-        "SELECT id FROM plugin_publications ORDER BY created_at DESC,rowid DESC LIMIT 100",
+        "SELECT id FROM plugin_publications
+        WHERE ?1 IS NULL OR rowid < (SELECT rowid FROM plugin_publications WHERE id=?1)
+        ORDER BY rowid DESC LIMIT 100",
     )?;
     let ids = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
+        .query_map([before], |r| r.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     ids.iter().map(|id| load(&conn, id)).collect()
 }
@@ -974,7 +953,7 @@ pub fn finish_step(
     file_id: Option<i64>,
     work_id: Option<i64>,
 ) -> AppResult<PublicationRecord> {
-    update(engine, id, |record| {
+    finish_update(engine, id, |record| {
         apply_finish(record, step, file_id, work_id)
     })
 }
@@ -989,12 +968,33 @@ pub(crate) fn finish_reconciliation(
     let step = observed
         .reconciliation_step()
         .ok_or_else(|| conflict("Publication cannot be reconciled at this phase"))?;
-    update(engine, &observed.id, |record| {
+    finish_update(engine, &observed.id, |record| {
         if record != observed {
             return Err(conflict("发布记录已变更，请刷新后重新核对"));
         }
         apply_finish(record, step, observed.file_id, work_id)
     })
+}
+
+// Completion callers hold no source or workflow lock. Wait for `update` to
+// return (and release the DB guard) before entering the draft workflow.
+fn finish_update(
+    engine: &FileEngine,
+    id: &str,
+    finish: impl FnOnce(&mut PublicationRecord) -> AppResult<bool>,
+) -> AppResult<PublicationRecord> {
+    let mut completed = false;
+    let record = update(engine, id, |record| {
+        let changed = finish(record)?;
+        completed = changed && record.state == PublicationState::Completed;
+        Ok(changed)
+    })?;
+    if completed {
+        if let PublicationSource::Draft { draft_id, .. } = &record.preview.source {
+            plugin_workflow::cleanup_consumed_agent_drafts(engine, Some(draft_id));
+        }
+    }
+    Ok(record)
 }
 
 fn apply_finish(

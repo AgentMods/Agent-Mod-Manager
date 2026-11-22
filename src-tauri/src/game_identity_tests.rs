@@ -155,7 +155,11 @@ fn names_and_queries_reject_paths_controls_and_oversize() {
     ] {
         assert!(validate_name(name).is_err(), "{name:?}");
     }
-    assert!(validate_name(&"x".repeat(129)).is_err());
+    let long_name = "游戏名称 ".repeat(150) + "官方版";
+    validate_name(&long_name).unwrap();
+    for suffix in ["/private", r"\private", "\u{202e}hidden", "\0hidden"] {
+        assert!(validate_name(&format!("{long_name}{suffix}")).is_err());
+    }
     assert!(validate_name("游戏名称").is_ok());
     assert!(validate_name("NieR:Automata").is_ok());
     assert!(validate_name("The Elder Scrolls V: Skyrim").is_ok());
@@ -168,7 +172,17 @@ fn names_and_queries_reject_paths_controls_and_oversize() {
     ] {
         assert!(public_query(query).is_err());
     }
-    assert!(public_query(&"x".repeat(513)).is_err());
+    let long = "Public game edition ".repeat(80) + "official site";
+    assert_eq!(public_query(&long).unwrap().query, long);
+    for suffix in [
+        " /private/file",
+        " https://user:secret@example.org/",
+        " https://127.0.0.1/",
+        " \u{202e}hidden",
+    ] {
+        assert!(public_query(&format!("{long}{suffix}")).is_err());
+    }
+    assert!(public_query(&"x".repeat(256 * 1024)).is_err());
     assert!(public_query("Public Game official website").is_ok());
 }
 
@@ -176,18 +190,22 @@ fn names_and_queries_reject_paths_controls_and_oversize() {
 async fn provider_receives_only_reviewed_query_and_cache_roundtrips() {
     let (_temp, engine, root) = fixture();
     let fp = snapshot(&engine, &root).unwrap().fingerprint;
+    // A reviewed query may exceed the size budget for the evidence metadata itself.
+    let reviewed_query = "公开 \"Public Game\" ".repeat(2048) + "official";
+    let reviewed = reviewed_query.as_str();
     let first = search_with(
         &engine,
         &root,
         &fp,
-        "Reviewed Public Game",
+        reviewed,
         "SEARCH_GAME_IDENTITY",
         &CancellationToken::new(),
         |q| async move {
-            assert_eq!(q.query, "Reviewed Public Game");
+            assert_eq!(q.query, reviewed);
             assert_eq!(q.count, 5);
             assert!(!q.query.contains("Secret"));
             let mut r = result(WebSearchStatus::Available);
+            r.results[0].title = "Public game edition ".repeat(10) + "Complete";
             r.results.resize(9, r.results[0].clone());
             Ok(r)
         },
@@ -195,13 +213,17 @@ async fn provider_receives_only_reviewed_query_and_cache_roundtrips() {
     .await
     .unwrap();
     assert_eq!(first.candidates.len(), 5);
+    assert_eq!(
+        first.candidates[0].name,
+        "Public game edition ".repeat(10) + "Complete"
+    );
     assert_eq!(serde_json::to_value(&first).unwrap()["provider"], "bing");
     assert!(search(
         &engine,
         &McpRuntime::default(),
         &root,
         &fp,
-        "Reviewed Public Game",
+        reviewed,
         "yes",
         &CancellationToken::new(),
     )
@@ -212,7 +234,7 @@ async fn provider_receives_only_reviewed_query_and_cache_roundtrips() {
         &McpRuntime::default(),
         &root,
         &fp,
-        "Reviewed Public Game",
+        reviewed,
         "SEARCH_GAME_IDENTITY",
         &CancellationToken::new(),
     )
@@ -226,6 +248,31 @@ async fn provider_receives_only_reviewed_query_and_cache_roundtrips() {
     let other = evidence(&engine, &root).await;
     assert_ne!(first.id, other.id);
     assert!(confirm(&engine, &first.id, 0, "Name", "CONFIRM_GAME_IDENTITY").is_err());
+}
+
+#[tokio::test]
+async fn oversized_candidate_evidence_does_not_replace_reviewed_evidence() {
+    let (_temp, engine, root) = fixture();
+    let saved = evidence(&engine, &root).await;
+    let rejected = search_with(
+        &engine,
+        &root,
+        &saved.fingerprint,
+        "Another public game",
+        "SEARCH_GAME_IDENTITY",
+        &CancellationToken::new(),
+        |_| async {
+            let mut response = result(WebSearchStatus::Available);
+            response.results[0].snippet = "x".repeat(MAX_EVIDENCE_METADATA_BYTES);
+            Ok(response)
+        },
+    )
+    .await;
+    assert!(matches!(rejected, Err(AppError::Invalid(message)) if message == "Oversized evidence"));
+    assert_eq!(
+        load_evidence(&engine.db.conn(), &saved.id).unwrap().id,
+        saved.id
+    );
 }
 
 #[tokio::test]
@@ -394,16 +441,21 @@ async fn confirm_is_atomic_preserves_metadata_counts_and_never_guesses_steam_or_
         "CONFIRM_GAME_IDENTITY"
     )
     .is_err());
+    let confirmed_name = "已确认的游戏名称 ".repeat(100) + "正式版";
     let confirmed = confirm(
         &engine,
         &searched.id,
         0,
-        "User reviewed name",
+        &confirmed_name,
         "CONFIRM_GAME_IDENTITY",
     )
     .unwrap();
     assert_eq!(confirmed.id, game.id);
-    assert_eq!(confirmed.name, "User reviewed name");
+    assert_eq!(confirmed.name, confirmed_name);
+    assert_eq!(
+        games::get_game(&engine.db, &confirmed.id).unwrap().name,
+        confirmed_name
+    );
     assert_eq!(
         (confirmed.installed_mod_count, confirmed.enabled_mod_count),
         (7, 3)

@@ -155,3 +155,132 @@ test("cancelling a turn disables its unfinished questionnaire", async ({page}) =
   await expect(card).toHaveCount(0);
   expect(await responses(page)).toEqual([]);
 });
+
+
+test("large questionnaire exposes later options, steps and full text answers", async ({page}) => {
+  const options = Array.from({length: 54}, (_, index) => `候选项 ${index + 1}`);
+  const text = "长回答包含详细的安装路径和核对结果。".repeat(150);
+  const steps = [{question: "请选择游戏发行版", options},
+    ...Array.from({length: 7}, (_, index) => ({question: `确认项目 ${index + 1}`}))];
+  await installMockTauri(page, {askUser: {preview: {title, questions: steps}}});
+  await askAgent(page);
+  const form = page.getByRole("region", {name: title});
+  await expect(form.getByText("1 / 8", {exact: true})).toBeVisible();
+  await form.getByRole("button", {name: "下一页选项", exact: true}).click();
+  await expect(form.getByText("第 2 / 2 页，共 54 个选项")).toBeVisible();
+  const last = form.getByRole("radio", {name: "候选项 54", exact: true});
+  await last.click();
+  const next = form.getByRole("button", {name: "下一步", exact: true});
+  await next.click();
+  await form.getByRole("button", {name: "上一步", exact: true}).click();
+  await expect(last).toBeChecked();
+  await next.click();
+  for (let index = 1; index < steps.length - 1; index++) {
+    await expect(form.getByText(`${index + 1} / 8`, {exact: true})).toBeVisible();
+    await form.getByRole("button", {name: "跳过", exact: true}).click();
+  }
+  const textarea = form.getByRole("textbox", {name: "填写回答"});
+  await expect(textarea).not.toHaveAttribute("maxlength");
+  await textarea.fill(text);
+  await expect(textarea).toHaveValue(text);
+  await form.getByRole("button", {name: "提交回答", exact: true}).click();
+  const answers = ["候选项 54", ...Array(6).fill(null), text];
+  await expect.poll(() => responses(page)).toEqual([expect.objectContaining({args: expect.objectContaining({
+    response: {approved: true, answer: JSON.stringify(answers)},
+  })})]);
+  await page.getByRole("button", {name: "已询问 8 个问题", exact: true}).click();
+  await expect(page.locator("dd").last()).toHaveText(text);
+});
+
+test("multi-select keeps ordered choices across questions and option pages, supports custom answers, skip and replay", async ({page}) => {
+  const options = Array.from({length: 54}, (_, index) => `候选项 ${index + 1}`);
+  const questions = [
+    {question: "支持哪些发行版本？", options, multiSelect: true},
+    {question: "可参考哪些来源？", options: ["已登记游戏", "本机文件"], multiSelect: true},
+    {question: "需要哪些可选运行方式？", options: ["稳定版", "测试版"], multiSelect: true},
+  ];
+  await installMockTauri(page, {askUser: {preview: {title, questions}}});
+  await askAgent(page);
+
+  const card = page.getByRole("region", {name: title});
+  await expect(card.getByText("可多选 · 已选 0 项", {exact: true})).toBeVisible();
+  await expect(card.getByRole("button", {name: "下一步", exact: true})).toBeDisabled();
+  await expect(card.getByRole("button", {name: "跳过", exact: true})).toBeEnabled();
+
+  await card.getByRole("checkbox", {name: "候选项 1", exact: true}).check();
+  await expect(card.getByText("可多选 · 已选 1 项", {exact: true})).toBeVisible();
+  await card.getByRole("button", {name: "下一页选项", exact: true}).click();
+  const lastOption = card.getByRole("checkbox", {name: "候选项 54", exact: true});
+  await lastOption.check();
+  await expect(card.getByText("可多选 · 已选 2 项", {exact: true})).toBeVisible();
+  await lastOption.uncheck();
+  await expect(card.getByText("可多选 · 已选 1 项", {exact: true})).toBeVisible();
+  await lastOption.check();
+
+  await card.getByRole("button", {name: "下一步", exact: true}).click();
+  await card.getByRole("checkbox", {name: "已登记游戏", exact: true}).check();
+  await card.getByRole("checkbox", {name: "自己填写", exact: true}).check();
+  const customAnswer = card.getByRole("textbox", {name: "填写回答"});
+  await customAnswer.fill("补充核对目录");
+  await card.getByRole("button", {name: "下一步", exact: true}).click();
+
+  await expect(card.getByRole("button", {name: "提交回答", exact: true})).toBeDisabled();
+  await expect(card.getByRole("button", {name: "跳过", exact: true})).toBeEnabled();
+  await card.getByRole("button", {name: "上一步", exact: true}).click();
+  await expect(card.getByRole("checkbox", {name: "已登记游戏", exact: true})).toBeChecked();
+  await expect(card.getByRole("checkbox", {name: "自己填写", exact: true})).toBeChecked();
+  await expect(customAnswer).toHaveValue("补充核对目录");
+  await card.getByRole("button", {name: "上一步", exact: true}).click();
+  const firstOptionPage = card.getByText("第 1 / 2 页，共 54 个选项", {exact: true});
+  if (await firstOptionPage.isVisible()) {
+    await card.getByRole("button", {name: "下一页选项", exact: true}).click();
+  }
+  await expect(card.getByRole("checkbox", {name: "候选项 54", exact: true})).toBeChecked();
+  await card.getByRole("button", {name: "上一页选项", exact: true}).click();
+  await expect(card.getByRole("checkbox", {name: "候选项 1", exact: true})).toBeChecked();
+
+  await card.getByRole("button", {name: "下一步", exact: true}).click();
+  await expect(card.getByRole("checkbox", {name: "已登记游戏", exact: true})).toBeChecked();
+  await card.getByRole("button", {name: "下一步", exact: true}).click();
+  await card.getByRole("button", {name: "跳过", exact: true}).click();
+  await expect.poll(() => responses(page)).toEqual([expect.objectContaining({args: expect.objectContaining({
+    response: {approved: true, answer: JSON.stringify([["候选项 1", "候选项 54"], ["已登记游戏", "补充核对目录"], null])},
+  })})]);
+
+  const trace = page.getByRole("button", {name: "已询问 3 个问题", exact: true});
+  const details = page.locator("dl").filter({hasText: questions[0].question});
+  await trace.click();
+  const answers = details.locator("dd");
+  await expect(answers.nth(0).locator("ul > li")).toHaveText(["候选项 1", "候选项 54"]);
+  await expect(answers.nth(1).locator("ul > li")).toHaveText(["已登记游戏", "补充核对目录"]);
+  await expect(answers.nth(2)).toHaveText("已跳过");
+
+  await page.reload();
+  await page.getByRole("button", {name: /^(新对话|帮我确认游戏适配信息)$/}).click();
+  const replayedTrace = page.getByRole("button", {name: "已询问 3 个问题", exact: true});
+  await replayedTrace.click();
+  const replayedDetails = page.locator("dl").filter({hasText: questions[0].question});
+  await expect(replayedDetails.locator("dd").nth(0).locator("ul > li")).toHaveText(["候选项 1", "候选项 54"]);
+  await expect(replayedDetails.locator("dd").nth(1).locator("ul > li")).toHaveText(["已登记游戏", "补充核对目录"]);
+  await expect(replayedDetails.locator("dd").nth(2)).toHaveText("已跳过");
+});
+
+test("unmarked legacy question with the multi-select stem hint allows ordered selections", async ({page}) => {
+  const question = "请选择兼容的平台（可多选，选择所有适用项）";
+  await installMockTauri(page, {askUser: {preview: {title, questions: [
+    {question, options: ["Windows", "Linux", "macOS"]},
+  ]}}});
+  await askAgent(page);
+
+  const card = page.getByRole("region", {name: title});
+  await expect(card.getByText("可多选 · 已选 0 项", {exact: true})).toBeVisible();
+  await card.getByRole("checkbox", {name: "Windows", exact: true}).check();
+  await card.getByRole("checkbox", {name: "Linux", exact: true}).check();
+  await card.getByRole("button", {name: "提交回答", exact: true}).click();
+
+  await expect.poll(() => responses(page)).toEqual([expect.objectContaining({args: expect.objectContaining({
+    response: {approved: true, answer: JSON.stringify([["Windows", "Linux"]])},
+  })})]);
+  await page.getByRole("button", {name: "已询问 1 个问题", exact: true}).click();
+  await expect(page.locator("dl dd ul > li")).toHaveText(["Windows", "Linux"]);
+});

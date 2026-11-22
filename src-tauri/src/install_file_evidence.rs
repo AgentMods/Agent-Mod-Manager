@@ -85,8 +85,7 @@ pub(crate) fn verify_managed_install(
             None => return Err(AppError::NotFound("目标游戏没有此安装事务记录".into())),
         }
     }
-    let mut pass = FileEvidencePass::new(engine, &game)?;
-    pass.cancel = Some(cancel);
+    let mut pass = FileEvidencePass::new(engine, &game)?.with_cancel(cancel);
     let evidence = pass.verify(install_id)?;
     if cancel.is_cancelled() {
         return Err(AppError::Cancelled);
@@ -182,6 +181,11 @@ impl<'a> FileEvidencePass<'a> {
             deadline: Instant::now() + SOFT_TIMEOUT,
             cancel: None,
         })
+    }
+
+    pub(crate) fn with_cancel(mut self, cancel: &'a CancellationToken) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     fn manifest(&self, id: &str) -> AppResult<ManifestEvidence> {

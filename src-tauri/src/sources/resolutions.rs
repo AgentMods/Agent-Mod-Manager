@@ -2,7 +2,10 @@
 use super::{
     validate_download_url, FileHashes, ModDependency, ResolveResult, ResolvedMod, SourceStatus,
 };
-use crate::error::{AppError, AppResult};
+use crate::{
+    download_tasks::{AgentDownloadArgs, ClassificationInput},
+    error::{AppError, AppResult},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -80,32 +83,55 @@ pub(crate) fn resolution_id(raw: &str) -> AppResult<Uuid> {
         .ok_or_else(|| AppError::Invalid("下载只接受 resolve_mod 返回的 resolution_id".into()))
 }
 
-pub(crate) fn request_id(args: &Value) -> AppResult<Uuid> {
-    let raw = args
-        .as_object()
-        .filter(|args| args.len() == 1)
-        .and_then(|args| args.get("resolution_id"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| AppError::Invalid("下载只接受 resolve_mod 返回的 resolution_id".into()))?;
-    resolution_id(raw)
+pub(crate) fn inbound_download_request(
+    args: &Value,
+) -> AppResult<(Uuid, Option<ClassificationInput>)> {
+    let invalid =
+        || AppError::Invalid("下载只接受 resolution_id 和可选的一个 gameId 或 gameName".into());
+    let object = args.as_object().ok_or_else(invalid)?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "resolution_id" | "gameId" | "gameName"))
+    {
+        return Err(invalid());
+    }
+    let id = resolution_id(
+        object
+            .get("resolution_id")
+            .and_then(Value::as_str)
+            .ok_or_else(invalid)?,
+    )?;
+    let (game_id, game_name) = match (object.get("gameId"), object.get("gameName")) {
+        (None, None) => return Ok((id, None)),
+        (Some(Value::String(id)), None) => (Some(id.clone()), None),
+        (None, Some(Value::String(name))) => (None, Some(name.clone())),
+        _ => return Err(invalid()),
+    };
+    let classification = ClassificationInput {
+        game_id,
+        game_name,
+        ..Default::default()
+    };
+    classification.validate_metadata()?;
+    Ok((id, Some(classification)))
 }
 
-// Do not preserve unexpected text (including legacy URL-bearing arguments) in
-// tool-call history. An invalid payload still fails ordinary tool validation.
-pub(crate) fn history_arguments(raw: &str) -> String {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Args {
-        resolution_id: String,
-    }
+#[derive(Deserialize, Serialize)]
+pub(crate) struct AgentResolutionId {
+    pub resolution_id: String,
+}
 
-    if let Some(id) = serde_json::from_str::<Args>(raw)
-        .ok()
-        .and_then(|args| resolution_id(&args.resolution_id).ok())
-    {
-        return serde_json::json!({"resolution_id":id}).to_string();
-    }
-    "{}".into()
+// Only preserve the opaque ID and valid public classification fields. An
+// invalid payload still fails ordinary tool validation.
+pub(crate) fn history_arguments(raw: &str) -> String {
+    AgentDownloadArgs::<AgentResolutionId>::from_history(raw)
+        .and_then(|args| {
+            let id = resolution_id(&args.transfer.resolution_id).ok()?;
+            let mut normalized = serde_json::to_value(args.classification).ok()?;
+            normalized["resolution_id"] = serde_json::json!(id);
+            Some(normalized.to_string())
+        })
+        .unwrap_or_else(|| "{}".into())
 }
 
 /// Older structured tool records remain on disk but must not send signed URLs
@@ -389,14 +415,43 @@ mod tests {
         let id = Uuid::new_v4();
         let valid = json!({"resolution_id":id});
         assert_eq!(history_arguments(&valid.to_string()), valid.to_string());
-        assert_eq!(request_id(&valid).unwrap(), id);
+        let classified = json!({"resolution_id":id,"gameName":"Skyrim","author":"Public Author","projectPage":"https://example.com/mod"});
+        assert_eq!(
+            serde_json::from_str::<Value>(&history_arguments(&classified.to_string())).unwrap(),
+            classified
+        );
+        let mut private = classified;
+        private["projectPage"] = json!("https://example.com/mod?signature=private");
+        assert_eq!(history_arguments(&private.to_string()), "{}");
+        let (parsed, legacy) = inbound_download_request(&valid).unwrap();
+        assert_eq!(parsed, id);
+        assert!(legacy.is_none());
+        let (_, explicit) =
+            inbound_download_request(&json!({"resolution_id":id,"gameName":"Not registered yet"}))
+                .unwrap();
+        assert_eq!(
+            explicit.unwrap().game_name.as_deref(),
+            Some("Not registered yet")
+        );
+        let (_, explicit) =
+            inbound_download_request(&json!({"resolution_id":id,"gameId":"g_abc"})).unwrap();
+        assert_eq!(explicit.unwrap().game_id.as_deref(), Some("g_abc"));
+        for invalid in [
+            json!({"resolution_id":id,"gameName":null}),
+            json!({"resolution_id":id,"gameName":" ","gameId":"g_abc"}),
+            json!({"resolution_id":id,"gameName":" "}),
+            json!({"resolution_id":id,"gameId":"https://private.example/token"}),
+            json!({"resolution_id":id,"gameName":"Known Game","projectPage":"https://example.com/project"}),
+        ] {
+            assert!(inbound_download_request(&invalid).is_err(), "{invalid}");
+        }
         for invalid in [
             json!({"resolved":{"download_url":SIGNED}}),
             json!({"resolution_id":id,"filename":"other.jar"}),
             json!({"resolution_id":SIGNED}),
             json!({"resolutionId":id}),
         ] {
-            assert!(request_id(&invalid).is_err());
+            assert!(inbound_download_request(&invalid).is_err());
             assert_eq!(history_arguments(&invalid.to_string()), "{}");
         }
         assert_eq!(

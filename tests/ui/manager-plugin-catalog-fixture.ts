@@ -25,9 +25,11 @@ export async function openCatalogFixture(page: Page, options: Options = {}) {
     const plugin = { ...adapter, id: release.pluginId, releaseId: release.releaseId, authorName: "山雀", steamAppId: "413150", description: "示例安装规则" };
     const other = { ...plugin, id: "21", releaseId: "22", name: "备用适配包", authorName: "远山", version: "2.0.0", platforms: ["macos"] };
     const catalog = [{id: "7", name: "我的世界", slug: "minecraft", aliases: ["Minecraft Java Edition", "方块世界"], steamAppId: "413150", plugins: [other, plugin]}];
-    const preview = { gameName: "我的世界", plugin, source: "https://www.glossmod.com/manager-plugins", adapterJson: adapterText, skillMarkdown: skillText, hashes, mcpServers: adapter.mcpServers, installedVersion: options.installed ? "1.0.0" : null };
+    const display = {description: "管理这款游戏已声明的模组安装规则。", coverPng: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jZQAAAABJRU5ErkJggg=="};
+    const preview = { display, gameName: "我的世界", plugin, source: "https://www.glossmod.com/manager-plugins", adapterJson: adapterText, skillMarkdown: skillText, hashes, mcpServers: adapter.mcpServers, installedVersion: options.installed ? "1.0.0" : null };
     const staged = {...preview, skillMarkdown: stagedSkill, hashes: {...hashes, skillSha256: stagedSkillHash}};
     host.__TAURI_INTERNALS__.invoke = async (command: string, args: Record<string, unknown> = {}) => {
+      if (command === "get_manager_plugin_display") return args.releaseId === release.releaseId ? display : null;
       if (command === "list_games") return (await original(command, args)).map((game: object) => ({...game, steamAppId: "413150"}));
       if (["list_manager_plugin_games", "preview_manager_plugin", "prepare_manager_plugin_import"].includes(command)) {
         host.__AMM_TEST__.calls.push({command, args});

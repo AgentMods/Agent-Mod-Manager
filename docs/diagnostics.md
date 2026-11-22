@@ -17,16 +17,28 @@ code page. Skyrim SE and Fallout 4 plugin lists separately use Windows-1252 as
 their legacy-format fallback, based on the libloadorder asterisk format
 implementation; the log setting does not affect these lists.
 
-Limits apply to bytes read, files, lines, line length and evidence. LF, CRLF and
-CR each count as one physical line break. Incomplete final lines after a byte
-limit and oversized lines never become evidence. The desktop reports the
-decoder used, status, and truncation by source; this does not imply the game
-can read the file using the same decoder.
+`read_logs` and `diagnose_game` return bounded pages. For `read_logs` use
+`nextCursor`; for `diagnose_game` use `logs.nextCursor`. Pass the cursor as
+`options.page.cursor` in the next call with the same game and client
+conversation. Keep reading until the cursor is null; an intermediate page can
+be empty when only directory entries or a partial physical line were processed.
+Use `options.page.cancel: true` with the cursor (or a caller-generated UUID in
+`options.page.requestId`) to stop. Cursors are in-memory, are not persistent
+snapshots and expire if left waiting for another page. Local MCP must keep the
+same `conversation_id` when continuing.
 
-Diagnostic file reads check the opened regular, single-link object against its
-authorized path before and after the bounded read. Observable replacement or
-change during the read suppresses text evidence without refunding its byte
-budget. This is not a snapshot of the game directory or its running process.
+File count, raw bytes per file/page, and line count bound the page, not the
+investigation. Positive caller options can reduce batch sizes; larger requested
+ranges are consumed across batches. LF, CRLF and CR count as physical line
+breaks even across buffer boundaries, and line numbers are absolute. An
+oversized individual line is kept as a display-only excerpt and does not become
+matching evidence. The tool does not return text from a malformed or binary
+batch; already delivered valid batches are not silently rewritten.
+
+Each file read verifies the regular, single-link object against its authorized
+path, size and modification time. Iteration doesn't follow symlinks or expand
+scope beyond the active adapter's roots; a change in registration requires a
+new run. This is not a snapshot of the directory or a running process.
 
 ## Minecraft Java: Fabric Startup Log
 
@@ -37,9 +49,10 @@ reported selection or its explicit failure. Mod rows carry IDs, version text,
 physical line numbers, and a marker for nested entries. The UI distinguishes
 partial, unavailable, unrecognized, and ambiguous evidence. It doesn't merge
 multiple observed starts or use a same-named crash report as the instance log.
-Only contiguous, bounded rows from a recognized selection are reported. At most
-100 entries are emitted, with an omission count for valid rows withheld from
-output. An incomplete section or repeated IDs is not a complete selection.
+The selection parser follows contiguous rows across raw log pages. Recognized
+selections are returned in batches of at most 64 rows; the full validated
+selection is used for disk correlation. An incomplete section, an unsupported
+record, or repeated IDs is not a complete selection.
 
 A selection report describes what the loader chose at that point in a prior
 startup. Fabric emits the list after resolving candidates and before invoking
@@ -119,8 +132,10 @@ the documented subset of Mod ID and version strings supported by the log
 parser are compared. ZIP64 and unsupported manifests are not absence evidence.
 The Fabric format reference is https://docs.fabricmc.net/develop/loader/fabric-mod-json.
 
-The scan considers at most 512 directory entries and 64 JARs, with a soft
-three-second work limit. Each file is checked as a single-link regular object
+The scan enumerates all eligible entries, returning at most 64 JAR observations
+per result page. A temporary disk index preserves duplicate-ID detection across
+pages without retaining the inventory in RAM. Cancellation is checked between
+entries. Each file is checked as a single-link regular object
 before and after reading; observable file changes suppress its metadata.
 Directory identity is checked separately, with descriptor-anchored enumeration
 on Linux and macOS. This is not a point-in-time filesystem snapshot.
@@ -149,8 +164,10 @@ complete header with a physically absent master produces an observed
 dependency finding tied to the `Plugins.txt` line; the file is never copied,
 rewritten, reordered or treated as an installation plan.
 
-The reader is intentionally bounded: at most 64 enabled entries, 256 KiB per
-plugin header, 4 MiB for one diagnosis, 256 master names and 4096 subrecords.
+The list is indexed across pages so a master on a later page still has the
+correct enabled order. Header work is paged (4 MiB total per header batch), with
+parser protections of 256 KiB per plugin header, 256 master names and 4096
+subrecords. These per-object limits are not resume points for unsafe parsing.
 Compressed or oversized TES4 data, malformed subrecords, truncated input,
 unsafe master names, concurrent file replacement and unreadable files become
 `limited`, `invalid` or `unreadable` evidence and do not become a missing

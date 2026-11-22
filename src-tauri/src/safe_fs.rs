@@ -2,7 +2,6 @@
 //! On desktop platforms, resolve each component relative to a held directory.
 
 use crate::error::AppError;
-#[cfg(not(windows))]
 use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
 #[cfg(not(windows))]
@@ -126,6 +125,27 @@ mod platform {
         )
         .map_err(io)?;
         Ok(fd.into())
+    }
+
+    pub(crate) fn open_transfer(path: &Path, create: bool) -> AppResult<File> {
+        let (dir, name) = parent(path, false)?;
+        let mut flags =
+            OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+        let mode = if create {
+            flags |= OFlags::CREATE | OFlags::EXCL;
+            Mode::from_raw_mode(0o600)
+        } else {
+            let before = fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io)?;
+            if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
+                || before.st_nlink != 1
+            {
+                return Err(wrong_identity(path));
+            }
+            Mode::empty()
+        };
+        let file = File::from(fs::openat(&dir, name, flags, mode).map_err(io)?);
+        verify_regular_at(&file, path)?;
+        Ok(file)
     }
 
     pub(crate) fn open_regular(path: &Path) -> AppResult<File> {
@@ -301,6 +321,13 @@ mod platform {
             })
         }
 
+        pub(crate) fn cleanup_guard(&self) -> AppResult<super::StagingCleanup> {
+            self.verify_path()?;
+            let expected = identity_at(&self.root, std::ffi::OsStr::new("."))?
+                .ok_or_else(|| wrong_identity(&self.path))?;
+            Ok(super::StagingCleanup::new(&self.path, expected))
+        }
+
         pub(crate) fn path(&self) -> &Path {
             &self.path
         }
@@ -398,6 +425,12 @@ mod platform {
         Ok(file)
     }
 
+    pub(crate) fn open_transfer(_path: &Path, _create: bool) -> AppResult<File> {
+        Err(AppError::Unsupported(
+            "当前平台不支持安全打开下载片段".into(),
+        ))
+    }
+
     pub(crate) fn verify_regular_at(_file: &File, _path: &Path) -> AppResult<()> {
         Err(AppError::Unsupported(
             "当前平台不支持验证普通文件对象".into(),
@@ -453,6 +486,12 @@ mod platform {
             Ok(staging)
         }
 
+        pub(crate) fn cleanup_guard(&self) -> AppResult<super::StagingCleanup> {
+            Err(AppError::Unsupported(
+                "当前平台不支持验证归档暂存目录".into(),
+            ))
+        }
+
         pub(crate) fn path(&self) -> &Path {
             &self.path
         }
@@ -497,7 +536,7 @@ mod platform {
 
 pub(crate) use platform::{
     create_dir, create_dir_all, create_new, directory_entries, identity, open_regular,
-    rename_checked, rename_exclusive, verify_regular_at, StagingDirectory,
+    open_transfer, rename_checked, rename_exclusive, verify_regular_at, StagingDirectory,
 };
 
 #[cfg(all(test, windows))]
@@ -566,4 +605,120 @@ mod tests {
         std::os::unix::fs::symlink(moved, &path).unwrap();
         assert!(verify_regular_at(&file, &path).is_err());
     }
+}
+
+/// Space available to the current caller, excluding a small margin for filesystem
+/// metadata, the database and other writers. This is admission control, not a
+/// reservation; writes can still fail and callers must handle that error.
+pub(crate) fn available_data_space(directory: &Path) -> AppResult<u64> {
+    #[cfg(windows)]
+    let available = {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let path: Vec<u16> = directory.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut available = 0;
+        if unsafe {
+            GetDiskFreeSpaceExW(
+                path.as_ptr(),
+                &mut available,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        available
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let available = {
+        let stats = rustix::fs::statvfs(directory).map_err(std::io::Error::from)?;
+        stats.f_bavail.saturating_mul(stats.f_frsize)
+    };
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    return Err(AppError::Unsupported("当前平台无法检查可用磁盘空间".into()));
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    Ok(available.saturating_sub((64 * 1024 * 1024).max(available / 20)))
+}
+
+pub(crate) struct DiskBudget<'a> {
+    directory: &'a Path,
+    remaining: u64,
+    until_refresh: u64,
+}
+
+impl<'a> DiskBudget<'a> {
+    pub(crate) fn new(directory: &'a Path) -> AppResult<Self> {
+        Ok(Self {
+            directory,
+            remaining: available_data_space(directory)?,
+            until_refresh: 32 * 1024 * 1024,
+        })
+    }
+
+    pub(crate) fn limit(&self) -> u64 {
+        self.remaining
+    }
+
+    pub(crate) fn require(&self, bytes: u64) -> AppResult<()> {
+        if bytes > self.remaining {
+            return Err(AppError::Invalid(format!(
+                "磁盘空间不足：需要 {bytes} 字节，可用 {} 字节",
+                self.remaining
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn charge(&mut self, bytes: u64) -> AppResult<()> {
+        if bytes >= self.until_refresh {
+            self.remaining = self.remaining.min(available_data_space(self.directory)?);
+            self.until_refresh = 32 * 1024 * 1024;
+        }
+        self.require(bytes)?;
+        self.remaining -= bytes;
+        self.until_refresh = self.until_refresh.saturating_sub(bytes);
+        Ok(())
+    }
+}
+
+/// Removes only a directory exclusively allocated by this operation. If its
+/// identity no longer matches, leave it alone instead of deleting a replacement.
+pub(crate) struct StagingCleanup {
+    path: std::path::PathBuf,
+    expected: FileIdentity,
+    keep: bool,
+}
+impl StagingCleanup {
+    fn new(path: &Path, expected: FileIdentity) -> Self {
+        Self {
+            path: path.into(),
+            expected,
+            keep: false,
+        }
+    }
+    pub(crate) fn keep(&mut self) {
+        self.keep = true;
+    }
+}
+impl Drop for StagingCleanup {
+    fn drop(&mut self) {
+        if !self.keep && identity(&self.path).ok().flatten().as_ref() == Some(&self.expected) {
+            // remove_dir_all does not traverse symbolic links within the tree.
+            if let Err(error) = remove_staging_tree(&self.path, &self.expected) {
+                tracing::warn!(path = ?self.path, %error, "could not clean owned staging");
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+use platform::remove_staging_tree;
+
+#[cfg(not(windows))]
+fn remove_staging_tree(path: &Path, expected: &FileIdentity) -> AppResult<()> {
+    if identity(path)?.as_ref() != Some(expected) {
+        return Err(wrong_identity(path));
+    }
+    Ok(std::fs::remove_dir_all(path)?)
 }

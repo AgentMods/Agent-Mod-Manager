@@ -273,7 +273,7 @@ async function installExternalMinecraftAdapter(ui) {
 async function registerAndOpen(ui, root) {
   const packagedUrl = windows ? /^https?:\/\/tauri\.localhost(?:[/?#]|$)/ : /^tauri:\/\/localhost(?:[/?#]|$)/;
   // A fresh profile starts with first-run onboarding before the normal shell is shown.
-  await ui.visible(textAt(main, '先找到你想管理的游戏', 'h2'));
+  await ui.visible(textAt(main, '设置数据存储目录', 'h2'));
   assert.equal(await ui.count('//nav[@aria-label="主导航"]'), 0, 'Onboarding must replace the normal navigation');
   await ui.click(button('退出引导'));
   await installExternalMinecraftAdapter(ui);

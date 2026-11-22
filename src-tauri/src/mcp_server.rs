@@ -588,7 +588,7 @@ impl DesktopSession {
             Tool::new("amm_session", "Create or read this connection's persistent conversation", json!({"type":"object","properties":{"title":{"type":"string"}},"additionalProperties":false}).as_object().unwrap().clone()),
             Tool::new("amm_events", "Read this connection's desktop Agent events; cannot approve requests", json!({"type":"object","properties":{"after":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":200}},"additionalProperties":false}).as_object().unwrap().clone()),
         ];
-        for definition in self.shared.runtime.registry.inbound_definitions() {
+        for definition in self.shared.runtime.registry.inbound_definitions(exported) {
             let function = &definition["function"];
             let name = function["name"].as_str().unwrap_or_default();
             if !exported(name) {
@@ -633,7 +633,7 @@ impl DesktopSession {
             ));
         }
         if name == "download_mod" {
-            crate::sources::resolutions::request_id(&args)?;
+            crate::sources::resolutions::inbound_download_request(&args)?;
         }
         if name == "amm_session" {
             if args.as_object().unwrap().keys().any(|key| key != "title") {
@@ -705,13 +705,16 @@ impl DesktopSession {
             self.shared.tracker.spawn(async move {
                 let _slots = (session_slot, global_slot);
                 let cancel = CancellationToken::new();
+                // Dependency traversal is progress-bounded by its provider
+                // and can be cancelled by the MCP caller or desktop shutdown.
+                let call_has_deadline = name != "resolve_modrinth_dependency_graph";
                 let operation = session.execute_native(&name, args, &cancel);
                 tokio::pin!(operation);
                 let result = tokio::select! {
                     biased;
                     _ = request_cancel.cancelled() => { cancel.cancel(); operation.await },
                     _ = session.shared.shutdown.cancelled() => { cancel.cancel(); operation.await },
-                    _ = tokio::time::sleep(CALL_TIMEOUT) => { cancel.cancel(); operation.await },
+                    _ = tokio::time::sleep(CALL_TIMEOUT), if call_has_deadline => { cancel.cancel(); operation.await },
                     result = &mut operation => result,
                 };
                 let _ = tx.send(result);
@@ -1008,7 +1011,7 @@ where
     let http = reqwest_mcp::Client::builder()
         .redirect(reqwest_mcp::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(31 * 60))
+        .read_timeout(Duration::from_secs(31 * 60))
         .build()
         .map_err(|_| AppError::Other("Cannot initialize desktop MCP proxy".into()))?;
     let config = StreamableHttpClientTransportConfig::with_uri(endpoint.to_owned())

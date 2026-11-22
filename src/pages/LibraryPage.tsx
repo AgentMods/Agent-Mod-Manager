@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { open } from "@tauri-apps/plugin-dialog";
 import { EllipsisIcon, FolderOpenIcon, Gamepad2Icon, GlobeIcon, PencilIcon, PlayIcon, PuzzleIcon, RefreshCwIcon, SearchIcon, SparklesIcon, Trash2Icon, XIcon } from "lucide-react";
@@ -101,7 +101,7 @@ function EditGameDialog({ game, onClose, onSaved }: { game: Game; onClose: () =>
     <FieldGroup>
       <Field>
         <FieldLabel htmlFor="game-name">游戏名称</FieldLabel>
-        <InputGroup><InputGroupInput id="game-name" value={name} maxLength={80} disabled={busy} onChange={(event) => setName(event.target.value)} /></InputGroup>
+        <InputGroup><InputGroupInput id="game-name" value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></InputGroup>
       </Field>
       <Field>
         <FieldLabel htmlFor="game-launch-path">启动程序</FieldLabel>
@@ -220,6 +220,12 @@ export default function LibraryPage() {
   const notify = useUI((state) => state.notify);
   const [search, setSearch] = useState("");
   const scanButton = useRef<HTMLButtonElement>(null);
+  const scanRequest = useRef<string | null>(null);
+  useEffect(() => () => {
+    const requestId = scanRequest.current;
+    scanRequest.current = null;
+    if (requestId) void api("scan_games", { options: { page: { requestId, cancel: true } } }).catch(() => {});
+  }, []);
   const [scanOpen, setScanOpen] = useState(false);
   const [directory, setDirectory] = useState("");
   const [candidates, setCandidates] = useState<GameCandidate[]>([]);
@@ -241,14 +247,32 @@ export default function LibraryPage() {
     setBusy(true); setDiscoveryError(null);
     try { await action(); } catch (failure) { setDiscoveryError(failure); } finally { setBusy(false); setScanning(false); }
   }
-  async function scan(root?: string) {
+  function stopScan() {
+    const requestId = scanRequest.current;
+    scanRequest.current = null;
+    if (requestId) void api("scan_games", { options: { page: { requestId, cancel: true } } }).catch(() => {});
+    setReport((current) => current && { ...current, nextCursor: null });
+  }
+  async function scan(root?: string, cursor?: string) {
     if (root === "") return;
-    setReport(null); setCandidates([]); setScanRoot(root ?? null); setScanning(true);
-    const result = await api<ScanReport>("scan_games", { options: { userRoots: root ? [root] : [], includeCommonRoots: !root } });
-    const distinct = reconcileCandidates(result.candidates);
-    setReport(result); setCandidates(distinct);
+    if (!cursor) {
+      stopScan();
+      setReport(null); setCandidates([]); setScanRoot(root ?? null);
+    }
+    const requestId = cursor ?? crypto.randomUUID();
+    scanRequest.current = requestId;
+    setScanning(true);
+    try {
+      const result = await api<ScanReport>("scan_games", { options: { userRoots: root ? [root] : [], includeCommonRoots: !root, page: cursor ? { cursor } : { requestId } } });
+      if (scanRequest.current !== requestId) return;
+      scanRequest.current = result.nextCursor ?? null;
+      setReport(result); setCandidates(reconcileCandidates(result.candidates));
+    } catch (error) {
+      if (scanRequest.current === requestId) { stopScan(); throw error; }
+    }
   }
   async function identify() {
+    stopScan();
     setReport(null); setCandidates([]);
     setCandidates([await api<GameCandidate>("identify_game", { directory })]);
   }
@@ -310,7 +334,7 @@ export default function LibraryPage() {
     {!rows.length && !games.error && <EmptyState icon={<Gamepad2Icon />} title={!backendAvailable ? "桌面能力未连接" : games.isLoading ? "正在读取游戏库…" : search ? "没有匹配的游戏" : "尚无管理中的游戏"} />}
 
     {scanOpen && <Modal title="扫描游戏" description="扫描常用位置或指定目录，然后选择要添加的游戏。" className="sm:max-w-3xl"
-      onClose={() => setScanOpen(false)} onCloseAutoFocus={(event) => { event.preventDefault(); scanButton.current?.focus(); }}>
+      onClose={() => { stopScan(); setScanOpen(false); }} onCloseAutoFocus={(event) => { event.preventDefault(); scanButton.current?.focus(); }}>
       <form className="flex flex-col gap-2" onSubmit={(event) => { event.preventDefault(); if (directory.trim()) void discover(() => scan(directory)); }}>
         <div className="flex items-center gap-2">
           <InputGroup className="min-w-0 flex-1"><InputGroupInput ref={directoryInput} aria-label="游戏目录" placeholder="输入游戏或游戏库目录的完整路径" value={directory} disabled={busy} onChange={(event) => setDirectory(event.target.value)} /></InputGroup>
@@ -323,11 +347,15 @@ export default function LibraryPage() {
         </div>
       </form>
       {scanning && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner />{scanRoot ? "正在扫描指定目录…" : "正在扫描常用位置…"}</p>}
+      <div className="flex flex-wrap gap-2">
+        {report?.nextCursor && !scanning && <Button type="button" variant="outline" disabled={busy} onClick={() => void discover(() => scan(scanRoot ?? undefined, report.nextCursor!))}>下一批候选</Button>}
+        {(scanning || report?.nextCursor) && <Button type="button" variant="ghost" onClick={stopScan}>停止扫描</Button>}
+      </div>
       <ErrorState error={discoveryError} />
       {report && <div role="status" className="flex flex-col gap-1 text-sm text-muted-foreground">
         {scanRoot && <PathText>扫描目录：{displayPath(scanRoot)}</PathText>}
-        <p>已检查 {report.directoriesChecked} 个目录、{report.entriesChecked} 个条目，发现 {discoveryRows.length} 个候选目录{report.truncated ? " · 已达到扫描上限" : ""}</p>
-        {!report.candidates.length && <p>{scanRoot ? "未发现候选游戏。若已选择单个游戏的安装目录，可使用“检查单个游戏”。" : "未在常用位置发现候选游戏，可指定目录扫描。"}</p>}
+        <p>已检查 {report.directoriesChecked} 个目录、{report.entriesChecked} 个条目，本批 {discoveryRows.length} 个候选目录{report.truncated ? " · 已达到扫描上限" : ""}</p>
+        {!report.candidates.length && !report.nextCursor && <p>{scanRoot ? "未发现候选游戏。若已选择单个游戏的安装目录，可使用“检查单个游戏”。" : "未在常用位置发现候选游戏，可指定目录扫描。"}</p>}
         {report.warnings.map((warning, index) => <PathText className="text-warning" key={index}>{displayPath(warning.path)}：{warning.message}</PathText>)}
       </div>}
       {discoveryRows.length > 0 && <ItemGroup aria-label="扫描候选游戏" className="gap-2">
@@ -356,7 +384,6 @@ export default function LibraryPage() {
     {editing && <EditGameDialog key={editing.id} game={editing} onClose={() => setEditing(null)} onSaved={async () => { await games.refetch(); notify("已保存游戏设置"); }} />}
     {choosingAdapter && <ChooseAdapterDialog key={choosingAdapter.id} game={choosingAdapter} writable={writable} plugins={plugins.data ?? []} onClose={() => setChoosingAdapter(null)} onSaved={async (updated) => {
       client.setQueryData(["game", updated.id], updated);
-      client.removeQueries({ queryKey: ["game-adapter", updated.id] });
       await games.refetch();
       notify(updated.adapterSlug ? "已应用游戏适配包" : "已移除游戏适配包");
     }} />}

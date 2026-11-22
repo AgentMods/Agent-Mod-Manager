@@ -17,6 +17,7 @@ pub(super) struct SetGameAdapter;
 struct BindingArgs {
     slug: String,
     game_id: Option<String>,
+    game_name: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -24,12 +25,13 @@ impl AgentTool for SetGameAdapter {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "set_game_adapter".into(),
-            description: "为已登记的游戏绑定已安装且启用的适配包。为当前游戏创建并部署适配包后，调用此工具完成绑定；若包已安装，可直接调用。游戏会话默认使用当前游戏，通用会话须提供目标登记 ID。".into(),
+            description: "为已登记的游戏绑定已安装且启用的适配包。为当前游戏创建并部署适配包后，调用此工具完成绑定；若包已安装，可直接调用。游戏会话默认使用当前游戏，通用会话须提供目标登记 ID。仅在用户要求更改游戏库显示名称时传入 game_name，与绑定一并提交；这不会改名适配包。".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "slug": {"type": "string", "description": "已安装适配包的 slug"},
-                    "game_id": {"type": "string", "description": "已登记游戏的 ID，游戏会话可省略"}
+                    "game_id": {"type": "string", "description": "已登记游戏的 ID，游戏会话可省略"},
+                    "game_name": {"type": "string", "description": "可选的游戏库显示名称；仅在用户要求时提供，省略则保留原名"}
                 },
                 "required": ["slug"],
                 "additionalProperties": false
@@ -45,8 +47,9 @@ impl AgentTool for SetGameAdapter {
         let ResolutionScope::Agent(conversation) = &context.resolution_scope else {
             return Err(AppError::Denied("适配包绑定仅供桌面 Agent 对话使用".into()));
         };
-        let args: BindingArgs = serde_json::from_value(args.clone())
-            .map_err(|_| AppError::Invalid("绑定适配包需要 slug，可选 game_id".into()))?;
+        let args: BindingArgs = serde_json::from_value(args.clone()).map_err(|_| {
+            AppError::Invalid("绑定适配包需要 slug，可选 game_id、game_name".into())
+        })?;
         let conversation = conversation.clone();
         let engine = context.engine.clone();
         let binding = tokio::task::spawn_blocking(move || {
@@ -63,7 +66,12 @@ impl AgentTool for SetGameAdapter {
             let id = current.or(args.game_id).ok_or_else(|| {
                 AppError::Invalid("请提供目标游戏的登记 ID，或在该游戏的对话中绑定适配包".into())
             })?;
-            game_actions::prepare_game_adapter_binding(&engine, &id, &args.slug)
+            game_actions::prepare_game_adapter_binding(
+                &engine,
+                &id,
+                &args.slug,
+                args.game_name.as_deref(),
+            )
         })
         .await
         .map_err(|error| AppError::Other(error.to_string()))??;

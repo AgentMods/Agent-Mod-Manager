@@ -91,7 +91,7 @@ export function GameIdentityDialog({ directory, writable, onClose, onCloseAutoFo
       </details>
       {preview.data.warnings.map((warning, i) => <Alert variant="warning" key={i}><AlertDescription>{warning}</AlertDescription></Alert>)}
       <FieldGroup>
-        <Field><FieldLabel htmlFor="identity-query">公开搜索词</FieldLabel><Input id="identity-query" aria-label="公开搜索词" value={query} maxLength={512} disabled={busy} onChange={event => changeQuery(event.target.value)}/></Field>
+        <Field><FieldLabel htmlFor="identity-query">公开搜索词</FieldLabel><Input id="identity-query" aria-label="公开搜索词" value={query} disabled={busy} onChange={event => changeQuery(event.target.value)}/></Field>
         <Label className="items-start font-normal"><Checkbox aria-label="同意发送公开搜索词" checked={searchConsent} disabled={busy} onCheckedChange={checked => setSearchConsent(checked === true)}/><span>我已核对搜索词不含本机路径、密钥或私人信息，同意将其发送给 Bing。</span></Label>
         <div><Button disabled={busy || !searchConsent || !query.trim()} onClick={() => { void search(); }}>{busy ? <Spinner data-icon="inline-start"/> : <SearchIcon data-icon="inline-start"/>}{busy ? '正在处理…' : '搜索候选'}</Button></div>
       </FieldGroup>
@@ -110,7 +110,7 @@ export function GameIdentityDialog({ directory, writable, onClose, onCloseAutoFo
             </Item>)}</ItemGroup>
           </RadioGroup> : <EmptyState title="没有找到可确认的候选"/>}
           {selected !== null && <FieldGroup>
-            <Field><FieldLabel htmlFor="identity-name">确认的游戏名称</FieldLabel><Input id="identity-name" aria-label="确认的游戏名称" maxLength={128} value={name} disabled={busy} onChange={event => { setName(event.target.value); setRegistrationConsent(false); }}/></Field>
+            <Field><FieldLabel htmlFor="identity-name">确认的游戏名称</FieldLabel><Input id="identity-name" aria-label="确认的游戏名称" value={name} disabled={busy} onChange={event => { setName(event.target.value); setRegistrationConsent(false); }}/></Field>
             <Label className="items-start font-normal"><Checkbox aria-label="确认添加" checked={registrationConsent} disabled={busy || !writable} onCheckedChange={checked => setRegistrationConsent(checked === true)}/><span>我已核对候选，确认将此目录添加到游戏管理器。不自动关联适配包或执行安装。</span></Label>
           </FieldGroup>}
         </>}

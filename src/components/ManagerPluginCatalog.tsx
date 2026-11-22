@@ -12,12 +12,14 @@ import { Spinner } from "@/components/ui/spinner";
 
 type Candidate = {
   id: string; releaseId: string; name: string; slug: string; version: string;
-  authorName: string; platforms: string[]; steamAppId: string; description: string;
+  authorName: string; platforms: string[]; steamAppId: string; description: string; tags?: string[];
 };
 type CatalogGame = { id: string; name: string; slug: string; aliases: string[]; steamAppId: string; plugins: Candidate[] };
 type CatalogSearch = { totalGames: number; skippedEntries: number; games: CatalogGame[] };
 type Hashes = { adapterSha256: string; skillSha256: string };
+type ReleaseDisplay = { description: string; coverPng: string };
 type ReleasePreview = {
+  display?: ReleaseDisplay | null;
   gameName: string; plugin: Candidate; source: string; adapterJson: string; skillMarkdown: string;
   hashes: Hashes; installedVersion: string | null;
   mcpServers: { id: string; name: string; transport: string; command: string | null; args: string[]; url: string | null }[];
@@ -31,6 +33,29 @@ function candidateByline(candidate: Candidate) {
 }
 function sameHashes(a: Hashes | null, b: Hashes) {
   return a?.adapterSha256 === b.adapterSha256 && a.skillSha256 === b.skillSha256;
+}
+
+function ReleaseCover({ png, className }: { png: string; className: string }) {
+  return <img alt="插件封面" decoding="async" loading="lazy" className={className} src={`data:image/png;base64,${png}`} />;
+}
+
+// The public index contains metadata only. Fetch artwork for visible releases on demand.
+function CatalogArtwork({ releaseId }: { releaseId: string }) {
+  const container = useRef<HTMLDivElement>(null);
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    if (!container.current) return;
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) {
+        setVisible(true);
+        observer.disconnect();
+      }
+    });
+    observer.observe(container.current);
+    return () => observer.disconnect();
+  }, []);
+  const display = useBackendQuery<ReleaseDisplay | null>(["manager-plugin-display", releaseId], "get_manager_plugin_display", {releaseId}, visible);
+  return <div ref={container} className="min-h-px">{display.data?.coverPng && <ReleaseCover png={display.data.coverPng} className="mb-1 aspect-video w-32 rounded-md object-cover" />}</div>;
 }
 
 function RawFile({ name, text }: { name: string; text: string }) {
@@ -103,6 +128,8 @@ function ReleaseImport({ candidate, writable, onBack, onReturnToGame }: CatalogP
           <dt>适配包</dt><dd>{preview.plugin.slug}</dd>
           <dt>发布 ID</dt><dd>{preview.plugin.releaseId}</dd>
         </dl>
+        {preview.display && <ReleaseCover png={preview.display.coverPng} className="aspect-video w-full max-w-sm rounded-md object-cover" />}
+        {preview.display && <p className="wrap-anywhere whitespace-pre-line text-sm">{preview.display.description}</p>}
         {preview.plugin.description && <p className="wrap-anywhere text-sm">{preview.plugin.description}</p>}
         {preview.installedVersion && phase !== "installed" && <Alert variant="warning"><AlertDescription>已安装同标识适配包 {preview.plugin.slug} {preview.installedVersion}。安装此版本将覆盖已安装的文件。</AlertDescription></Alert>}
         <section aria-label="声明的 MCP 服务" className="flex flex-col gap-1.5 text-sm">
@@ -156,7 +183,10 @@ export function ManagerPluginCatalog({ writable, initialQuery = "", onReturnToGa
           : games.map(game => <section key={game.id} aria-label={game.name} className="min-w-0">
             <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b pb-2"><h3 className="wrap-anywhere text-sm font-semibold">{game.name}</h3>{game.steamAppId && <span className="text-xs text-muted-foreground">Steam App ID {game.steamAppId}</span>}</div>
             <ul className="divide-y">{game.plugins.map(plugin => <li key={plugin.releaseId} className="flex min-w-0 flex-col items-start gap-2 py-3">
+              <CatalogArtwork releaseId={plugin.releaseId} />
               <h4 className="wrap-anywhere font-medium">{plugin.name}</h4><p className="wrap-anywhere text-sm text-muted-foreground">{candidateByline(plugin)}</p>
+              {plugin.description && <p className="wrap-anywhere text-sm">{plugin.description}</p>}
+              {!!plugin.tags?.length && <div className="flex flex-wrap gap-1">{plugin.tags.map(tag => <Badge key={tag}>{tag}</Badge>)}</div>}
               {plugin.steamAppId && plugin.steamAppId !== game.steamAppId && <p className="text-xs text-muted-foreground">Steam App ID {plugin.steamAppId}</p>}
               <Button size="sm" variant="outline" aria-label={`查看并导入 ${plugin.name} · ${plugin.authorName} · ${plugin.version}`} onClick={event => { trigger.current = event.currentTarget; setSelected(plugin); }}>查看并导入</Button>
             </li>)}</ul>

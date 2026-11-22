@@ -10,9 +10,17 @@ provider can still return results.
 `resolve_mod` returns `download: null` for a manual or unavailable download.
 Otherwise the preview includes `download.resolution_id`, source/project/version,
 filename, size, source hashes, and warnings. It does not include the CDN URL.
-The desktop IPC accepts `{taskId, resolutionId}` for `download_mod`. The Agent
-and local MCP call it with `{"resolution_id":"…"}`. None accepts a caller-supplied
-provider, version, URL, filename, size or checksum for a catalog download.
+The desktop IPC accepts `taskId`, `resolutionId` and `classification` for
+`download_mod`; classification selects `gameId` or `gameName`. The desktop Agent
+uses `resolution_id` plus the same game selector, or the current game from its
+conversation. An inbound MCP client can supply `gameId` or `gameName` alongside
+`resolution_id` for the same classification. Existing resolution-only clients
+continue receiving their transport receipt in `downloads`. None
+accepts a caller-supplied provider, version, URL, filename, size or checksum for
+a catalog download. After a completed, cataloged transfer, retry library filing
+locally with its `artifactId` instead of requesting the same release again. The
+Agent exposes `retry_mod_library_download` for this operation. The retry must
+match the game's saved classification and cannot claim legacy downloads.
 
 The backend keeps the exact resolved request in memory. IDs are single-use and
 scoped separately to this desktop process, an Agent conversation, or an inbound
@@ -32,7 +40,11 @@ downloads. `download_mod` does not accept uncataloged links.
 
 The Agent checks the selected file against the connected source MCP first. The native catalog is independent of the connected services. On Mod 客栈, `list_works` and `list_work_files` identify the exact attachment. The official MCP's `get_work_file_download` issues a short-lived link and counts the download. The desktop adapter requests the signed link and transfers the selected attachment under one approval, returning the local archive receipt for later review. Signed URLs stay out of the conversation and the database.
 
-When the source cannot deliver the attachment, the Agent uses the connected Playwright MCP to download the same file through the official page and checks the saved file. A denied approval stops the operation. The stock browser reports absolute file paths and writes under `Agent Mod Manager/Playwright` in the user’s downloads directory (or a user-writable fallback). Browser downloads and local files saved by third-party MCPs use the desktop archive import flow for installation.
+When the source cannot deliver the attachment, the Agent uses the connected Playwright MCP to download the same file through the official page and checks the saved file. A denied approval stops the operation. The stock browser reports absolute file paths and writes under `Agent Mod Manager/Playwright` in the user’s downloads directory (or a user-writable fallback). For new library downloads, `list_mod_receipt_folders` returns the managed incoming folder and the stock Playwright download folder. `file_received_mod` files the verified download under its game in `Mods`. A file saved elsewhere goes through the desktop picker and reviewed import. The Agent installs from the resulting library artifact ID.
+
+### Downloads with proxy DNS
+
+The downloader validates and pins the IPs for each HTTPS hop. If the OS resolver returns only benchmark addresses in `198.18.0.0/15` or `2001:2::/48` for a public hostname, it queries Cloudflare over HTTPS for A and AAAA records. The resolver receives only the hostname and record type. Its connection uses fixed public bootstrap addresses and normal TLS certificate verification. The download uses the verified addresses with the original HTTPS hostname. Private or mixed DNS answers still fail closed. If no public address can be obtained after signing, use the official work page in the connected Playwright MCP without issuing a second ticket.
 
 ## Reviewed public archive links
 
@@ -40,8 +52,8 @@ For an explicitly requested native direct-link transfer, the desktop Agent can u
 `download_web_mod` with `{"url":"https://…/release.zip"}`. The link must be
 explicitly provided or present in evidence; a search hit on a project page is
 not a direct download. The tool requires per-transfer approval even in Full
-Trust, shows the canonical URL, filename, and 1 GiB limit, and makes no download
-request before approval. It is not a desktop IPC command or an exported local
+Trust, shows the canonical URL, filename, and disk-space policy, and makes no
+download request before approval. It is not a desktop IPC command or an exported local
 MCP tool.
 
 The starting link must be public HTTPS on the standard port, without userinfo,

@@ -58,6 +58,28 @@ pub(crate) fn create_new(path: &Path) -> AppResult<File> {
     create_new_at(&parent, name)
 }
 
+pub(crate) fn open_transfer(path: &Path, create: bool) -> AppResult<File> {
+    let (parent, name) = parent(path, false)?;
+    let file = parent.open_leaf(
+        name,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+        if create { FILE_CREATE } else { FILE_OPEN },
+        FILE_NON_DIRECTORY_FILE,
+        SHARE_FILE,
+    )?;
+    verify_regular_at(&file, path)?;
+    Ok(file)
+}
+
+pub(crate) fn remove_staging_tree(path: &Path, expected: &FileIdentity) -> AppResult<()> {
+    // Retain the anchored parent chain while std removes its child tree.
+    let (_parent, _) = parent(path, false)?;
+    if identity(path)?.as_ref() != Some(expected) {
+        return Err(wrong_identity(path));
+    }
+    Ok(std::fs::remove_dir_all(path)?)
+}
+
 pub(crate) fn open_regular(path: &Path) -> AppResult<File> {
     let (parent, name) = parent(path, false)?;
     parent.open_leaf(
@@ -235,6 +257,12 @@ impl StagingDirectory {
             path: path.into(),
             root: parent.create_child(name)?,
         })
+    }
+
+    pub(crate) fn cleanup_guard(&self) -> AppResult<super::StagingCleanup> {
+        let (expected, _) = identity_by_handle(self.root.file())?;
+        self.verify_path()?;
+        Ok(super::StagingCleanup::new(&self.path, expected))
     }
 
     pub(crate) fn path(&self) -> &Path {

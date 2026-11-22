@@ -132,15 +132,16 @@ async fn authored_external_package_binds_to_the_registered_game_in_one_turn() {
 }
 
 #[tokio::test]
-async fn existing_package_binding_obeys_chat_approval() {
+async fn existing_package_binding_and_rename_obey_one_chat_approval() {
     for approve in [false, true] {
         let (_temp, engine, root) = setup();
         std::fs::write(root.join("options.txt"), "").unwrap();
         plugins::test_fixtures::install(&engine.db, &engine.paths).unwrap();
+        let original = games::get_game(&engine.db, "g").unwrap();
         let (url, job) = server(vec![
             tool_call(
                 "set_game_adapter",
-                json!({"slug":"minecraft-java","game_id":"g"}),
+                json!({"slug":"minecraft-java","game_id":"g","game_name":"  游戏库新名称  "}),
             ),
             final_reply(),
         ])
@@ -151,10 +152,14 @@ async fn existing_package_binding_obeys_chat_approval() {
             .unwrap();
         let approval = next(&mut rx, "approval-request").await;
         assert_eq!(approval.payload["title"], "set_game_adapter");
-        assert!(games::get_game(&agent.engine.db, "g")
-            .unwrap()
-            .adapter_slug
-            .is_none());
+        assert_eq!(approval.payload["preview"]["gameName"], original.name);
+        assert_eq!(
+            approval.payload["preview"]["targetGameName"],
+            "游戏库新名称"
+        );
+        let pending = games::get_game(&agent.engine.db, "g").unwrap();
+        assert_eq!(pending.name, original.name);
+        assert!(pending.adapter_slug.is_none());
         agent
             .respond_approval(
                 &conv,
@@ -175,7 +180,28 @@ async fn existing_package_binding_obeys_chat_approval() {
             game.adapter_slug.as_deref(),
             approve.then_some("minecraft-java")
         );
+        assert_eq!(
+            game.name,
+            if approve {
+                "游戏库新名称"
+            } else {
+                &original.name
+            }
+        );
+        if approve {
+            assert_eq!(result.payload["result"]["gameName"], game.name);
+        }
         next(&mut rx, "done").await;
+        assert_eq!(
+            agent
+                .events
+                .replay(&conv, 0, 200)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "approval-request")
+                .count(),
+            1
+        );
         job.await.unwrap();
     }
 }
@@ -251,7 +277,7 @@ async fn offline_mcp_evidence_validates_two_archive_layouts_without_touching_gam
     .await;
     let (agent, conversation, mut rx) = runtime(engine, &model_url);
 
-    // Exercise a recognized tokenizer profile at the default 32K context budget.
+    // Exercise the multi-sample tool flow with a GPT-family model.
     agent.settings.set("model", json!("gpt-4o-mini")).unwrap();
     let mut config = ServerConfig::http("fixture-catalog", "Offline catalog", &catalog_url);
     config.enabled = true;

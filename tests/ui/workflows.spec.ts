@@ -65,7 +65,7 @@ test("trash restore needs a visible plan and separate apply confirmation", async
   expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((c: any) => c.command === "apply_plan").length)).toBe(1);
 });
 
-test("permanent trash purge needs both acknowledgement and exact confirmation", async ({page}) => {
+test("permanent trash purge requires the acknowledgement switch to be on", async ({page}) => {
   await installMockTauri(page);
   await page.goto("/");
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
@@ -74,10 +74,29 @@ test("permanent trash purge needs both acknowledgement and exact confirmation", 
   await page.getByRole("button", {name: "永久删除所选", exact: true}).click();
   const dialog = page.getByRole("dialog", {name: "永久删除回收站文件", exact: true});
   const confirm = dialog.getByRole("button", {name: "永久删除", exact: true});
+  const acknowledgement = dialog.getByRole("switch", {name: "我确认永久删除以上文件，且无法再从回收站恢复。", exact: true});
+  await expect(dialog.getByRole("textbox")).toHaveCount(0);
+  await expect(acknowledgement).toHaveAttribute("aria-checked", "false");
   await expect(confirm).toBeDisabled();
-  await dialog.getByRole("textbox", {name: "永久删除确认文本", exact: true}).fill("PURGE_TRASH");
+  await acknowledgement.click();
+  await expect(acknowledgement).toHaveAttribute("aria-checked", "true");
+  await expect(confirm).toBeEnabled();
+  await dialog.getByRole("button", {name: "取消", exact: true}).click();
+  await expect(dialog).not.toBeVisible();
+  expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((c: any) => c.command === "purge_trash"))).toHaveLength(0);
+
+  await page.getByRole("button", {name: "永久删除所选", exact: true}).click();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("textbox")).toHaveCount(0);
+  await expect(acknowledgement).toHaveAttribute("aria-checked", "false");
   await expect(confirm).toBeDisabled();
-  await dialog.getByRole("checkbox").check();
+  await acknowledgement.click();
+  await expect(confirm).toBeEnabled();
+  await acknowledgement.press("Space");
+  await expect(acknowledgement).toHaveAttribute("aria-checked", "false");
+  await expect(confirm).toBeDisabled();
+  await acknowledgement.press("Space");
+  await expect(acknowledgement).toHaveAttribute("aria-checked", "true");
   await expect(confirm).toBeEnabled();
   await confirm.click();
   await expect(dialog).not.toBeVisible();
@@ -138,7 +157,7 @@ for (const theme of ["light", "dark"] as const) {
     await last.check();
     expect(await viewport.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
     await picker.getByRole("button", {name: "添加所选（1）"}).click();
-    await expect(page.getByLabel("fixture-model-80 上下文预算")).toHaveValue("32768");
+    await expect(page.getByLabel("fixture-model-80 实际请求模型")).toHaveValue("fixture-model-80");
     await expect(page.getByRole("button", {name: "保存设置", exact: true})).toBeEnabled();
   });
 }
@@ -588,8 +607,8 @@ test("directory picker scans only the chosen library without registering games",
   expect(calls.filter((call: any) => ["register_game", "identify_game", "register_user_root"].includes(call.command))).toHaveLength(0);
   expect(calls.filter((call: any) => call.command === "plugin:dialog|open")).toHaveLength(2);
   expect(calls.filter((call: any) => call.command === "scan_games").map((call: any) => call.args.options)).toEqual([
-    {userRoots: [], includeCommonRoots: true},
-    {userRoots: ["/sandbox/new-game"], includeCommonRoots: false},
+    {userRoots: [], includeCommonRoots: true, page: { requestId: expect.any(String) }},
+    {userRoots: ["/sandbox/new-game"], includeCommonRoots: false, page: { requestId: expect.any(String) }},
   ]);
 
   await directory.fill("/sandbox/empty  ");
@@ -597,123 +616,11 @@ test("directory picker scans only the chosen library without registering games",
   await expect(discovery.getByText(/未发现候选游戏/)).toBeVisible();
   await expect(adapted).toHaveCount(0);
   const lastScan = await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "scan_games").at(-1));
-  expect(lastScan.args.options).toEqual({userRoots: ["/sandbox/empty  "], includeCommonRoots: false});
+  expect(lastScan.args.options).toEqual({userRoots: ["/sandbox/empty  "], includeCommonRoots: false, page: { requestId: expect.any(String) }});
   await page.keyboard.press("Escape");
   await expect(discovery).toBeHidden();
   await expect(page.getByTestId("library-page")).toBeVisible();
 });
-
-test("local archive import and game installation have separate approvals", async ({page}) => {
-  await installMockTauri(page, {withExternalAdapter: true});
-  await page.goto("/");
-  await page.getByRole("button", {name: "游戏库", exact: true}).click();
-  await page.getByRole("button").filter({hasText: "Minecraft Java Edition"}).click();
-  await page.getByRole("button", {name: "安装归档", exact: true}).click();
-  await page.getByRole("button", {name: "导入本地归档", exact: true}).click();
-  const review = page.getByRole("dialog", {name: "确认文件变更", exact: true});
-  await expect(review).toContainText("导入本地归档到管理器");
-  await expect(review).not.toContainText("/sandbox/minecraft/mods");
-  expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((c: any) => c.command === "plan_install"))).toHaveLength(0);
-  await review.getByRole("button", {name: "批准并执行", exact: true}).click();
-  const install = page.getByRole("dialog", {name: "归档安装预览", exact: true});
-  await expect(install.getByLabel("管理器内归档路径", {exact: true})).toHaveValue("/sandbox/data/staging/imports/fixture/Fixture.jar");
-  await install.getByLabel("Mod 名称", {exact: true}).fill("Fixture");
-  await install.getByLabel("适配包 Mod 类型", {exact: true}).selectOption("java-mod");
-  await install.getByRole("button", {name: "生成变更预览", exact: true}).click();
-  await expect(review).toContainText("/sandbox/minecraft/mods/Fixture.jar");
-  await review.getByRole("button", {name: "取消", exact: true}).click();
-  const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
-  expect(calls.filter((c: any) => c.command === "apply_plan").map((c: any) => c.args.planId)).toEqual(["txn-import-fixture"]);
-  expect(calls.find((c: any) => c.command === "plan_install").args.request.expectedSha256).toBe("b".repeat(64));
-});
-
-async function openFomodInstall(page: Page) {
-  await page.getByRole("button").filter({hasText: "Minecraft Java Edition"}).click();
-  await page.getByRole("button", {name: "安装归档", exact: true}).click();
-  await page.getByRole("button", {name: "导入本地归档", exact: true}).click();
-  const importReview = page.getByRole("dialog", {name: "确认文件变更", exact: true});
-  await importReview.getByRole("button", {name: "批准并执行", exact: true}).click();
-  const install = page.getByRole("dialog", {name: "归档安装预览", exact: true});
-  await install.getByLabel("Mod 名称", {exact: true}).fill("Fixture FOMOD");
-  await install.getByLabel("适配包 Mod 类型", {exact: true}).selectOption("java-mod");
-  return install;
-}
-
-test("FOMOD preview requires an explicit option before sending mappings to install", async ({page}) => {
-  await installMockTauri(page, {withExternalAdapter: true});
-  await page.goto("/");
-  await page.getByRole("button", {name: "游戏库", exact: true}).click();
-  const install = await openFomodInstall(page);
-  await install.getByRole("button", {name: "扫描 FOMOD 配置", exact: true}).click();
-  await expect(install).toContainText("Fixture FOMOD");
-  await expect(install.getByRole("status").filter({hasText: "需要用户选择"})).toBeVisible();
-  await expect(install.getByRole("radio", {name: /HD/})).not.toBeChecked();
-  await expect(install.getByRole("radio", {name: /SD/})).not.toBeChecked();
-  await expect(install.getByRole("button", {name: "生成变更预览", exact: true })).toBeDisabled();
-  await install.getByRole("radio", {name: /HD/}).check();
-  await expect(install.getByRole("button", {name: "生成变更预览", exact: true })).toBeEnabled();
-  await install.getByRole("button", {name: "生成变更预览", exact: true}).click();
-  await expect(page.getByRole("dialog", {name: "确认文件变更", exact: true})).toContainText("/sandbox/minecraft/mods/Fixture.jar");
-  const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
-  const request = calls.find((call: any) => call.command === "plan_install").args.request;
-  expect(request.mappings).toEqual([
-    {source: "Data/base.esp", destination: "base.esp"},
-    {source: "Data/hd.dds", destination: "textures/fixture.dds"},
-  ]);
-  expect(calls.filter((call: any) => call.command === "apply_plan").map((call: any) => call.args.planId)).toEqual(["txn-import-fixture"]);
-});
-
-for (const theme of ["light", "dark"] as const) {
-  test(`safe FOMOD local archive previews deterministic mappings for review in ${theme} theme`, async ({page}) => {
-    await installMockTauri(page, {fomodSelection: "safe", withExternalAdapter: true});
-    await page.emulateMedia({colorScheme: theme});
-    await page.goto("/");
-    await page.getByRole("button", {name: "游戏库", exact: true}).click();
-    await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
-
-    const install = await openFomodInstall(page);
-    await install.getByRole("button", {name: "扫描 FOMOD 配置", exact: true}).click();
-    await expect(install.getByRole("status").filter({hasText: "已预选确定性选项"})).toBeVisible();
-    await expect(install.getByRole("checkbox", {name: "Terrain textures", exact: true})).toBeChecked();
-    await expect(install.getByRole("checkbox", {name: "Interface icons", exact: true})).toBeChecked();
-    await expect(install.getByRole("radio", {name: "Core plugin", exact: true})).toBeChecked();
-
-    const mappings = [
-      {source: "Data/base.esp", destination: "base.esp"},
-      {source: "Data/terrain.dds", destination: "textures/terrain.dds"},
-      {source: "Data/icons.dds", destination: "textures/ui/icons.dds"},
-      {source: "Data/core.esp", destination: "core.esp"},
-    ];
-    const table = install.getByRole("table", {name: "文件映射预览", exact: true});
-    await expect(table.getByRole("columnheader")).toHaveText(["归档源文件", "安装目标"]);
-    await expect(table.getByRole("cell")).toHaveCount(mappings.length * 2);
-    for (const {source, destination} of mappings) {
-      const row = table.getByRole("row").filter({has: page.getByRole("cell", {name: source, exact: true})});
-      await expect(row.getByRole("cell")).toHaveText([source, destination]);
-    }
-    expect(await install.locator('[data-slot="modal-body"]').evaluate(body => {
-      const bounds = body.getBoundingClientRect();
-      return bounds.left >= 0 && bounds.right <= innerWidth + 1 && body.scrollWidth <= body.clientWidth + 1;
-    })).toBe(true);
-
-    const installCalls = () => page.evaluate(() => (window as any).__AMM_TEST__.calls.filter(
-      (call: any) => ["plan_install", "apply_plan", "respond_approval"].includes(call.command),
-    ));
-    const importApproval = [{command: "apply_plan", args: {planId: "txn-import-fixture"}}];
-    const review = page.getByRole("dialog", {name: "确认文件变更", exact: true});
-    await expect(review).not.toBeVisible();
-    expect(await installCalls()).toEqual(importApproval);
-
-    const generate = install.getByRole("button", {name: "生成变更预览", exact: true});
-    await expect(generate).toBeEnabled();
-    await generate.click();
-    await expect(review.getByRole("button", {name: "批准并执行", exact: true})).toBeVisible();
-    expect(await installCalls()).toEqual([
-      ...importApproval,
-      {command: "plan_install", args: {request: expect.objectContaining({mappings})}},
-    ]);
-  });
-}
 
 test("installed mods distinguish exact download origins from legacy labels", async ({page}) => {
   await installMockTauri(page);
@@ -734,7 +641,7 @@ test("installed mods distinguish exact download origins from legacy labels", asy
     };
   });
   await page.getByRole('button').filter({hasText: 'Minecraft Java Edition'}).click();
-  await page.getByRole('tab', {name: '已装 Mod', exact: true}).click();
+  await page.getByRole('tab', {name: 'Mod 管理', exact: true}).click();
   const catalog = page.getByRole('row').filter({hasText: 'Catalog Fixture'});
   await expect(catalog).toContainText('1.0.0');
   await expect(catalog).toContainText('版本 ID：PINNED01');

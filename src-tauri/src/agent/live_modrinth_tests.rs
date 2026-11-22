@@ -95,12 +95,14 @@ fn model_reply(step: usize, request: &Value, game_id: &str) -> String {
             tool(
                 "download",
                 "download_mod",
-                json!({"resolution_id":resolution_id}),
+                json!({"resolution_id":resolution_id,"gameId":game_id}),
             )
         }
         3 => {
-            let artifact: DownloadArtifact =
-                serde_json::from_value(result(request, "download")).unwrap();
+            let receipt = result(request, "download");
+            let artifact: DownloadArtifact = serde_json::from_value(receipt.clone()).unwrap();
+            assert_eq!(receipt["artifactId"], artifact.id);
+            assert_eq!(receipt["gameId"], game_id);
             assert_eq!(artifact.filename, FILENAME);
             assert!(
                 artifact.integrity_verified
@@ -110,10 +112,9 @@ fn model_reply(step: usize, request: &Value, game_id: &str) -> String {
             assert_eq!(artifact.sha512, SHA512);
             tool(
                 "install",
-                "install_mod",
+                "install_library_mod",
                 json!({"request":{
-                    "gameId":game_id,"artifactPath":artifact.path,"filename":artifact.filename,
-                    "expectedSha256":artifact.sha256,"name":"Sodium","modType":"java-mod",
+                    "gameId":game_id,"artifactId":artifact.id,"mode":"adapter","modType":"java-mod",
                 }}),
             )
         }
@@ -123,7 +124,7 @@ fn model_reply(step: usize, request: &Value, game_id: &str) -> String {
         }
         5 => {
             let installed = result(request, "install");
-            let transaction = installed["plan"]["id"].as_str().unwrap();
+            let transaction = installed["transactionId"].as_str().unwrap();
             tool(
                 "rollback",
                 "rollback_transaction",
@@ -205,8 +206,13 @@ async fn opt_in_live_modrinth_agent_install_and_rollback() {
     let approval = next_live(&mut rx, "approval-request").await;
     assert_eq!(approval.turn_id, turn);
     assert!(artifacts::list(&app.engine.db).unwrap().is_empty());
+    let downloads = app.engine.paths.downloads();
+    assert_eq!(fs::read_dir(&downloads).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(downloads.join("incoming")).unwrap().count(), 0);
     assert_eq!(
-        fs::read_dir(app.engine.paths.downloads()).unwrap().count(),
+        fs::read_dir(app.engine.paths.mod_library())
+            .unwrap()
+            .count(),
         0
     );
     assert_eq!(fs::read(&dst).unwrap(), original);
@@ -232,7 +238,7 @@ async fn opt_in_live_modrinth_agent_install_and_rollback() {
     );
     let artifact = &record.artifact;
     let bytes = fs::read(&artifact.path).unwrap();
-    assert!(artifact.path.starts_with(app.engine.paths.downloads()));
+    assert!(artifact.path.starts_with(app.engine.paths.mod_library()));
     assert_eq!(bytes.len() as u64, SIZE);
     assert_eq!(hex::encode(Sha512::digest(&bytes)), SHA512);
     assert_eq!(
@@ -256,7 +262,7 @@ async fn opt_in_live_modrinth_agent_install_and_rollback() {
         util::sha256_file(&dst).unwrap()
     );
     assert_eq!(entry.source.as_ref().unwrap().sha256, artifact.sha256);
-    approve(&agent, &conv, &approval, "install_mod");
+    approve(&agent, &conv, &approval, "install_library_mod");
 
     let done = next_live(&mut rx, "done").await;
     assert_eq!(done.turn_id, turn);

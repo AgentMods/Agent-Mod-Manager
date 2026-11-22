@@ -1,4 +1,4 @@
-use super::client::{McpClient, McpTool, MAX_ARGUMENT_BYTES};
+use super::client::{McpClient, McpTool};
 use crate::{
     agent::{
         policy::Effect,
@@ -58,6 +58,10 @@ impl McpClient {
     ) -> AppResult<Vec<String>> {
         let tools = self.agent_tools(cancel).await?;
         let names = tools.iter().map(|tool| tool.definition().name).collect();
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        self.ensure_current()?;
         registry.register_batch(tools)?;
         Ok(names)
     }
@@ -83,10 +87,8 @@ impl AgentTool for McpAgentTool {
         if context.cancel.is_cancelled() {
             return Err(AppError::Cancelled);
         }
-        if !args.is_object() || serde_json::to_vec(args)?.len() > MAX_ARGUMENT_BYTES {
-            return Err(AppError::Invalid(
-                "Invalid or oversized MCP arguments".into(),
-            ));
+        if !args.is_object() {
+            return Err(AppError::Invalid("MCP 参数必须是对象".into()));
         }
         let mut server = self.client.server_config().clone();
         server.description = None;

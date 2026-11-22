@@ -2,7 +2,6 @@ use crate::{
     error::{AppError, AppResult},
     paths::safe_join,
     safe_fs::{self, StagingDirectory},
-    util,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -11,8 +10,136 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-pub const MAX_ENTRY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-pub const MAX_COMPRESSION_RATIO: u64 = 100;
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
+use tokio_util::sync::CancellationToken;
+
+#[path = "archive_zip.rs"]
+mod archive_zip;
+
+// Metadata consumes memory even for empty files; charge names and parents
+// separately from the byte limit for streamed payloads.
+const METADATA_BYTES: usize = 64 * 1024 * 1024;
+const SEVENZ_HEADER_KIB: usize = 4 * 1024;
+const SEVENZ_HEADER_INPUT_BYTES: u64 = 16 * 1024 * 1024;
+// The third-party 7z header decoder is opaque until it returns the block
+// inventory. Retain a separate time guard here, not on streaming file data.
+const SEVENZ_HEADER_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const SEVENZ_DICTIONARY_KIB: usize = 128 * 1024;
+const MAX_TAR_EXTENSION: u64 = 64 * 1024;
+const MAX_TAR_PADDING: u64 = 16 * 1024 * 1024;
+const TAR_FRAMING_BYTES: u64 = 128 * 1024 * 1024;
+static ARCHIVE_WORK: Mutex<()> = Mutex::new(());
+
+struct Work<'a> {
+    cancel: &'a CancellationToken,
+}
+impl<'a> Work<'a> {
+    fn new(cancel: &'a CancellationToken) -> Self {
+        Self { cancel }
+    }
+    fn check(&self) -> AppResult<()> {
+        if self.cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        Ok(())
+    }
+}
+
+/// A bounded, cancellable view of one physical archive. Real progress is
+/// measured in bytes, not by how quickly the filesystem or decoder runs.
+/// ZIP preflight and 7z metadata can seek and read an extent more than once;
+/// account for those reads too, so corrupt metadata cannot cause unbounded replay.
+struct CheckedInput<'a, R> {
+    inner: R,
+    work: &'a Work<'a>,
+    length: u64,
+    position: u64,
+    remaining_io: u64,
+}
+impl<'a, R> CheckedInput<'a, R> {
+    fn new(inner: R, work: &'a Work<'a>, length: u64) -> Self {
+        Self {
+            inner,
+            work,
+            length,
+            position: 0,
+            remaining_io: length.saturating_mul(4).saturating_add(128 * 1024),
+        }
+    }
+}
+impl<R: Read> Read for CheckedInput<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.work.check().map_err(std::io::Error::other)?;
+        let remaining = self.length - self.position;
+        if remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining_io == 0 {
+            return Err(std::io::Error::other("归档压缩数据重复读取超过字节预算"));
+        }
+        let len = remaining.min(self.remaining_io).min(buf.len() as u64) as usize;
+        let n = self.inner.read(&mut buf[..len])?;
+        self.position += n as u64;
+        self.remaining_io -= n as u64;
+        Ok(n)
+    }
+}
+impl<R: Seek> Seek for CheckedInput<'_, R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.work.check().map_err(std::io::Error::other)?;
+        let target = match pos {
+            SeekFrom::Start(target) => Some(target),
+            SeekFrom::End(delta) => self.length.checked_add_signed(delta),
+            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
+        }
+        .filter(|target| *target <= self.length)
+        .ok_or_else(|| std::io::Error::other("归档数据偏移超出文件范围"))?;
+        self.position = self.inner.seek(SeekFrom::Start(target))?;
+        Ok(self.position)
+    }
+}
+
+struct SevenZHeaderInput<R> {
+    inner: R,
+    started: Instant,
+    remaining: u64,
+}
+impl<R> SevenZHeaderInput<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            started: Instant::now(),
+            remaining: SEVENZ_HEADER_INPUT_BYTES,
+        }
+    }
+    fn check(&self) -> std::io::Result<()> {
+        if self.started.elapsed() > SEVENZ_HEADER_TIMEOUT {
+            return Err(std::io::Error::other("7z 归档头解析超时"));
+        }
+        Ok(())
+    }
+}
+impl<R: Read> Read for SevenZHeaderInput<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.check()?;
+        if self.remaining == 0 && !buf.is_empty() {
+            return Err(std::io::Error::other("7z 归档头超过压缩元数据读取预算"));
+        }
+        let len = self.remaining.min(buf.len() as u64) as usize;
+        let n = self.inner.read(&mut buf[..len])?;
+        self.remaining -= n as u64;
+        Ok(n)
+    }
+}
+impl<R: Seek> Seek for SevenZHeaderInput<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.check()?;
+        self.inner.seek(pos)
+    }
+}
 type WrittenFiles = Vec<(PathBuf, String)>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,15 +213,12 @@ fn detect_format_from(path: &Path, file: &mut File) -> AppResult<&'static str> {
 }
 
 fn check_entry(entry: &ArchiveEntry) -> AppResult<()> {
+    if entry.path.len() > 4096 || entry.path.split(['/', '\\']).count() > 128 {
+        return Err(unsafe_archive("归档条目路径过长或层级过深"));
+    }
     // Validate the original name before stripping a root can hide traversal.
     if !is_root_directory(entry) {
         safe_join(Path::new(""), &entry.path)?;
-    }
-    if entry.size > MAX_ENTRY_BYTES {
-        return Err(unsafe_archive(format!(
-            "{} 超过单文件上限 4 GiB",
-            entry.path
-        )));
     }
     if entry.is_dir && entry.size != 0 {
         return Err(unsafe_archive(format!("目录包含数据: {}", entry.path)));
@@ -120,7 +244,7 @@ fn check_declared(entries: &[ArchiveEntry], limit: u64) -> AppResult<()> {
             .checked_add(entry.size)
             .ok_or_else(|| unsafe_archive("归档大小溢出"))?;
         if total > limit {
-            return Err(unsafe_archive("总解压比超过 100:1"));
+            return Err(unsafe_archive("声明解压大小超过可用磁盘预算"));
         }
     }
     Ok(())
@@ -138,15 +262,15 @@ fn copy_bounded(
     writer: &mut dyn Write,
     name: &str,
     expected: u64,
-    entry_limit: u64,
     budget: &mut ReadBudget,
+    work: &Work<'_>,
 ) -> AppResult<()> {
     let mut actual = 0u64;
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let remaining = entry_limit
+        work.check()?;
+        let remaining = expected
             .saturating_sub(actual)
-            .min(expected.saturating_sub(actual))
             .min(budget.limit.saturating_sub(budget.total));
         let len = remaining.saturating_add(1).min(buf.len() as u64) as usize;
         let n = match reader.read(&mut buf[..len]) {
@@ -161,7 +285,7 @@ fn copy_bounded(
         }
         if n as u64 > remaining {
             return Err(unsafe_archive(format!(
-                "{name} 实际读取超过大小或总解压比限额"
+                "{name} 实际读取超过声明大小或可用磁盘预算"
             )));
         }
         actual += n as u64;
@@ -175,9 +299,14 @@ struct Processing<'a> {
     strip_root: Option<&'a str>,
     entries: Vec<ArchiveEntry>,
     written: WrittenFiles,
+    capture: Option<&'a BTreeMap<PathBuf, usize>>,
+    captured: BTreeMap<PathBuf, ArchiveMemberPrefix>,
     // Include implicit parents and case aliases for portable collision checks.
     names: HashMap<String, (PathBuf, bool)>,
     budget: ReadBudget,
+    disk: Option<safe_fs::DiskBudget<'a>>,
+    metadata_left: usize,
+    work: &'a Work<'a>,
 }
 
 impl<'a> Processing<'a> {
@@ -185,6 +314,7 @@ impl<'a> Processing<'a> {
         dest: Option<&'a StagingDirectory>,
         strip_root: Option<&'a str>,
         limit: u64,
+        work: &'a Work<'a>,
     ) -> AppResult<Self> {
         if let Some(root) = strip_root {
             let rel = safe_join(Path::new(""), root)?;
@@ -197,9 +327,24 @@ impl<'a> Processing<'a> {
             strip_root,
             entries: Vec::new(),
             written: Vec::new(),
+            capture: None,
+            captured: BTreeMap::new(),
             names: HashMap::new(),
             budget: ReadBudget { total: 0, limit },
+            disk: dest
+                .map(|d| safe_fs::DiskBudget::new(d.path()))
+                .transpose()?,
+            metadata_left: METADATA_BYTES,
+            work,
         })
+    }
+
+    fn metadata(&mut self, bytes: usize) -> AppResult<()> {
+        self.metadata_left = self
+            .metadata_left
+            .checked_sub(bytes)
+            .ok_or_else(|| unsafe_archive("归档路径与索引超过可用元数据预算"))?;
+        Ok(())
     }
 
     fn register(&mut self, path: &Path, is_dir: bool) -> AppResult<()> {
@@ -214,6 +359,10 @@ impl<'a> Processing<'a> {
                     return Err(unsafe_archive(format!("条目路径冲突: {}", path.display())));
                 }
             } else {
+                self.metadata(128 + key.len() + parts.as_os_str().len())?;
+                if let Some(disk) = &mut self.disk {
+                    disk.charge(4096)?;
+                }
                 self.names.insert(key, (parts.clone(), directory));
             }
         }
@@ -221,7 +370,15 @@ impl<'a> Processing<'a> {
     }
 
     fn entry(&mut self, entry: ArchiveEntry, reader: &mut dyn Read) -> AppResult<()> {
+        self.work.check()?;
         check_entry(&entry)?;
+        self.metadata(192 + entry.path.len() * 3)?;
+        if entry.size > self.budget.limit.saturating_sub(self.budget.total) {
+            return Err(unsafe_archive("声明解压大小超过可用磁盘预算"));
+        }
+        if let Some(disk) = &self.disk {
+            disk.require(entry.size)?;
+        }
         let relative = if is_root_directory(&entry) {
             String::new()
         } else {
@@ -238,6 +395,38 @@ impl<'a> Processing<'a> {
             self.register(&rel, entry.is_dir)?;
             Some(rel)
         };
+        if let (Some(capture), Some(relative), false) =
+            (self.capture, relative.as_ref(), entry.is_dir)
+        {
+            let capture_limit = capture.get(relative).copied();
+            self.metadata(128 + relative.as_os_str().len())?;
+            let mut proof = MemberProofWriter {
+                hash: Sha256::new(),
+                prefix: Vec::new(),
+                limit: capture_limit.unwrap_or_default(),
+            };
+            copy_bounded(
+                reader,
+                &mut proof,
+                &entry.path,
+                entry.size,
+                &mut self.budget,
+                self.work,
+            )?;
+            self.written
+                .push((relative.clone(), hex::encode(proof.hash.finalize())));
+            if capture_limit.is_some() {
+                self.captured.insert(
+                    relative.clone(),
+                    ArchiveMemberPrefix {
+                        truncated: entry.size > proof.prefix.len() as u64,
+                        prefix: proof.prefix,
+                    },
+                );
+            }
+            self.entries.push(entry);
+            return Ok(());
+        }
         let mut output = match (self.dest, relative.as_ref(), entry.is_dir) {
             (Some(dest), Some(relative), true) => {
                 dest.create_dir_all(relative)?;
@@ -257,13 +446,17 @@ impl<'a> Processing<'a> {
             Some((_, file)) => file,
             None => &mut sink,
         };
+        let mut writer = BudgetedWriter {
+            inner: writer,
+            disk: self.disk.as_mut(),
+        };
         copy_bounded(
             reader,
-            writer,
+            &mut writer,
             &entry.path,
             entry.size,
-            MAX_ENTRY_BYTES,
             &mut self.budget,
+            self.work,
         )?;
         writer.flush()?;
         if let Some((path, file)) = output {
@@ -271,6 +464,24 @@ impl<'a> Processing<'a> {
         }
         self.entries.push(entry);
         Ok(())
+    }
+}
+
+struct BudgetedWriter<'a, 'disk> {
+    inner: &'a mut dyn Write,
+    disk: Option<&'a mut safe_fs::DiskBudget<'disk>>,
+}
+impl Write for BudgetedWriter<'_, '_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Some(disk) = &mut self.disk {
+            disk.charge(buf.len() as u64)
+                .map_err(std::io::Error::other)?;
+        }
+        self.inner.write_all(buf)?;
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -291,18 +502,52 @@ impl Write for HashedOutput {
     }
 }
 
-fn process_zip(file: &mut File, processing: &mut Processing<'_>) -> AppResult<()> {
-    let mut zip = zip::ZipArchive::new(file)?;
+struct MemberProofWriter {
+    hash: Sha256,
+    prefix: Vec<u8>,
+    limit: usize,
+}
+
+impl Write for MemberProofWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.hash.update(bytes);
+        let take = self
+            .limit
+            .saturating_sub(self.prefix.len())
+            .min(bytes.len());
+        self.prefix.extend_from_slice(&bytes[..take]);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn process_zip(file: &mut (impl Read + Seek), processing: &mut Processing<'_>) -> AppResult<()> {
+    let (mut zip, count) = archive_zip::open(file)?;
+    let central = zip.central_directory_start();
+    let mut ranges = Vec::with_capacity(count);
     let mut entries = Vec::new();
     for i in 0..zip.len() {
         let entry = zip.by_index_raw(i)?;
         check_mode(entry.unix_mode().unwrap_or(0), entry.is_dir(), entry.name())?;
+        let end = entry
+            .data_start()
+            .checked_add(entry.compressed_size())
+            .filter(|end| *end <= central && entry.data_start() > entry.header_start())
+            .ok_or_else(|| unsafe_archive("ZIP 条目超出压缩数据范围"))?;
+        ranges.push((entry.header_start(), end));
         entries.push(ArchiveEntry {
             path: entry.name().to_string(),
             is_dir: entry.is_dir(),
             size: entry.size(),
             compressed_size: entry.compressed_size(),
         });
+    }
+    ranges.sort_unstable();
+    if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(unsafe_archive("ZIP 条目压缩数据重叠"));
     }
     check_declared(&entries, processing.budget.limit)?;
     for (i, entry) in entries.into_iter().enumerate() {
@@ -311,10 +556,31 @@ fn process_zip(file: &mut File, processing: &mut Processing<'_>) -> AppResult<()
     Ok(())
 }
 
-fn process_7z(file: &mut File, length: u64, processing: &mut Processing<'_>) -> AppResult<()> {
-    let mut reader = sevenz_rust::SevenZReader::new(file, length, sevenz_rust::Password::empty())
-        .map_err(|e| unsafe_archive(format!("7z 读取失败: {e}")))?;
-    let convert = |entry: &sevenz_rust::SevenZArchiveEntry| -> AppResult<ArchiveEntry> {
+fn process_7z(
+    file: &mut (impl Read + Seek),
+    length: u64,
+    processing: &mut Processing<'_>,
+    dictionary_kib: usize,
+) -> AppResult<()> {
+    let password = sevenz_rust2::Password::empty();
+    let archive = {
+        let mut header = SevenZHeaderInput::new(&mut *file);
+        let parsed = sevenz_rust2::Archive::read_with_memory_limit(
+            &mut header,
+            &password,
+            SEVENZ_HEADER_KIB,
+        );
+        header.check().map_err(|e| unsafe_archive(e.to_string()))?;
+        parsed.map_err(|e| unsafe_archive(format!("7z 头或字典超出解析能力: {e}")))?
+    };
+    archive
+        .pack_sizes()
+        .iter()
+        .try_fold(archive.pack_pos().saturating_add(32), |offset, size| {
+            offset.checked_add(*size).filter(|end| *end <= length)
+        })
+        .ok_or_else(|| unsafe_archive("7z 压缩流位于归档范围之外"))?;
+    let convert = |entry: &sevenz_rust2::ArchiveEntry| -> AppResult<ArchiveEntry> {
         if entry.is_anti_item
             || (entry.has_windows_attributes && entry.windows_attributes & (0x400 | 0x40) != 0)
         {
@@ -337,20 +603,42 @@ fn process_7z(file: &mut File, length: u64, processing: &mut Processing<'_>) -> 
             compressed_size: entry.compressed_size,
         })
     };
-    let entries = reader
-        .archive()
+    let entries = archive
         .files
         .iter()
         .map(convert)
         .collect::<AppResult<Vec<_>>>()?;
     check_declared(&entries, processing.budget.limit)?;
     let mut unpacked = 0u64;
-    for folder in &reader.archive().folders {
-        if folder.total_output_streams > folder.unpack_sizes.len() {
-            return Err(unsafe_archive("7z 解压流大小无效"));
+    for block in &archive.blocks {
+        // LZMA/LZMA2/BCJ(2) and BZip2 are decoded on one thread. The library
+        // limits each dictionary, not their sum; reject exotic stacks before
+        // they can combine many dictionaries or decoded intermediate streams.
+        let size = block.get_unpack_size();
+        let lzma_count = block
+            .coders
+            .iter()
+            .filter(|coder| {
+                matches!(
+                    coder.encoder_method_id(),
+                    [0x21] | [0x03, 0x01, 0x01] | [0x04, 0x02, 0x02]
+                )
+            })
+            .count();
+        if block.coders.len() > 8
+            || block
+                .coders
+                .iter()
+                .enumerate()
+                .any(|(i, _)| block.get_unpack_size_at_index(i) > size)
+        {
+            return Err(unsafe_archive("不支持具有额外解压工作量的 7z 编码结构"));
+        }
+        if lzma_count > 4 {
+            return Err(unsafe_archive("7z 解码器组合超过内存预算"));
         }
         unpacked = unpacked
-            .checked_add(folder.get_unpack_size())
+            .checked_add(size)
             .ok_or_else(|| unsafe_archive("7z 解压流大小溢出"))?;
     }
     let declared = entries
@@ -360,44 +648,62 @@ fn process_7z(file: &mut File, length: u64, processing: &mut Processing<'_>) -> 
     if unpacked != declared {
         return Err(unsafe_archive("7z 解压流大小与文件大小不符"));
     }
-    // High-level extraction creates a destination even with a custom callback.
-    // The reader API has no filesystem side effects.
-    reader
-        .for_each_entries(|entry, data| {
-            processing
-                .entry(
-                    convert(entry).map_err(|e| sevenz_rust::Error::other(e.to_string()))?,
-                    data,
+    for (index, block) in archive.blocks.iter().enumerate() {
+        processing.work.check()?;
+        let dictionaries = block
+            .coders
+            .iter()
+            .filter(|coder| {
+                matches!(
+                    coder.encoder_method_id(),
+                    [0x21] | [0x03, 0x01, 0x01] | [0x04, 0x02, 0x02]
                 )
-                .map_err(|e| sevenz_rust::Error::other(e.to_string()))?;
+            })
+            .count()
+            .max(1);
+        let mut failure = None;
+        let decoded = sevenz_rust2::BlockDecoder::new_with_memory_limit(
+            1,
+            dictionary_kib / dictionaries,
+            index,
+            &archive,
+            &password,
+            file,
+        )
+        .for_each_entries(&mut |entry, data| {
+            if let Err(error) = convert(entry).and_then(|entry| processing.entry(entry, data)) {
+                failure = Some(error);
+                return Err(sevenz_rust2::Error::Other("entry rejected".into()));
+            }
             Ok(true)
-        })
-        .map_err(|e| unsafe_archive(format!("7z 读取失败: {e}")))
-}
-
-/// Bound the whole tar stream, including PAX metadata and trailing padding.
-struct LimitedReader<R> {
-    inner: R,
-    remaining: u64,
-}
-
-impl<R: Read> Read for LimitedReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let len = self.remaining.saturating_add(1).min(buf.len() as u64) as usize;
-        let n = self.inner.read(&mut buf[..len])?;
-        if n as u64 > self.remaining {
-            return Err(std::io::Error::other("tar 实际解压比超过 100:1"));
+        });
+        if let Some(error) = failure {
+            return Err(error);
         }
-        self.remaining -= n as u64;
-        Ok(n)
+        decoded.map_err(|e| unsafe_archive(format!("7z 解码或字典限制: {e}")))?;
     }
+    for (entry, block) in entries
+        .into_iter()
+        .zip(&archive.stream_map.file_block_index)
+    {
+        if block.is_none() {
+            processing.entry(entry, &mut std::io::empty())?;
+        }
+    }
+    if processing.budget.total != declared || processing.entries.len() != archive.files.len() {
+        return Err(unsafe_archive("7z 实际条目清单与声明不符"));
+    }
+    Ok(())
 }
 
-fn process_tar(file: &mut File, processing: &mut Processing<'_>) -> AppResult<()> {
+// TAR metadata is small, but the tar iterator buffers GNU/PAX records before
+// it exposes the next member. Read the 512-byte framing ourselves so an
+// untrusted extension cannot force a payload-sized allocation.
+fn process_tar(file: &mut (impl Read + Seek), processing: &mut Processing<'_>) -> AppResult<()> {
     let mut magic = [0u8; 6];
     let n = file.read(&mut magic)?;
-    file.seek(SeekFrom::Start(0))?;
-    let reader: Box<dyn Read + '_> = if magic[..n].starts_with(b"\x1f\x8b") {
+    file.rewind()?;
+    let mut reader: Box<dyn Read + '_> = if magic[..n].starts_with(b"\x1f\x8b") {
         Box::new(flate2::read::MultiGzDecoder::new(file))
     } else if magic[..n].starts_with(b"BZh") {
         Box::new(bzip2::read::MultiBzDecoder::new(file))
@@ -406,34 +712,129 @@ fn process_tar(file: &mut File, processing: &mut Processing<'_>) -> AppResult<()
     } else {
         Box::new(file)
     };
-    let mut archive = tar::Archive::new(LimitedReader {
-        inner: reader,
-        remaining: processing.budget.limit,
-    });
-    for entry in archive
-        .entries()
-        .map_err(|e| unsafe_archive(e.to_string()))?
-    {
-        let mut entry = entry.map_err(|e| unsafe_archive(e.to_string()))?;
-        let name = std::str::from_utf8(&entry.path_bytes())
-            .map_err(|_| unsafe_archive("tar 条目名不是 UTF-8"))?
-            .to_string();
-        let kind = entry.header().entry_type();
-        if !kind.is_file() && !kind.is_dir() {
-            return Err(unsafe_archive(format!(
-                "tar 链接、设备或特殊条目被拒绝: {name}"
-            )));
+    let mut framing = TAR_FRAMING_BYTES;
+    let mut charge_framing = |bytes| {
+        framing = framing
+            .checked_sub(bytes)
+            .ok_or_else(|| unsafe_archive("tar 扩展头与填充超过元数据预算"))?;
+        Ok::<_, AppError>(())
+    };
+    let mut pending_name = None;
+    let mut pending_size = None;
+    let mut pax = false;
+    let mut header = tar::Header::new_old();
+    let mut padding = [0; 512];
+    loop {
+        processing.work.check()?;
+        charge_framing(512)?;
+        reader.read_exact(header.as_mut_bytes())?;
+        let raw = header.as_bytes();
+        if raw.iter().all(|&byte| byte == 0) {
+            break;
         }
-        let info = ArchiveEntry {
-            path: name,
-            is_dir: kind.is_dir(),
-            size: entry.size(),
-            compressed_size: 0,
+        let checksum = raw[..148]
+            .iter()
+            .chain(&raw[156..])
+            .map(|&b| u32::from(b))
+            .sum::<u32>()
+            + 8 * 32;
+        if header.cksum()? != checksum {
+            return Err(unsafe_archive("tar 头校验和不符"));
+        }
+        let kind = header.entry_type();
+        let size = if kind.is_gnu_longname() || kind.is_pax_local_extensions() {
+            let size = header.entry_size()?;
+            if size > MAX_TAR_EXTENSION {
+                return Err(unsafe_archive("tar 扩展头超过元数据预算"));
+            }
+            charge_framing(size)?;
+            let mut data = vec![0; size as usize];
+            reader.read_exact(&mut data)?;
+            if kind.is_gnu_longname() {
+                if pending_name.is_some() {
+                    return Err(unsafe_archive("tar 条目名称重复声明"));
+                }
+                if data.last() == Some(&0) {
+                    data.pop();
+                }
+                pending_name = Some(data);
+            } else {
+                if pax {
+                    return Err(unsafe_archive("tar PAX 头重复"));
+                }
+                pax = true;
+                for extension in tar::PaxExtensions::new(&data) {
+                    let extension = extension?;
+                    match extension.key_bytes() {
+                        b"path" if pending_name.is_none() => {
+                            pending_name = Some(extension.value_bytes().to_vec())
+                        }
+                        b"size" if pending_size.is_none() => {
+                            pending_size = Some(
+                                extension
+                                    .value()
+                                    .ok()
+                                    .and_then(|x| x.parse::<u64>().ok())
+                                    .ok_or_else(|| unsafe_archive("tar PAX 大小无效"))?,
+                            );
+                        }
+                        b"path" | b"size" | b"linkpath" | b"SCHILY.realsize" => {
+                            return Err(unsafe_archive("tar PAX 路径或大小重复/不受支持"))
+                        }
+                        key if key.starts_with(b"GNU.sparse") => {
+                            return Err(unsafe_archive("不支持稀疏 tar 条目"))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            size
+        } else {
+            if !kind.is_file() && !kind.is_dir() {
+                return Err(unsafe_archive("tar 链接、设备或特殊条目被拒绝"));
+            }
+            let path = pending_name
+                .take()
+                .unwrap_or_else(|| header.path_bytes().into_owned());
+            let size = pending_size.take().unwrap_or(header.entry_size()?);
+            pax = false;
+            let path =
+                String::from_utf8(path).map_err(|_| unsafe_archive("tar 条目名不是 UTF-8"))?;
+            processing.entry(
+                ArchiveEntry {
+                    path,
+                    is_dir: kind.is_dir(),
+                    size,
+                    compressed_size: 0,
+                },
+                &mut (&mut reader).take(size),
+            )?;
+            size
         };
-        processing.entry(info, &mut entry)?;
+        let padded = ((512 - size % 512) % 512) as usize;
+        charge_framing(padded as u64)?;
+        reader.read_exact(&mut padding[..padded])?;
+        if padding[..padded].iter().any(|&byte| byte != 0) {
+            return Err(unsafe_archive("tar 条目填充包含非零数据"));
+        }
     }
-    std::io::copy(&mut archive.into_inner(), &mut std::io::sink())
-        .map_err(|e| unsafe_archive(e.to_string()))?;
+    if pax || pending_name.is_some() || pending_size.is_some() {
+        return Err(unsafe_archive("tar 扩展头没有对应条目"));
+    }
+    // Consume only real zero padding and validate the gzip/bzip2 trailer(s).
+    let mut tail = 0;
+    let mut buf = [0; 64 * 1024];
+    loop {
+        processing.work.check()?;
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        tail += n as u64;
+        if tail > MAX_TAR_PADDING || buf[..n].iter().any(|&byte| byte != 0) {
+            return Err(unsafe_archive("tar 结束标记后有非零数据或异常填充"));
+        }
+    }
     Ok(())
 }
 
@@ -442,47 +843,182 @@ fn process<'a>(
     format: &str,
     dest: Option<&'a StagingDirectory>,
     strip_root: Option<&'a str>,
+    limit: u64,
+    work: &'a Work<'a>,
 ) -> AppResult<Processing<'a>> {
+    process_with_capture(file, format, dest, strip_root, limit, work, None)
+}
+
+fn process_with_capture<'a>(
+    file: &mut File,
+    format: &str,
+    dest: Option<&'a StagingDirectory>,
+    strip_root: Option<&'a str>,
+    limit: u64,
+    work: &'a Work<'a>,
+    capture: Option<&'a BTreeMap<PathBuf, usize>>,
+) -> AppResult<Processing<'a>> {
+    // ZIP indexes and 7z dictionaries have bounded but nontrivial memory.
+    // Do not let concurrent previews multiply that budget without bound.
+    let _slot = loop {
+        work.check()?;
+        match ARCHIVE_WORK.try_lock() {
+            Ok(slot) => break slot,
+            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+        }
+    };
     file.rewind()?;
     let length = file.metadata()?.len();
-    let mut processing = Processing::new(
-        dest,
-        strip_root,
-        length.saturating_mul(MAX_COMPRESSION_RATIO),
-    )?;
-    match format {
-        "zip" => process_zip(file, &mut processing)?,
-        "7z" => process_7z(file, length, &mut processing)?,
-        _ => process_tar(file, &mut processing)?,
+    let mut input = CheckedInput::new(&mut *file, work, length);
+    let mut processing = Processing::new(dest, strip_root, limit, work)?;
+    processing.capture = capture;
+    let result = match format {
+        "zip" => process_zip(&mut input, &mut processing),
+        "7z" => process_7z(&mut input, length, &mut processing, SEVENZ_DICTIONARY_KIB),
+        _ => process_tar(&mut input, &mut processing),
+    };
+    work.check()?;
+    result?;
+    if file.metadata()?.len() != length {
+        return Err(AppError::Conflict("归档文件长度在读取期间已变化".into()));
     }
     Ok(processing)
 }
 
+fn disk_space_for(path: &Path) -> AppResult<u64> {
+    safe_fs::available_data_space(
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )
+}
+
 pub fn list_zip(path: &Path) -> AppResult<Vec<ArchiveEntry>> {
-    Ok(process(&mut safe_fs::open_regular(path)?, "zip", None, None)?.entries)
+    Ok(process(
+        &mut safe_fs::open_regular(path)?,
+        "zip",
+        None,
+        None,
+        disk_space_for(path)?,
+        &Work::new(&CancellationToken::new()),
+    )?
+    .entries)
 }
 
 pub fn list_7z(path: &Path) -> AppResult<Vec<ArchiveEntry>> {
-    Ok(process(&mut safe_fs::open_regular(path)?, "7z", None, None)?.entries)
+    Ok(process(
+        &mut safe_fs::open_regular(path)?,
+        "7z",
+        None,
+        None,
+        disk_space_for(path)?,
+        &Work::new(&CancellationToken::new()),
+    )?
+    .entries)
 }
 
 pub fn list_tar_gz(path: &Path) -> AppResult<Vec<ArchiveEntry>> {
-    Ok(process(&mut safe_fs::open_regular(path)?, "tar", None, None)?.entries)
+    Ok(process(
+        &mut safe_fs::open_regular(path)?,
+        "tar",
+        None,
+        None,
+        disk_space_for(path)?,
+        &Work::new(&CancellationToken::new()),
+    )?
+    .entries)
 }
 
 pub fn list_archive(path: &Path) -> AppResult<ArchiveListing> {
-    let mut file = safe_fs::open_regular(path)?;
-    let format = detect_format_from(path, &mut file)?;
-    build_listing(format, process(&mut file, format, None, None)?.entries)
+    list_archive_cancellable(path, &CancellationToken::new())
 }
 
-pub(crate) fn list_verified_archive(path: &Path, expected: &str) -> AppResult<ArchiveListing> {
+pub(crate) fn list_archive_cancellable(
+    path: &Path,
+    cancel: &CancellationToken,
+) -> AppResult<ArchiveListing> {
     let mut file = safe_fs::open_regular(path)?;
-    verify_open_file(&mut file, expected)?;
     let format = detect_format_from(path, &mut file)?;
-    let listing = build_listing(format, process(&mut file, format, None, None)?.entries)?;
-    verify_open_file(&mut file, expected)?;
+    let work = Work::new(cancel);
+    build_listing(
+        format,
+        process(&mut file, format, None, None, disk_space_for(path)?, &work)?.entries,
+    )
+}
+
+pub(crate) fn list_verified_archive(
+    path: &Path,
+    expected: &str,
+    cancel: &CancellationToken,
+) -> AppResult<ArchiveListing> {
+    let work = Work::new(cancel);
+    let mut file = safe_fs::open_regular(path)?;
+    verify_open_file_with_work(&mut file, expected, &work)?;
+    let format = detect_format_from(path, &mut file)?;
+    let listing = build_listing(
+        format,
+        process(&mut file, format, None, None, disk_space_for(path)?, &work)?.entries,
+    )?;
+    verify_open_file_with_work(&mut file, expected, &work)?;
     Ok(listing)
+}
+
+pub(crate) struct ArchiveMemberPrefix {
+    pub(crate) prefix: Vec<u8>,
+    pub(crate) truncated: bool,
+}
+
+pub(crate) struct VerifiedArchiveMembers {
+    pub(crate) listing: ArchiveListing,
+    pub(crate) hashes: BTreeMap<PathBuf, String>,
+    pub(crate) captured: BTreeMap<PathBuf, ArchiveMemberPrefix>,
+}
+
+/// Verify and hash all normalized regular members using the same parsers and
+/// budgets as extraction, but never write. Optional text previews retain only
+/// the requested prefixes; validation still consumes whole archive members.
+pub(crate) fn verify_archive_members(
+    path: &Path,
+    expected: &str,
+    capture: &BTreeMap<PathBuf, usize>,
+    cancel: &CancellationToken,
+) -> AppResult<VerifiedArchiveMembers> {
+    const MAX_PREFIX_BYTES: usize = 512 * 1024;
+    if capture.len() > 8
+        || capture
+            .values()
+            .try_fold(0usize, |total, bytes| total.checked_add(*bytes))
+            .is_none_or(|total| total > MAX_PREFIX_BYTES)
+    {
+        return Err(unsafe_archive("归档预览超过保留字节预算"));
+    }
+    let work = Work::new(cancel);
+    let mut file = safe_fs::open_regular(path)?;
+    safe_fs::verify_regular_at(&file, path)?;
+    verify_open_file_with_work(&mut file, expected, &work)?;
+    let format = detect_format_from(path, &mut file)?;
+    let proof = process_with_capture(
+        &mut file,
+        format,
+        None,
+        None,
+        disk_space_for(path)?,
+        &work,
+        Some(capture),
+    )?;
+    verify_open_file_with_work(&mut file, expected, &work)?;
+    safe_fs::verify_regular_at(&file, path)?;
+    if proof.captured.len() != capture.len() {
+        return Err(AppError::NotFound("归档缺少请求的普通文件成员".into()));
+    }
+    Ok(VerifiedArchiveMembers {
+        listing: build_listing(format, proof.entries)?,
+        hashes: proof.written.into_iter().collect(),
+        captured: proof.captured,
+    })
 }
 
 fn build_listing(format: &str, entries: Vec<ArchiveEntry>) -> AppResult<ArchiveListing> {
@@ -510,7 +1046,7 @@ fn build_listing(format: &str, entries: Vec<ArchiveEntry>) -> AppResult<ArchiveL
 }
 
 /// Validate without writes, then extract exclusively into a newly created directory.
-/// A write failure retains the partial staging directory for inspection/trash.
+/// A write failure discards the owned partial staging directory.
 pub fn extract_archive(
     path: &Path,
     dest: &Path,
@@ -531,40 +1067,133 @@ fn extract_open_file(
     dest: &Path,
     strip_root: Option<&str>,
 ) -> AppResult<(ArchiveListing, WrittenFiles)> {
-    let listing = build_listing(format, process(file, format, None, strip_root)?.entries)?;
+    let (listing, written, mut cleanup) = extract_open_file_with_work(
+        file,
+        format,
+        dest,
+        strip_root,
+        None,
+        &Work::new(&CancellationToken::new()),
+    )?;
+    cleanup.keep();
+    Ok((listing, written))
+}
+
+fn extract_open_file_with_work(
+    file: &mut File,
+    format: &str,
+    dest: &Path,
+    strip_root: Option<&str>,
+    expected: Option<&str>,
+    work: &Work<'_>,
+) -> AppResult<(ArchiveListing, WrittenFiles, safe_fs::StagingCleanup)> {
+    let limit = disk_space_for(dest)?;
+    let preflight = process(file, format, None, strip_root, limit, work)?;
+    let listing = build_listing(format, preflight.entries)?;
+    let path_count = preflight.names.len() as u64;
+    drop(preflight.names);
+    let estimate = listing
+        .total_size
+        .checked_add(path_count.saturating_mul(4096))
+        .ok_or_else(|| unsafe_archive("归档磁盘预算溢出"))?;
+    if estimate > disk_space_for(dest)? {
+        return Err(unsafe_archive("磁盘空间不足，无法创建解压暂存"));
+    }
+    work.check()?;
+    // Release the held staging descriptor before attempting removal on Windows.
+    let cleanup;
     let staging = StagingDirectory::create(dest)?;
-    let output = process(file, format, Some(&staging), strip_root)?;
+    cleanup = staging.cleanup_guard()?;
+    let output = process(file, format, Some(&staging), strip_root, limit, work)?;
     if listing.entries != output.entries {
         return Err(AppError::Conflict("归档内容在预检和解压之间已变化".into()));
     }
+    let written = output.written;
+    if let Some(expected) = expected {
+        verify_open_file_with_work(file, expected, work)?;
+    }
     staging.verify_path()?;
-    Ok((listing, output.written))
+    work.check()?;
+    Ok((listing, written, cleanup))
 }
 
 pub(crate) struct VerifiedExtraction {
     pub(crate) listing: ArchiveListing,
     pub(crate) files: BTreeMap<PathBuf, String>,
+    pub(crate) cleanup: safe_fs::StagingCleanup,
 }
 
+#[cfg(test)]
 pub(crate) fn extract_verified_archive(
     path: &Path,
     dest: &Path,
     expected_sha256: &str,
 ) -> AppResult<VerifiedExtraction> {
+    let mut extraction = extract_verified_archive_cancellable(
+        path,
+        dest,
+        expected_sha256,
+        &CancellationToken::new(),
+    )?;
+    extraction.cleanup.keep();
+    Ok(extraction)
+}
+
+pub(crate) fn extract_verified_archive_cancellable(
+    path: &Path,
+    dest: &Path,
+    expected_sha256: &str,
+    cancel: &CancellationToken,
+) -> AppResult<VerifiedExtraction> {
+    let work = Work::new(cancel);
     let mut file = safe_fs::open_regular(path)?;
-    verify_open_file(&mut file, expected_sha256)?;
+    verify_open_file_with_work(&mut file, expected_sha256, &work)?;
     let format = detect_format_from(path, &mut file)?;
-    let (listing, written) = extract_open_file(&mut file, format, dest, None)?;
-    verify_open_file(&mut file, expected_sha256)?;
+    let (listing, written, cleanup) =
+        extract_open_file_with_work(&mut file, format, dest, None, Some(expected_sha256), &work)?;
     Ok(VerifiedExtraction {
         listing,
         files: written.into_iter().collect(),
+        cleanup,
     })
 }
 
+#[cfg(all(test, unix))]
 fn verify_open_file(file: &mut File, expected: &str) -> AppResult<()> {
+    verify_open_file_with_work(file, expected, &Work::new(&CancellationToken::new()))
+}
+
+pub(crate) fn hash_file_cancellable(path: &Path, cancel: &CancellationToken) -> AppResult<String> {
+    hash_open_file(&mut safe_fs::open_regular(path)?, &Work::new(cancel))
+}
+
+fn hash_open_file(file: &mut File, work: &Work<'_>) -> AppResult<String> {
+    let expected = file.metadata()?.len();
     file.rewind()?;
-    if !util::sha256_reader(file)?.eq_ignore_ascii_case(expected) {
+    let mut digest = Sha256::new();
+    let mut buf = [0; 64 * 1024];
+    let mut remaining = expected;
+    let changed = || AppError::Conflict("载荷文件长度在完整性校验期间已变化".into());
+    while remaining > 0 {
+        work.check()?;
+        let len = remaining.min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..len])?;
+        if n == 0 {
+            return Err(changed());
+        }
+        remaining -= n as u64;
+        digest.update(&buf[..n]);
+    }
+    work.check()?;
+    if file.read(&mut buf[..1])? != 0 || file.metadata()?.len() != expected {
+        return Err(changed());
+    }
+    file.rewind()?;
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn verify_open_file_with_work(file: &mut File, expected: &str, work: &Work<'_>) -> AppResult<()> {
+    if !hash_open_file(file, work)?.eq_ignore_ascii_case(expected) {
         return Err(AppError::Conflict(
             "载荷 SHA-256 在归档验证期间已变化".into(),
         ));
@@ -668,64 +1297,90 @@ mod tests {
     }
 
     #[test]
-    fn highly_compressed_zip_is_rejected() {
+    fn high_ratio_zip_is_admitted_only_with_payload_budget() {
         let dir = fixture_dir();
         let path = dir.path().join("bomb.zip");
         zip_file(&path, &[("bomb", &vec![0; 1024 * 1024])], true);
-        assert!(matches!(
-            list_archive(&path),
-            Err(AppError::UnsafeArchive(_))
-        ));
+        assert_eq!(list_archive(&path).unwrap().total_size, 1024 * 1024);
+        let cancel = CancellationToken::new();
+        assert!(process(
+            &mut File::open(&path).unwrap(),
+            "zip",
+            None,
+            None,
+            1024,
+            &Work::new(&cancel)
+        )
+        .is_err());
         let dest = dir.path().join("out");
-        assert!(extract_archive(&path, &dest, None).is_err());
-        assert!(!dest.exists());
+        assert_eq!(
+            extract_archive(&path, &dest, None).unwrap(),
+            [dest.join("bomb")]
+        );
     }
 
     #[test]
-    fn actual_reads_enforce_entry_and_total_limits_and_declared_size() {
-        for (declared, entry_limit, total_limit, data) in [
-            (9, 8, 100, b"123456789".as_slice()),
-            (9, 100, 8, b"123456789".as_slice()),
-            (8, 100, 100, b"123456789".as_slice()),
-            (10, 100, 100, b"123456789".as_slice()),
-        ] {
+    fn actual_reads_enforce_declared_size_and_disk_budget() {
+        let cancel = CancellationToken::new();
+        let work = Work::new(&cancel);
+        for (declared, total_limit) in [(9, 8), (8, 100), (10, 100)] {
             let mut output = Vec::new();
             assert!(copy_bounded(
-                &mut &*data,
+                &mut &b"123456789"[..],
                 &mut output,
-                "bomb",
+                "entry",
                 declared,
-                entry_limit,
                 &mut ReadBudget {
                     total: 0,
                     limit: total_limit
-                }
+                },
+                &work
             )
             .is_err());
-            assert!(output.len() as u64 <= entry_limit.min(total_limit).min(declared));
+            assert!(output.len() as u64 <= declared.min(total_limit));
         }
-        let entry = ArchiveEntry {
-            path: "huge".into(),
-            is_dir: false,
-            size: MAX_ENTRY_BYTES + 1,
-            compressed_size: 1,
-        };
-        assert!(check_entry(&entry).is_err());
-        let mut output = Vec::new();
         let mut budget = ReadBudget {
             total: 99,
             limit: 100,
         };
         assert!(copy_bounded(
             &mut &b"ab"[..],
-            &mut output,
+            &mut std::io::sink(),
             "second",
             2,
-            MAX_ENTRY_BYTES,
-            &mut budget
+            &mut budget,
+            &work
         )
         .is_err());
-        assert!(output.is_empty());
+        assert_eq!(budget.total, 99);
+    }
+
+    #[test]
+    fn entry_sizes_above_four_gib_are_counted_as_u64() {
+        const SIZE: u64 = 4 * 1024 * 1024 * 1024 + 17;
+        let entry = ArchiveEntry {
+            path: "large.bin".into(),
+            is_dir: false,
+            size: SIZE,
+            compressed_size: SIZE,
+        };
+        assert!(check_declared(&[entry], SIZE).is_ok());
+        // Synthesize repeated bytes directly into the bounded reader; no giant fixture or disk write.
+        let cancel = CancellationToken::new();
+        let mut budget = ReadBudget {
+            total: 0,
+            limit: SIZE,
+        };
+        copy_bounded(
+            &mut std::io::repeat(0).take(SIZE),
+            &mut std::io::sink(),
+            "large.bin",
+            SIZE,
+            &mut budget,
+            &Work::new(&cancel),
+        )
+        .unwrap();
+        assert_eq!(budget.total, SIZE);
     }
 
     fn tar_file(
@@ -770,7 +1425,7 @@ mod tests {
             ("char", tar::EntryType::Char, 0),
             ("block", tar::EntryType::Block, 0),
             ("fifo", tar::EntryType::Fifo, 0),
-            ("huge", tar::EntryType::Regular, MAX_ENTRY_BYTES + 1),
+            ("huge", tar::EntryType::Regular, 4 * 1024 * 1024 * 1024 + 1),
         ]
         .into_iter()
         .enumerate()
@@ -816,12 +1471,16 @@ mod tests {
             &vec![0; 1024 * 1024],
             true,
         );
-        assert!(list_archive(&path).is_err());
+        assert_eq!(list_archive(&path).unwrap().total_size, 1024 * 1024);
         // tar iteration stops at the end marker; the gzip stream must still
         // be drained under its budget, including concatenated gzip members.
         tar_file(&path, "small", tar::EntryType::Regular, 0, b"", true);
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-        encoder.write_all(&vec![0; 1024 * 1024]).unwrap();
+        std::io::copy(
+            &mut std::io::repeat(0).take(MAX_TAR_PADDING + 1),
+            &mut encoder,
+        )
+        .unwrap();
         OpenOptions::new()
             .append(true)
             .open(&path)
@@ -832,13 +1491,45 @@ mod tests {
     }
 
     fn sevenz_file(path: &Path, name: &str, attributes: Option<u32>, data: &[u8]) {
-        let mut writer = sevenz_rust::SevenZWriter::create(path).unwrap();
-        let mut entry = sevenz_rust::SevenZArchiveEntry::new();
+        let mut writer = sevenz_rust2::ArchiveWriter::create(path).unwrap();
+        let mut entry = sevenz_rust2::ArchiveEntry::new();
         entry.name = name.into();
         entry.has_windows_attributes = attributes.is_some();
         entry.windows_attributes = attributes.unwrap_or(0);
         writer.push_archive_entry(entry, Some(data)).unwrap();
         writer.finish().unwrap();
+    }
+
+    #[test]
+    fn solid_sevenz_is_streamed_and_requires_a_bounded_dictionary() {
+        let dir = fixture_dir();
+        let path = dir.path().join("solid.7z");
+        let data = vec![0u8; 512 * 1024];
+        let mut writer = sevenz_rust2::ArchiveWriter::create(&path).unwrap();
+        writer
+            .push_archive_entries(
+                ["left.bin", "right.bin"]
+                    .into_iter()
+                    .map(sevenz_rust2::ArchiveEntry::new_file)
+                    .collect(),
+                [data.as_slice(), data.as_slice()]
+                    .into_iter()
+                    .map(sevenz_rust2::SourceReader::new)
+                    .collect(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        let listing = list_archive(&path).unwrap();
+        assert_eq!(listing.total_size, 2 * data.len() as u64);
+        assert_eq!(listing.entries.len(), 2);
+        let mut file = File::open(&path).unwrap();
+        let length = file.metadata().unwrap().len();
+        let cancel = CancellationToken::new();
+        let work = Work::new(&cancel);
+        let mut processing = Processing::new(None, None, u64::MAX, &work).unwrap();
+        let err = process_7z(&mut file, length, &mut processing, 1).unwrap_err();
+        assert!(err.to_string().contains("7z 解码或字典限制"), "{err}");
+        assert!(processing.entries.is_empty());
     }
 
     #[test]
@@ -892,8 +1583,8 @@ mod tests {
             assert!(!dest.exists());
         }
         let path = dir.path().join("bomb.7z");
-        sevenz_file(&path, "bomb", None, &vec![0; 1024 * 1024]);
-        assert!(list_archive(&path).is_err());
+        sevenz_file(&path, "compressed", None, &vec![0; 1024 * 1024]);
+        assert_eq!(list_archive(&path).unwrap().total_size, 1024 * 1024);
     }
 
     #[test]
@@ -934,7 +1625,121 @@ mod tests {
     }
 
     #[test]
-    fn total_ratio_is_exact_and_allows_a_high_ratio_member_in_a_safe_archive() {
+    fn archive_progress_checks_real_extent_replays_and_cancellation() {
+        let token = CancellationToken::new();
+        let work = Work::new(&token);
+        let mut input = CheckedInput::new(std::io::Cursor::new(b"123456"), &work, 4);
+        input.remaining_io = 6;
+        let mut data = [0; 8];
+        assert_eq!(input.read(&mut data).unwrap(), 4);
+        assert_eq!(&data[..4], b"1234");
+        assert_eq!(input.read(&mut data).unwrap(), 0);
+        assert_eq!(input.seek(SeekFrom::End(0)).unwrap(), 4);
+        assert!(input.seek(SeekFrom::End(1)).is_err());
+        input.rewind().unwrap();
+        assert_eq!(input.read(&mut data).unwrap(), 2);
+        assert!(input
+            .read(&mut data)
+            .unwrap_err()
+            .to_string()
+            .contains("重复读取超过字节预算"));
+        token.cancel();
+        assert!(matches!(work.check(), Err(AppError::Cancelled)));
+        assert!(input.rewind().unwrap_err().to_string().contains("已取消"));
+    }
+
+    #[test]
+    fn zip_rejects_overlapping_member_data_in_preflight() {
+        let dir = fixture_dir();
+        let path = dir.path().join("overlap.zip");
+        zip_file(&path, &[("a", b"same"), ("b", b"same")], false);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let records: Vec<_> = bytes
+            .windows(4)
+            .enumerate()
+            .filter_map(|(i, w)| (w == b"PK\x01\x02").then_some(i))
+            .collect();
+        let offset: [u8; 4] = bytes[records[0] + 42..records[0] + 46].try_into().unwrap();
+        bytes[records[1] + 42..records[1] + 46].copy_from_slice(&offset);
+        std::fs::write(&path, bytes).unwrap();
+        let dest = dir.path().join("out");
+        assert!(extract_archive(&path, &dest, None).is_err());
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn zip64_directory_above_one_hundred_thousand_entries_is_admitted() {
+        let dir = fixture_dir();
+        let path = dir.path().join("many.zip");
+        let mut writer = zip::ZipWriter::new(File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for index in 0..100_001 {
+            writer.start_file(format!("m{index:06}"), options).unwrap();
+        }
+        writer.finish().unwrap();
+        let (zip, count) = archive_zip::open(&mut File::open(&path).unwrap())
+            .map(|(zip, count)| (zip.len(), count))
+            .unwrap();
+        assert_eq!((zip, count), (100_001, 100_001));
+    }
+
+    #[test]
+    fn verified_member_previews_keep_only_requested_prefixes() {
+        let dir = fixture_dir();
+        let path = dir.path().join("mod.zip");
+        zip_file(
+            &path,
+            &[("nested/README.txt", b"review"), ("payload", b"full")],
+            true,
+        );
+        let cancel = CancellationToken::new();
+        let digest = hash_file_cancellable(&path, &cancel).unwrap();
+        let member = Path::new("nested").join("README.txt");
+        let selected = BTreeMap::from([(member.clone(), 3)]);
+        let output = verify_archive_members(&path, &digest, &selected, &cancel).unwrap();
+        assert_eq!(output.listing.total_size, 10);
+        assert_eq!(output.hashes.len(), 2);
+        assert_eq!(
+            output.hashes[&member],
+            hex::encode(Sha256::digest(b"review"))
+        );
+        assert!(output.captured[&member].truncated);
+        assert_eq!(output.captured[&member].prefix, b"rev");
+        assert_eq!(output.captured.len(), 1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn extraction_cancellation_and_final_hash_failure_do_not_leave_staging() {
+        let dir = fixture_dir();
+        let path = dir.path().join("mod.zip");
+        let dest = dir.path().join("out");
+        zip_file(&path, &[("file.txt", b"valid")], false);
+        let cancel = CancellationToken::new();
+        let wrong = "00".repeat(32);
+        assert!(matches!(
+            extract_open_file_with_work(
+                &mut File::open(&path).unwrap(),
+                "zip",
+                &dest,
+                None,
+                Some(&wrong),
+                &Work::new(&cancel)
+            ),
+            Err(AppError::Conflict(_))
+        ));
+        assert!(!dest.exists());
+        cancel.cancel();
+        assert!(matches!(
+            extract_verified_archive_cancellable(&path, &dest, &wrong, &cancel),
+            Err(AppError::Cancelled)
+        ));
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn declaration_is_checked_against_exact_budget() {
         let entry = ArchiveEntry {
             path: "data".into(),
             is_dir: false,
@@ -1041,7 +1846,7 @@ mod tests {
         let path = dir.path().join("anti.7z");
         std::fs::write(&path, data).unwrap();
         let reader =
-            sevenz_rust::SevenZReader::open(&path, sevenz_rust::Password::empty()).unwrap();
+            sevenz_rust2::ArchiveReader::open(&path, sevenz_rust2::Password::empty()).unwrap();
         assert!(reader.archive().files[0].is_anti_item);
         assert!(matches!(
             list_archive(&path),

@@ -11,12 +11,17 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(test)]
+use std::io::Read;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::Read,
     path::{Component, Path, PathBuf},
 };
+
+#[path = "diagnostics_pages.rs"]
+mod paging;
+pub use paging::{diagnose_game_page, read_logs_page};
 
 #[path = "diagnostics_bethesda.rs"]
 mod bethesda;
@@ -66,6 +71,7 @@ pub struct ReadOptions {
     pub max_evidence: usize,
     /// A caller-selected fallback for logs only, never an encoding guess.
     pub legacy_log_encoding: Option<LegacyLogEncoding>,
+    pub page: games::pages::PageRequest,
 }
 impl Default for ReadOptions {
     fn default() -> Self {
@@ -78,9 +84,11 @@ impl Default for ReadOptions {
             max_directory_entries: 256,
             max_evidence: 64,
             legacy_log_encoding: None,
+            page: Default::default(),
         }
     }
 }
+#[cfg(test)]
 impl ReadOptions {
     fn validate(&self) -> AppResult<()> {
         if self.max_files == 0
@@ -142,9 +150,17 @@ pub struct DiagnosticFile {
     /// Decoder used for the bounded prefix; not proof of the game's encoding.
     pub encoding: Option<String>,
     pub lines: Vec<LogLine>,
+    #[serde(default)]
+    pub continued: bool,
+    #[serde(default)]
+    pub continues: bool,
     pub notes: Vec<String>,
     #[serde(skip)]
     bg3: Option<Result<Vec<bg3::Finding>, &'static str>>,
+    #[serde(skip)]
+    fabric: Option<fabric::CapturedEvidence>,
+    #[serde(skip)]
+    bethesda: Option<bethesda::CapturedEvidence>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -153,7 +169,7 @@ pub struct ReadIssue {
     pub path: String,
     pub message: String,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogReport {
     pub game_id: String,
@@ -163,6 +179,8 @@ pub struct LogReport {
     pub issues: Vec<ReadIssue>,
     pub bytes_read: usize,
     pub truncated: bool,
+    #[serde(default)]
+    pub next_cursor: Option<uuid::Uuid>,
     pub limitations: Vec<String>,
 }
 
@@ -338,8 +356,12 @@ fn blank_file(path: &Path, kind: FileKind, status: ReadStatus, note: String) -> 
         truncated: false,
         encoding: None,
         lines: vec![],
+        continued: false,
+        continues: false,
         notes: vec![note],
         bg3: None,
+        fabric: None,
+        bethesda: None,
     }
 }
 fn failed_file(path: &Path, kind: FileKind, error: AppError) -> DiagnosticFile {
@@ -372,6 +394,7 @@ fn bounded_text(text: &str, limit: usize) -> (String, bool) {
     (clean.chars().take(limit).collect(), truncated)
 }
 
+#[cfg(test)]
 fn read_file(
     ctx: &Context,
     path: &Path,
@@ -417,8 +440,12 @@ fn read_file(
             truncated: prefix_truncated,
             encoding: None,
             lines: vec![],
+            continued: false,
+            continues: false,
             notes: vec![],
             bg3: None,
+            fabric: None,
+            bethesda: None,
         };
         if let Some(error) = read_error {
             report.status = ReadStatus::IoError;
@@ -500,6 +527,7 @@ fn read_file(
 
 /// Read only adapter-declared log/load-order locations for an already registered
 /// game. No arbitrary input paths and no user-root inference from game.metadata.
+#[cfg(test)]
 pub fn read_logs(
     engine: &FileEngine,
     game_id: &str,
@@ -510,6 +538,7 @@ pub fn read_logs(
     collect_logs(&ctx, options, false)
 }
 
+#[cfg(test)]
 fn collect_logs(
     ctx: &Context,
     options: &ReadOptions,
@@ -523,6 +552,7 @@ fn collect_logs(
         issues: vec![],
         bytes_read: 0,
         truncated: false,
+        next_cursor: None,
         limitations: vec![
             "日志为不可信数据；只读取有界前缀，不递归日志子目录。缺少日志不证明缺少加载器。".into(),
             "优先识别 UTF-8 和带 BOM 的 UTF-16；其他日志编码须显式选择，不自动猜测。".into(),
@@ -688,7 +718,7 @@ pub struct RepairSuggestion {
     pub requires_confirmation: bool,
     pub file_ops_input: Option<FileOpsInput>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Diagnosis {
     pub game_id: String,
@@ -848,6 +878,7 @@ fn pattern(line: &str, adapter: &str) -> Option<(CauseKind, &'static str)> {
 
 /// Adapter-aware, non-mutating diagnosis. It reports observations/heuristics,
 /// never a success verdict. Missing data produces explicit unknowns.
+#[cfg(test)]
 pub fn diagnose_game(
     engine: &FileEngine,
     game_id: &str,
@@ -856,27 +887,79 @@ pub fn diagnose_game(
     options.validate()?;
     let ctx = context(engine, game_id)?;
     let logs = collect_logs(&ctx, options, true)?;
+    diagnose_collected(
+        engine,
+        &ctx,
+        game_id,
+        options,
+        logs,
+        true,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+}
+
+fn diagnose_collected(
+    #[cfg(test)] engine: &FileEngine,
+    ctx: &Context,
+    game_id: &str,
+    options: &ReadOptions,
+    logs: LogReport,
+    #[cfg(test)] include_state: bool,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> AppResult<Diagnosis> {
     let fabric_path = ctx.root.join("logs").join("latest.log");
     let fabric_log = logs.files.iter().find(|file| {
         ctx.adapter.slug == "minecraft-java"
             && file.kind == FileKind::Log
             && Path::new(&file.file) == fabric_path
     });
-    let fabric_startup = fabric_log.map(fabric::inspect);
-    let fabric_disk = fabric_disk::inspect(engine, &ctx, fabric_startup.as_ref());
-    let fabric_failure = fabric_startup
-        .as_ref()
-        .filter(|startup| startup.status == fabric::FabricStatus::ResolutionFailed)
-        .and_then(|startup| startup.failure_line)
-        .and_then(|number| {
-            let file = fabric_log?;
-            let line = file
-                .lines
-                .iter()
-                .find(|line| !line.truncated && line.number == number)?;
-            let details = fabric::dependency_details(file, number).unwrap_or_default();
-            Some((file.file.clone(), line.clone(), details))
-        });
+    #[cfg(test)]
+    let is_legacy = include_state;
+    let captured = fabric_log.and_then(|file| file.fabric.as_ref());
+    let fabric_startup = captured.map(|(evidence, _)| evidence.clone()).or_else(|| {
+        let file = fabric_log.filter(|file| file.status != ReadStatus::Read)?;
+        Some(fabric::FabricEvidence::empty(
+            file,
+            fabric::FabricStatus::Unavailable,
+        ))
+    });
+    let fabric_failure = captured
+        .and_then(|(_, failure)| failure.as_ref())
+        .zip(fabric_log)
+        .map(|((line, details), file)| (file.file.clone(), line.clone(), details.clone()));
+    #[cfg(test)]
+    let fabric_startup = if is_legacy {
+        fabric_log.map(fabric::inspect)
+    } else {
+        fabric_startup
+    };
+    #[cfg(test)]
+    let fabric_failure = if is_legacy {
+        fabric_startup
+            .as_ref()
+            .filter(|startup| startup.status == fabric::FabricStatus::ResolutionFailed)
+            .and_then(|startup| startup.failure_line)
+            .and_then(|number| {
+                let file = fabric_log?;
+                let line = file
+                    .lines
+                    .iter()
+                    .find(|line| !line.truncated && line.number == number)?;
+                Some((
+                    file.file.clone(),
+                    line.clone(),
+                    fabric::legacy_dependency_details(file, number).unwrap_or_default(),
+                ))
+            })
+    } else {
+        fabric_failure
+    };
+    #[cfg(test)]
+    let fabric_disk = (include_state && is_legacy)
+        .then(|| fabric_disk::inspect(engine, ctx, fabric_startup.as_ref()))
+        .flatten();
+    #[cfg(not(test))]
+    let fabric_disk = None;
     let mut result = Diagnosis { game_id: game_id.into(), status: "unknown".into(), causes: vec![], evidence: vec![], repair_suggestions: vec![], logs,
         unknowns: vec!["没有运行游戏或校验加载器 ABI；没有完整依赖解算、存档兼容性验证或自动排序。".into(),
             "没有读取聊天/工具历史作为游戏故障证据，也没有将诊断结果写入历史；由调用方按会话权限记录。".into()], fabric_startup, fabric_disk, bethesda_plugins: None };
@@ -907,6 +990,9 @@ pub fn diagnose_game(
         }
     }
     for file in result.logs.files.clone() {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
         if file.status != ReadStatus::Read {
             continue;
         }
@@ -934,30 +1020,33 @@ pub fn diagnose_game(
         if file.kind == FileKind::LoadOrder
             && matches!(ctx.adapter.load_order.kind, LoadOrderKind::BethesdaPlugins)
         {
-            inspect_bethesda_order(&ctx, options, &file, &mut result);
-            let (evidence, findings) = bethesda::inspect(&ctx, options, &file);
-            result.bethesda_plugins = Some(evidence);
-            for finding in findings {
-                finding.add_to(&mut result, options);
+            inspect_bethesda_order(ctx, options, &file, &mut result);
+            if let Some((evidence, findings)) = file.bethesda.clone() {
+                result.bethesda_plugins = Some(evidence);
+                for finding in findings {
+                    finding.add_to(&mut result, options);
+                }
+            }
+            #[cfg(test)]
+            if is_legacy {
+                let (evidence, findings) = bethesda::inspect(ctx, options, &file);
+                result.bethesda_plugins = Some(evidence);
+                for finding in findings {
+                    finding.add_to(&mut result, options);
+                }
             }
         }
         match &file.bg3 {
             Some(Ok(findings)) => {
                 for finding in findings {
-                    let Some(line) = finding
-                        .line
-                        .checked_sub(1)
-                        .and_then(|index| file.lines.get(index))
-                    else {
-                        continue;
-                    };
+                    let line = file.lines.iter().find(|line| line.number == finding.line);
                     result.add(
                         options,
                         CauseKind::LoadOrder,
                         Basis::Observed,
                         &file.file,
-                        Some(line.number),
-                        &line.text,
+                        Some(finding.line),
+                        line.map_or("", |line| line.text.as_str()),
                         "load_order",
                         finding.summary,
                     );
@@ -973,55 +1062,12 @@ pub fn diagnose_game(
     if matches!(ctx.adapter.load_order.kind, LoadOrderKind::BethesdaPlugins) {
         result.unknown("插件诊断只在有界范围内读取 Plugins.txt 声明的 loose 插件 TES4 MAST；不验证 MO2/VFS、非默认配置、归档/BSA/BA2、ESL slot 或完整有效顺序。");
     }
-    for marker in ctx
-        .adapter
-        .markers
-        .iter()
-        .filter(|m| m.required && m.platforms.contains(&ctx.platform))
-        .take(128)
-    {
-        let path = ctx.root.join(&marker.path);
-        match ctx
-            .guard(&path)
-            .and_then(|_| fs::symlink_metadata(&path).map_err(AppError::from))
-        {
-            Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => result.add(
-                options,
-                CauseKind::MissingFile,
-                Basis::Observed,
-                &path.display().to_string(),
-                None,
-                "适配包必需标记不存在",
-                "filesystem",
-                "缺少适配包必需文件/目录，安装布局可能不完整",
-            ),
-            Ok(m)
-                if !match marker.kind {
-                    MarkerKind::File => m.is_file(),
-                    MarkerKind::Directory => m.is_dir(),
-                } =>
-            {
-                result.add(
-                    options,
-                    CauseKind::MissingFile,
-                    Basis::Observed,
-                    &path.display().to_string(),
-                    None,
-                    "标记的文件类型与适配包声明不一致",
-                    "filesystem",
-                    "适配包标记的文件类型不匹配",
-                )
-            }
-            Err(e) => result.unknown(format!("无法校验标记 {}: {e}", marker.path)),
-            _ => {}
-        }
+    #[cfg(test)]
+    if include_state && is_legacy {
+        inspect_markers(ctx, options, &mut result, cancel, true, |_| Ok(()))?;
+        inspect_installs(engine, ctx, options, &mut result)?;
+        inspect_transactions(engine, game_id, options, &mut result)?;
     }
-    if ctx.adapter.markers.len() > 128 {
-        result.logs.truncated = true;
-        result.unknown("适配包标记超过 128 项，未检查剩余标记。");
-    }
-    inspect_installs(engine, &ctx, options, &mut result)?;
-    inspect_transactions(engine, game_id, options, &mut result)?;
     if !result.logs.issues.is_empty() {
         result.unknown("部分适配日志或顺序根未登记/不可读，不能据此断言加载器缺失。");
     }
@@ -1044,6 +1090,15 @@ pub fn diagnose_game(
     {
         result.unknown("没有读取到非空日志/顺序内容；无法确认本次故障。");
     }
+    finish_diagnosis(&mut result);
+    Ok(result)
+}
+
+fn finish_diagnosis(result: &mut Diagnosis) {
+    result
+        .causes
+        .retain(|cause| cause.kind != CauseKind::Unknown);
+    result.repair_suggestions.clear();
     let kinds: BTreeSet<_> = result.causes.iter().map(|c| c.kind).collect();
     for kind in [
         CauseKind::Loader,
@@ -1082,7 +1137,68 @@ pub fn diagnose_game(
             evidence_ids: vec![],
         });
     }
-    Ok(result)
+}
+
+fn inspect_markers(
+    ctx: &Context,
+    options: &ReadOptions,
+    result: &mut Diagnosis,
+    cancel: &tokio_util::sync::CancellationToken,
+    legacy: bool,
+    mut before: impl FnMut(&mut Diagnosis) -> AppResult<()>,
+) -> AppResult<()> {
+    for marker in ctx
+        .adapter
+        .markers
+        .iter()
+        .filter(|m| m.required && m.platforms.contains(&ctx.platform))
+        .take(if legacy { 128 } else { usize::MAX })
+    {
+        if cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        before(result)?;
+        let path = ctx.root.join(&marker.path);
+        match ctx
+            .guard(&path)
+            .and_then(|_| fs::symlink_metadata(&path).map_err(AppError::from))
+        {
+            Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => result.add(
+                options,
+                CauseKind::MissingFile,
+                Basis::Observed,
+                &path.display().to_string(),
+                None,
+                "适配包必需标记不存在",
+                "filesystem",
+                "缺少适配包必需文件/目录，安装布局可能不完整",
+            ),
+            Ok(m)
+                if !match marker.kind {
+                    MarkerKind::File => m.is_file(),
+                    MarkerKind::Directory => m.is_dir(),
+                } =>
+            {
+                result.add(
+                    options,
+                    CauseKind::MissingFile,
+                    Basis::Observed,
+                    &path.display().to_string(),
+                    None,
+                    "标记的文件类型与适配包声明不一致",
+                    "filesystem",
+                    "适配包标记的文件类型不匹配",
+                )
+            }
+            Err(e) => result.unknown(format!("无法校验标记 {}: {e}", marker.path)),
+            _ => {}
+        }
+    }
+    if legacy && ctx.adapter.markers.len() > 128 {
+        result.logs.truncated = true;
+        result.unknown("适配包标记超过 128 项，未检查剩余标记。");
+    }
+    Ok(())
 }
 
 fn inspect_bethesda_order(
@@ -1172,6 +1288,7 @@ fn inspect_bethesda_order(
     }
 }
 
+#[cfg(test)]
 fn inspect_installs(
     engine: &FileEngine,
     ctx: &Context,
@@ -1235,44 +1352,53 @@ fn inspect_installs(
                 return Ok(());
             }
             checks += 1;
-            let Some(path) = file
-                .as_str()
-                .or_else(|| file.get("path").and_then(Value::as_str))
-            else {
-                result.unknown(format!("安装 {id} 含未知文件记录格式。"));
-                continue;
-            };
-            if path.len() > 8192 || path.chars().any(char::is_control) {
-                result.unknown(format!("安装 {id} 含过长或控制字符路径，未访问。"));
-                continue;
-            }
-            let path = PathBuf::from(path);
-            if let Err(e) = ctx.guard(&path) {
-                result.unknown(format!("忽略安装 {id} 越权/未知路径: {e}"));
-                continue;
-            }
-            match fs::symlink_metadata(&path) {
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => result.add(
-                    options,
-                    CauseKind::MissingFile,
-                    Basis::Observed,
-                    &path.display().to_string(),
-                    None,
-                    &format!("enabled 安装 {id} 的记录文件不存在"),
-                    "install_record",
-                    "启用安装记录中的文件不存在；记录可能陈旧，未自动重装",
-                ),
-                Ok(m) if !m.is_file() => {
-                    result.unknown(format!("安装 {id} 的文件记录实际不是普通文件。"))
-                }
-                Err(e) => result.unknown(format!("无法核对安装 {id}: {e}")),
-                _ => {}
-            }
+            inspect_install_file(ctx, options, result, &id, &file);
         }
     }
     Ok(())
 }
 
+fn inspect_install_file(
+    ctx: &Context,
+    options: &ReadOptions,
+    result: &mut Diagnosis,
+    id: &str,
+    file: &Value,
+) {
+    let Some(path) = file
+        .as_str()
+        .or_else(|| file.get("path").and_then(Value::as_str))
+    else {
+        result.unknown(format!("安装 {id} 含未知文件记录格式。"));
+        return;
+    };
+    if path.len() > 8192 || path.chars().any(char::is_control) {
+        result.unknown(format!("安装 {id} 含过长或控制字符路径，未访问。"));
+        return;
+    }
+    let path = PathBuf::from(path);
+    if let Err(e) = ctx.guard(&path) {
+        result.unknown(format!("忽略安装 {id} 越权/未知路径: {e}"));
+        return;
+    }
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => result.add(
+            options,
+            CauseKind::MissingFile,
+            Basis::Observed,
+            &path.display().to_string(),
+            None,
+            &format!("enabled 安装 {id} 的记录文件不存在"),
+            "install_record",
+            "启用安装记录中的文件不存在；记录可能陈旧，未自动重装",
+        ),
+        Ok(m) if !m.is_file() => result.unknown(format!("安装 {id} 的文件记录实际不是普通文件。")),
+        Err(e) => result.unknown(format!("无法核对安装 {id}: {e}")),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
 fn inspect_transactions(
     engine: &FileEngine,
     game_id: &str,

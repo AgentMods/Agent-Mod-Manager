@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use roxmltree::{Document, Error, Node, ParsingOptions};
 use uuid::Uuid;
 
-const MAX_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_BYTES: usize = 1024 * 1024;
 const MAX_NODES: u32 = 32_768;
 const LIMIT: &str = "modsettings.lsx 超出 XML 检查上限";
 const DTD: &str = "modsettings.lsx 包含不支持的 XML DTD";

@@ -100,7 +100,7 @@ test('shows selected Fabric Mods with keyboard disclosure, source lines, and res
 
   const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls as { command: string; args: unknown }[]);
   expect(calls.filter(call => call.command === 'diagnose_game')).toEqual([
-    { command: 'diagnose_game', args: { gameId: 'game-fixture', options: null } },
+    { command: 'diagnose_game', args: { gameId: 'game-fixture', options: { page: { requestId: expect.any(String) } } } },
   ]);
   expect(calls.filter(call => /^(plan_|apply_|write_|launch_)/.test(call.command))).toEqual([]);
 });

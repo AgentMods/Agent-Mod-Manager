@@ -33,6 +33,16 @@ impl AgentTool for DiagnosticTool {
                 "properties": {
                     "game_id": {"type":"string"},
                     "options": {"type":"object","properties":{
+                        "page":{"type":"object","description":"使用同一会话，按响应的 nextCursor（诊断在 logs 内）作为 cursor 继续，或传 cancel:true 停止。","properties":{
+                            "cursor":{"type":"string"}, "requestId":{"type":"string"}, "cancel":{"type":"boolean"}
+                        }},
+                        "maxFiles":{"type":"integer","minimum":1},
+                        "maxBytesPerFile":{"type":"integer","minimum":1},
+                        "maxTotalBytes":{"type":"integer","minimum":1},
+                        "maxLinesPerFile":{"type":"integer","minimum":1},
+                        "maxLineChars":{"type":"integer","minimum":1},
+                        "maxDirectoryEntries":{"type":"integer","minimum":1},
+                        "maxEvidence":{"type":"integer","minimum":1},
                         "legacyLogEncoding": {
                             "enum":[null,"windows-1252","windows-1251","gbk","big5","shift_jis"],
                             "description":"仅非 UTF 日志的回退编码。用户明确提供时才传，不能猜测。"
@@ -57,20 +67,37 @@ impl AgentTool for DiagnosticTool {
             .as_str()
             .ok_or_else(|| AppError::Invalid("缺少 game_id".into()))?
             .to_string();
-        let options: ReadOptions = args
+        let mut options: ReadOptions = args
             .get("options")
             .cloned()
             .map(serde_json::from_value)
             .transpose()?
             .unwrap_or_default();
+        for (key, value, fallback) in [
+            (
+                "maxBytesPerFile",
+                &mut options.max_bytes_per_file,
+                64 * 1024,
+            ),
+            ("maxTotalBytes", &mut options.max_total_bytes, 64 * 1024),
+            ("maxLinesPerFile", &mut options.max_lines_per_file, 512),
+        ] {
+            if args["options"].get(key).is_none() {
+                *value = fallback;
+            }
+        }
         let engine = context.engine.clone();
         let name = self.name.clone();
+        let cancel = context.cancel.clone();
+        let scope = context.read_page_scope();
         tokio::task::spawn_blocking(move || {
             if name == "read_logs" {
-                Ok(json!(diagnostics::read_logs(&engine, &game_id, &options)?))
+                Ok(json!(diagnostics::read_logs_page(
+                    &engine, game_id, options, &scope, &cancel
+                )?))
             } else {
-                Ok(json!(diagnostics::diagnose_game(
-                    &engine, &game_id, &options
+                Ok(json!(diagnostics::diagnose_game_page(
+                    &engine, game_id, options, &scope, &cancel
                 )?))
             }
         })

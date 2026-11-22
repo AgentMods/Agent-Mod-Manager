@@ -57,7 +57,10 @@ fn exact(path: &'static str, project: &str, declarations: Vec<Value>) -> Step {
 async fn read_graph(req: DependencyGraphRequest, steps: Vec<Step>) -> (Value, MockApi) {
     let count = steps.len();
     let (sources, mock) = source(steps);
-    let graph = sources.modrinth_dependency_graph(&req).await.unwrap();
+    let graph = sources
+        .modrinth_dependency_graph(&req, &CancellationToken::new())
+        .await
+        .unwrap();
     mock.assert_finished(count);
     let graph = serde_json::to_value(graph).unwrap();
     assert_eq!(graph["root_version_id"], req.version_id);
@@ -376,7 +379,10 @@ async fn modrinth_dependency_graph_rejects_invalid_root_id_and_mismatched_exact_
             ..request()
         },
     ] {
-        assert!(sources.modrinth_dependency_graph(&req).await.is_err());
+        assert!(sources
+            .modrinth_dependency_graph(&req, &CancellationToken::new())
+            .await
+            .is_err());
     }
     mock.assert_finished(0);
 
@@ -396,7 +402,10 @@ async fn modrinth_dependency_graph_rejects_invalid_root_id_and_mismatched_exact_
     ] {
         let (sources, mock) = source(vec![Step::ok(ROOT, metadata.to_string())]);
         assert!(
-            sources.modrinth_dependency_graph(&req).await.is_err(),
+            sources
+                .modrinth_dependency_graph(&req, &CancellationToken::new())
+                .await
+                .is_err(),
             "accepted mismatched {problem}"
         );
         mock.assert_finished(1);
@@ -461,79 +470,39 @@ const BRANCHES: [(&str, &str, &str); 48] = branch_paths![
 ];
 
 #[tokio::test]
-async fn modrinth_dependency_graph_stops_at_depth_eight() {
+async fn modrinth_dependency_graph_walks_deep_cycles_once_without_recursing() {
     let mut steps = vec![exact(
         ROOT,
         "RootProj",
-        vec![required(BRANCHES[0].0, Some(BRANCHES[0].0))],
+        vec![required("Branch01", Some("Branch01"))],
     )];
-    for (&(project, path, _), &(next, _, _)) in BRANCHES[..8].iter().zip(&BRANCHES[1..9]) {
+    for (&(project, path, _), &(next, _, _)) in BRANCHES.iter().zip(&BRANCHES[1..]) {
         steps.push(exact(path, project, vec![required(next, Some(next))]));
     }
+    let &(last, path, _) = BRANCHES.last().unwrap();
+    steps.push(exact(
+        path,
+        last,
+        vec![required("RootProj", Some("Root0001"))],
+    ));
     let (graph, _) = read_graph(request(), steps).await;
-    assert_eq!(rows(&graph, "nodes").len(), 9);
+    assert_eq!(rows(&graph, "nodes").len(), 49);
+    assert_eq!(rows(&graph, "edges").len(), 49);
     assert_eq!(graph["complete"], false);
-    assert_eq!(graph["truncated"], true);
-    assert_eq!(
-        edge(&graph, "Branch08", &required("Branch09", Some("Branch09")))["state"],
-        "limit_reached"
-    );
+    assert_eq!(graph["truncated"], false);
+    let issues = rows(&graph, "issues");
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0]["kind"], "cycle");
+    let witness = rows(&issues[0], "version_ids");
+    assert_eq!(witness.len(), 50);
+    assert_eq!(witness.first(), witness.last());
 }
 
 #[tokio::test]
-async fn modrinth_dependency_graph_stops_at_thirty_two_nodes() {
-    let mut steps = vec![exact(
-        ROOT,
-        "RootProj",
-        BRANCHES[..32]
-            .iter()
-            .map(|&(id, _, _)| required(id, Some(id)))
-            .collect(),
-    )];
-    steps.extend(
-        BRANCHES[..31]
-            .iter()
-            .map(|&(id, path, _)| exact(path, id, vec![])),
-    );
-    let (graph, _) = read_graph(request(), steps).await;
-    assert_eq!(rows(&graph, "nodes").len(), 32);
-    assert_eq!(graph["complete"], false);
-    assert_eq!(graph["truncated"], true);
-    assert_eq!(
-        edge(&graph, "Root0001", &required("Branch32", Some("Branch32")))["state"],
-        "limit_reached"
-    );
-}
-
-#[tokio::test]
-async fn modrinth_dependency_graph_stops_at_two_hundred_fifty_six_edges() {
-    let optional: Vec<_> = (0..128)
-        .map(|index| dep("optional", Some(&format!("Option{index:03}")), None, None))
-        .collect();
-    let (graph, _) = read_graph(
-        request(),
-        vec![
-            exact(
-                ROOT,
-                "RootProj",
-                vec![
-                    required("ChildPrA", Some("Child001")),
-                    required("ChildPrB", Some("Child002")),
-                ],
-            ),
-            exact("/v2/version/Child001", "ChildPrA", optional.clone()),
-            exact("/v2/version/Child002", "ChildPrB", optional),
-        ],
-    )
-    .await;
-    assert_eq!(rows(&graph, "nodes").len(), 3);
-    assert_eq!(rows(&graph, "edges").len(), 256);
-    assert_eq!(graph["complete"], false);
-    assert_eq!(graph["truncated"], true);
-}
-
-#[tokio::test]
-async fn modrinth_dependency_graph_stops_at_forty_eight_requests() {
+async fn modrinth_dependency_graph_accepts_more_than_thirty_two_pins_and_nodes() {
+    let mut req = request();
+    req.project_pins
+        .extend(BRANCHES.iter().map(|&(id, _, _)| (id.into(), id.into())));
     let mut steps = vec![exact(
         ROOT,
         "RootProj",
@@ -542,22 +511,102 @@ async fn modrinth_dependency_graph_stops_at_forty_eight_requests() {
             .map(|&(id, _, _)| required(id, None))
             .collect(),
     )];
-    // Empty listings spend the request budget without spending the node budget.
     steps.extend(
-        BRANCHES[..47]
+        BRANCHES
             .iter()
-            .map(|&(_, _, path)| Step::ok(path, "[]")),
+            .map(|&(id, path, _)| exact(path, id, vec![])),
     );
+    let (graph, _) = read_graph(req, steps).await;
+    assert_eq!(rows(&graph, "nodes").len(), 49);
+    assert_eq!(rows(&graph, "edges").len(), 48);
+    assert_eq!(graph["complete"], true);
+    assert_eq!(graph["truncated"], false);
+}
+
+#[tokio::test]
+async fn modrinth_dependency_graph_retains_more_than_two_hundred_fifty_six_unique_edges() {
+    let mut declarations: Vec<_> = (0..300)
+        .map(|index| dep("optional", Some(&format!("Option{index:03}")), None, None))
+        .collect();
+    declarations.extend(declarations.clone());
+    let (graph, _) = read_graph(request(), vec![exact(ROOT, "RootProj", declarations)]).await;
+    assert_eq!(rows(&graph, "nodes").len(), 1);
+    assert_eq!(rows(&graph, "edges").len(), 300);
+    assert_eq!(graph["complete"], true);
+    assert_eq!(graph["truncated"], false);
+}
+
+#[tokio::test]
+async fn modrinth_dependency_graph_tries_distinct_projects_beyond_forty_eight_requests() {
+    let mut declarations: Vec<_> = BRANCHES
+        .iter()
+        .map(|&(id, _, _)| required(id, None))
+        .collect();
+    let filename_ref = dep("required", Some("Branch48"), None, Some("same-project.jar"));
+    declarations.push(filename_ref.clone());
+    let mut steps = vec![exact(ROOT, "RootProj", declarations)];
+    // Each empty listing is a finite negative observation, not a retry.
+    steps.extend(BRANCHES.iter().map(|&(_, _, path)| Step::ok(path, "[]")));
     let (graph, _) = read_graph(request(), steps).await;
     assert_eq!(rows(&graph, "nodes").len(), 1);
     assert_eq!(graph["complete"], false);
-    assert_eq!(graph["truncated"], true);
+    assert_eq!(graph["truncated"], false);
     assert_eq!(
-        edge(&graph, "Root0001", &required("Branch47", None))["state"],
+        edge(&graph, "Root0001", &required("Branch48", None))["state"],
         "no_compatible_version"
     );
     assert_eq!(
-        edge(&graph, "Root0001", &required("Branch48", None))["state"],
-        "limit_reached"
+        edge(&graph, "Root0001", &filename_ref)["state"],
+        "no_compatible_version"
     );
+}
+
+#[tokio::test]
+async fn modrinth_dependency_graph_stops_at_the_available_budget_not_a_fixed_size() {
+    let suffix = "x".repeat(240);
+    let declarations: Vec<_> = (0..32)
+        .map(|id| {
+            dep(
+                "optional",
+                None,
+                None,
+                Some(&format!("{id:05}{suffix}.jar")),
+            )
+        })
+        .collect();
+    let child = required("ChildPrj", Some("Child001"));
+    for (budget, fits) in [(1024, false), (32 * 1024, true)] {
+        let (provider, mock) = provider(
+            "modrinth",
+            vec![
+                exact(ROOT, "RootProj", vec![child.clone()]),
+                exact("/v2/version/Child001", "ChildPrj", declarations.clone()),
+            ],
+        );
+        let graph = provider
+            .modrinth_graph_with_budget(&request(), &CancellationToken::new(), budget)
+            .await
+            .unwrap();
+        mock.assert_finished(2);
+        let graph = serde_json::to_value(graph).unwrap();
+        assert_eq!(graph["truncated"], !fits);
+        assert_eq!(graph["complete"], fits);
+        assert_eq!(rows(&graph, "nodes").len(), if fits { 2 } else { 1 });
+        assert_eq!(
+            edge(&graph, "Root0001", &child)["state"],
+            if fits { "selected" } else { "limit_reached" }
+        );
+    }
+}
+
+#[tokio::test]
+async fn modrinth_dependency_graph_cancellation_does_not_query_the_root() {
+    let (sources, mock) = source(vec![]);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    assert!(matches!(
+        sources.modrinth_dependency_graph(&request(), &cancel).await,
+        Err(AppError::Cancelled)
+    ));
+    mock.assert_finished(0);
 }

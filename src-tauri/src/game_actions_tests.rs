@@ -63,10 +63,11 @@ fn executable(path: &Path) -> PathBuf {
 }
 
 #[test]
-fn validates_trimmed_names_and_unicode_character_count() {
+fn validates_trimmed_names_and_rejects_control_characters() {
     assert_eq!(validate_name("  游戏 名称　").unwrap(), "游戏 名称");
-    assert!(validate_name(&"界".repeat(80)).is_ok());
-    for name in ["　", "改\n名", "a\0b", "a\u{7f}b", &"界".repeat(81)] {
+    let long = "界".repeat(600);
+    assert_eq!(validate_name(&long).unwrap(), long);
+    for name in ["　", "改\n名", "a\0b", "a\u{7f}b"] {
         assert!(matches!(validate_name(name), Err(AppError::Invalid(_))));
     }
 }
@@ -665,10 +666,11 @@ fn adapter_binding_preview_round_trips_and_preserves_unrelated_edits() {
     ).unwrap();
     let before = serde_json::to_value(f.game()).unwrap();
     let before_files = transaction::fingerprint(&f.root).unwrap();
-    let binding = prepare_game_adapter_binding(&f.engine, "g", "minecraft-java").unwrap();
+    let binding = prepare_game_adapter_binding(&f.engine, "g", "minecraft-java", None).unwrap();
     let preview = serde_json::to_value(&binding).unwrap();
     assert_eq!(preview["gameId"], "g");
     assert_eq!(preview["gameName"], "Original");
+    assert!(preview.get("targetGameName").is_none());
     assert_eq!(preview["rootPath"], paths::display_path(&f.root));
     #[cfg(windows)]
     assert_ne!(preview["rootPath"], f.root.to_str().unwrap());
@@ -709,6 +711,7 @@ fn adapter_binding_preview_round_trips_and_preserves_unrelated_edits() {
     ));
     let updated =
         apply_game_adapter_binding(&f.engine, &serde_json::from_value(preview).unwrap()).unwrap();
+    assert_eq!(updated.name, "Original");
     assert_eq!(updated.adapter_slug.as_deref(), Some("minecraft-java"));
     assert_eq!(updated.installed_mod_count, 2);
     assert_eq!(updated.enabled_mod_count, 1);
@@ -727,7 +730,7 @@ fn adapter_binding_preview_round_trips_and_preserves_unrelated_edits() {
         Err(AppError::Conflict(_))
     ));
 
-    let repeat = prepare_game_adapter_binding(&f.engine, "g", "minecraft-java").unwrap();
+    let repeat = prepare_game_adapter_binding(&f.engine, "g", "minecraft-java", None).unwrap();
     let repeated = apply_game_adapter_binding(&f.engine, &repeat).unwrap();
     assert_eq!(repeated.updated_at, updated.updated_at);
     assert_eq!(repeated.last_scanned_at, updated.last_scanned_at);
@@ -737,10 +740,148 @@ fn adapter_binding_preview_round_trips_and_preserves_unrelated_edits() {
 }
 
 #[test]
+fn adapter_binding_renames_atomically_and_preserves_latest_launch_metadata() {
+    let f = Fixture::new();
+    make_minecraft_selectable(&f);
+    let first_launch = executable(&f.root.join("first.exe"));
+    let next_launch = executable(&f.root.join("second.exe"));
+    let original = update_game(&f.engine, "g", "Original", first_launch.to_str()).unwrap();
+    let preview =
+        prepare_game_adapter_binding(&f.engine, "g", "minecraft-java", Some("  游戏新名称　"))
+            .unwrap();
+    let wire = serde_json::to_value(&preview).unwrap();
+    assert_eq!(wire["gameName"], "Original");
+    assert_eq!(wire["targetGameName"], "游戏新名称");
+    assert_eq!(
+        serde_json::from_value::<GameAdapterBinding>(wire).unwrap(),
+        preview
+    );
+    assert_eq!(f.game().name, original.name);
+    assert_eq!(f.game().adapter_slug, original.adapter_slug);
+
+    // The user can change the launch path while the approval is open.
+    let latest = update_game(&f.engine, "g", "Original", next_launch.to_str()).unwrap();
+    f.engine
+        .db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_name BEFORE UPDATE OF name ON games
+         WHEN NEW.name<>OLD.name BEGIN SELECT RAISE(ABORT, 'test rename failure'); END;",
+        )
+        .unwrap();
+    assert!(matches!(
+        apply_game_adapter_binding(&f.engine, &preview),
+        Err(AppError::Db(_))
+    ));
+    assert_eq!(
+        serde_json::to_value(f.game()).unwrap(),
+        serde_json::to_value(&latest).unwrap()
+    );
+    f.engine
+        .db
+        .conn()
+        .execute_batch("DROP TRIGGER reject_name")
+        .unwrap();
+
+    let updated = apply_game_adapter_binding(&f.engine, &preview).unwrap();
+    assert_eq!(updated.name, "游戏新名称");
+    assert_eq!(updated.adapter_slug.as_deref(), Some("minecraft-java"));
+    assert_eq!(updated.id, original.id);
+    assert_eq!(updated.root_path, original.root_path);
+    assert_eq!(
+        updated.metadata["launchPath"],
+        latest.metadata["launchPath"]
+    );
+    assert_eq!(updated.metadata["keep"], original.metadata["keep"]);
+    assert_eq!(f.game().name, updated.name);
+}
+
+#[test]
+fn adapter_binding_already_applied_rename_preserves_all_other_fields() {
+    let f = Fixture::new();
+    make_minecraft_selectable(&f);
+    let program = executable(&f.root.join("game.exe"));
+    update_game(&f.engine, "g", "Original", program.to_str()).unwrap();
+    set_game_adapter(&f.engine, "g", "minecraft-java").unwrap();
+    f.engine
+        .db
+        .conn()
+        .execute("UPDATE games SET updated_at='old' WHERE id='g'", [])
+        .unwrap();
+    let before = serde_json::to_value(f.game()).unwrap();
+    let preview =
+        prepare_game_adapter_binding(&f.engine, "g", "minecraft-java", Some("Renamed")).unwrap();
+    let updated = apply_game_adapter_binding(&f.engine, &preview).unwrap();
+    assert_ne!(updated.updated_at, "old");
+    let mut expected = before;
+    expected["name"] = json!("Renamed");
+    expected["updatedAt"] = json!(updated.updated_at);
+    assert_eq!(serde_json::to_value(f.game()).unwrap(), expected);
+
+    let preview =
+        prepare_game_adapter_binding(&f.engine, "g", "minecraft-java", Some(" Renamed ")).unwrap();
+    let unchanged = apply_game_adapter_binding(&f.engine, &preview).unwrap();
+    assert_eq!(serde_json::to_value(unchanged).unwrap(), expected);
+}
+
+#[test]
+fn adapter_binding_refreshes_stale_identification_and_renames_same_package() {
+    let f = Fixture::new();
+    make_minecraft_selectable(&f);
+    let original = set_game_adapter(&f.engine, "g", "minecraft-java").unwrap();
+    f.engine.db.conn().execute(
+        "UPDATE games SET metadata_json=json_remove(metadata_json,'$.lastIdentification'),last_scanned_at='old' WHERE id='g'",
+        [],
+    ).unwrap();
+    let preview =
+        prepare_game_adapter_binding(&f.engine, "g", "minecraft-java", Some("Renamed")).unwrap();
+    let updated = apply_game_adapter_binding(&f.engine, &preview).unwrap();
+    assert_eq!(updated.name, "Renamed");
+    assert_eq!(updated.adapter_slug, original.adapter_slug);
+    assert_eq!(updated.adapter_version, original.adapter_version);
+    assert_eq!(
+        updated.metadata["lastIdentification"],
+        original.metadata["lastIdentification"]
+    );
+    assert_eq!(updated.metadata["keep"], original.metadata["keep"]);
+    assert_ne!(updated.last_scanned_at.as_deref(), Some("old"));
+}
+
+#[test]
+fn adapter_binding_rejects_invalid_unreviewed_and_stale_renames() {
+    let f = Fixture::new();
+    make_minecraft_selectable(&f);
+    let preview = |name| prepare_game_adapter_binding(&f.engine, "g", "minecraft-java", name);
+    for name in ["　", "改\n名", "带\0符号"] {
+        assert!(matches!(preview(Some(name)), Err(AppError::Invalid(_))));
+    }
+    let name = "Reviewed game edition ".repeat(50) + "Final";
+    let reviewed = preview(Some(&name)).unwrap();
+    assert_eq!(reviewed.target_game_name.as_deref(), Some(name.as_str()));
+    for changed in [Some("Approval did not show this".to_owned()), None] {
+        let mut tampered = reviewed.clone();
+        tampered.target_game_name = changed;
+        assert!(matches!(
+            apply_game_adapter_binding(&f.engine, &tampered),
+            Err(AppError::Conflict(_))
+        ));
+    }
+
+    assert_eq!(f.game().name, "Original");
+    update_game(&f.engine, "g", "Newer library name", None).unwrap();
+    assert!(matches!(
+        apply_game_adapter_binding(&f.engine, &reviewed),
+        Err(AppError::Conflict(_))
+    ));
+    assert_eq!(f.game().name, "Newer library name");
+    assert!(f.game().adapter_slug.is_none());
+}
+
+#[test]
 fn adapter_binding_revalidates_game_match_and_exact_package() {
     let f = Fixture::new();
     make_minecraft_selectable(&f);
-    let preview = || prepare_game_adapter_binding(&f.engine, "g", "minecraft-java").unwrap();
+    let preview = || prepare_game_adapter_binding(&f.engine, "g", "minecraft-java", None).unwrap();
     let reviewed = preview();
     update_game(&f.engine, "g", "Renamed after review", None).unwrap();
     assert!(matches!(
@@ -794,7 +935,7 @@ fn adapter_binding_rechecks_blockers_without_blocking_its_own_active_turn() {
          INSERT INTO tool_calls(id,conversation_id,name,status,started_at)
            VALUES ('binding','c','set_game_adapter','running','now');",
     ).unwrap();
-    let reviewed = prepare_game_adapter_binding(&f.engine, "g", "minecraft-java").unwrap();
+    let reviewed = prepare_game_adapter_binding(&f.engine, "g", "minecraft-java", None).unwrap();
     f.engine
         .db
         .conn()

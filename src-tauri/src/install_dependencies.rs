@@ -12,12 +12,78 @@ use crate::{
     },
     transaction::FileEngine,
 };
-use rusqlite::params;
+use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Mutex,
+};
+use tokio_util::sync::CancellationToken;
 
-const MAX_RECORDS: usize = 4096;
+use uuid::Uuid;
 const MAX_MATCHES_PER_DECLARATION: usize = 4;
+
+/// Tauri IPC calls do not have a request cancellation channel. A caller can
+/// provide a fresh UUID and cancel the running read with a second IPC call.
+#[derive(Default)]
+pub(crate) struct DesktopDependencyOperations(Mutex<HashMap<Uuid, CancellationToken>>);
+
+pub(crate) struct DesktopDependencyOperation<'a> {
+    registry: &'a DesktopDependencyOperations,
+    id: Option<Uuid>,
+    pub(crate) cancel: CancellationToken,
+}
+
+impl DesktopDependencyOperations {
+    pub(crate) fn start(&self, id: Option<Uuid>) -> AppResult<DesktopDependencyOperation<'_>> {
+        let cancel = CancellationToken::new();
+        if let Some(id) = id {
+            use std::collections::hash_map::Entry;
+            let mut active = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            match active.entry(id) {
+                Entry::Vacant(entry) => {
+                    entry.insert(cancel.clone());
+                }
+                Entry::Occupied(_) => {
+                    return Err(AppError::Conflict("依赖核对请求 ID 正在使用".into()))
+                }
+            }
+        }
+        Ok(DesktopDependencyOperation {
+            registry: self,
+            id,
+            cancel,
+        })
+    }
+
+    pub(crate) fn cancel(&self, id: Uuid) -> bool {
+        let cancel = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned();
+        if let Some(cancel) = cancel {
+            cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for DesktopDependencyOperation<'_> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(id) = self.id {
+            self.registry
+                .0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&id);
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -106,6 +172,14 @@ fn valid_local_id(id: &str) -> bool {
 }
 
 pub fn check(engine: &FileEngine, request: &CheckRequest) -> AppResult<DependencyReport> {
+    check_with_cancel(engine, request, &CancellationToken::new())
+}
+
+pub(crate) fn check_with_cancel(
+    engine: &FileEngine,
+    request: &CheckRequest,
+    cancel: &CancellationToken,
+) -> AppResult<DependencyReport> {
     if !valid_local_id(&request.game_id)
         || request
             .replace_install_id
@@ -119,36 +193,38 @@ pub fn check(engine: &FileEngine, request: &CheckRequest) -> AppResult<Dependenc
         return Err(AppError::Invalid("游戏、替换项或依赖声明格式无效".into()));
     }
 
-    let mut report = DependencyReport {
+    journal_checkpoint(cancel)?;
+    let conn = engine.db.conn();
+    let tx = conn.unchecked_transaction()?;
+    let dependencies = request.dependencies.as_deref();
+    let include_records = dependencies.is_some_and(|rows| !rows.is_empty());
+    validate_journal(&tx, &request.game_id, include_records)?;
+    let mut excluded_install_id = None;
+    let checks = match dependencies {
+        Some(rows) if include_records => {
+            let replacement = request.replace_install_id.as_deref();
+            validate_replacement(&tx, &request.game_id, replacement, None)?;
+            excluded_install_id = request.replace_install_id.clone();
+            Some(scan_checks(
+                &tx,
+                &request.game_id,
+                rows,
+                replacement,
+                cancel,
+            )?)
+        }
+        Some(_) => Some(Vec::new()),
+        None => None,
+    };
+    journal_checkpoint(cancel)?;
+    Ok(DependencyReport {
         game_id: request.game_id.clone(),
-        excluded_install_id: None,
-        checks: request.dependencies.as_ref().map(|_| Vec::new()),
-    };
-    let mut records = read_records(
-        engine,
-        &request.game_id,
-        request
-            .dependencies
-            .as_ref()
-            .is_some_and(|rows| !rows.is_empty()),
-    )?;
-    let Some(dependencies) = request.dependencies.as_deref().filter(|d| !d.is_empty()) else {
-        return Ok(report);
-    };
-    if let Some(id) = &request.replace_install_id {
-        exclude_replacement(&mut records, id, None)?;
-        report.excluded_install_id = Some(id.clone());
-    }
-    report.checks = Some(dependencies.iter().map(|d| compare(d, &records)).collect());
-    Ok(report)
+        excluded_install_id,
+        checks,
+    })
 }
 
-fn read_records(
-    engine: &FileEngine,
-    game_id: &str,
-    include_records: bool,
-) -> AppResult<Vec<InstallMatch>> {
-    let conn = engine.db.conn();
+fn validate_journal(conn: &Connection, game_id: &str, include_records: bool) -> AppResult<()> {
     let game_exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM games WHERE id=?1)",
         [game_id],
@@ -157,74 +233,119 @@ fn read_records(
     if !game_exists {
         return Err(AppError::NotFound("目标游戏未登记".into()));
     }
-    if !include_records {
-        return Ok(Vec::new());
+    if include_records {
+        let pending: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file_transactions WHERE status IN ('applying','rolling_back','recovery_failed'))",
+            [],
+            |row| row.get(0),
+        )?;
+        if pending {
+            return Err(AppError::Conflict(
+                "有待处理的文件事务，暂不能核对依赖".into(),
+            ));
+        }
     }
-
-    let pending: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM file_transactions WHERE status IN ('applying','rolling_back','recovery_failed'))",
-        [],
-        |row| row.get(0),
-    )?;
-    if pending {
-        return Err(AppError::Conflict(
-            "有待处理的文件事务，暂不能核对依赖".into(),
-        ));
-    }
-    let mut statement = conn.prepare(&format!(
-        "WITH records AS (
-           SELECT id, {INSTALL_STATE} AS deployment_state,
-             CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{{}}' END AS metadata
-           FROM installs
-           WHERE game_id=?1 AND source='modrinth' AND EXISTS (
-             SELECT 1 FROM install_transactions a WHERE a.install_id=installs.id AND a.action='install'
-           )
-         )
-         SELECT id, deployment_state,
-           substr(json_extract(metadata, '$.downloadOrigin.projectId'), 1, 33),
-           substr(json_extract(metadata, '$.downloadOrigin.versionId'), 1, 33)
-         FROM records
-         WHERE deployment_state IN ('enabled','partially_restored')
-           AND json_extract(metadata, '$.downloadOrigin.sourceId')='modrinth'
-           AND json_type(metadata, '$.downloadOrigin.projectId')='text'
-           AND json_type(metadata, '$.downloadOrigin.versionId')='text'
-         ORDER BY id LIMIT ?2"
-    ))?;
-    let mut records = statement
-        .query_map(params![game_id, MAX_RECORDS + 1], |row| {
-            Ok(InstallMatch {
-                install_id: row.get(0)?,
-                status: row.get(1)?,
-                project_id: row.get(2)?,
-                version_id: row.get(3)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    if records.len() > MAX_RECORDS {
-        return Err(AppError::Invalid("已装版本记录超出本次核对上限".into()));
-    }
-    records
-        .retain(|row| modrinth_id(&row.project_id).is_ok() && modrinth_id(&row.version_id).is_ok());
-    Ok(records)
+    Ok(())
 }
 
-fn exclude_replacement(
-    records: &mut Vec<InstallMatch>,
-    id: &str,
+fn journal_query(id_predicate: &str) -> String {
+    format!(
+        "WITH records AS (
+           SELECT id, CASE WHEN source='modrinth' THEN {INSTALL_STATE} END AS deployment_state,
+             CASE WHEN source='modrinth' AND json_valid(metadata_json) THEN metadata_json ELSE '{{}}' END AS metadata
+           FROM installs WHERE game_id=?1 {id_predicate}
+         )
+         SELECT id, deployment_state,
+           CASE WHEN json_extract(metadata, '$.downloadOrigin.sourceId')='modrinth'
+             AND json_type(metadata, '$.downloadOrigin.projectId')='text'
+             AND instr(json_extract(metadata, '$.downloadOrigin.projectId'), char(0))=0
+             THEN substr(json_extract(metadata, '$.downloadOrigin.projectId'), 1, 33) END,
+           CASE WHEN json_type(metadata, '$.downloadOrigin.versionId')='text'
+             AND instr(json_extract(metadata, '$.downloadOrigin.versionId'), char(0))=0
+             THEN substr(json_extract(metadata, '$.downloadOrigin.versionId'), 1, 33) END
+         FROM records"
+    )
+}
+
+fn read_record(row: &Row<'_>) -> rusqlite::Result<Option<InstallMatch>> {
+    let Some(status) = row.get::<_, Option<String>>(1)? else {
+        return Ok(None);
+    };
+    if !matches!(status.as_str(), "enabled" | "partially_restored") {
+        return Ok(None);
+    }
+    let (Some(project_id), Some(version_id)) = (
+        row.get::<_, Option<String>>(2)?,
+        row.get::<_, Option<String>>(3)?,
+    ) else {
+        return Ok(None);
+    };
+    if modrinth_id(&project_id).is_err() || modrinth_id(&version_id).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(InstallMatch {
+        install_id: row.get(0)?,
+        status,
+        project_id,
+        version_id,
+    }))
+}
+
+fn validate_replacement(
+    conn: &Connection,
+    game_id: &str,
+    id: Option<&str>,
     root: Option<&DownloadOrigin>,
 ) -> AppResult<()> {
-    let index = records
-        .iter()
-        .position(|record| {
-            record.install_id == id
-                && record.status == "enabled"
+    let Some(id) = id else { return Ok(()) };
+    let mut statement = conn.prepare(&journal_query("AND id=?2"))?;
+    let mut rows = statement.query(params![game_id, id])?;
+    if let Some(row) = rows.next()? {
+        if read_record(row)?.is_some_and(|record| {
+            record.status == "enabled"
                 && root.is_none_or(|root| {
                     record.project_id == root.project_id && record.version_id != root.version_id
                 })
-        })
-        .ok_or_else(|| AppError::Conflict("待替换的版本已变化，需重新选择".into()))?;
-    records.remove(index);
-    Ok(())
+        }) {
+            return Ok(());
+        }
+    }
+    Err(AppError::Conflict("待替换的版本已变化，需重新选择".into()))
+}
+
+fn journal_checkpoint(cancel: &CancellationToken) -> AppResult<()> {
+    if cancel.is_cancelled() {
+        Err(AppError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn scan_checks(
+    conn: &Connection,
+    game_id: &str,
+    declarations: &[ModDependency],
+    excluded: Option<&str>,
+    cancel: &CancellationToken,
+) -> AppResult<Vec<DependencyCheck>> {
+    journal_checkpoint(cancel)?;
+    let mut index = MatchIndex::new(declarations);
+    if !index.projects.is_empty() || !index.versions.is_empty() {
+        // SQLite's cursor progresses through the registered game's rows in a
+        // read snapshot. Don't sort or collect the library; keep counts and
+        // representative matches only for IDs mentioned in the declarations.
+        let mut statement = conn.prepare(&journal_query("AND id IS NOT ?2"))?;
+        let mut rows = statement.query(params![game_id, excluded])?;
+        loop {
+            let row = rows.next()?;
+            journal_checkpoint(cancel)?;
+            let Some(row) = row else { break };
+            if let Some(record) = read_record(row)? {
+                index.observe(&record);
+            }
+        }
+    }
+    Ok(declarations.iter().map(|dep| index.compare(dep)).collect())
 }
 
 fn graph_origin(engine: &FileEngine, request: &GraphReviewRequest) -> AppResult<DownloadOrigin> {
@@ -243,61 +364,81 @@ fn graph_origin(engine: &FileEngine, request: &GraphReviewRequest) -> AppResult<
         .and_then(|record| record.origin())
         .filter(|root| root.source_id == "modrinth" && root.artifact_id == request.artifact_id)
         .ok_or_else(|| AppError::Invalid("下载归档没有可核对的 Modrinth 项目及版本记录".into()))?;
-    graph_records(engine, request, &root)?;
+    graph_game(engine, request)?;
+    let conn = engine.db.conn();
+    let tx = conn.unchecked_transaction()?;
+    validate_journal(&tx, &request.game_id, true)?;
+    validate_replacement(
+        &tx,
+        &request.game_id,
+        request.replace_install_id.as_deref(),
+        Some(&root),
+    )?;
     Ok(root)
 }
 
-fn graph_records(
-    engine: &FileEngine,
-    request: &GraphReviewRequest,
-    root: &DownloadOrigin,
-) -> AppResult<(Game, Vec<InstallMatch>)> {
+fn graph_game(engine: &FileEngine, request: &GraphReviewRequest) -> AppResult<Game> {
     let game = crate::games::get_game(&engine.db, &request.game_id)?;
     if game.adapter_slug.as_deref() != Some("minecraft-java") {
         return Err(AppError::Unsupported(
             "Modrinth 传递依赖核对需要已确认 Minecraft Java 适配包的游戏".into(),
         ));
     }
-    let mut records = read_records(engine, &request.game_id, true)?;
-    if let Some(id) = &request.replace_install_id {
-        exclude_replacement(&mut records, id, Some(root))?;
-    }
-    Ok((game, records))
+    Ok(game)
 }
 
 pub(crate) async fn review_graph(
     engine: FileEngine,
     sources: &Sources,
     request: GraphReviewRequest,
+    cancel: &CancellationToken,
 ) -> AppResult<GraphReview> {
+    journal_checkpoint(cancel)?;
     let preflight = engine.clone();
+    let preflight_cancel = cancel.clone();
     let (request, root) = tokio::task::spawn_blocking(move || {
+        journal_checkpoint(&preflight_cancel)?;
         let root = graph_origin(&preflight, &request)?;
+        journal_checkpoint(&preflight_cancel)?;
         Ok::<_, AppError>((request, root))
     })
     .await
     .map_err(|_| AppError::Other("读取依赖核对范围失败".into()))??;
     let graph = sources
-        .modrinth_dependency_graph(&DependencyGraphRequest {
-            project_id: Some(root.project_id.clone()),
-            version_id: root.version_id.clone(),
-            game_version: request.game_version.clone(),
-            loader: request.loader.clone(),
-            project_pins: request.project_pins.clone(),
-        })
+        .modrinth_dependency_graph(
+            &DependencyGraphRequest {
+                project_id: Some(root.project_id.clone()),
+                version_id: root.version_id.clone(),
+                game_version: request.game_version.clone(),
+                loader: request.loader.clone(),
+                project_pins: request.project_pins.clone(),
+            },
+            cancel,
+        )
         .await?;
+    let cancel = cancel.clone();
     tokio::task::spawn_blocking(move || {
         // Do not use an install snapshot taken before an asynchronous provider lookup.
-        let _guard = crate::transaction::write_lock();
-        let (game, records) = graph_records(&engine, &request, &root)?;
-        let checks: Vec<_> = graph
-            .journal_declarations()
-            .iter()
-            .map(|dep| compare(dep, &records))
-            .collect();
+        let _guard = crate::transaction::write_lock_cancellable(&cancel)?;
+        let game = graph_game(&engine, &request)?;
+        let checks = {
+            let conn = engine.db.conn();
+            let tx = conn.unchecked_transaction()?;
+            let replacement = request.replace_install_id.as_deref();
+            validate_journal(&tx, &request.game_id, true)?;
+            validate_replacement(&tx, &request.game_id, replacement, Some(&root))?;
+            scan_checks(
+                &tx,
+                &request.game_id,
+                &graph.journal_declarations(),
+                replacement,
+                &cancel,
+            )?
+        };
         let mut file_evidence = BTreeMap::new();
-        let mut pass = FileEvidencePass::new(&engine, &game)?;
+        let mut pass = FileEvidencePass::new(&engine, &game)?.with_cancel(&cancel);
         for (selected, check) in graph.selected_edges().zip(&checks) {
+            journal_checkpoint(&cancel)?;
             if selected && check.status == DependencyStatus::RecordedExact {
                 let id = &check.matches[0].install_id;
                 if let std::collections::btree_map::Entry::Vacant(entry) =
@@ -307,6 +448,7 @@ pub(crate) async fn review_graph(
                 }
             }
         }
+        journal_checkpoint(&cancel)?;
         Ok(GraphReview {
             artifact_id: request.artifact_id,
             game_id: request.game_id,
@@ -322,49 +464,131 @@ pub(crate) async fn review_graph(
     .map_err(|_| AppError::Other("读取依赖安装记录失败".into()))?
 }
 
-fn compare(dependency: &ModDependency, records: &[InstallMatch]) -> DependencyCheck {
-    use DependencyStatus::*;
-    let project = dependency.project_id.as_deref();
-    let version = dependency.version_id.as_deref();
-    let mut matches = Vec::new();
-    let mut match_count = 0;
-    let mut inconsistent = false;
-    let (status, reason) = if dependency.dependency_type == DependencyType::Embedded {
-        (Embedded, None)
-    } else if project.is_none() && version.is_none() {
-        (Unconfirmed, Some(UnconfirmedReason::FileReference))
-    } else {
-        for record in records {
-            let same_project = project == Some(record.project_id.as_str());
-            let same_version = version == Some(record.version_id.as_str());
-            if same_version && project.is_some() && !same_project {
-                inconsistent = true;
+#[derive(Default)]
+struct MatchSummary {
+    count: usize,
+    samples: Vec<InstallMatch>,
+}
+
+#[derive(Default)]
+struct MatchIndex<'a> {
+    projects: HashMap<&'a str, MatchSummary>,
+    versions: HashMap<&'a str, MatchSummary>,
+    pairs: HashMap<&'a str, HashMap<&'a str, usize>>,
+}
+
+impl<'a> MatchIndex<'a> {
+    fn new(declarations: &'a [ModDependency]) -> Self {
+        let mut index = Self::default();
+        for dep in declarations
+            .iter()
+            .filter(|dep| dep.dependency_type != DependencyType::Embedded)
+        {
+            let project = dep.project_id.as_deref();
+            let version = dep.version_id.as_deref();
+            if let Some(project) = project {
+                index.projects.entry(project).or_default();
             }
-            if same_project || same_version {
-                match_count += 1;
-                if matches.len() < MAX_MATCHES_PER_DECLARATION {
-                    matches.push(record.clone());
+            if let Some(version) = version {
+                index.versions.entry(version).or_default();
+            }
+            if let (Some(project), Some(version)) = (project, version) {
+                index
+                    .pairs
+                    .entry(project)
+                    .or_default()
+                    .entry(version)
+                    .or_default();
+            }
+        }
+        index
+    }
+
+    fn observe(&mut self, record: &InstallMatch) {
+        for group in [
+            self.projects.get_mut(record.project_id.as_str()),
+            self.versions.get_mut(record.version_id.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            group.count += 1;
+            let position = group
+                .samples
+                .partition_point(|seen| seen.install_id < record.install_id);
+            if position < MAX_MATCHES_PER_DECLARATION {
+                if group.samples.len() == MAX_MATCHES_PER_DECLARATION {
+                    group.samples.pop();
                 }
+                group.samples.insert(position, record.clone());
             }
         }
-        match (match_count, matches.first()) {
-            _ if inconsistent => (Unconfirmed, Some(UnconfirmedReason::InconsistentIds)),
-            (0, _) => (NotRecorded, None),
-            (1, Some(row)) if row.status == "partially_restored" => {
-                (Unconfirmed, Some(UnconfirmedReason::PartialInstall))
-            }
-            (1, Some(row)) if version == Some(row.version_id.as_str()) => (RecordedExact, None),
-            (1, Some(_)) if version.is_none() => (RecordedProject, None),
-            (1, Some(_)) => (DifferentVersion, None),
-            _ => (Unconfirmed, Some(UnconfirmedReason::AmbiguousRecords)),
+        // Exact-pair groups are needed for inclusion/exclusion counts only.
+        if let Some(count) = self
+            .pairs
+            .get_mut(record.project_id.as_str())
+            .and_then(|versions| versions.get_mut(record.version_id.as_str()))
+        {
+            *count += 1;
         }
-    };
-    DependencyCheck {
-        dependency: dependency.clone(),
-        status,
-        reason,
-        matches,
-        match_count,
+    }
+
+    fn compare(&self, dependency: &ModDependency) -> DependencyCheck {
+        use DependencyStatus::*;
+        let project = dependency.project_id.as_deref();
+        let version = dependency.version_id.as_deref();
+        let mut matches = Vec::new();
+        let mut match_count = 0;
+        let (status, reason) = if dependency.dependency_type == DependencyType::Embedded {
+            (Embedded, None)
+        } else if project.is_none() && version.is_none() {
+            (Unconfirmed, Some(UnconfirmedReason::FileReference))
+        } else {
+            let p = project.and_then(|id| self.projects.get(id));
+            let v = version.and_then(|id| self.versions.get(id));
+            let p_count = p.map_or(0, |group| group.count);
+            let v_count = v.map_or(0, |group| group.count);
+            let both = project
+                .zip(version)
+                .and_then(|(project, version)| self.pairs.get(project)?.get(version))
+                .copied()
+                .unwrap_or(0);
+            match_count = p_count + (v_count - both);
+            // The first k of the union must be within the first k of either
+            // group. Sort these small samples by ID, regardless of scan order.
+            let mut samples: Vec<_> = p
+                .into_iter()
+                .chain(v)
+                .flat_map(|group| &group.samples)
+                .collect();
+            samples.sort_unstable_by(|a, b| a.install_id.cmp(&b.install_id));
+            samples.dedup_by(|a, b| a.install_id == b.install_id);
+            matches = samples
+                .into_iter()
+                .take(MAX_MATCHES_PER_DECLARATION)
+                .cloned()
+                .collect();
+            match (match_count, matches.first()) {
+                _ if project.is_some() && v_count > both => {
+                    (Unconfirmed, Some(UnconfirmedReason::InconsistentIds))
+                }
+                (0, _) => (NotRecorded, None),
+                (1, Some(row)) if row.status == "partially_restored" => {
+                    (Unconfirmed, Some(UnconfirmedReason::PartialInstall))
+                }
+                (1, Some(row)) if version == Some(row.version_id.as_str()) => (RecordedExact, None),
+                (1, Some(_)) if version.is_none() => (RecordedProject, None),
+                (1, Some(_)) => (DifferentVersion, None),
+                _ => (Unconfirmed, Some(UnconfirmedReason::AmbiguousRecords)),
+            }
+        };
+        DependencyCheck {
+            dependency: dependency.clone(),
+            status,
+            reason,
+            matches,
+            match_count,
+        }
     }
 }
 

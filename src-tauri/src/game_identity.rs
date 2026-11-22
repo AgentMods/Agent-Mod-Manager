@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 const MAX_ENTRIES: usize = 512;
 const MAX_NAME_BYTES: usize = 512;
 const MAX_PATH_BYTES: usize = 4096;
-const MAX_EVIDENCE_BYTES: usize = 32 * 1024;
+const MAX_EVIDENCE_METADATA_BYTES: usize = 32 * 1024;
 const TTL_SECONDS: i64 = 24 * 60 * 60;
 const LEGACY_PROVIDER: &str = "brave";
 
@@ -502,7 +502,7 @@ where
             .into_iter()
             .take(5)
             .map(|hit| GameIdentityCandidate {
-                name: hit.title.chars().take(128).collect(),
+                name: hit.title.clone(),
                 title: hit.title,
                 url: hit.url,
                 snippet: hit.snippet,
@@ -524,6 +524,8 @@ where
     };
     let digest = hex::encode(Sha256::digest(serde_json::to_vec(&evidence)?));
     evidence.id = format!("{}_{digest}", evidence.id);
+    let encoded = serde_json::to_string(&evidence)?;
+    check_evidence_size(&encoded, &evidence.query)?;
     let _guard = crate::transaction::write_lock();
     check_cancel(cancel)?;
     if snapshot(engine, directory)?.fingerprint != evidence.fingerprint {
@@ -536,10 +538,19 @@ where
         [root],
     )?;
     tx.execute("INSERT INTO game_identity_searches(id,root_path,fingerprint,query,evidence_json,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
-        params![evidence.id,root,evidence.fingerprint,evidence.query,serde_json::to_string(&evidence)?,evidence.created_at])?;
+        params![evidence.id,root,evidence.fingerprint,evidence.query,encoded,evidence.created_at])?;
     check_cancel(cancel)?;
     tx.commit()?;
     Ok(evidence)
+}
+
+// Public queries have their own bounded wire format. Keep the independent evidence
+// budget for the candidate details and metadata, including when reloading old rows.
+fn check_evidence_size(encoded: &str, validated_query: &str) -> AppResult<()> {
+    if encoded.len() > MAX_EVIDENCE_METADATA_BYTES + serde_json::to_vec(validated_query)?.len() {
+        return Err(invalid("Oversized evidence"));
+    }
+    Ok(())
 }
 
 fn load_evidence(conn: &Connection, id: &str) -> AppResult<GameIdentitySearch> {
@@ -551,9 +562,8 @@ fn load_evidence(conn: &Connection, id: &str) -> AppResult<GameIdentitySearch> {
         [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?;
     let (root, fingerprint, query, encoded, created) =
         row.ok_or_else(|| invalid("搜索证据不存在或已被替换，请重新搜索"))?;
-    if encoded.len() > MAX_EVIDENCE_BYTES {
-        return Err(invalid("Oversized evidence"));
-    }
+    public_query(&query)?;
+    check_evidence_size(&encoded, &query)?;
     let mut evidence: GameIdentitySearch = serde_json::from_str(&encoded)?;
     if evidence.id != id
         || evidence.root_path != root
@@ -578,7 +588,6 @@ fn load_evidence(conn: &Connection, id: &str) -> AppResult<GameIdentitySearch> {
     if age < chrono::Duration::zero() || age >= chrono::Duration::seconds(TTL_SECONDS) {
         return Err(invalid("搜索证据已过期，请重新搜索"));
     }
-    public_query(&evidence.query)?;
     if evidence.candidates.len() > 5 {
         return Err(invalid("Too many candidates"));
     }
@@ -589,18 +598,15 @@ fn validate_name(name: &str) -> AppResult<()> {
     let drive_path = name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
         && name.as_bytes().get(1) == Some(&b':')
         && name.as_bytes().get(2) != Some(&b' ');
-    if !(1..=128).contains(&name.chars().count())
+    if name.is_empty()
         || name.trim() != name
-        || name.trim().is_empty()
         || name.chars().any(|ch| {
             unsafe_character(ch) || (ch.is_whitespace() && ch != ' ') || matches!(ch, '/' | '\\')
         })
         || drive_path
         || matches!(name, "." | "..")
     {
-        return Err(invalid(
-            "游戏名称须为 1 至 128 个可见字符，不能包含路径或控制字符",
-        ));
+        return Err(invalid("游戏名称不能为空、含首尾空白、路径或控制字符"));
     }
     Ok(())
 }

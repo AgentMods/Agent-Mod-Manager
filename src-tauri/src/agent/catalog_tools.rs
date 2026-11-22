@@ -84,7 +84,7 @@ impl AgentTool for CatalogTool {
             ),
             Action::Import => (
                 "import_cloud_plugin",
-                "审查并导入所选发布的原文为草稿，返回 draftId。",
+                "审查并导入所选发布的原文为临时草稿，返回 draftId；安装或发布完成后自动移入回收站。",
                 Effect::ManagerWrite,
             ),
         };
@@ -113,6 +113,7 @@ impl AgentTool for CatalogTool {
                 .client
                 .prepare_import(&context.engine, &a.plugin_id, &a.release_id)
                 .await?;
+            crate::plugin_workflow::mark_agent_draft(&context.engine, &import.draft_id)?;
             return Ok(reviewed_import(import));
         }
         Ok(PreparedTool {

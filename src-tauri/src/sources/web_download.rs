@@ -4,7 +4,6 @@ use crate::error::{AppError, AppResult};
 use percent_encoding::percent_decode_str;
 use url::Url;
 
-pub(crate) const MAX_WEB_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const MAX_WEB_URL_BYTES: usize = 2048;
 const MAX_ENDPOINT_BYTES: usize = 8192;
 

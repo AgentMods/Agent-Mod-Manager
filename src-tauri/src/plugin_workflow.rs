@@ -16,14 +16,14 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
-    io::{Read, Write},
+    io::Write,
     path::{Component, Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
 
+// Public catalog download limits; not used for approved local assets.
 pub(crate) const ADAPTER_LIMIT: usize = 256 * 1024;
 pub(crate) const SKILL_LIMIT: usize = 128 * 1024;
-const RECORD_LIMIT: usize = 1024 * 1024;
 const SOURCE: &str = "external";
 static WORKFLOW_LOCK: Mutex<()> = Mutex::new(());
 
@@ -34,7 +34,7 @@ fn invalid(message: impl Into<String>) -> AppError {
     AppError::Invalid(message.into())
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DraftInfo {
     pub id: String,
@@ -126,9 +126,6 @@ impl Content {
         }
     }
     fn package(&self, slug: &str) -> AppResult<GamePackage> {
-        if self.adapter_json.len() > ADAPTER_LIMIT || self.skill_markdown.len() > SKILL_LIMIT {
-            return Err(invalid("包内容超出大小限制"));
-        }
         if PackageHashes::of(&self.adapter_json, &self.skill_markdown) != self.hashes {
             return Err(AppError::Conflict(
                 "持久包记录的 SHA-256 与原文不一致".into(),
@@ -254,21 +251,13 @@ fn scratch_path(engine: &FileEngine, id: &str) -> AppResult<PathBuf> {
         &engine.paths.staging().join("plugin-scratch").join(id),
     )
 }
-fn read_text(engine: &FileEngine, path: &Path, limit: usize) -> AppResult<String> {
+fn read_text(engine: &FileEngine, path: &Path, limit: Option<u64>) -> AppResult<String> {
     checked_path(engine, path)?;
-    let meta = fs::symlink_metadata(path)?;
-    if !meta.is_file() || meta.len() > limit as u64 {
-        return Err(invalid("包文件须为大小受限的普通文件"));
-    }
-    let file = fs::File::open(path)?;
+    let text = plugins::read_local_text(path, limit)?;
     checked_path(engine, path)?;
-    let mut bytes = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > limit {
-        return Err(invalid("读取包文件超过上限"));
-    }
-    String::from_utf8(bytes).map_err(|_| invalid("包文件必须是 UTF-8"))
+    Ok(text)
 }
+
 pub(crate) fn validate_package_directory(engine: &FileEngine, directory: &Path) -> AppResult<()> {
     checked_path(engine, directory)?;
     if !fs::symlink_metadata(directory)?.is_dir() {
@@ -293,10 +282,18 @@ pub(crate) fn validate_package_directory(engine: &FileEngine, directory: &Path) 
 }
 
 fn read_content(engine: &FileEngine, directory: &Path) -> AppResult<Content> {
+    read_content_with_limits(engine, directory, [None; 2])
+}
+
+fn read_content_with_limits(
+    engine: &FileEngine,
+    directory: &Path,
+    [adapter_limit, skill_limit]: [Option<u64>; 2],
+) -> AppResult<Content> {
     validate_package_directory(engine, directory)?;
     Ok(Content::new(
-        read_text(engine, &directory.join("adapter.json"), ADAPTER_LIMIT)?,
-        read_text(engine, &directory.join("SKILL.md"), SKILL_LIMIT)?,
+        read_text(engine, &directory.join("adapter.json"), adapter_limit)?,
+        read_text(engine, &directory.join("SKILL.md"), skill_limit)?,
     ))
 }
 
@@ -310,9 +307,6 @@ pub fn plan_write_draft(
 ) -> AppResult<DraftPreview> {
     let _lock = lock();
     external_slug(engine, slug)?;
-    if adapter_json.len() > ADAPTER_LIMIT || skill_markdown.len() > SKILL_LIMIT {
-        return Err(invalid("草稿文件超过适配包/Skill 大小上限"));
-    }
     let id = util::new_id("draft");
     let target = draft_path(engine, &id, slug)?;
     if fs::symlink_metadata(&target).is_ok() {
@@ -423,12 +417,21 @@ pub(crate) fn ensure_draft_not_deleted(conn: &Connection, id: &str) -> AppResult
     Ok(())
 }
 
-/// Only the confirmed desktop IPC may authorize this move. Preserve the
-/// original draft/write transaction as evidence for already installed packages.
+/// Manual deletion requires the confirmed desktop IPC. Automated retirement
+/// uses the same reversible transaction with narrower eligibility checks.
 pub(crate) fn delete_confirmed_draft(engine: &FileEngine, id: &str) -> AppResult<()> {
     validate_draft_id(id)?;
     let _workflow = lock();
     let files = transaction::write_lock();
+    recycle_draft_locked(engine, id, &files, false)
+}
+
+fn recycle_draft_locked(
+    engine: &FileEngine,
+    id: &str,
+    files: &MutexGuard<'static, ()>,
+    automatic: bool,
+) -> AppResult<()> {
     let draft = get_draft(engine, id)?;
     ensure_draft_not_deleted(&engine.db.conn(), id)?;
     if transaction_status(engine, &draft.write_transaction_id)? != "committed" {
@@ -461,14 +464,18 @@ pub(crate) fn delete_confirmed_draft(engine: &FileEngine, id: &str) -> AppResult
         &TrashRequest {
             paths: vec![expected.to_string_lossy().into_owned()],
             game_id: None,
-            reason: format!("删除插件草稿 {id}"),
+            reason: if automatic {
+                format!("自动清理已用完的 Agent 插件草稿 {id}")
+            } else {
+                format!("删除插件草稿 {id}")
+            },
         },
     )?;
     let [item] = trash.as_slice() else {
         return Err(invalid("插件草稿删除必须对应唯一的回收站项"));
     };
     let plan = engine.build_locked_plan(
-        &files,
+        files,
         vec![item.operation.clone()],
         format!("移入回收站：插件草稿 {} ({id})", draft.slug),
         true,
@@ -486,6 +493,13 @@ pub(crate) fn delete_confirmed_draft(engine: &FileEngine, id: &str) -> AppResult
             "草稿或回收站路径已改变，不能移动草稿".into(),
         ));
     }
+    // An automatic move must never sweep up a user's edits or extra files.
+    // Check AFTER the move plan fingerprints the directory: apply rechecks that snapshot.
+    if automatic && !validate_inner(engine, id)?.valid {
+        return Err(AppError::Conflict(
+            "草稿内容与已审查的原文不符，已保留".into(),
+        ));
+    }
     let trash_id = item.id().to_owned();
     {
         // The plan, recycle-bin item and tombstone are durable before any
@@ -501,8 +515,28 @@ pub(crate) fn delete_confirmed_draft(engine: &FileEngine, id: &str) -> AppResult
         tx.commit()?;
     }
     engine.approve_plan(&plan.id)?;
-    engine.apply_locked(&files, &plan.id)?;
+    engine.apply_locked(files, &plan.id)?;
     Ok(())
+}
+
+mod draft_cleanup;
+pub(crate) use draft_cleanup::{cleanup_consumed_agent_drafts, mark_agent_draft};
+
+/// Reads only reconcile registration. Retire staging files after applying a
+/// deployment (or during startup recovery), not as a side effect of listing packages.
+pub(crate) fn reconcile_after_apply(
+    engine: &FileEngine,
+    plan: &FilePlan,
+) -> AppResult<ReconcileReport> {
+    let report = reconcile_deployments(engine)?;
+    if let Some(FileOp::Copy { src, .. }) = plan.entries.first().map(|e| &e.operation) {
+        if let Ok(relative) = src.strip_prefix(engine.paths.staging().join("plugin-drafts")) {
+            if let Some(id) = relative.iter().next().and_then(|id| id.to_str()) {
+                cleanup_consumed_agent_drafts(engine, Some(id));
+            }
+        }
+    }
+    Ok(report)
 }
 
 /// An already reviewed deployment preview must not use a deleted draft even
@@ -625,11 +659,35 @@ fn validate_inner(engine: &FileEngine, id: &str) -> AppResult<DraftValidation> {
         if report.transaction_status != "committed" {
             return Err(AppError::Conflict("草稿写入事务尚未提交或已回滚".into()));
         }
-        let content = read_content(engine, &expected)?;
-        verify_copy_plan(
-            &engine.get_plan(&report.draft.write_transaction_id)?,
+        let plan = engine.get_plan(&report.draft.write_transaction_id)?;
+        let scratch = scratch_path(engine, id)?;
+        let entries = package_copy_entries(
+            &plan,
             &report.draft.write_transaction_id,
-            &scratch_path(engine, id)?,
+            &scratch,
+            &expected,
+            true,
+        )?;
+        let size = |entry: &crate::transaction::PlannedEntry| {
+            entry
+                .source
+                .as_ref()
+                .filter(|fp| fp.kind == "file")
+                .map(|fp| fp.size)
+                .ok_or_else(|| invalid("草稿计划缺少文件源快照"))
+        };
+        // The committed draft's actual snapshot sets the read budget. A larger
+        // replacement is rejected before allocating/reading it, however large
+        // the explicitly reviewed original was.
+        let content = read_content_with_limits(
+            engine,
+            &expected,
+            [Some(size(entries[0])?), Some(size(entries[1])?)],
+        )?;
+        verify_copy_plan(
+            &plan,
+            &report.draft.write_transaction_id,
+            &scratch,
             &expected,
             &content,
             true,
@@ -670,7 +728,11 @@ fn deployment_rows(engine: &FileEngine) -> AppResult<Vec<DeploymentRow>> {
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 fn deployment_record(engine: &FileEngine, row: &DeploymentRow) -> AppResult<DeploymentRecord> {
-    let json: String = engine.db.conn().query_row("SELECT CASE WHEN length(CAST(package_json AS BLOB))<=?2 THEN package_json ELSE '' END FROM plugin_deployments WHERE transaction_id=?1", params![row.transaction_id,RECORD_LIMIT], |r| r.get(0))?;
+    let json: String = engine.db.conn().query_row(
+        "SELECT package_json FROM plugin_deployments WHERE transaction_id=?1",
+        [&row.transaction_id],
+        |r| r.get(0),
+    )?;
     let record: DeploymentRecord = serde_json::from_str(&json)?;
     if record.schema_version != 1 {
         return Err(invalid("部署记录版本不受支持"));
@@ -883,9 +945,6 @@ pub fn plan_install_plugin(engine: &FileEngine, draft_id: &str) -> AppResult<Dep
         skill_enabled: state.as_ref().is_none_or(|s| s.skill_enabled),
     };
     let json = serde_json::to_string(&record)?;
-    if json.len() > RECORD_LIMIT {
-        return Err(invalid("部署回放记录超过上限"));
-    }
     let plan = engine.plan_file_ops(
         ["adapter.json", "SKILL.md"]
             .iter()
@@ -1126,8 +1185,8 @@ fn verified_installed_content(
     let content = read_content(engine, target)?;
     let package = content.package(&info.slug)?;
     let registered: String = engine.db.conn().query_row(
-        "SELECT CASE WHEN length(CAST(adapter_json AS BLOB))<=?2 THEN adapter_json ELSE '' END FROM plugins WHERE slug=?1",
-        params![info.slug, ADAPTER_LIMIT],
+        "SELECT adapter_json FROM plugins WHERE slug=?1",
+        [&info.slug],
         |r| r.get(0),
     )?;
     if package.adapter.version != info.version

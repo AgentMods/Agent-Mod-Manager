@@ -15,9 +15,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MAX_ADAPTER_BYTES: usize = 256 * 1024;
-const MAX_SKILL_BYTES: usize = 128 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Platform {
@@ -492,11 +489,10 @@ impl GameAdapter {
 /// YAML tags, aliases, multiline scalars and executable extensions are rejected.
 pub fn parse_skill(markdown: &str, expected_slug: &str) -> AppResult<SkillMetadata> {
     validate_slug(expected_slug)?;
-    if markdown.len() > MAX_SKILL_BYTES || markdown.contains('\0') {
-        return Err(invalid("SKILL.md 超出大小限制或包含空字节"));
+    if markdown.contains('\0') {
+        return Err(invalid("SKILL.md 包含空字节"));
     }
-    let normalized = markdown.replace("\r\n", "\n");
-    let mut lines = normalized.lines();
+    let mut lines = markdown.lines();
     if lines.next() != Some("---") {
         return Err(invalid("SKILL.md 缺少 YAML frontmatter"));
     }
@@ -542,7 +538,7 @@ pub fn parse_skill(markdown: &str, expected_slug: &str) -> AppResult<SkillMetada
         }
         fields.insert(key, value);
     }
-    if !closed || lines.collect::<Vec<_>>().join("\n").trim().is_empty() {
+    if !closed || !lines.any(|line| !line.trim().is_empty()) {
         return Err(invalid("SKILL.md frontmatter 未闭合或正文为空"));
     }
     let name = fields
@@ -569,9 +565,6 @@ pub fn parse_package(
     skill_markdown: &str,
 ) -> AppResult<GamePackage> {
     validate_slug(directory_name)?;
-    if adapter_json.len() > MAX_ADAPTER_BYTES {
-        return Err(invalid("adapter.json 超出大小限制"));
-    }
     let adapter: GameAdapter = serde_json::from_str(adapter_json)?;
     adapter.validate()?;
     if adapter.slug != directory_name {
@@ -596,27 +589,35 @@ pub fn load_package(directory: &Path) -> AppResult<GamePackage> {
         .and_then(|s| s.to_str())
         .ok_or_else(|| invalid("适配包目录名无效"))?;
     validate_slug(slug)?;
-    let read = |name: &str, limit: usize| -> AppResult<String> {
-        use std::io::Read;
-        let path = directory.join(name);
-        let meta = fs::symlink_metadata(&path)?;
-        if !meta.file_type().is_file() || meta.len() > limit as u64 {
-            return Err(invalid(format!("{name} 必须是大小受限的普通文件")));
-        }
-        let mut bytes = Vec::new();
-        fs::File::open(path)?
-            .take(limit as u64 + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() > limit {
-            return Err(invalid(format!("{name} 超出大小限制")));
-        }
-        String::from_utf8(bytes).map_err(|_| invalid(format!("{name} 必须为 UTF-8")))
-    };
     parse_package(
         slug,
-        &read("adapter.json", MAX_ADAPTER_BYTES)?,
-        &read("SKILL.md", MAX_SKILL_BYTES)?,
+        &read_local_text(&directory.join("adapter.json"), None)?,
+        &read_local_text(&directory.join("SKILL.md"), None)?,
     )
+}
+
+/// Read a regular-file snapshot, not an unbounded stream. A changed length
+/// (including a file that grows during the read) invalidates the snapshot.
+/// Callers additionally validate the managed directory and recorded hashes.
+pub(crate) fn read_local_text(path: &Path, limit: Option<u64>) -> AppResult<String> {
+    use std::io::Read;
+    let mut file = crate::safe_fs::open_regular(path)?;
+    crate::safe_fs::verify_regular_at(&file, path)?;
+    let before = file.metadata()?;
+    let len = before.len();
+    if limit.is_some_and(|limit| len > limit) {
+        return Err(invalid("文本文件超过读取上限"));
+    }
+    let mut text = String::new();
+    (&mut file)
+        .take(len.saturating_add(1))
+        .read_to_string(&mut text)?;
+    crate::safe_fs::verify_regular_at(&file, path)?;
+    let after = file.metadata()?;
+    if text.len() as u64 != len || after.len() != len || after.modified()? != before.modified()? {
+        return Err(AppError::Conflict("文本文件在读取期间改变".into()));
+    }
+    Ok(text)
 }
 
 /// Park directories registered by earlier desktop releases, including local edits.
@@ -678,8 +679,8 @@ pub struct PluginInfo {
 
 pub fn list_plugins(db: &Db) -> AppResult<Vec<PluginInfo>> {
     let conn = db.conn();
-    let mut statement = conn.prepare("SELECT slug,name,game_name,version,description,source,enabled,validated,install_path,CASE WHEN length(CAST(adapter_json AS BLOB))<=?1 THEN adapter_json END FROM plugins ORDER BY name,slug")?;
-    let rows = statement.query_map([MAX_ADAPTER_BYTES], |r| {
+    let mut statement = conn.prepare("SELECT slug,name,game_name,version,description,source,enabled,validated,install_path,adapter_json FROM plugins ORDER BY name,slug")?;
+    let rows = statement.query_map([], |r| {
         let slug: String = r.get(0)?;
         let version: String = r.get(3)?;
         let validated: bool = r.get(7)?;
@@ -718,7 +719,7 @@ pub fn list_plugins(db: &Db) -> AppResult<Vec<PluginInfo>> {
 }
 
 pub(crate) fn matches_registered_adapter(json: &str, adapter: &GameAdapter) -> AppResult<bool> {
-    if json.is_empty() || json.len() > MAX_ADAPTER_BYTES {
+    if json.is_empty() {
         return Ok(false);
     }
     let registered: GameAdapter = serde_json::from_str(json)?;
@@ -740,9 +741,6 @@ pub fn adapter_for(db: &Db, slug: &str) -> AppResult<GameAdapter> {
         row.ok_or_else(|| AppError::NotFound(format!("适配包: {slug}")))?;
     if !enabled || !validated {
         return Err(AppError::Denied(format!("适配包未启用或未验证: {slug}")));
-    }
-    if json.len() > MAX_ADAPTER_BYTES {
-        return Err(invalid("数据库适配包超出大小限制"));
     }
     let adapter: GameAdapter = serde_json::from_str(&json)?;
     adapter.validate()?;
@@ -933,10 +931,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_input_and_invalid_package_files() {
+    fn accepts_large_text_but_rejects_invalid_package_files() {
         let (slug, json, skill) = test_fixtures::PACKAGES[0];
-        assert!(parse_package(slug, &" ".repeat(MAX_ADAPTER_BYTES + 1), skill).is_err());
-        assert!(parse_package(slug, json, &" ".repeat(MAX_SKILL_BYTES + 1)).is_err());
+        let large_adapter = format!("{json}{}", " ".repeat(256 * 1024));
+        let large_skill = format!("{skill}\n{}", "指南\n".repeat(32 * 1024));
+        let parsed = parse_package(slug, &large_adapter, &large_skill).unwrap();
+        assert_eq!(parsed.skill_markdown, large_skill);
         let temp = tempfile::tempdir().unwrap();
         let package = temp.path().join(slug);
         fs::create_dir_all(&package).unwrap();

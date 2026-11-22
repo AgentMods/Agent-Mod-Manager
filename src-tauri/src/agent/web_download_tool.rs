@@ -4,13 +4,14 @@ use super::{
 };
 use crate::{
     download::DownloadManager,
+    download_tasks::{agent_download_schema, AgentDownloadArgs, CompletedSource, DownloadTarget},
     error::{AppError, AppResult},
     sources::{
         resolutions::ResolutionScope,
-        web_download::{WebDownload, MAX_WEB_BYTES, MAX_WEB_URL_BYTES},
+        web_download::{WebDownload, MAX_WEB_URL_BYTES},
     },
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -22,22 +23,26 @@ pub(super) fn register(registry: &ToolRegistry) -> AppResult<()> {
 
 struct WebDownloadTool;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Args {
+#[derive(Deserialize, Serialize)]
+struct Transfer {
     url: String,
 }
 
 pub(super) fn history_arguments(raw: &str) -> String {
     // Keep only the canonical public URL. In particular, do not store a
     // rejected signed URL in the assistant tool call or tool-start event.
-    serde_json::from_str::<Args>(raw)
-        .ok()
-        .and_then(|args| WebDownload::parse(&args.url).ok())
-        .map_or_else(|| "{}".into(), |file| json!({"url":file.url()}).to_string())
+    AgentDownloadArgs::<Transfer>::from_history(raw)
+        .and_then(|mut args| {
+            args.transfer.url = WebDownload::parse(&args.transfer.url)
+                .ok()?
+                .url()
+                .to_owned();
+            serde_json::to_string(&args).ok()
+        })
+        .unwrap_or_else(|| "{}".into())
 }
 
-fn request(context: &ToolContext, args: Value) -> AppResult<WebDownload> {
+fn request(context: &ToolContext, args: &Value) -> AppResult<(WebDownload, DownloadTarget)> {
     if context.cancel.is_cancelled() {
         return Err(AppError::Cancelled);
     }
@@ -46,18 +51,20 @@ fn request(context: &ToolContext, args: Value) -> AppResult<WebDownload> {
             "网页归档下载只在桌面 Agent 对话内接受审批".into(),
         ));
     }
-    let args: Args = serde_json::from_value(args).map_err(|_| {
-        AppError::Invalid("只接受 url：不含签名或查询参数的公开 HTTPS 归档直链".into())
-    })?;
-    WebDownload::parse(&args.url)
+    let args = AgentDownloadArgs::<Transfer>::parse(args)?;
+    let file = WebDownload::parse(&args.transfer.url)?;
+    let mut classification = args.classification.for_agent(context)?;
+    classification.omit_transport_page(file.url());
+    Ok((file, classification))
 }
 
-fn preview(request: &WebDownload) -> Value {
+fn preview(request: &WebDownload, classification: &DownloadTarget) -> Value {
     json!({
         "url": request.url(),
         "filename": request.filename(),
-        "maxBytes": MAX_WEB_BYTES,
-        "destination": "downloads/",
+        "sizePolicy": "按实际可用磁盘空间执行，未声明大小的响应使用较小预算",
+        "destination": "Mods/",
+        "classification": classification,
         "redirects": "允许经逐跳公网校验的 HTTPS 重定向，最终下载主机可能不同",
         "warnings": ["未绑定来源、项目或版本；下载后须检查归档内容", "本次只下载，不解压、不安装"],
     })
@@ -68,16 +75,16 @@ impl AgentTool for WebDownloadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: NAME.into(),
-            description: "仅用于用户明确点名通过管理器的直链下载工具传输公开 HTTPS ZIP/JAR/7z/tar.gz 归档。常规 Mod 下载请先用来源 MCP，无法取得文件时用 Playwright MCP 的浏览器下载。不要猜测 URL，不要提交网页、私有链接、登录链接或带参数/签名的地址。结果不是目录版本、不会自动安装；安装需要另外核对文件和创建安装计划。".into(),
-            parameters: json!({"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":MAX_WEB_URL_BYTES}},"required":["url"],"additionalProperties":false}),
+            description: "仅用于用户明确点名通过管理器的直链下载工具传输公开 HTTPS ZIP/JAR/7z/tar.gz 归档。常规 Mod 下载请先用来源 MCP，无法取得文件时用 Playwright MCP 的浏览器下载。不要猜测 URL，不要提交网页、私有链接、登录链接或带参数/签名的地址。聊天未关联游戏时提供登记游戏 ID 或明确的游戏名称，作为 Mods 库游戏分类。结果不是目录版本、不会自动安装；安装需要另外核对文件和创建安装计划。".into(),
+            parameters: agent_download_schema(json!({"url":{"type":"string","minLength":1,"maxLength":MAX_WEB_URL_BYTES}}), vec!["url"]),
             effect: Effect::UncatalogedDownload,
         }
     }
 
     async fn prepare(&self, context: &ToolContext, args: &Value) -> AppResult<PreparedTool> {
-        let request = request(context, args.clone())?;
+        let (request, classification) = request(context, args)?;
         Ok(PreparedTool {
-            preview: preview(&request),
+            preview: preview(&request, &classification),
             effect: Effect::UncatalogedDownload,
             plan: None,
         })
@@ -89,10 +96,10 @@ impl AgentTool for WebDownloadTool {
         args: Value,
         prepared: PreparedTool,
     ) -> AppResult<Value> {
-        let request = request(context, args)?;
+        let (request, classification) = request(context, &args)?;
         if prepared.effect != Effect::UncatalogedDownload
             || prepared.plan.is_some()
-            || prepared.preview != preview(&request)
+            || prepared.preview != preview(&request, &classification)
         {
             return Err(AppError::Denied(
                 "网页下载与审批的地址或文件名不一致".into(),
@@ -106,7 +113,13 @@ impl AgentTool for WebDownloadTool {
         let artifact = DownloadManager::new(&context.engine.paths)?
             .download_web(&request, context.cancel.clone(), progress)
             .await?;
-        crate::artifacts::record_web(&context.engine, &artifact)?;
+        let artifact = classification
+            .finish(
+                &context.engine,
+                artifact,
+                CompletedSource::Web(request.url()),
+            )
+            .await?;
         Ok(json!(artifact.into_user_paths()))
     }
 }
@@ -125,6 +138,7 @@ mod tests {
         for raw in [
             json!({"url":"https://example.com/file.zip?token=private"}).to_string(),
             json!({"url":url,"source_id":"modrinth"}).to_string(),
+            json!({"url":url,"projectPage":"https://example.com/mod?token=private"}).to_string(),
             json!({"url":"https://example.com/mod-page"}).to_string(),
             format!(r#"{{"url":"{url}","url":"{url}"}}"#),
         ] {
@@ -141,7 +155,7 @@ mod tests {
             progress: None,
             resolution_scope: ResolutionScope::Agent("fixture".into()),
         };
-        let args = json!({"url":"https://example.com/file.zip"});
+        let args = json!({"url":"https://example.com/file.zip","gameName":"Example Game"});
         let prepared = WebDownloadTool.prepare(&context, &args).await.unwrap();
         assert_eq!(prepared.preview["url"], args["url"]);
         assert_eq!(prepared.preview["filename"], "file.zip");
@@ -149,7 +163,7 @@ mod tests {
             WebDownloadTool
                 .execute(
                     &context,
-                    json!({"url":"https://example.net/file.zip"}),
+                    json!({"url":"https://example.net/file.zip","gameName":"Example Game"}),
                     prepared
                 )
                 .await,
@@ -160,9 +174,19 @@ mod tests {
             WebDownloadTool.prepare(&context, &args).await,
             Err(AppError::Denied(_))
         ));
-        assert!(std::fs::read_dir(context.engine.paths.downloads())
-            .unwrap()
-            .next()
-            .is_none());
+        let downloads = context.engine.paths.downloads();
+        assert_eq!(std::fs::read_dir(&downloads).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(downloads.join("incoming"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_dir(context.engine.paths.mod_library())
+                .unwrap()
+                .count(),
+            0
+        );
     }
 }

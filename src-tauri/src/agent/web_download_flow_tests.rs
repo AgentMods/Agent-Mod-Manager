@@ -86,7 +86,7 @@ async fn generic_web_download_is_reviewed_before_network_io_in_every_permission_
         let target = TcpListener::bind((REVIEWED_URL_HOST, 0)).await.unwrap();
         let target_address = target.local_addr().unwrap();
         let download_url = format!("http://{target_address}/archive.zip");
-        let tool_arguments = json!({"url":download_url});
+        let tool_arguments = json!({"url":download_url,"gameName":"Example Game","author":"Public Author","projectPage":"https://example.com/project"});
         let (model_url, model_job) = server_with(2, move |step, _| {
             if step == 0 {
                 tool_call("download_web_mod", tool_arguments.clone())
@@ -113,17 +113,23 @@ async fn generic_web_download_is_reviewed_before_network_io_in_every_permission_
         let preview = &approval.payload["preview"];
         assert_eq!(preview["url"], download_url);
         assert_eq!(preview["filename"], "archive.zip");
-        let max_bytes = preview["maxBytes"]
-            .as_u64()
-            .expect("approval preview must include a numeric maxBytes");
-        assert!(max_bytes >= archive.len() as u64);
+        assert_eq!(preview["classification"]["gameName"], "Example Game");
+        assert!(preview.get("maxBytes").is_none());
+        assert!(preview["sizePolicy"].is_string());
         assert!(artifacts::list(&agent.engine.db).unwrap().is_empty());
+        let downloads = agent.engine.paths.downloads();
+        assert_eq!(std::fs::read_dir(&downloads).unwrap().count(), 1);
         assert_eq!(
-            std::fs::read_dir(agent.engine.paths.downloads())
+            std::fs::read_dir(downloads.join("incoming"))
                 .unwrap()
                 .count(),
-            0,
-            "nothing should be downloaded while approval is pending"
+            0
+        );
+        assert_eq!(
+            std::fs::read_dir(agent.engine.paths.mod_library())
+                .unwrap()
+                .count(),
+            0
         );
 
         match tokio::time::timeout(Duration::from_millis(250), target.accept()).await {
@@ -162,6 +168,7 @@ async fn generic_web_download_is_reviewed_before_network_io_in_every_permission_
         let result = next_expected(&mut rx, "tool-result").await;
         let done = next_expected(&mut rx, "done").await;
         assert_eq!(done.payload["status"], "done", "mode: {mode:?}");
+        assert_eq!(result.payload["status"], "done", "{}", result.payload);
         let model_requests = tokio::time::timeout(Duration::from_secs(10), model_job)
             .await
             .expect("timed out waiting for scripted model requests")
@@ -183,7 +190,7 @@ async fn generic_web_download_is_reviewed_before_network_io_in_every_permission_
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            ["url"]
+            ["author", "gameId", "gameName", "projectPage", "url"]
         );
 
         let records = artifacts::list(&agent.engine.db).unwrap();
@@ -196,26 +203,34 @@ async fn generic_web_download_is_reviewed_before_network_io_in_every_permission_
         assert!(record.version.is_empty());
         assert!(record.origin().is_none());
         assert_eq!(record.artifact.filename, "archive.zip");
-        let downloads_root = agent.engine.paths.downloads().canonicalize().unwrap();
-        let artifact_path = record.artifact.path.canonicalize().unwrap();
+        let receipt = &result.payload["result"];
+        let stored_path = std::path::Path::new(receipt["path"].as_str().unwrap());
+        let canonical_library = agent.engine.paths.mod_library().canonicalize().unwrap();
+        let final_path = stored_path.canonicalize().unwrap();
+        assert!(final_path.starts_with(canonical_library));
+        assert_eq!(record.artifact.path, final_path);
+        assert_eq!(receipt["artifactId"], record.artifact.id);
+        assert_eq!(receipt["id"], record.artifact.id);
+        assert_eq!(receipt["sha256"], record.artifact.sha256);
+        assert_eq!(receipt["projectPage"], "https://example.com/project");
+        assert_eq!(receipt["authorHint"], "Public Author");
+        let (page, author): (String, String) = agent.engine.db.conn().query_row(
+            "SELECT project_page,author_hint FROM mod_library_entries WHERE id=?1 AND state='ready'",
+            [&record.artifact.id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(page, "https://example.com/project");
+        assert_eq!(author, "Public Author");
+        let persisted = record.native_library_intent().unwrap();
         assert_eq!(
-            artifact_path.parent().and_then(std::path::Path::parent),
-            Some(downloads_root.as_path()),
-            "artifact must be stored below the managed downloads root"
+            persisted.project_page.as_deref(),
+            Some("https://example.com/project")
         );
-        assert_eq!(
-            record.artifact.path, artifact_path,
-            "artifact path must not alias another path"
-        );
-        assert_eq!(
-            result.payload["result"],
-            json!(record.artifact.clone().into_user_paths())
-        );
+        assert_eq!(persisted.author_hint.as_deref(), Some("Public Author"));
         assert!(!record.artifact.integrity_verified);
         assert!(record.artifact.requires_review);
         assert!(!record.artifact.auto_install_allowed);
 
-        let mut downloaded = zip::ZipArchive::new(File::open(&record.artifact.path).unwrap())
+        let mut downloaded = zip::ZipArchive::new(File::open(stored_path).unwrap())
             .expect("download should be a readable ZIP archive");
         let mut readme = String::new();
         downloaded
@@ -300,4 +315,72 @@ async fn web_download_rejects_unreviewed_destination_without_network_io() {
         .expect("timed out waiting for scripted model requests")
         .unwrap();
     assert_eq!(model_requests.len(), 2);
+}
+
+#[tokio::test]
+async fn web_download_requires_game_or_context_and_cancelled_approval_never_fetches() {
+    for cancel_approval in [false, true] {
+        let (_dir, engine, _) = setup();
+        let target = TcpListener::bind((REVIEWED_URL_HOST, 0)).await.unwrap();
+        let mut args =
+            json!({"url": format!("http://{}/archive.zip", target.local_addr().unwrap())});
+        if cancel_approval {
+            args["gameName"] = json!("Unregistered Game");
+        }
+        let requests = if cancel_approval { 1 } else { 2 };
+        let (model_url, model_job) = server_with(requests, move |step, _| {
+            if step == 0 {
+                tool_call("download_web_mod", args.clone())
+            } else {
+                final_reply()
+            }
+        })
+        .await;
+        let (agent, conversation, mut rx) = runtime(engine, &model_url);
+        let turn = agent
+            .start_turn(TurnRequest {
+                conversation_id: conversation.clone(),
+                content: "下载这个归档".into(),
+                attachments: None,
+                model: None,
+                permission_mode: Some(PermissionMode::FullTrust),
+                reasoning_effort: None,
+            })
+            .unwrap();
+        if cancel_approval {
+            next_expected(&mut rx, "approval-request").await;
+            agent.cancel_turn(&conversation, &turn).unwrap();
+        } else {
+            let failed = next_expected(&mut rx, "tool-result").await;
+            assert_eq!(failed.payload["status"], "error");
+            assert!(failed.payload["result"]["error"]
+                .as_str()
+                .unwrap()
+                .contains("gameName"));
+            assert!(!agent
+                .events
+                .replay(&conversation, 0, 100)
+                .unwrap()
+                .iter()
+                .any(|event| event.kind == "approval-request"));
+        }
+        let done = next_expected(&mut rx, "done").await;
+        assert_eq!(
+            done.payload["status"],
+            if cancel_approval { "cancelled" } else { "done" }
+        );
+        assert!(artifacts::list(&agent.engine.db).unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_dir(agent.engine.paths.mod_library())
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), target.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(model_job.await.unwrap().len(), requests);
+    }
 }

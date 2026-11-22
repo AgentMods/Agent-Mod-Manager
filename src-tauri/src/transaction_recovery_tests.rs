@@ -39,7 +39,7 @@ fn load_journal(engine: &FileEngine, id: &str) -> Vec<JournalEntry> {
             |r| r.get(0),
         )
         .unwrap();
-    serde_json::from_str(&json).unwrap()
+    FileEngine::decode_journal(&engine.db.conn(), id, &json).unwrap()
 }
 
 fn wait_for_worker<T>(mut poll: impl FnMut() -> io::Result<Option<T>>) -> io::Result<T> {
@@ -561,4 +561,38 @@ fn older_journal_history_is_readable_but_an_ambiguous_intent_is_not_undone() {
     assert_eq!(status(&engine, &plan.id), "recovery_failed");
     assert!(dst.is_dir());
     assert!(!journal[0].undo.exists());
+}
+
+#[test]
+fn missing_active_journal_entry_fails_closed_on_recovery() {
+    let (_dir, engine, game) = setup();
+    let path = game.join("untouched");
+    let plan = engine
+        .plan_file_ops(
+            vec![FileOp::Mkdir { dst: path.clone() }],
+            "incomplete journal".into(),
+        )
+        .unwrap();
+    engine
+        .save_journal(
+            &plan.id,
+            "applying",
+            &engine.prepare_journal(&plan).unwrap(),
+        )
+        .unwrap();
+    engine
+        .db
+        .conn()
+        .execute(
+            "DELETE FROM file_transaction_journal WHERE transaction_id=?1",
+            [&plan.id],
+        )
+        .unwrap();
+    let engine = reopen(engine);
+    assert!(matches!(
+        engine.recover_interrupted(),
+        Err(AppError::Conflict(_))
+    ));
+    assert_eq!(status(&engine, &plan.id), "applying");
+    assert!(!path.exists());
 }

@@ -19,6 +19,8 @@ impl AppPaths {
         };
         for dir in [
             p.downloads(),
+            p.mod_library(),
+            p.downloads().join("incoming"),
             p.staging(),
             p.backups(),
             p.trash(),
@@ -49,6 +51,9 @@ impl AppPaths {
     }
     pub fn downloads(&self) -> PathBuf {
         self.root.join("downloads")
+    }
+    pub fn mod_library(&self) -> PathBuf {
+        self.root.join("Mods")
     }
     pub fn staging(&self) -> PathBuf {
         self.root.join("staging")

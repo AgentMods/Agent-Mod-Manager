@@ -622,3 +622,46 @@ async fn admission_timeout_releases_waiter_and_idle_origin_can_be_evicted() {
         .unwrap();
     assert_eq!(other.count("/new-origin"), 1);
 }
+
+#[tokio::test]
+async fn dependency_graph_source_client_only_times_out_on_stalled_reads() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // One response drips regularly for more than a whole idle interval. A
+    // second response stops mid-body and must release the reader on its own.
+    let idle = Duration::from_millis(300);
+    for stalled in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/graph", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 5\r\nConnection: close\r\n\r\n[")
+                .await
+                .unwrap();
+            if stalled {
+                std::future::pending::<()>().await;
+            }
+            for chunk in [b"1", b",", b"2", b"]"] {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                stream.write_all(chunk).await.unwrap();
+            }
+        });
+        let client = graph_client_with_idle_timeout(idle).unwrap();
+        let state = HttpState::new(config());
+        let value = tokio::time::timeout(Duration::from_secs(5), get(&state, &client, url))
+            .await
+            .expect("test watchdog fired");
+        if stalled {
+            server.abort();
+            assert!(matches!(value, Err(AppError::Other(_))));
+        } else {
+            server.await.unwrap();
+            assert_eq!(value.unwrap(), json!([1, 2]));
+        }
+    }
+}

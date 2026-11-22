@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const MAX_CONFIG_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_CONFIG_BYTES: usize = 256 * 1024;
 const MAX_GROUPS: usize = 128;
 const MAX_OPTIONS: usize = 512;
 const MAX_MAPPINGS: usize = 10_000;
@@ -406,15 +406,15 @@ fn automatic_selection(
     }
 }
 
-fn find_config(files: &BTreeMap<PathBuf, String>) -> AppResult<PathBuf> {
+pub(crate) fn find_config<'a>(files: impl IntoIterator<Item = &'a Path>) -> AppResult<PathBuf> {
     let mut candidates: Vec<_> = files
-        .keys()
+        .into_iter()
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.eq_ignore_ascii_case("ModuleConfig.xml"))
         })
-        .cloned()
+        .map(Path::to_path_buf)
         .collect();
     candidates.sort();
     if candidates.is_empty() {
@@ -592,8 +592,20 @@ fn artifact_path(engine: &FileEngine, path: &Path) -> AppResult<PathBuf> {
 }
 
 pub fn preview(engine: &FileEngine, requested_path: &Path) -> AppResult<FomodPreview> {
+    preview_cancellable(
+        engine,
+        requested_path,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+}
+
+pub(crate) fn preview_cancellable(
+    engine: &FileEngine,
+    requested_path: &Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> AppResult<FomodPreview> {
     let artifact = artifact_path(engine, requested_path)?;
-    let digest = util::sha256_file(&artifact)?;
+    let digest = archive::hash_file_cancellable(&artifact, cancel)?;
     let preview_root = engine.paths.staging().join("fomod-previews");
     safe_fs::create_dir_all(&preview_root)?;
     let destination = engine
@@ -601,7 +613,8 @@ pub fn preview(engine: &FileEngine, requested_path: &Path) -> AppResult<FomodPre
         .staging()
         .join("fomod-previews")
         .join(uuid::Uuid::new_v4().to_string());
-    let extracted = archive::extract_verified_archive(&artifact, &destination, &digest)?;
+    let extracted =
+        archive::extract_verified_archive_cancellable(&artifact, &destination, &digest, cancel)?;
     preview_extracted(&extracted, &destination, artifact, digest)
 }
 
@@ -611,7 +624,7 @@ pub(crate) fn preview_extracted(
     artifact: PathBuf,
     digest: String,
 ) -> AppResult<FomodPreview> {
-    let config_path = find_config(&extracted.files)?;
+    let config_path = find_config(extracted.files.keys().map(PathBuf::as_path))?;
     let display_path = config_path
         .strip_prefix(destination)
         .map_err(|_| invalid("FOMOD 配置不在预览目录内"))?
@@ -635,8 +648,20 @@ pub(crate) fn preview_extracted(
         .filter_map(|path| path.strip_prefix(destination).ok())
         .filter_map(Path::to_str)
         .map(|path| path.replace('\\', "/"));
-    let mut preview = parse_config(&bytes, display_path, artifact, digest, archive_files)?;
-    if extracted.files.keys().any(|path| {
+    preview_verified_member(&bytes, display_path, artifact, digest, archive_files)
+}
+
+/// Parse bytes supplied by a verified archive scan, without extracting a payload.
+pub(crate) fn preview_verified_member(
+    bytes: &[u8],
+    config_path: String,
+    artifact: PathBuf,
+    digest: String,
+    archive_files: impl IntoIterator<Item = String>,
+) -> AppResult<FomodPreview> {
+    let archive_files: Vec<_> = archive_files.into_iter().collect();
+    let has_script = archive_files.iter().any(|path| {
+        let path = Path::new(path);
         path.parent()
             .and_then(Path::file_name)
             .is_some_and(|name| name.eq_ignore_ascii_case("fomod"))
@@ -645,7 +670,9 @@ pub(crate) fn preview_extracted(
                     .iter()
                     .any(|script| name.eq_ignore_ascii_case(script))
             })
-    }) {
+    });
+    let mut preview = parse_config(bytes, config_path, artifact, digest, archive_files)?;
+    if has_script {
         let selection = &mut preview.automatic_selection;
         selection.status = "requires_user".into();
         selection.selected_options.clear();

@@ -1,20 +1,21 @@
 import type { Page } from "@playwright/test";
 import type { GameCandidate } from "../../src/lib/types";
 
-type AskUserQuestionFixture = {question: string; options?: string[]};
+type AskUserQuestionFixture = {question: string; options?: string[]; multiSelect?: boolean};
 type AskUserPreviewFixture = {title?: string; questions: AskUserQuestionFixture[]} | {question: string};
 
 // Test-only IPC transport. It is never imported by the shipped application.
 export async function installMockTauri(page: Page, {
-  fomodSelection = "requires_user", onboarding = false, onboardingStarted = false, failRegistration = false,
+  modLibrary = [], onboarding = false, onboardingStarted = false, failRegistration = false,
   gameRootPath = "/sandbox/minecraft", gameLaunchPath, gameWithoutAdapter = false, gameWithoutMods = false, adapterDisabled = false, withExternalAdapter = false, holdAgentTurn = false,
   gamePlanConflicts = [],
   duplicatePluginDraftSlug = false, failPluginDraftDeletion = false, seedPublishedPluginRecord = false,
   providerModels = ["fixture-thinking", "fixture-standard"],
+  configuredModels,
   askUser,
   storage,
 }: {
-  fomodSelection?: "safe" | "requires_user";
+  modLibrary?: Array<{artifactId: string; gameId: string | null; gameName: string; name: string; filename: string; version: string | null; sha256: string; projectPage?: string | null}>;
   onboarding?: boolean;
   onboardingStarted?: boolean;
   failRegistration?: boolean;
@@ -30,10 +31,18 @@ export async function installMockTauri(page: Page, {
   failPluginDraftDeletion?: boolean;
   seedPublishedPluginRecord?: boolean;
   providerModels?: string[];
+  configuredModels?: import("../../src/lib/types").AgentModelSettings[];
   askUser?: {preview: AskUserPreviewFixture; approvalId?: string; toolCallId?: string; deferResult?: boolean};
-  storage?: {dataRoot: string; parent: string; previousError?: string; rejectFirstMigration?: boolean};
+  storage?: {
+    dataRoot: string;
+    parent: string;
+    previousError?: string;
+    rejectFirstMigration?: boolean;
+    holdMigration?: boolean;
+    nextBootstrap?: {dataRoot?: string; storageMigrationError?: string | null};
+  };
 } = {}) {
-  await page.addInitScript(({fomodSelection, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, askUser, storage}) => {
+  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage}) => {
     type Args = Record<string, any>;
     const now = "2026-11-18T00:00:00Z";
     const callbacks = new Map<number, (value: any) => void>();
@@ -41,6 +50,9 @@ export async function installMockTauri(page: Page, {
     let counter = 0;
     let seq = 0;
     let migrationAttempts = 0;
+    let releaseStorageMigration: (() => void) | undefined;
+    const storageBootstrapKey = "amm.test.storageBootstrapAfterMigration";
+    const restoredStorage = storage?.nextBootstrap ? JSON.parse(sessionStorage.getItem(storageBootstrapKey) ?? "{}") : {};
     let pendingGameConflicts = structuredClone(gamePlanConflicts ?? []);
     const calls: Array<{ command: string; args: Args }> = [];
     const savedQuestionnaire = askUser ? JSON.parse(sessionStorage.getItem("amm.test.questionnaire") ?? "null") : null;
@@ -85,6 +97,11 @@ export async function installMockTauri(page: Page, {
     let directoryPickCount = 0;
     let modsFolderMissing = false;
     let archiveImported = false;
+    let importedEntry: Args | null = null;
+    let fixtureUninstalled = false;
+    const removedRecords = new Set<string>();
+    const removedArchives = new Set<string>();
+    let modAction: {name: "install_library_mod" | "uninstall_mod"; target: Args; preview: Args} | null = null;
     let identitySearch: Args | null = null;
     let publicationOutcome = 'completed';
     let publicationReconcileOutcome: 'verified' | 'unconfirmed' = 'verified';
@@ -110,7 +127,7 @@ export async function installMockTauri(page: Page, {
       ...draft, id: 'draft-fixture-duplicate', path: '/sandbox/data/staging/plugin-drafts/fixture-duplicate',
       writeTransactionId: 'txn-draft-fixture-duplicate',
     }] : [])];
-    let settings: Args = { base_url: "https://example.com/v1", model: onboarding ? "" : "mock-model", context_budget: 32768, permission_mode: "request_approval", api_key_ref: "model.api_key", onboarding_completed: !onboarding };
+    let settings: Args = { base_url: "https://example.com/v1", model: onboarding ? "" : "mock-model", models: configuredModels, permission_mode: "request_approval", api_key_ref: "model.api_key", onboarding_completed: !onboarding };
     let composerPreferences: Args = {model: null, reasoning_effort: null, permission_mode: null};
     let onboardingCompleted = !onboarding;
     let onboardingInProgress = onboardingStarted;
@@ -193,7 +210,13 @@ export async function installMockTauri(page: Page, {
           const submitted = approved ? "questions" in askUser.preview ? JSON.parse(answer!) : answer : null;
           emit("tool-result", {toolCallId, status: "done", result: {answer: submitted}});
         } else {
-          emit("tool-result", {toolCallId, status: approved ? "done" : "denied", result: {status: approved ? "committed" : "denied"}});
+          if (approved && modAction?.name === "uninstall_mod") {
+            fixtureUninstalled = true;
+            initialGame.installedModCount = 0;
+            initialGame.enabledModCount = 0;
+          }
+          emit("tool-result", {toolCallId, ...(modAction && {name: modAction.name}), status: approved ? "done" : "denied",
+            result: {status: approved ? "committed" : "denied"}});
         }
         delta(askUser
           ? approved ? "\n回答已提交。" : "\n回答已跳过。"
@@ -214,11 +237,22 @@ export async function installMockTauri(page: Page, {
       if (command === "plugin:window|is_maximized") return false;
       if (command.startsWith("plugin:window|") || command.startsWith("plugin:opener|")) return null;
       switch (command) {
-        case "get_bootstrap_state": return { dataRoot: storage?.dataRoot ?? "/sandbox/data", storageMigrationError: storage?.previousError ?? null, recoveredTransactions: [], recoveryError: null, onboardingCompleted, isFirstRun: !onboardingCompleted && games.length === 0, resumeOnboarding: !onboardingCompleted && onboardingInProgress };
+        case "get_bootstrap_state": {
+          const bootstrap = { dataRoot: storage?.dataRoot ?? "/sandbox/data", storageMigrationError: storage?.previousError ?? null,
+            recoveredTransactions: [], recoveryError: null, onboardingCompleted, isFirstRun: !onboardingCompleted && games.length === 0,
+            resumeOnboarding: !onboardingCompleted && onboardingInProgress };
+          return {...bootstrap, ...restoredStorage};
+        }
         case "plugin:path|join": return args.paths.join("\\");
         case "migrate_storage": {
           if (!storage || args.parent !== storage.parent) throw new Error("unexpected storage location");
-          if (++migrationAttempts === 1 && storage.rejectFirstMigration) throw new Error("所选位置已包含 Agent Mod Manager 文件夹");
+          const attempt = ++migrationAttempts;
+          if (storage.holdMigration) await new Promise<void>((resolve) => { releaseStorageMigration = () => resolve(); });
+          if (attempt === 1 && storage.rejectFirstMigration) throw new Error("所选位置已包含 Agent Mod Manager 文件夹");
+          if (storage.nextBootstrap) {
+            try { sessionStorage.setItem(storageBootstrapKey, JSON.stringify(storage.nextBootstrap)); }
+            catch { /* The migration call still reports its configured result. */ }
+          }
           return null;
         }
         case "plugin:dialog|open": {
@@ -267,8 +301,8 @@ export async function installMockTauri(page: Page, {
         case "get_agent_model_metadata": {
           if (args.baseUrl === "https://offline.example/v1") throw new Error("metadata unavailable");
           return args.modelIds.flatMap((id: string) => {
-            if (id === "fixture-thinking") return [{id, contextBudget: 128000, reasoningLevels: ["low", "medium", "high"]}];
-            if (id === "fixture-standard") return [{id, contextBudget: 64000, reasoningLevels: []}];
+            if (id === "fixture-thinking") return [{id, reasoningLevels: ["low", "medium", "high"]}];
+            if (id === "fixture-standard") return [{id, reasoningLevels: []}];
             return [];
           });
         }
@@ -296,6 +330,27 @@ export async function installMockTauri(page: Page, {
           return replayed;
         }
         case "start_turn": {
+          modAction = null;
+          const match = /目标（精确 ID）：(\{[^\n]+\})。/.exec(args.request.content);
+          if (match) {
+            const target = JSON.parse(match[1]);
+            const game = conversations.find(c => c.id === args.request.conversationId)?.game_id;
+            if (game !== target.gameId || game !== initialGame.id || args.request.permissionMode !== "request_approval") {
+              throw new Error("Mod action requires exact game context and approval");
+            }
+            if (target.artifactId) {
+              const entry = [...modLibrary, importedEntry].find(entry => entry?.artifactId === target.artifactId);
+              if (!entry || entry.gameId !== game) throw new Error("library artifact is not bound to the chosen game");
+              modAction = {name: "install_library_mod", target, preview: {
+                installRoot: "/sandbox/minecraft/mods", plan: {...installPlan, summary: `安装 ${entry.filename}`,
+                  entries: [{...installPlan.entries[0], operation: {...installPlan.entries[0].operation,
+                    dst: `/sandbox/minecraft/mods/${entry.filename}`}}]},
+              }};
+            } else {
+              if (target.installId !== "install-fixture" || fixtureUninstalled) throw new Error("unrecognized installation");
+              modAction = {name: "uninstall_mod", target, preview: {...plan, summary: "卸载 Example（install-fixture）"}};
+            }
+          }
           activeConversation = args.request.conversationId;
           const history = messages.get(activeConversation) ?? [];
           history.push({ id: "user-fixture", role: "user", content: args.request.content,
@@ -310,8 +365,20 @@ export async function installMockTauri(page: Page, {
           pending = true;
           if (!holdAgentTurn) setTimeout(() => {
             if (!pending) return;
-            emit("tool-start", { toolCallId, providerCallId: "provider-fixture", name: askUser ? "ask_user" : "apply_file_ops", arguments: askUser?.preview ?? { plan_id: plan.id } });
-            emit("approval-request", { approvalId, toolCallId, title: askUser ? "ask_user" : "apply_file_ops", preview: askUser?.preview ?? plan });
+            let modArgs: Args | undefined;
+            if (modAction?.name === "install_library_mod") {
+              const {gameId, artifactId} = modAction.target;
+              emit("tool-start", {toolCallId: "tool-match-library", name: "match_mod_install", arguments: {game_id: gameId, artifact_id: artifactId}});
+              emit("tool-result", {toolCallId: "tool-match-library", name: "match_mod_install", status: "done", result: {status: "matched"}});
+              modArgs = {request: {gameId, artifactId, mode: "adapter"}};
+            } else if (modAction?.name === "uninstall_mod") {
+              modArgs = {game_id: modAction.target.gameId, install_id: modAction.target.installId};
+              emit("tool-start", {toolCallId: "tool-inspect-install", name: "inspect_install", arguments: modArgs});
+              emit("tool-result", {toolCallId: "tool-inspect-install", name: "inspect_install", status: "done", result: {reconciliation: {recommendedAction: "safe_uninstall"}}});
+            }
+            const name = modAction?.name ?? (askUser ? "ask_user" : "apply_file_ops");
+            emit("tool-start", { toolCallId, providerCallId: "provider-fixture", name, arguments: modArgs ?? askUser?.preview ?? { plan_id: plan.id } });
+            emit("approval-request", { approvalId, toolCallId, title: name, preview: modAction?.preview ?? askUser?.preview ?? plan });
           }, 120);
           return "turn-fixture";
         }
@@ -345,74 +412,42 @@ export async function installMockTauri(page: Page, {
             return completed;
           }
           if (args.planId === importPlan.id) {archiveImported = true; return importPlan;}
-          if (args.planId === installPlan.id && archiveImported) return installPlan;
           if (args.planId === skillPlan.id) {skillRemoved = true; return skillPlan;}
           if (args.planId === filePlan.id) {fileTrashed = true; return filePlan;}
           if (args.planId !== plan.id) throw new Error("unknown plan");
           restored = true; return plan;
         }
         case "list_snapshots": return [];
-        case "list_installs": return [{ id: "install-fixture", gameId: "game-fixture", name: "Example", version: "1.0.0", source: "modrinth", status: "enabled", installRoot: "/sandbox/minecraft/mods", files: [], metadata: {}, installedAt: now }];
+        case "list_installs": return removedRecords.has("install-fixture") ? [] : [{ id: "install-fixture", gameId: "game-fixture", name: "Example", version: "1.0.0", source: "modrinth", status: fixtureUninstalled ? "uninstalled" : "enabled", installRoot: "/sandbox/minecraft/mods", files: [], metadata: {}, installedAt: now }];
         case "list_user_roots": return {};
         case "list_downloads": return (window as any).__AMM_TEST__.seedDownload ? [{artifact: {id: 'artifact-fixture', path: '/sandbox/data/downloads/fixture/Fixture.jar', filename: 'Fixture.jar', size: 1024, sha256: 'b'.repeat(64), integrity_verified: true, requires_review: true, warnings: []}, sourceId: 'modrinth', projectId: 'fixture', versionId: 'V'.repeat(128), name: 'Downloaded Fixture', version: '1.0.0', createdAt: now}] : [];
         case "plan_import_archive": if (args.path !== "/sandbox/incoming/Fixture.jar") throw new Error("unknown archive"); return {filename: "Fixture.jar", artifactPath: "/sandbox/data/staging/imports/fixture/Fixture.jar", sha256: "b".repeat(64), size: 1024, plan: importPlan, warnings: []};
-        case "preview_fomod": {
-          if (!["/sandbox/data/staging/imports/fixture/Fixture.jar", "/sandbox/data/downloads/fixture/Fixture.jar"].includes(args.artifactPath)) throw new Error("unknown FOMOD artifact");
-          const requiredMappings = [{source: "Data/base.esp", destination: "base.esp", priority: null}];
-          function option(name: string, source: string, destination: string, description: string | null = null) {
-            return {name, description, image: null, mappings: [{source, destination, priority: null}], hasConditions: false};
-          }
-          const groups = fomodSelection === "safe" ? [
-            {
-              name: "Assets", selectionType: "SelectAll", hasConditions: false,
-              options: [
-                option("Terrain textures", "Data/terrain.dds", "textures/terrain.dds"),
-                option("Interface icons", "Data/icons.dds", "textures/ui/icons.dds"),
-              ],
-            },
-            // Distinct groups can have the same name. The wire indices identify each one.
-            {
-              name: "Assets", selectionType: "SelectExactlyOne", hasConditions: false,
-              options: [option("Core plugin", "Data/core.esp", "core.esp")],
-            },
-          ] : [
-            {
-              name: "Textures", selectionType: "SelectExactlyOne", hasConditions: false,
-              options: [
-                option("HD", "Data/hd.dds", "textures/fixture.dds", "High resolution"),
-                option("SD", "Data/sd.dds", "textures/fixture.dds", "Standard resolution"),
-              ],
-            },
-          ];
-          const automaticSelection = fomodSelection === "safe" ? {
-            status: "safe",
-            selectedOptions: groups.flatMap((group, groupIndex) => group.options.map((option, optionIndex) => ({
-              group: group.name, groupIndex, option: option.name, optionIndex,
-            }))),
-            mappings: [...requiredMappings, ...groups.flatMap(group => group.options.flatMap(option => option.mappings))],
-            warnings: [],
-          } : {
-            status: "requires_user",
-            selectedOptions: [],
-            mappings: requiredMappings,
-            warnings: ["FOMOD 组 Textures 不能由安全规则唯一选择；需要用户确认"],
-          };
-          return {
-            artifactPath: args.artifactPath,
-            artifactSha256: "b".repeat(64),
-            configPath: "fomod/ModuleConfig.xml",
-            moduleName: "Fixture FOMOD",
-            requiredMappings, groups, automaticSelection,
-            warnings: groups.filter(group => group.selectionType === "SelectExactlyOne")
-              .map(group => `FOMOD 组 ${group.name} 使用 SelectExactlyOne 选择约束；安装前仍需用户确认`),
-          };
+        case "remove_managed_mod": {
+          if (args.gameId !== initialGame.id) throw new Error("unknown game");
+          if (args.target.kind === "archive") removedArchives.add(args.target.id);
+          else if (args.target.kind === "record" && fixtureUninstalled) removedRecords.add(args.target.id);
+          else throw new Error("record is still installed");
+          return null;
         }
-        case "plan_install": {
-          if (args.request.artifactPath === '/sandbox/data/downloads/fixture/Fixture.jar' && (window as any).__AMM_TEST__.seedDownload) {
-            if (args.request.modType !== 'java-mod' || args.request.expectedSha256 !== 'b'.repeat(64)) throw new Error('unverified download or invalid mod type');
-            return {plan: {...installPlan, summary: `安装 Downloaded Fixture（modrinth，项目 ID：fixture，版本 ID：${'V'.repeat(128)}）到 Minecraft`, entries: [{...installPlan.entries[0], operation: {...installPlan.entries[0].operation, src: args.request.artifactPath}}]}, warnings: []};
+        case "list_mod_library": {
+          const game = games.find(game => game.id === args.gameId);
+          if (!game) return [];
+          const gameKey = (name: string) => name.trim().toLowerCase().replace(/\s+/g, " ");
+          return [...modLibrary, ...(importedEntry ? [importedEntry] : [])].filter(entry =>
+            !removedArchives.has(entry.artifactId) && (entry.gameId === game.id || (entry.gameId === null && gameKey(entry.gameName) === gameKey(game.name))));
+        }
+        case "bind_mod_library_entry": {
+          const entry = modLibrary.find(entry => entry.artifactId === args.artifactId);
+          if (!entry || args.gameId !== initialGame.id || (entry.gameId !== null && entry.gameId !== args.gameId)) {
+            throw new Error("archive unavailable for the chosen game");
           }
-          if (!archiveImported || args.request.artifactPath !== "/sandbox/data/staging/imports/fixture/Fixture.jar") throw new Error("archive not imported"); return {plan: installPlan, warnings: []};
+          entry.gameId = args.gameId;
+          return entry;
+        }
+        case "register_imported_mod": {
+          if (args.gameId !== initialGame.id || args.transactionId !== importPlan.id || !archiveImported) throw new Error("archive not committed for the chosen game");
+          importedEntry = {artifactId: "artifact-import-fixture", gameId: args.gameId, gameName: initialGame.name, name: "Fixture", filename: "Fixture.jar", version: null, sha256: "b".repeat(64), projectPage: null};
+          return importedEntry;
         }
         case "mcp_list": return [];
         case "mcp_startup_requests": return [];
@@ -495,6 +530,7 @@ export async function installMockTauri(page: Page, {
           pluginDrafts.splice(index, 1);
           return null;
         }
+        case "get_plugin_publication": return structuredClone(publications.find(item => item.id === args.id));
         case "list_plugin_publications": return structuredClone(publications);
         case "prepare_plugin_publication": {
           if (args.draftId !== draft.id) throw new Error('unknown draft');
@@ -601,7 +637,7 @@ export async function installMockTauri(page: Page, {
           const game = games.find((item) => item.id === args.id);
           if (!game) throw new Error(`未找到: 游戏: ${args.id}`);
           const name = String(args.name ?? "").trim();
-          if (!name || name.length > 80) throw new Error("无效输入: 游戏名称去除首尾空白后须为 1 到 80 个字符，且不能含有控制字符");
+          if (!name || /\p{Cc}/u.test(name)) throw new Error("无效输入: 游戏名称去除首尾空白后不能为空，且不能含有控制字符");
           const launchPath = typeof args.launchPath === "string" ? args.launchPath.trim() : "";
           if (launchPath && !launchPath.startsWith(`${game.rootPath}/`)) throw new Error("路径越界: 启动程序必须位于该游戏的根目录内");
           game.name = name;
@@ -630,10 +666,14 @@ export async function installMockTauri(page: Page, {
     };
     target.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: (_event: string, id: number) => listeners.delete(id) };
     target.__AMM_TEST__ = {
-      calls, emit, emitEvent, persistOnly, replayedEvents, events, conversations,
+      calls, emit, emitEvent, persistOnly, replayedEvents, events, conversations, games, modLibrary, pluginDrafts,
       publishQuestionResult() {
         deferredQuestionResult?.();
         deferredQuestionResult = undefined;
+      },
+      finishStorageMigration() {
+        releaseStorageMigration?.();
+        releaseStorageMigration = undefined;
       },
       get pending() { return pending; },
       get modsFolderMissing() { return modsFolderMissing; },
@@ -647,5 +687,5 @@ export async function installMockTauri(page: Page, {
         seq = Math.max(seq, ...values.map((event) => event.seq).filter(Number.isSafeInteger));
       },
     };
-  }, {fomodSelection, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, askUser, storage});
+  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage});
 }

@@ -1,16 +1,10 @@
-use crate::{
-    error::{AppError, AppResult},
-    mcp::client::MAX_RESULT_BYTES,
-};
-use base64::{engine::general_purpose::STANDARD, Engine};
+use crate::error::{AppError, AppResult};
+use base64::{engine::general_purpose::STANDARD, read::DecoderReader};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::{self, Read};
 
-const MAX_ATTACHMENTS: usize = 10;
 const MAX_NAME_CHARS: usize = 255;
-const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
-const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
-pub(super) const MAX_CONTEXT_IMAGE_BYTES: usize = MAX_ATTACHMENT_BYTES;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
@@ -35,19 +29,13 @@ impl Attachment {
 }
 
 pub(crate) fn validate_user_input(content: &str, attachments: &[Attachment]) -> AppResult<()> {
-    if content.len() > 128 * 1024 || (content.trim().is_empty() && attachments.is_empty()) {
-        return Err(AppError::Invalid("消息为空或超过128KiB".into()));
+    if content.trim().is_empty() && attachments.is_empty() {
+        return Err(AppError::Invalid("消息为空".into()));
     }
     validate_attachments(attachments)
 }
 
 fn validate_attachments(attachments: &[Attachment]) -> AppResult<()> {
-    if attachments.len() > MAX_ATTACHMENTS {
-        return Err(AppError::Invalid(format!(
-            "每条消息最多 {MAX_ATTACHMENTS} 个附件"
-        )));
-    }
-    let mut total = 0;
     for attachment in attachments {
         let name = attachment.name();
         if name.trim().is_empty()
@@ -58,30 +46,18 @@ fn validate_attachments(attachments: &[Attachment]) -> AppResult<()> {
                 "附件名称必须为 1–{MAX_NAME_CHARS} 个字符，且不能包含控制字符"
             )));
         }
-        total += match attachment {
+        match attachment {
             Attachment::Image { data_url, .. } => validate_image(name, data_url)?,
-            Attachment::Document { markdown, .. } => {
-                if markdown.len() > MAX_RESULT_BYTES {
-                    return Err(AppError::Invalid(format!(
-                        "文档「{name}」的 Markdown 超过 1 MiB，请拆分或删减后重试"
-                    )));
-                }
-                if markdown.trim().is_empty() {
-                    return Err(AppError::Invalid(format!("文档「{name}」的 Markdown 为空")));
-                }
-                markdown.len()
+            Attachment::Document { markdown, .. } if markdown.trim().is_empty() => {
+                return Err(AppError::Invalid(format!("文档「{name}」的 Markdown 为空")));
             }
-        };
-        if total > MAX_ATTACHMENT_BYTES {
-            return Err(AppError::Invalid(
-                "单条消息的图片与 Markdown 合计不能超过 20 MiB".into(),
-            ));
+            Attachment::Document { .. } => {}
         }
     }
     Ok(())
 }
 
-fn validate_image(name: &str, data_url: &str) -> AppResult<usize> {
+fn validate_image(name: &str, data_url: &str) -> AppResult<()> {
     let (header, payload) = data_url.split_once(',').unwrap_or_default();
     let matches_header: fn(&[u8]) -> bool = match header {
         "data:image/png;base64" => |b| b.starts_with(b"\x89PNG\r\n\x1a\n"),
@@ -94,23 +70,24 @@ fn validate_image(name: &str, data_url: &str) -> AppResult<usize> {
             )))
         }
     };
-    if payload.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4
-        || base64_decoded_len(payload) > MAX_IMAGE_BYTES
-    {
-        return Err(AppError::Invalid(format!(
-            "图片「{name}」超过 5 MiB，请缩小后重试"
-        )));
-    }
     let invalid = || {
         AppError::Invalid(format!(
             "图片「{name}」的数据无效或与格式不符，请重新导出并添加图片"
         ))
     };
-    let bytes = STANDARD.decode(payload).map_err(|_| invalid())?;
-    if !matches_header(&bytes) {
+    // Check the signature, then validate the rest of the Base64 without allocating
+    // a second, decoded copy of the user-selected file or decompressing the image.
+    let mut bytes = DecoderReader::new(payload.as_bytes(), &STANDARD);
+    let mut prefix = [0; 12];
+    let length = base64_decoded_len(payload).min(prefix.len());
+    bytes
+        .read_exact(&mut prefix[..length])
+        .map_err(|_| invalid())?;
+    if !matches_header(&prefix[..length]) {
         return Err(invalid());
     }
-    Ok(bytes.len())
+    io::copy(&mut bytes, &mut io::sink()).map_err(|_| invalid())?;
+    Ok(())
 }
 
 fn base64_padding(payload: &str) -> usize {
@@ -210,33 +187,24 @@ mod tests {
     }
 
     #[test]
-    fn agent_attachment_size_limits_cover_decoded_images_markdown_and_total() {
-        let maximum = sized_png(MAX_IMAGE_BYTES);
-        let oversize = sized_png(MAX_IMAGE_BYTES + 1);
-        assert_eq!(
-            maximum.len(),
-            oversize.len(),
-            "limit must account for padding, not just base64 length"
-        );
-        assert!(validate_image("image", &oversize)
-            .unwrap_err()
-            .to_string()
-            .contains("5 MiB"));
-        let markdown = "字".repeat(MAX_RESULT_BYTES / 3) + "x";
-        assert_eq!(markdown.len(), MAX_RESULT_BYTES);
-        validate_attachments(&[document(markdown.clone())]).unwrap();
-        assert!(validate_attachments(&[document(markdown + "x")])
-            .unwrap_err()
-            .to_string()
-            .contains("1 MiB"));
+    fn agent_attachment_allows_user_input_above_former_quotas() {
+        let text = "字".repeat(128 * 1024 / 3 + 1);
+        let mut attachments = vec![document("x".into()); 11];
+        attachments.push(document("字".repeat(1024 * 1024 / 3 + 1)));
+        let large_png = sized_png(5 * 1024 * 1024 + 1);
+        attachments.extend((0..4).map(|_| image(large_png.clone())));
+        validate_user_input(&text, &attachments).unwrap();
+        assert!(validate_user_input("  ", &[]).is_err());
         assert!(validate_attachments(&[document(" ".into())]).is_err());
-        assert!(validate_attachments(&vec![document("x".into()); MAX_ATTACHMENTS + 1]).is_err());
-        let mut exactly_twenty_mib = vec![image(maximum); 4];
-        validate_attachments(&exactly_twenty_mib).unwrap();
-        exactly_twenty_mib.push(document("x".into()));
-        assert!(validate_attachments(&exactly_twenty_mib)
-            .unwrap_err()
-            .to_string()
-            .contains("20 MiB"));
+    }
+
+    #[test]
+    fn agent_attachment_checks_base64_beyond_the_first_read() {
+        let mut png = sized_png(4096);
+        png.push_str("AAAA"); // Data after canonical padding is invalid.
+        assert!(validate_image("image", &png).is_err());
+        let mut png = sized_png(4098);
+        png.replace_range(png.len() - 4.., "éAA");
+        assert!(validate_image("image", &png).is_err());
     }
 }

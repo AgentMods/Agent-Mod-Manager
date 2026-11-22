@@ -169,3 +169,42 @@ fn startup_finishes_a_copy_promoted_before_the_location_was_committed() {
     assert_eq!(location.startup_root().unwrap(), migration.target);
     assert!(location.failure().unwrap().is_none());
 }
+
+#[test]
+fn moving_storage_preserves_the_game_library_and_picker_receipt() {
+    let (temp, engine, _) = crate::transaction::tests::setup();
+    let source = engine.paths.root.clone();
+    let original = temp.path().canonicalize().unwrap().join("picked.zip");
+    let mut zip = zip::ZipWriter::new(fs::File::create(&original).unwrap());
+    zip.start_file("payload.txt", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(b"fixture").unwrap();
+    zip.finish().unwrap();
+    let ready = crate::imports::plan_import_archive(&engine, &original).unwrap();
+    engine.approve_plan(&ready.plan.id).unwrap();
+    engine.apply_file_ops(&ready.plan.id).unwrap();
+    let entry = crate::imports::register_imported_mod(&engine, "g", &ready.plan.id).unwrap();
+    let parent = temp.path().join("new parent");
+    fs::create_dir(&parent).unwrap();
+    let location = StorageLocation::new(source.clone()).unwrap();
+    location.schedule(&engine, &parent).unwrap();
+    drop(engine);
+    drop(location);
+    let location = StorageLocation::new(source.clone()).unwrap();
+    let target = location.startup_root().unwrap();
+    assert_eq!(target, parent.canonicalize().unwrap().join(DATA_FOLDER));
+    let paths = AppPaths::new(target.clone())
+        .unwrap()
+        .with_control_root(&source);
+    let engine = FileEngine::new(Db::open(&paths.db_file()).unwrap(), paths);
+    let listed = crate::mod_library::list_for_game(&engine.db, "g").unwrap();
+    assert_eq!(listed.as_slice(), std::slice::from_ref(&entry));
+    let verified = crate::mod_library::verify_for_install(&engine, "g", &entry.id).unwrap();
+    assert!(verified.archive_path.starts_with(target.join("Mods")));
+    assert_eq!(
+        fs::read(verified.archive_path).unwrap(),
+        fs::read(original).unwrap()
+    );
+    let repeated = crate::imports::register_imported_mod(&engine, "g", &ready.plan.id).unwrap();
+    assert_eq!(repeated.id, entry.id);
+}

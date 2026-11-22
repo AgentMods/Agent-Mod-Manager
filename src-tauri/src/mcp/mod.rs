@@ -9,6 +9,7 @@ mod runtime;
 
 pub use bridge::McpAgentTool;
 pub use client::{ConnectionConsent, McpClient, McpTool};
+pub(crate) use config::playwright_receipt_dir;
 pub use config::{McpServers, McpTransport, ServerConfig};
 pub use runtime::McpRuntime;
 

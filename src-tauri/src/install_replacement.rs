@@ -63,7 +63,7 @@ fn expected(file: &InstalledFile) -> Fingerprint {
 
 // Compare path components conservatively on every platform so previews remain
 // safe on case-insensitive Steam libraries and external volumes.
-fn path_key(path: &Path) -> String {
+pub(super) fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
@@ -82,7 +82,7 @@ fn overlaps(paths: &BTreeSet<String>, path: &str) -> bool {
         .is_some_and(|p| p.starts_with(&prefix))
 }
 
-fn verify_ownership(
+pub(super) fn verify_ownership(
     engine: &FileEngine,
     paths: &BTreeSet<String>,
     ignored: (&str, Option<&str>),
@@ -279,16 +279,7 @@ pub(crate) fn validate_apply(engine: &FileEngine, plan: &FilePlan) -> AppResult<
         .inspect_plan(engine, plan, Some(&next_id))?;
     } else if let Some((id, action, None)) = link {
         if action == "uninstall" {
-            let install = get_install(engine, &id)?;
-            if install.status != "enabled" {
-                return Err(conflict("安装状态已变化，需重新预览卸载"));
-            }
-            let paths = install
-                .files
-                .iter()
-                .map(|file| path_key(&file.path))
-                .collect();
-            verify_ownership(engine, &paths, (&id, None), None)?;
+            super::validate_uninstall_apply(engine, plan, &id)?;
         }
     }
     Ok(())

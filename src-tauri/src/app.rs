@@ -14,6 +14,7 @@ pub struct AppServices {
     pub(crate) runtime: crate::mcp::McpRuntime,
     pub mcp_connections: crate::mcp_connections::McpConnections,
     pub downloads: crate::download_tasks::DownloadTasks,
+    pub(crate) dependency_operations: crate::install_dependencies::DesktopDependencyOperations,
     _log_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
@@ -50,6 +51,9 @@ impl AppServices {
         };
         plugins::retire_builtin_adapters(&engine.db, &engine.paths)?;
         let plugin_report = crate::plugin_workflow::reconcile_deployments(&engine)?;
+        if recovery_error.is_none() {
+            crate::plugin_workflow::cleanup_consumed_agent_drafts(&engine, None);
+        }
         for issue in plugin_report.issues {
             tracing::warn!(
                 code = issue.code,
@@ -74,6 +78,7 @@ impl AppServices {
             runtime: runtime.clone(),
             mcp_connections: crate::mcp_connections::McpConnections::with_runtime(runtime),
             downloads: Default::default(),
+            dependency_operations: Default::default(),
             _log_guard: if logging { Some(guard) } else { None },
         })
     }

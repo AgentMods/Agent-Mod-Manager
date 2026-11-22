@@ -2278,3 +2278,331 @@ fn fabric_disk_diagnosis_is_read_only() {
     assert_eq!(row_after, row_before);
     assert_eq!(f.engine.db.conn().total_changes(), changes);
 }
+
+fn logs_on_pages(f: &Fixture, options: ReadOptions, mut visit: impl FnMut(LogReport)) -> usize {
+    let token = tokio_util::sync::CancellationToken::new();
+    let mut options = options;
+    for index in 1..1024 {
+        let page = read_logs_page(
+            &f.engine,
+            f.game.id.clone(),
+            options.clone(),
+            "test",
+            &token,
+        )
+        .unwrap();
+        let cursor = page.next_cursor;
+        visit(page);
+        if cursor.is_none() {
+            return index;
+        }
+        options.page.cursor = cursor;
+    }
+    panic!("诊断游标未结束");
+}
+
+fn diagnoses_on_pages(
+    f: &Fixture,
+    options: ReadOptions,
+    mut visit: impl FnMut(Diagnosis),
+) -> usize {
+    let token = tokio_util::sync::CancellationToken::new();
+    let mut options = options;
+    for index in 1..1024 {
+        let page = diagnose_game_page(
+            &f.engine,
+            f.game.id.clone(),
+            options.clone(),
+            "test",
+            &token,
+        )
+        .unwrap();
+        let cursor = page.logs.next_cursor;
+        visit(page);
+        if cursor.is_none() {
+            return index;
+        }
+        options.page.cursor = cursor;
+    }
+    panic!("诊断游标未结束");
+}
+
+#[test]
+fn log_pages_reach_files_bytes_physical_lines_and_directory_entries_beyond_old_ceiling() {
+    let f = Fixture::new("minecraft-java");
+    let log = f.root.join("crash-reports");
+    fs::create_dir_all(&log).unwrap();
+    for i in 0..2100 {
+        write(&log.join(format!("irrelevant-{i}.bin")), []);
+    }
+    for i in 0..40 {
+        write(
+            &log.join(format!("chunk-{i:02}.log")),
+            format!("marker {i}\n"),
+        );
+    }
+    let record = "字".repeat(132);
+    let data = format!(
+        "{}\nlast row",
+        format!("{record}\r\n")
+            .repeat(12_000)
+            .trim_end_matches("\r\n")
+    );
+    assert!(data.len() > 4 * 1024 * 1024);
+    write(&f.root.join("logs/latest.log"), &data);
+    let mut marker_files = BTreeSet::new();
+    let mut lines = 0;
+    let mut bytes = 0;
+    let count = logs_on_pages(
+        &f,
+        ReadOptions {
+            max_total_bytes: usize::MAX,
+            max_files: 40,
+            max_bytes_per_file: 2 * 1024 * 1024,
+            max_lines_per_file: 15_000,
+            ..Default::default()
+        },
+        |page| {
+            assert!(page.files.len() <= 32);
+            assert!(page.bytes_read <= 4 * 1024 * 1024);
+            bytes += page.bytes_read;
+            for file in page.files {
+                if file.file.ends_with("latest.log") {
+                    assert!(!file.truncated);
+                    assert!(file.bytes_read <= 1024 * 1024);
+                    for line in file.lines {
+                        lines += 1;
+                        assert_eq!(line.number, lines);
+                        assert_eq!(
+                            line.text,
+                            if lines == 12_001 {
+                                "last row"
+                            } else {
+                                record.as_str()
+                            }
+                        );
+                    }
+                } else if file.file.contains("chunk-") {
+                    marker_files.insert(file.file);
+                }
+            }
+        },
+    );
+    assert!(count > 4);
+    assert_eq!(marker_files.len(), 40);
+    assert_eq!(lines, 12_001);
+    assert!(bytes > 4 * 1024 * 1024);
+}
+
+#[test]
+fn log_pages_keep_utf16_line_boundaries_and_bind_cursor_to_scope() {
+    let f = Fixture::new("minecraft-java");
+    let mut utf16 = vec![0xff, 0xfe];
+    utf16.extend(
+        "alpha🗺\r\nbeta\r終"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes),
+    );
+    write(&f.root.join("logs/latest.log"), &utf16);
+    let mut lines = Vec::new();
+    let options = ReadOptions {
+        max_bytes_per_file: 1,
+        max_total_bytes: 1,
+        max_lines_per_file: 1,
+        ..Default::default()
+    };
+    logs_on_pages(&f, options.clone(), |page| {
+        assert!(page.bytes_read <= 1);
+        lines.extend(
+            page.files
+                .into_iter()
+                .filter(|f| f.file.ends_with("latest.log"))
+                .flat_map(|f| f.lines)
+                .map(|line| line.text),
+        );
+    });
+    assert_eq!(lines, ["alpha🗺", "beta", "終"]);
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let first = read_logs_page(&f.engine, f.game.id.clone(), options, "original", &cancel).unwrap();
+    let mut next = ReadOptions::default();
+    next.page.cursor = Some(first.next_cursor.unwrap());
+    assert!(matches!(
+        read_logs_page(&f.engine, f.game.id.clone(), next.clone(), "other", &cancel),
+        Err(AppError::NotFound(_))
+    ));
+    next.page.cancel = true;
+    assert!(read_logs_page(
+        &f.engine,
+        f.game.id.clone(),
+        next.clone(),
+        "original",
+        &cancel
+    )
+    .unwrap()
+    .next_cursor
+    .is_none());
+    next.page.cancel = false;
+    assert!(matches!(
+        read_logs_page(&f.engine, f.game.id.clone(), next, "original", &cancel),
+        Err(AppError::NotFound(_))
+    ));
+}
+
+#[test]
+fn paged_fabric_correlates_more_than_100_selected_mods_and_64_jars() {
+    let f = Fixture::new("minecraft-java");
+    let ids = (0..132).map(|n| format!("mod_{n:03}")).collect::<Vec<_>>();
+    write_fabric_selection(
+        &f.root,
+        &ids.iter()
+            .map(|id| (id.as_str(), "1.0"))
+            .collect::<Vec<_>>(),
+    );
+    for i in 0..520 {
+        write(&f.root.join(format!("mods/reject-{i}.tmp")), []);
+    }
+    for id in &ids {
+        write_fabric_jar(&f.root.join(format!("mods/{id}.jar")), id, "1.0");
+    }
+    let mut mods = 0;
+    let mut jars = 0;
+    diagnoses_on_pages(
+        &f,
+        ReadOptions {
+            max_lines_per_file: 20,
+            ..Default::default()
+        },
+        |page| {
+            let page = serde_json::to_value(page).unwrap();
+            if let Some(evidence) = page.get("fabricStartup") {
+                assert_eq!(evidence["status"], "selection_reported");
+                let rows = evidence["mods"].as_array().unwrap();
+                assert!(rows.len() <= 64);
+                mods += rows.len();
+            }
+            if let Some(evidence) = page.get("fabricDisk") {
+                let rows = evidence["jars"].as_array().unwrap();
+                assert!(rows.len() <= 64);
+                assert!(rows
+                    .iter()
+                    .all(|jar| jar["logRelation"]["status"] == "exact"));
+                jars += rows.len();
+            }
+        },
+    );
+    assert_eq!(mods, 132);
+    assert_eq!(jars, 132);
+}
+
+#[test]
+fn paged_bethesda_reads_more_than_64_plugin_headers_with_complete_list_relations() {
+    let f = Fixture::new("fallout4");
+    let appdata = f.user("local-profile");
+    let mut order = String::new();
+    for index in 0..70 {
+        let name = format!("p{index:03}.esp");
+        order.push_str(&format!("*{name}\r\n"));
+        if index == 66 {
+            write_bethesda_plugin(&f.root.join("Data").join(name), &["p069.esp"]);
+        } else {
+            write_bethesda_plugin(&f.root.join("Data").join(name), &[]);
+        }
+    }
+    write(&appdata.join("Plugins.txt"), order);
+    let mut count = 0;
+    let mut relation = false;
+    diagnoses_on_pages(
+        &f,
+        ReadOptions {
+            max_lines_per_file: 8,
+            ..Default::default()
+        },
+        |page| {
+            if let Some(evidence) = page.bethesda_plugins {
+                count += evidence.plugins.len();
+                if let Some(item) = evidence.plugins.iter().find(|p| p.name == "p066.esp") {
+                    assert!(item.unlisted_masters.is_empty());
+                    assert_eq!(item.masters_after_plugin, ["p069.esp"]);
+                    assert_eq!(item.load_order, 67);
+                    relation = true;
+                }
+            }
+        },
+    );
+    assert_eq!(count, 70);
+    assert!(relation);
+}
+
+#[test]
+fn paged_diagnosis_keeps_late_installs_transactions_and_evidence() {
+    let f = Fixture::new("minecraft-java");
+    write(
+        &f.root.join("logs/latest.log"),
+        "missing dependency example\n".repeat(30),
+    );
+    for i in 0..133 {
+        let paths = if i == 132 {
+            json!([f.root.join("late-file.txt").display().to_string()]).to_string()
+        } else {
+            "[]".into()
+        };
+        f.install(&format!("install-{i:03}"), "enabled", &paths, "[]");
+    }
+    for i in 0..20 {
+        f.transaction(&format!("transaction-{i:03}"), "failed", &f.game.id);
+    }
+    let mut transaction_count = 0;
+    let mut log_count = 0;
+    let mut late_file = 0;
+    diagnoses_on_pages(
+        &f,
+        ReadOptions {
+            max_evidence: 7,
+            ..Default::default()
+        },
+        |page| {
+            assert!(page.evidence.len() <= 7);
+            for row in page.evidence {
+                transaction_count += usize::from(row.source == "database");
+                log_count += usize::from(row.source == "log");
+                late_file += usize::from(
+                    row.source == "install_record" && row.file.ends_with("late-file.txt"),
+                );
+            }
+        },
+    );
+    assert_eq!((transaction_count, log_count, late_file), (20, 30, 1));
+}
+
+#[test]
+fn log_pages_fail_closed_if_game_was_removed_between_pages() {
+    let f = Fixture::new("minecraft-java");
+    write(
+        &f.root.join("logs/latest.log"),
+        "first line\nsecond line\nthird line\n",
+    );
+    let mut options = ReadOptions {
+        max_lines_per_file: 1,
+        ..Default::default()
+    };
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let first = read_logs_page(
+        &f.engine,
+        f.game.id.clone(),
+        options.clone(),
+        "test",
+        &cancel,
+    )
+    .unwrap();
+    options.page.cursor = first.next_cursor;
+    assert!(options.page.cursor.is_some());
+    f.engine
+        .db
+        .conn()
+        .execute("DELETE FROM games WHERE id=?1", [&f.game.id])
+        .unwrap();
+    assert!(matches!(
+        read_logs_page(&f.engine, f.game.id.clone(), options, "test", &cancel),
+        Err(AppError::NotFound(_))
+    ));
+}

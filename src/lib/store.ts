@@ -12,13 +12,28 @@ interface UIState {
   planReview: { plan: FilePlan; onApplied?: () => void } | null;
   navigate: (view: PageName) => void;
   selectGame: (id: string) => void;
-  openConversation: (id: string) => void;
+  openConversation: (id: string, fromGameId?: string) => void;
   startAdapterChat: (target?: { name: string; slug?: string; gameId?: string }) => void;
   setConversation: (id: string | null, keepAdapterChat?: boolean) => void;
   toggleTheme: () => void;
   notify: (message: string) => void;
   reviewPlan: (plan: FilePlan, onApplied?: () => void) => void;
   closePlan: () => void;
+}
+
+// The WebView keeps this one-shot return point while the desktop restarts to migrate data.
+const onboardingMigrationKey = "amm.onboarding.migrationOrigin";
+
+export function pendingOnboardingMigration(): string | null {
+  try { return localStorage.getItem(onboardingMigrationKey); }
+  catch { return null; }
+}
+
+export function rememberOnboardingMigration(root: string | null) {
+  try {
+    if (root) localStorage.setItem(onboardingMigrationKey, root);
+    else localStorage.removeItem(onboardingMigrationKey);
+  } catch { /* First-run detection can still reopen the guide without WebView storage. */ }
 }
 
 function initialTheme(): "light" | "dark" {
@@ -30,10 +45,14 @@ function initialTheme(): "light" | "dark" {
 const adapterResearchPrompt = "请先使用已有的 Mod 平台 MCP，查找并获取该游戏不同安装类型的代表性 Mod。结合发布页的安装说明、依赖声明和压缩包目录结构，分析并核实各类型的安装规则。请自行核实游戏识别标记，只在信息无法核实或需要我决定偏好时向我提问。";
 
 export const useUI = create<UIState>((set) => ({
-  view: "agent", gameId: null, conversationId: null, adapterChat: null, theme: initialTheme(), planReview: null,
+  view: pendingOnboardingMigration() ? "onboarding" : "agent", gameId: null, conversationId: null, adapterChat: null, theme: initialTheme(), planReview: null,
   navigate: (view) => set({view}),
   selectGame: (gameId) => set({gameId, view: "detail"}),
-  openConversation: (conversationId) => set({conversationId, adapterChat: null, view: "agent"}),
+  openConversation: (conversationId, fromGameId) => set(state => {
+    // A native launch can finish after the user has navigated elsewhere.
+    if (fromGameId !== undefined && (state.view !== "detail" || state.gameId !== fromGameId)) return state;
+    return {conversationId, adapterChat: null, view: "agent"};
+  }),
   startAdapterChat: (target) => set({
     conversationId: null,
     view: "agent",

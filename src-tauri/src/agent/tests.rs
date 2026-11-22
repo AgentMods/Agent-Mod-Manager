@@ -20,6 +20,12 @@ use tokio::{
 #[path = "attachment_tests.rs"]
 mod agent_attachment;
 
+#[path = "context_compression_tests.rs"]
+pub(super) mod context_compression;
+
+#[path = "tool_loop_regression_tests.rs"]
+mod tool_loop_regression;
+
 #[path = "game_adapter_flow_tests.rs"]
 mod game_adapter_flow;
 
@@ -158,6 +164,7 @@ fn runtime(
         }),
     )
     .unwrap();
+    agent.set_test_context_window("mock-model", None);
     (agent, conversation.id, rx)
 }
 
@@ -679,12 +686,16 @@ async fn reject_approval_does_not_touch_game_files() {
 }
 
 #[tokio::test]
-async fn rejected_plugin_publication_never_grants_upload_consent_in_either_review_mode() {
+async fn rejected_plugin_publication_never_grants_upload_consent_in_any_review_mode() {
     use crate::{agent::policy::PermissionMode, manager_publication, plugins};
-    for mode in [PermissionMode::RequestApproval, PermissionMode::AutoApprove] {
+    for mode in [
+        PermissionMode::RequestApproval,
+        PermissionMode::AutoApprove,
+        PermissionMode::FullTrust,
+    ] {
         let (_dir, engine, _) = setup();
         let draft = install_adapter_package(&engine, plugins::test_fixtures::PACKAGES[0]);
-        let args = json!({"draft_id":draft.id,"tags":["fixture"]});
+        let args = json!({"draft_id":draft.id});
         let response = format!(
             "{}data: [DONE]\n\n",
             event(
@@ -693,6 +704,13 @@ async fn rejected_plugin_publication_never_grants_upload_consent_in_either_revie
         );
         let (url, job) = server(vec![response, final_reply()]).await;
         let (agent, conv, mut rx) = runtime(engine, &url);
+        agent.registry.unregister(&["publish_plugin".into()]);
+        agent
+            .registry
+            .register(crate::agent::publication_tool::tests::no_owner_test_tool(
+                &agent.engine,
+            ))
+            .unwrap();
         agent
             .start_turn(TurnRequest {
                 conversation_id: conv.clone(),
@@ -713,10 +731,17 @@ async fn rejected_plugin_publication_never_grants_upload_consent_in_either_revie
             2
         );
         let id = approval.payload["preview"]["id"].as_str().unwrap();
-        assert!(manager_publication::get_publication(&agent.engine, id)
-            .unwrap()
-            .approved_digest
-            .is_none());
+        let preview_record = manager_publication::get_publication(&agent.engine, id).unwrap();
+        assert_eq!(
+            approval.payload["preview"],
+            serde_json::to_value(&preview_record).unwrap()
+        );
+        assert!(preview_record.approved_digest.is_none());
+        assert!(preview_record
+            .preview
+            .files
+            .iter()
+            .all(|file| !file.text.is_empty() && file.sha256.len() == 64));
         agent
             .respond_approval(
                 &conv,
@@ -735,6 +760,7 @@ async fn rejected_plugin_publication_never_grants_upload_consent_in_either_revie
             record.state,
             manager_publication::PublicationState::Intended
         );
+        assert_eq!(record.preview.digest, preview_record.preview.digest);
         assert_eq!(job.await.unwrap().len(), 2);
     }
 }
@@ -803,10 +829,28 @@ async fn rejected_online_identification_never_searches_or_registers_in_either_re
 #[tokio::test]
 async fn questionnaire_waits_for_valid_answers_and_resumes_with_ordered_skips() {
     let (_dir, engine, _game) = setup();
-    let questions = json!({"title":"确认适配信息","questions":[
-        {"question":"平台？","options":["Windows PC","其他"]},
-        {"question":"目录？"}
-    ]});
+    let last_option = "选项".repeat(150);
+    let mut options: Vec<_> = (0..8).map(|i| format!("平台 {i}")).collect();
+    options.push(last_option.clone());
+    let mut questions = vec![
+        json!({"question":"平台？","options":options}),
+        json!({"question":"要安装哪些 Mod？","options":["增强画质","改进界面"],"multiSelect":true}),
+        json!({"question":"可选组件（可多选）如果只能选一个，优先推荐 A。","options":["A","B"]}),
+        json!({"question":"启用哪些扩展？","options":["C","D"],"multiSelect":true}),
+    ];
+    questions.extend((4..9).map(|i| json!({"question":format!("目录 {i}？")})));
+    let questions = json!({"title":"确认适配信息","questions":questions});
+    let mut expected_preview = questions.clone();
+    expected_preview["questions"][2]["multiSelect"] = json!(true);
+    let mut answers = vec![Value::Null; 9];
+    answers[0] = json!(last_option);
+    answers[1] = json!(["增强画质", "改进界面"]);
+    answers[2] = json!(["A"]);
+    answers[8] = json!("目录描述".repeat(6001));
+    let mut submitted = answers.clone();
+    submitted[1] = json!([" 增强画质 ", " 改进界面 "]);
+    submitted[2] = json!(" A "); // The old client sends a scalar for the inferred multi-select.
+    assert!(json!(answers).to_string().len() > 72_020);
     let response = format!(
         "{}data: [DONE]\n\n",
         event(
@@ -828,36 +872,57 @@ async fn questionnaire_waits_for_valid_answers_and_resumes_with_ordered_skips() 
         })
         .unwrap();
     let request = next(&mut rx, "approval-request").await;
-    assert_eq!(request.payload["preview"], questions);
+    assert_eq!(request.payload["preview"], expected_preview);
     let id = request.payload["approvalId"].as_str().unwrap();
-    assert!(agent
-        .respond_approval(
-            &conv,
-            id,
-            ApprovalResponse {
-                approved: true,
-                answer: json!("[]")
-            }
-        )
-        .is_err());
+    let mut wrong_shape = submitted.clone();
+    wrong_shape[0] = json!([last_option]);
+    for invalid in [
+        "[]".to_owned(),
+        serde_json::to_string(&wrong_shape).unwrap(),
+    ] {
+        assert!(agent
+            .respond_approval(
+                &conv,
+                id,
+                ApprovalResponse {
+                    approved: true,
+                    answer: json!(invalid),
+                }
+            )
+            .is_err());
+    }
     agent
         .respond_approval(
             &conv,
             id,
             ApprovalResponse {
                 approved: true,
-                answer: json!(r#"["Windows PC",null]"#),
+                answer: json!(serde_json::to_string(&submitted).unwrap()),
             },
         )
         .unwrap();
     let resolved = next(&mut rx, "approval-resolved").await;
     assert_eq!(resolved.payload["status"], "approved");
     let result = next(&mut rx, "tool-result").await;
-    assert_eq!(
-        result.payload["result"],
-        json!({"answer":["Windows PC",null]})
-    );
+    assert_eq!(result.payload["result"], json!({"answer":answers}));
     assert_eq!(next(&mut rx, "done").await.payload["status"], "done");
+    let replay = agent.events.replay(&conv, 0, 100).unwrap();
+    assert_eq!(
+        replay
+            .iter()
+            .find(|e| e.kind == "approval-request")
+            .unwrap()
+            .payload["preview"],
+        expected_preview
+    );
+    assert_eq!(
+        replay
+            .iter()
+            .find(|e| e.kind == "tool-result")
+            .unwrap()
+            .payload["result"],
+        result.payload["result"]
+    );
     let requests = job.await.unwrap();
     let response = requests[1]["messages"]
         .as_array()
@@ -936,19 +1001,18 @@ async fn agent_turn_uses_only_reasoning_effort_enabled_for_the_active_model() {
     let (_dir, engine, _) = setup();
     let (url, job) = server(vec![final_reply(), final_reply(), final_reply()]).await;
     let (agent, conv, mut rx) = runtime(engine, &url);
+    agent.set_test_context_window("second-model", None);
     let mut settings = agent.settings.load().unwrap();
     settings.model = "second-model".into();
     settings.models = vec![
         AgentModelSettings {
             display_name: "Mock model".into(),
             id: "mock-model".into(),
-            context_budget: 32_768,
             reasoning_levels: vec![ReasoningEffort::Low],
         },
         AgentModelSettings {
             display_name: "Second model".into(),
             id: "second-model".into(),
-            context_budget: 128_000,
             reasoning_levels: vec![ReasoningEffort::None, ReasoningEffort::High],
         },
     ];
@@ -984,24 +1048,23 @@ async fn agent_turn_uses_only_reasoning_effort_enabled_for_the_active_model() {
 }
 
 #[tokio::test]
-async fn per_turn_model_override_uses_configured_budget_and_preserves_saved_default() {
+async fn per_turn_model_override_preserves_saved_default() {
     use crate::settings::{AgentModelSettings, ReasoningEffort};
 
     let (_dir, engine, _) = setup();
     let (url, job) = server(vec![final_reply()]).await;
     let (agent, conv, mut rx) = runtime(engine, &url);
+    agent.set_test_context_window("second-model", None);
     let mut settings = agent.settings.load().unwrap();
     settings.models = vec![
         AgentModelSettings {
             display_name: "Mock model".into(),
             id: "mock-model".into(),
-            context_budget: 1,
             reasoning_levels: vec![ReasoningEffort::Low],
         },
         AgentModelSettings {
             display_name: "Second model".into(),
             id: "second-model".into(),
-            context_budget: 32_768,
             reasoning_levels: vec![ReasoningEffort::Ultra],
         },
     ];
@@ -1032,11 +1095,11 @@ fn per_turn_model_and_reasoning_are_validated_before_writing_messages() {
 
     let (_dir, engine, _) = setup();
     let (agent, conv, _rx) = runtime(engine, "http://127.0.0.1:1");
+    agent.set_test_context_window("second-model", None);
     let mut settings = agent.settings.load().unwrap();
     settings.models = vec![AgentModelSettings {
         display_name: "Second model".into(),
         id: "second-model".into(),
-        context_budget: 32_768,
         reasoning_levels: vec![ReasoningEffort::High],
     }];
     settings.model = "second-model".into();
@@ -1402,7 +1465,7 @@ async fn model_stream_tool_only_retry_replaces_partial_only_after_validation() {
 }
 
 #[tokio::test]
-async fn model_stream_exhausted_retries_keep_the_last_visible_reply() {
+async fn model_stream_terminal_fallback_error_keeps_the_last_visible_reply() {
     let (_dir, engine, _) = setup();
     let api_key = "sk-offline-exhausted-redaction-token";
     let partial = event(json!({"choices":[{"delta":{"reasoning_content":"半截推理"}}]}));
@@ -1605,44 +1668,6 @@ async fn truncated_tool_stream_never_executes() {
     assert!(requests[2].body.get("stream_options").is_none());
     let events = agent.events.replay(&conv, 0, 100).unwrap();
     assert!(!events.iter().any(|event| event.kind == "tool-start"));
-}
-
-#[tokio::test]
-async fn context_compression_preserves_full_history_and_summarizes_only_older_turns() {
-    let (_dir, engine, _game) = setup();
-    let (url, job) = server(vec![final_reply(), final_reply()]).await;
-    let (agent, conv, mut rx) = runtime(engine, &url);
-    let history = History::new(agent.engine.db.clone());
-    let old = "历史任务".repeat(6000);
-    history
-        .append_message(&conv, "user", &old, None, None)
-        .unwrap();
-    history
-        .append_message(&conv, "assistant", "previous answer", None, None)
-        .unwrap();
-    // The input budget now includes the registered tool schemas. Keep enough
-    // room for the tool contract while making the deliberately long history
-    // force a compression pass.
-    agent.settings.set("context_budget", json!(32768)).unwrap();
-    agent
-        .start_turn(TurnRequest {
-            conversation_id: conv.clone(),
-            content: "继续安装".into(),
-            attachments: None,
-            model: None,
-            permission_mode: None,
-            reasoning_effort: None,
-        })
-        .unwrap();
-    assert_eq!(next(&mut rx, "done").await.payload["status"], "done");
-    let bodies = job.await.unwrap();
-    assert!(bodies[0].get("tools").is_none());
-    let final_request = bodies[1]["messages"].as_array().unwrap();
-    assert!(final_request.iter().any(|m| m["content"] == "继续安装"));
-    assert!(!final_request.iter().any(|m| m["content"] == old));
-    let detail = history.get_conversation(&conv).unwrap();
-    assert!(detail.messages.iter().any(|m| m.content == old));
-    assert_eq!(detail.conversation.task_summary.as_deref(), Some("完成"));
 }
 
 #[tokio::test]
@@ -1901,7 +1926,7 @@ fn fallback_regression_json_reply(
 }
 
 #[tokio::test]
-async fn model_non_stream_fallback_after_two_body_errors_keeps_request_and_parses_standard_json() {
+async fn model_non_stream_fallback_survives_more_transport_errors_and_preserves_request() {
     use std::cell::RefCell;
 
     let draft = event(json!({"choices":[{"index":0,"delta":{"content":"暂存草稿"}}]}));
@@ -1926,6 +1951,18 @@ async fn model_non_stream_fallback_after_two_body_errors_keeps_request_and_parse
         FallbackRegressionReply {
             status: "200 OK",
             content_type: "text/event-stream",
+            body: String::new(),
+            truncate: true,
+        },
+        FallbackRegressionReply {
+            status: "200 OK",
+            content_type: "application/json",
+            body: final_json.clone(),
+            truncate: true,
+        },
+        FallbackRegressionReply {
+            status: "200 OK",
+            content_type: "application/json",
             body: String::new(),
             truncate: true,
         },
@@ -1998,7 +2035,7 @@ async fn model_non_stream_fallback_after_two_body_errors_keeps_request_and_parse
     );
 
     let requests = server.await.unwrap();
-    assert_eq!(requests.len(), 3);
+    assert_eq!(requests.len(), 5);
     assert!(requests
         .iter()
         .all(|request| request.target == "/v1/chat/completions"));
@@ -2019,7 +2056,9 @@ async fn model_non_stream_fallback_after_two_body_errors_keeps_request_and_parse
         .unwrap()
         .remove("stream_options")
         .is_some());
-    assert_eq!(requests[2].body, expected_fallback);
+    for request in &requests[2..] {
+        assert_eq!(request.body, expected_fallback);
+    }
 }
 
 struct FallbackRegressionSecrets(String);
@@ -2063,5 +2102,6 @@ fn runtime_with_fallback_regression_key(
         }),
     )
     .unwrap();
+    agent.set_test_context_window("mock-model", None);
     (agent, conversation.id, rx)
 }

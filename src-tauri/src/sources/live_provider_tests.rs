@@ -102,6 +102,10 @@ async fn opt_in_live_thunderstore_download_stays_inert() {
             &resolutions,
             "live-thunderstore".into(),
             download.resolution_id,
+            crate::download_tasks::ClassificationInput {
+                game_name: Some("Valheim".into()),
+                ..Default::default()
+            },
             Arc::new(move |event| {
                 let _ = progress.send(event);
             }),
@@ -110,11 +114,12 @@ async fn opt_in_live_thunderstore_download_stays_inert() {
     .await
     .expect("Thunderstore transfer timed out")
     .unwrap();
+    let artifact = artifact.artifact;
     assert!(updates
         .try_iter()
         .any(|p| p.phase == DownloadPhase::Completed && p.downloaded == SIZE));
     assert_eq!(artifact.size, SIZE);
-    assert!(artifact.path.starts_with(app.engine.paths.downloads()));
+    assert!(artifact.path.starts_with(app.engine.paths.mod_library()));
     assert!(
         !artifact.integrity_verified && artifact.requires_review && !artifact.auto_install_allowed
     );

@@ -1,13 +1,14 @@
-import { useRef, useState, type Ref } from "react";
+import { useEffect, useRef, useState, type Ref } from "react";
 import { ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, PlusIcon, ShieldAlertIcon, ShieldIcon, SquareIcon } from "lucide-react";
 import { DropdownMenu as Menu, Popover, Slider } from "radix-ui";
 import { Button } from "@/components/ui/button";
+import { Field, FieldDescription, FieldError, FieldLabel } from "@/components/ui/field";
+import { Input } from "@/components/ui/input";
 import { AttachmentGroup } from "@/components/ui/attachment";
 import { Spinner } from "@/components/ui/spinner";
 import { ComposerAttachment, useAttachmentConverterStart } from "./AgentAttachments";
 import { ErrorState } from "./ui";
-import { MAX_ATTACHMENTS, MAX_MESSAGE_ATTACHMENT_BYTES, type DraftAttachment } from "@/lib/agent-attachments";
-import { toast } from "sonner";
+import type { DraftAttachment } from "@/lib/agent-attachments";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -35,7 +36,8 @@ interface AgentComposerProps {
   onInputChange: (value: string) => void;
   attachments: DraftAttachment[];
   updateAttachments: (apply: (current: DraftAttachment[]) => DraftAttachment[]) => void;
-  onSend: (attachments: AgentAttachment[]) => void;
+  libraryGameName?: string;
+  onSend: (attachments: AgentAttachment[], newGameName?: string) => void;
   onCancel?: () => void;
   disabled: boolean;
   busy: boolean;
@@ -50,17 +52,21 @@ interface AgentComposerProps {
 }
 
 export function AgentComposer({
-  input, inputRef, onCancelEdit, onInputChange, attachments, updateAttachments, onSend, onCancel, disabled, busy, permission, inheritedPermission,
+  input, inputRef, onCancelEdit, onInputChange, attachments, updateAttachments, libraryGameName, onSend, onCancel, disabled, busy, permission, inheritedPermission,
   onPermissionChange, model, models, onModelChange, reasoningEffort, onReasoningChange,
 }: AgentComposerProps) {
   const [picker, setPicker] = useState<"model" | "reasoning" | null>(null);
+  const [editedGameName, setEditedGameName] = useState<string | null>(null);
+  useEffect(() => setEditedGameName(null), [libraryGameName]);
+  const trimmedName = editedGameName?.trim();
+  const newGameName = libraryGameName !== undefined && trimmedName !== libraryGameName.trim() ? trimmedName : undefined;
+  const invalidGameName = newGameName !== undefined && (!newGameName || /\p{Cc}/u.test(newGameName));
   const filePicker = useRef<HTMLInputElement>(null);
   const converter = useAttachmentConverterStart();
   const needsSetup = attachments.some((item) => item.state === "error" && item.needsConsent);
   const controlsDisabled = disabled || busy;
   const ready = attachments.filter((item) => item.state === "ready");
-  const tooLarge = ready.reduce((total, item) => total + item.bytes, 0) > MAX_MESSAGE_ATTACHMENT_BYTES;
-  const canSend = !controlsDisabled && !tooLarge && ready.length === attachments.length && (Boolean(input.trim()) || ready.length > 0);
+  const canSend = !controlsDisabled && !invalidGameName && ready.length === attachments.length && (Boolean(input.trim()) || ready.length > 0);
 
   function retryFailed(shouldRetry: (item: Extract<DraftAttachment, { state: "error" }>) => boolean) {
     updateAttachments((current) => current.map((item) => item.state === "error" && shouldRetry(item)
@@ -74,10 +80,6 @@ export function AgentComposer({
 
   function addFiles(files: File[]) {
     if (controlsDisabled || !files.length) return;
-    if (attachments.length + files.length > MAX_ATTACHMENTS) {
-      toast.error(`每条消息最多添加 ${MAX_ATTACHMENTS} 个附件。`);
-      return;
-    }
     const pending = files.map((file) => ({ id: crypto.randomUUID(), file, state: "processing" as const }));
     updateAttachments((current) => [...current, ...pending]);
   }
@@ -90,8 +92,18 @@ export function AgentComposer({
 
   return <form onSubmit={(event) => {
     event.preventDefault();
-    if (canSend) onSend(ready.map((item) => item.attachment));
+    if (canSend) onSend(ready.map((item) => item.attachment), newGameName);
   }}>
+    {libraryGameName !== undefined && <Field className="mb-3 gap-1.5" data-invalid={invalidGameName || undefined}>
+      <div className="flex items-center gap-3">
+        <FieldLabel className="shrink-0" htmlFor="adapter-game-name">游戏库显示名称</FieldLabel>
+        <Input id="adapter-game-name" className="min-w-0 max-w-sm" value={editedGameName ?? libraryGameName}
+          aria-invalid={invalidGameName} aria-describedby="adapter-game-name-hint" disabled={controlsDisabled}
+          onChange={(event) => setEditedGameName(event.target.value)} />
+      </div>
+      {invalidGameName ? <FieldError id="adapter-game-name-hint">请输入游戏名称，且不含控制字符。</FieldError>
+        : <FieldDescription id="adapter-game-name-hint">绑定适配包时会同步更新游戏库中的名称。</FieldDescription>}
+    </Field>}
     {onCancelEdit && <div className="mb-1 flex items-center justify-between gap-2 px-2 text-xs text-muted-foreground">
       <span>正在编辑消息</span>
       <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={onCancelEdit}>取消编辑</Button>
@@ -115,7 +127,6 @@ export function AgentComposer({
           </Button>
           <ErrorState error={converter.error} />
         </>}
-        {tooLarge && <span role="alert" className="text-xs text-destructive">附件合计超过 20 MiB，请移除部分附件后分次发送。</span>}
       </InputGroupAddon>}
       <InputGroupTextarea
         ref={inputRef}

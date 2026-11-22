@@ -21,23 +21,20 @@ import { Spinner } from "@/components/ui/spinner";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
 const KEY_URL = "https://one.gloscai.com/keys";
-const DEFAULT_CONTEXT = 32768;
-const MAX_CONTEXT = 16777216;
-const MAX_MODELS = 64;
+const MODEL_CANDIDATES_PER_PAGE = 100;
 const modelColumnHead = "h-8 px-1 text-xs text-muted-foreground";
 const modelTableCell = "min-w-0 p-0 @min-[37rem]:p-1";
 const modelInput = "h-8 px-2 text-sm";
 const compactFieldLabel = "mb-1 block text-xs text-muted-foreground @min-[37rem]:hidden";
 const modelMetadataQuery = "get_agent_model_metadata";
-type ModelDraft = Omit<AgentModelSettings, "context_budget" | "reasoning_levels"> & {
+type ModelDraft = Omit<AgentModelSettings, "reasoning_levels"> & {
   rowKey: number;
   lookupId: string;
   focusOnAdd?: boolean;
-  context_budget: number | null;
   reasoning_levels: ReasoningEffort[] | null;
 };
 type Draft = Omit<AppSettings, "models" | "model"> & {models: ModelDraft[]; defaultModelKey: number | undefined};
-type ModelMetadata = {id: string; contextBudget: number | null; reasoningLevels: ReasoningEffort[]};
+type ModelMetadata = {id: string; reasoningLevels: ReasoningEffort[]};
 type Props = {
   onSaved?: () => void;
   onSavingChange?: (saving: boolean) => void;
@@ -47,12 +44,13 @@ type Props = {
 function initialDraft({model: defaultId, models: savedModels = [], ...settings}: AppSettings): Draft {
   const legacyId = defaultId.trim();
   const configured = legacyId && !savedModels.some((model) => model.id === legacyId)
-    ? [{display_name: legacyId, id: legacyId, context_budget: settings.context_budget, reasoning_levels: []}, ...savedModels.slice(0, MAX_MODELS - 1)]
+    ? [{display_name: legacyId, id: legacyId, reasoning_levels: []}, ...savedModels]
     : savedModels;
   const models = configured.map((model, rowKey) => ({
     ...model,
     display_name: model.display_name || model.id,
-    rowKey,
+    // Loaded rows and newly added rows use separate key ranges.
+    rowKey: -rowKey - 1,
     lookupId: model.id,
   }));
   return {...settings, models, defaultModelKey: models.find((model) => model.id === legacyId)?.rowKey ?? models[0]?.rowKey};
@@ -79,10 +77,12 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
   const notify = useUI((state) => state.notify);
   const [edited, setEdited] = useState<Draft>();
   const [apiKey, setApiKey] = useState("");
-  const nextRowKey = useRef(MAX_MODELS);
+  const nextRowKey = useRef(0);
   const [serviceModels, setServiceModels] = useState<string[] | null>(null);
   const [selection, setSelection] = useState<string[]>([]);
   const [filter, setFilter] = useState("");
+  const [candidatePage, setCandidatePage] = useState(0);
+  const candidateList = useRef<HTMLDivElement>(null);
   const [listing, setListing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [draggingRow, setDraggingRow] = useState<number>();
@@ -93,27 +93,46 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
   const saved = useMemo(() => settings.data && initialDraft(settings.data), [settings.data]);
   const draft = edited ?? saved;
   const baseUrl = draft?.base_url.trim() ?? "";
-  const modelIds = draft?.models.map((model) => model.id.trim()) ?? [];
+  const modelIds = useMemo(() => draft?.models.map((model) => model.id.trim()) ?? [], [draft?.models]);
+  const configuredIds = useMemo(() => new Set(modelIds), [modelIds]);
   const lookupIds = [...new Set(draft?.models.map((model) => model.lookupId).filter(validModelText))].sort();
   const metadata = useBackendQuery<ModelMetadata[]>(["agent-model-metadata", baseUrl, lookupIds],
     modelMetadataQuery, {baseUrl, modelIds: lookupIds}, !!baseUrl && lookupIds.length > 0);
   const metadataById = new Map(metadata.data?.map((model) => [model.id, model]));
   const disabled = !draft || saving;
-  const available = serviceModels?.filter((modelId) => !modelIds.includes(modelId) && modelId.toLowerCase().includes(filter.trim().toLowerCase()));
-  const selectedIds = selection.filter((modelId) => !modelIds.includes(modelId));
-  const duplicateIds = new Set(modelIds.filter((modelId, index) => modelId && modelIds.indexOf(modelId) !== index));
+  const available = useMemo(() => {
+    const query = filter.trim().toLowerCase();
+    return serviceModels?.filter((modelId) => !configuredIds.has(modelId) && (!query || modelId.toLowerCase().includes(query)));
+  }, [serviceModels, configuredIds, filter]);
+  const candidatePages = Math.max(1, Math.ceil((available?.length ?? 0) / MODEL_CANDIDATES_PER_PAGE));
+  const currentPage = Math.min(candidatePage, candidatePages - 1);
+  const pageStart = currentPage * MODEL_CANDIDATES_PER_PAGE;
+  const selectedIds = new Set(selection.filter((modelId) => !configuredIds.has(modelId)));
+  const seenIds = new Set<string>();
+  const duplicateIds = new Set<string>();
+  for (const modelId of modelIds) {
+    if (!modelId) continue;
+    if (seenIds.has(modelId)) duplicateIds.add(modelId);
+    seenIds.add(modelId);
+  }
   const invalidModelIds = duplicateIds.size > 0 || modelIds.some((modelId) => !validModelText(modelId));
   const invalidNames = draft?.models.some((model) => !!model.display_name.trim() && !validModelText(model.display_name.trim()));
   const waitingForDefaults = metadata.isFetching && draft?.models.some((model) =>
-    model.id.trim() === model.lookupId && (model.context_budget === null || model.reasoning_levels === null));
+    model.id.trim() === model.lookupId && model.reasoning_levels === null);
   const defaultModel = draft?.models.find((model) => model.rowKey === draft.defaultModelKey);
-  const canSubmit = !(disabled || listing || invalidModelIds || invalidNames || selectedIds.length || (navigation && !defaultModel));
+  const canSubmit = !(disabled || listing || invalidModelIds || invalidNames || selectedIds.size || (navigation && !defaultModel));
 
   function resetModelList() {
     setServiceModels(null);
     setSelection([]);
     setFilter("");
+    setCandidatePage(0);
     setListError(undefined);
+  }
+
+  function showCandidatePage(page: number) {
+    setCandidatePage(page);
+    candidateList.current?.closest("[data-slot=scroll-area-viewport]")?.scrollTo({top: 0});
   }
 
   async function listModels() {
@@ -130,13 +149,9 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
 
   function appendModels(requested: string[], focusOnAdd = false) {
     if (!draft) return;
-    if (draft.models.length + requested.length > MAX_MODELS) {
-      setError(`最多可添加 ${MAX_MODELS} 个模型。`);
-      return;
-    }
     const additions = requested.map((id) => ({
       id, display_name: id, rowKey: nextRowKey.current++, lookupId: id, focusOnAdd,
-      context_budget: null, reasoning_levels: null,
+      reasoning_levels: null,
     }));
     setEdited({...draft, defaultModelKey: draft.defaultModelKey ?? additions[0]?.rowKey, models: [...draft.models, ...additions]});
     if (!focusOnAdd) resetModelList();
@@ -166,10 +181,6 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
     setEdited({...draft, models});
   }
 
-  function contextFor(model: ModelDraft, defaults = metadataById) {
-    return model.context_budget ?? defaults.get(model.id.trim())?.contextBudget ?? DEFAULT_CONTEXT;
-  }
-
   function levelsFor(model: ModelDraft, defaults = metadataById) {
     return model.reasoning_levels ?? defaults.get(model.id.trim())?.reasoningLevels ?? [];
   }
@@ -186,7 +197,7 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
       // A click on Save can also be the first blur of an edited request ID.
       // Resolve defaults for the IDs being saved, even when that lookup just started.
       let defaults = metadataById;
-      if (rows.some((model) => model.context_budget === null || model.reasoning_levels === null)) {
+      if (rows.some((model) => model.reasoning_levels === null)) {
         const idsToResolve = [...modelIds].sort();
         const queryKey = ["agent-model-metadata", baseUrl, idsToResolve];
         if (queryClient.getQueryState(queryKey)?.status !== "error") {
@@ -200,11 +211,11 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
       const models = rows.map((model) => ({
         display_name: model.display_name.trim() || model.id.trim(),
         id: model.id.trim(),
-        context_budget: contextFor(model, defaults), reasoning_levels: levelsFor(model, defaults),
+        reasoning_levels: levelsFor(model, defaults),
       }));
-      const next: AppSettings = {...settings, base_url: baseUrl, models, model: defaultModel?.id.trim() ?? "",
-        context_budget: defaultModel ? contextFor(defaultModel, defaults) : DEFAULT_CONTEXT,
-        api_key_ref: key ? "model.api_key" : settings.api_key_ref};
+      const next: AppSettings = {base_url: baseUrl, models, model: defaultModel?.id.trim() ?? "",
+        api_key_ref: key ? "model.api_key" : settings.api_key_ref,
+        permission_mode: settings.permission_mode, onboarding_completed: settings.onboarding_completed};
       if (key) await api("set_secret", {key: "model.api_key", value: key});
       await api("set_settings", {settings: next});
       setApiKey("");
@@ -262,7 +273,7 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
               {listing ? <Spinner data-icon="inline-start"/> : <DownloadIcon data-icon="inline-start"/>}
               {listing ? "获取中…" : "获取模型列表"}
             </Button>
-            <Button type="button" variant="outline" size="sm" disabled={disabled || draft.models.length >= MAX_MODELS} onClick={() => appendModels([""], true)}>
+            <Button type="button" variant="outline" size="sm" disabled={disabled} onClick={() => appendModels([""], true)}>
               <PlusIcon data-icon="inline-start"/>手动添加
             </Button>
           </div>
@@ -272,19 +283,26 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
         {available && <FieldSet disabled={disabled} className="gap-3 rounded-lg border p-4">
           <FieldLegend variant="label">服务商模型（可多选）</FieldLegend>
           <Label htmlFor={`${id}-filter`} className="sr-only">搜索服务商模型</Label>
-          <Input id={`${id}-filter`} type="search" value={filter} onChange={(event) => setFilter(event.target.value)} placeholder="搜索模型 ID"/>
+          <Input id={`${id}-filter`} type="search" value={filter} onChange={(event) => {
+            setFilter(event.target.value);
+            showCandidatePage(0);
+          }} placeholder="搜索模型 ID"/>
           <ScrollArea className="min-w-0 rounded-md border [&_[data-slot=scroll-area-viewport]]:max-h-48 [&_[data-slot=scroll-area-viewport]>div]:block!">
-            <div className="flex flex-col gap-2 p-3">
-              {available.slice(0, 100).map((name) => <Label key={name} className="font-normal break-all">
-                <Checkbox checked={selectedIds.includes(name)} onCheckedChange={(checked) => setSelection((current) => checked === true ? [...current, name] : current.filter((item) => item !== name))}/>
+            <div ref={candidateList} className="flex flex-col gap-2 p-3">
+              {available.slice(pageStart, pageStart + MODEL_CANDIDATES_PER_PAGE).map((name) => <Label key={name} className="font-normal break-all">
+                <Checkbox checked={selectedIds.has(name)} onCheckedChange={(checked) => setSelection((current) => checked === true ? [...current, name] : current.filter((item) => item !== name))}/>
                 <span>{name}</span>
               </Label>)}
               {!available.length && <p className="text-sm text-muted-foreground">没有可添加的匹配模型。</p>}
             </div>
           </ScrollArea>
-          {available.length > 100 && <FieldDescription>请搜索以查看其他模型。</FieldDescription>}
+          {available.length > MODEL_CANDIDATES_PER_PAGE && <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" variant="outline" size="sm" disabled={currentPage === 0} onClick={() => showCandidatePage(currentPage - 1)}>上一页模型</Button>
+            <span role="status" className="text-xs text-muted-foreground tabular-nums">第 {currentPage + 1} / {candidatePages} 页，共 {available.length} 个模型</span>
+            <Button type="button" variant="outline" size="sm" disabled={currentPage + 1 === candidatePages} onClick={() => showCandidatePage(currentPage + 1)}>下一页模型</Button>
+          </div>}
           <div className="flex flex-wrap gap-2">
-            <Button type="button" size="sm" variant="outline" disabled={!selectedIds.length} onClick={() => appendModels(selectedIds)}>添加所选（{selectedIds.length}）</Button>
+            <Button type="button" size="sm" variant="outline" disabled={!selectedIds.size} onClick={() => appendModels([...selectedIds])}>添加所选（{selectedIds.size}）</Button>
             <Button type="button" size="sm" variant="ghost" onClick={resetModelList}>收起</Button>
           </div>
         </FieldSet>}
@@ -296,7 +314,6 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
                 <TableHead role="columnheader" scope="col" className="h-8 w-9" aria-label="排序"/>
                 <TableHead role="columnheader" scope="col" className={modelColumnHead}>菜单显示名</TableHead>
                 <TableHead role="columnheader" scope="col" className={modelColumnHead}>实际请求模型</TableHead>
-                <TableHead role="columnheader" scope="col" className={cn(modelColumnHead, "w-[7rem]")}>上下文窗口</TableHead>
                 <TableHead role="columnheader" scope="col" className={cn(modelColumnHead, "w-[24%]")}>思考等级</TableHead>
                 <TableHead role="columnheader" scope="col" className="h-8 w-9" aria-label="删除"/>
               </TableRow>
@@ -308,7 +325,6 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
                 const displayName = model.display_name.trim();
                 const fieldName = requestId || "新模型";
                 const rowName = displayName || fieldName;
-                const details = metadataById.get(requestId);
                 const enabledLevels = levelsFor(model);
                 return <TableRow key={rowKey} role="row" data-state={draggingRow === rowKey ? "selected" : undefined}
                   className="grid grid-cols-2 gap-x-2 gap-y-1.5 p-2 @min-[37rem]:table-row @min-[37rem]:p-0"
@@ -363,15 +379,7 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
                         if (requestId !== model.lookupId || requestId !== model.id) updateModel(rowKey, {id: requestId, lookupId: requestId});
                       }}/>
                   </TableCell>
-                  <TableCell role="cell" className={modelTableCell}>
-                    <span className={compactFieldLabel} aria-hidden="true">上下文窗口</span>
-                    <Input aria-label={`${fieldName} 上下文预算`} className={cn(modelInput, "tabular-nums")}
-                      type="number" min={1} max={MAX_CONTEXT} required disabled={disabled}
-                      title={details?.contextBudget ? `BaseLLM 建议 ${details.contextBudget.toLocaleString("zh-CN")} tokens` : undefined}
-                      value={model.context_budget === 0 ? "" : contextFor(model)}
-                      onChange={(event) => updateModel(rowKey, {context_budget: Number(event.target.value)})}/>
-                  </TableCell>
-                  <TableCell role="cell" className={modelTableCell}>
+                  <TableCell role="cell" className={cn(modelTableCell, "col-span-2 @min-[37rem]:col-auto")}>
                     <span className={compactFieldLabel} aria-hidden="true">思考等级</span>
                     <DropdownMenu modal={false}>
                       <DropdownMenuTrigger asChild>

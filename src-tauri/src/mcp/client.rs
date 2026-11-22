@@ -1,16 +1,23 @@
-use super::config::{McpServers, McpTransport, ServerConfig};
+use super::config::{McpServers, McpTransport, ServerConfig, PLAYWRIGHT_COMMAND};
 use super::redaction::ConnectionSecrets;
 use super::McpRuntime;
 use crate::{
+    agent::sse::available_memory,
     error::{AppError, AppResult},
     settings::Settings,
 };
+use futures_util::StreamExt;
+use reqwest_mcp::header::{HeaderName, HeaderValue};
 use rmcp::{
-    model::{CallToolRequestParams, PaginatedRequestParams},
-    service::{ClientInitializeError, RunningService},
+    model::{CallToolRequestParams, ClientJsonRpcMessage, PaginatedRequestParams},
+    service::{ClientInitializeError, RunningService, ServiceError},
     transport::{
-        async_rw::AsyncRwTransport,
-        streamable_http_client::{StreamableHttpClientTransportConfig, StreamableHttpError},
+        async_rw::{AsyncRwTransport, DEFAULT_MAX_LINE_LENGTH},
+        common::client_side_sse::BoxedSseResponse,
+        streamable_http_client::{
+            SseError, StreamableHttpClient, StreamableHttpClientTransportConfig,
+            StreamableHttpError, StreamableHttpPostResponse,
+        },
         StreamableHttpClientTransport,
     },
     RoleClient, ServiceExt,
@@ -19,26 +26,37 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
+    io,
+    pin::Pin,
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering::Relaxed},
+        Arc, Mutex,
+    },
+    task::{Context, Poll},
     time::Duration,
 };
-use tokio::process::Child;
+use tokio::{
+    io::{AsyncRead, ReadBuf},
+    process::{Child, Command},
+    sync::{Mutex as AsyncMutex, MutexGuard},
+};
 use tokio_util::sync::CancellationToken;
 
-pub const MAX_TOOLS: usize = 128;
-pub const MAX_TOOL_PAGES: usize = 8;
-pub const MAX_TOOL_LIST_BYTES: usize = 2 * 1024 * 1024;
-pub const MAX_SCHEMA_BYTES: usize = 64 * 1024;
-pub const MAX_RESULT_BYTES: usize = 1024 * 1024;
-pub const MAX_ARGUMENT_BYTES: usize = 256 * 1024;
-pub const MAX_WIRE_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+static RESERVED_MCP_MEMORY: AtomicUsize = AtomicUsize::new(0);
 pub(crate) const MARKDOWN_TOOL: &str = "convert_to_markdown";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const TOOL_PAGE_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECTION_CLOSED_MESSAGE: &str = "MCP 连接已关闭；远端工具可能已经产生外部影响";
+const REMOTE_ERROR_MESSAGE: &str = "MCP request failed (remote details suppressed)";
 const TIMEOUT_MESSAGE: &str = "MCP request timed out; external effects may already have occurred";
-const RESULT_LIMIT_MESSAGE: &str = "MCP result exceeds limits";
+const MEMORY_MESSAGE: &str = "MCP 当前可用内存预算不足；请减少并发操作或缩小单次请求。";
+const HTTP_POSTS: usize = 2;
+const HTTP_QUEUE: usize = 4;
+// Fixed success-body input cap in the pinned rmcp reqwest backend; reserve
+// raw buffer/capacity only while a POST can hold it, not while a client is idle.
+const RMCP_HTTP_JSON_CAP: usize = 16 * 1024 * 1024;
 
 /// For stdio, the initialize deadline also covers anything the launcher must
 /// install before an MCP server exists. This never extends tool call timeouts.
@@ -133,11 +151,93 @@ pub struct McpTool {
     pub input_schema: Value,
 }
 
+// Limit termination of browser and converter process trees to their own group/job.
+#[derive(Default)]
+struct StdioScope {
+    #[cfg(unix)]
+    group: bool,
+    #[cfg(windows)]
+    job: Option<std::os::windows::io::OwnedHandle>,
+}
+
+impl StdioScope {
+    fn new(_child: &Child, _scoped: bool) -> io::Result<Self> {
+        #[cfg(unix)]
+        let scope = Self { group: _scoped };
+        #[cfg(windows)]
+        let scope = Self {
+            job: _scoped.then(|| stdio_job(_child)).transpose()?,
+        };
+        #[cfg(not(any(unix, windows)))]
+        let scope = Self::default();
+        Ok(scope)
+    }
+
+    fn stop(&self, child: &mut Child) {
+        #[cfg(unix)]
+        if self.group {
+            // process_group(0) made the owned child the group leader. Its Child
+            // handle has not been reaped, so the PID is not recycled here.
+            if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+        }
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+            unsafe {
+                TerminateJobObject(job.as_raw_handle(), 1);
+            }
+        }
+        let _ = child.start_kill();
+    }
+}
+
+#[cfg(windows)]
+fn stdio_job(child: &Child) -> io::Result<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    let process = child
+        .raw_handle()
+        .ok_or_else(|| io::Error::other("stdio process exited"))?;
+    // The unnamed, non-inheritable job handle is owned by this session only.
+    let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of_val(&limits) as u32,
+        )
+    };
+    if configured == 0 || unsafe { AssignProcessToJobObject(job.as_raw_handle(), process) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(job)
+}
+
 struct Session {
     service: RunningService<RoleClient, ()>,
     lifetime: CancellationToken,
     child: Mutex<Option<Child>>,
+    stdio_scope: StdioScope,
     secrets: ConnectionSecrets,
+    has_secrets: bool,
+    frames: FrameLimit,
+    operation: AsyncMutex<()>,
 }
 
 impl Session {
@@ -149,7 +249,7 @@ impl Session {
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
         {
-            let _ = child.start_kill();
+            self.stdio_scope.stop(child);
         }
     }
 }
@@ -194,39 +294,69 @@ impl McpClient {
         }
         let lifetime = CancellationToken::new();
         let mut resolved_secrets = Vec::new();
-        let (service, child, secrets) = match config.transport {
+        let (service, child, stdio_scope, secrets, has_secrets, frames) = match config.transport {
             McpTransport::StreamableHttp => {
-                let mut transport_config =
-                    StreamableHttpClientTransportConfig::with_uri(config.url.clone().unwrap())
-                        .max_concurrent_requests(2)
-                        .max_sse_event_size(MAX_WIRE_MESSAGE_BYTES)
-                        // Never automatically replay a request that may mutate external state.
-                        .reinit_on_expired_session(false)
-                        .control_request_timeout(Duration::from_secs(2));
-                transport_config.channel_buffer_capacity = 4;
+                let defaults =
+                    StreamableHttpClientTransportConfig::with_uri(config.url.clone().unwrap());
+                // The SDK default is the defensive ceiling. The HTTP adapter
+                // reserves actual in-flight work and may reduce its SSE bound.
+                let bytes = defaults.max_sse_event_size;
+                let frames = FrameLimit::new(bytes, "HTTP SSE 事件", &lifetime);
+                let mut transport_config = defaults
+                    .max_concurrent_requests(HTTP_POSTS)
+                    .max_sse_event_size(bytes)
+                    // Never automatically replay a request that may mutate external state.
+                    .reinit_on_expired_session(false)
+                    .control_request_timeout(Duration::from_secs(2));
+                transport_config.channel_buffer_capacity = HTTP_QUEUE;
                 let (headers, token) = http_authorization(settings, &config)?;
                 resolved_secrets.extend(token);
+                let has_secrets = !resolved_secrets.is_empty();
                 let secrets = ConnectionSecrets::new(resolved_secrets)?;
                 let http = reqwest_mcp::Client::builder()
                     .default_headers(headers)
                     .redirect(reqwest_mcp::redirect::Policy::none())
                     .connect_timeout(Duration::from_secs(10))
-                    .timeout(REQUEST_TIMEOUT)
                     .build()
                     .map_err(|_| AppError::Other("Cannot initialize MCP HTTP client".into()))?;
-                let transport = StreamableHttpClientTransport::with_client(http, transport_config);
+                let transport = StreamableHttpClientTransport::with_client(
+                    BoundedHttp {
+                        http,
+                        frames: frames.clone(),
+                    },
+                    transport_config,
+                );
                 let service = bounded_startup(
                     cancel,
                     StartupBudget::HTTP,
                     ().serve_with_ct(transport, lifetime.clone()),
                 )
-                .await?;
-                (service, None, secrets)
+                .await
+                .map_err(|err| frames.prefer_overflow(err))?;
+                (
+                    service,
+                    None,
+                    StdioScope::default(),
+                    secrets,
+                    has_secrets,
+                    frames,
+                )
             }
             McpTransport::Stdio => {
+                let mut memory = McpMemory::new();
+                let bytes = memory.frame_bytes(DEFAULT_MAX_LINE_LENGTH, 1)?;
+                let frames = FrameLimit::new(bytes, "stdio 单条消息", &lifetime);
                 let executable = config.command.as_deref().unwrap();
                 let budget = StartupBudget::stdio(executable);
-                let mut command = runtime.command(executable, cancel).await?;
+                let mut command = if executable == PLAYWRIGHT_COMMAND {
+                    let (install, server) = runtime.playwright_commands(cancel).await?;
+                    if uses_managed_chromium(&config.args) {
+                        ensure_chromium(install, cancel).await?;
+                    }
+                    server
+                } else {
+                    runtime.command(executable, cancel).await?
+                };
                 command
                     .args(&config.args)
                     .envs(budget.launcher_env.iter().copied())
@@ -256,7 +386,14 @@ impl McpClient {
                     command.env(env, &value);
                     resolved_secrets.push(value);
                 }
+                let has_secrets = !resolved_secrets.is_empty();
                 let secrets = ConnectionSecrets::new(resolved_secrets)?;
+                let owns_process_tree = executable == PLAYWRIGHT_COMMAND
+                    || (config.builtin && config.id == super::config::MARKITDOWN_ID);
+                #[cfg(unix)]
+                if owns_process_tree {
+                    command.process_group(0);
+                }
                 let mut child = {
                     // A plugin commit and the launch of its old executable must not cross.
                     let _plugin_write = config
@@ -278,6 +415,9 @@ impl McpClient {
                         _ => "无法启动 MCP 进程，请检查启动程序及其执行权限。",
                     }.into()))?
                 };
+                let stdio_scope = StdioScope::new(&child, owns_process_tree).map_err(|_| {
+                    AppError::Other("无法为 MCP 启动程序建立可取消的进程范围。".into())
+                })?;
                 let stdout = child
                     .stdout
                     .take()
@@ -286,8 +426,16 @@ impl McpClient {
                     .stdin
                     .take()
                     .ok_or_else(|| AppError::Other("Missing MCP stdin".into()))?;
-                let transport = AsyncRwTransport::<RoleClient, _, _>::new(stdout, stdin)
-                    .with_max_line_length(MAX_WIRE_MESSAGE_BYTES);
+                let transport = AsyncRwTransport::<RoleClient, _, _>::new(
+                    StdioFrameReader {
+                        inner: stdout,
+                        line_bytes: 0,
+                        frames: frames.clone(),
+                        _memory: memory,
+                    },
+                    stdin,
+                )
+                .with_max_line_length(bytes);
                 let service = match bounded_startup(
                     cancel,
                     budget,
@@ -297,14 +445,21 @@ impl McpClient {
                 {
                     Ok(service) => service,
                     Err(err) => {
-                        let _ = child.start_kill();
+                        stdio_scope.stop(&mut child);
                         if let Err(cleanup) = reap_child(child).await {
                             tracing::warn!(%cleanup, "could not reap MCP child after startup failure");
                         }
-                        return Err(err);
+                        return Err(frames.prefer_overflow(err));
                     }
                 };
-                (service, Some(child), secrets)
+                (
+                    service,
+                    Some(child),
+                    stdio_scope,
+                    secrets,
+                    has_secrets,
+                    frames,
+                )
             }
         };
         Ok(Self {
@@ -314,7 +469,11 @@ impl McpClient {
                 service,
                 lifetime,
                 child: Mutex::new(child),
+                stdio_scope,
                 secrets,
+                has_secrets,
+                frames,
+                operation: AsyncMutex::new(()),
             }),
         })
     }
@@ -351,6 +510,10 @@ impl McpClient {
         Ok(())
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        self.session.lifetime.is_cancelled() || self.session.service.is_closed()
+    }
+
     pub(crate) fn ensure_current(&self) -> AppResult<()> {
         let current = match self.servers.get(&self.config.id) {
             Ok(config) => config,
@@ -365,7 +528,7 @@ impl McpClient {
                 "MCP configuration changed or was disabled; reconnect with confirmation".into(),
             ));
         }
-        if self.session.service.is_closed() {
+        if self.is_closed() {
             return Err(AppError::Conflict(
                 "MCP session closed; reconnect with confirmation".into(),
             ));
@@ -374,100 +537,105 @@ impl McpClient {
     }
 
     pub async fn list_tools(&self, cancel: &CancellationToken) -> AppResult<Vec<McpTool>> {
-        self.ensure_current()?;
-        let discover = async {
-            let mut tools = Vec::new();
-            let mut cursor = None;
-            let mut cursors = HashSet::new();
-            let mut names = HashSet::new();
-            let mut bytes = 0;
-            for _ in 0..MAX_TOOL_PAGES {
-                let params = cursor.take().map(|cursor| {
-                    let mut params = PaginatedRequestParams::default();
-                    params.cursor = Some(cursor);
-                    params
-                });
-                let page = self
-                    .session
-                    .service
-                    .peer()
-                    .list_tools(params)
-                    .await
-                    .map_err(|_| AppError::Other("MCP tools/list failed".into()))?;
-                bytes += serde_json::to_vec(&page)?.len();
-                if bytes > MAX_TOOL_LIST_BYTES || tools.len() + page.tools.len() > MAX_TOOLS {
-                    return Err(AppError::Invalid("MCP tool listing exceeds limits".into()));
-                }
-                for tool in page.tools {
-                    let remote_name = tool.name.to_string();
-                    if remote_name.is_empty()
-                        || remote_name.len() > 256
-                        || remote_name.chars().any(char::is_control)
-                        || !names.insert(remote_name.clone())
-                    {
-                        return Err(AppError::Invalid(
-                            "Invalid or repeated MCP tool name".into(),
-                        ));
-                    }
-                    if self.session.secrets.contains(&remote_name) {
-                        return Err(AppError::Other(
-                            "MCP tool name withheld by credential filter".into(),
-                        ));
-                    }
-                    let input_schema = serde_json::to_value(tool.input_schema)?;
-                    if serde_json::to_vec(&input_schema)?.len() > MAX_SCHEMA_BYTES {
-                        return Err(AppError::Invalid("MCP tool schema exceeds limits".into()));
-                    }
-                    // Changing schema keys/enums would alter the approved tool
-                    // contract. Reject credential-bearing schemas instead.
-                    if self.session.secrets.redact_value(input_schema.clone())? != input_schema {
-                        return Err(AppError::Other(
-                            "MCP tool schema withheld by credential filter".into(),
-                        ));
-                    }
-                    let description = tool.description.unwrap_or_default().to_string();
-                    if description.len() > 16 * 1024 {
-                        return Err(AppError::Invalid("MCP description exceeds limits".into()));
-                    }
-                    let description = self
-                        .session
-                        .secrets
-                        .redact_value(Value::String(description))?;
-                    let description = description.as_str().unwrap().to_owned();
-                    if description.len() > 16 * 1024 {
-                        return Err(AppError::Invalid("MCP description exceeds limits".into()));
-                    }
-                    // Remote annotations cannot grant local read-only trust.
-                    tools.push(McpTool {
-                        name: namespaced_tool_name(&self.config.id, &remote_name),
-                        remote_name,
-                        description,
-                        input_schema,
-                    });
-                }
-                match page.next_cursor {
-                    None => return Ok(tools),
-                    Some(next) if next.len() <= 4096 && cursors.insert(next.clone()) => {
-                        cursor = Some(next)
-                    }
-                    _ => return Err(AppError::Invalid("Invalid MCP pagination cursor".into())),
-                }
-            }
-            Err(AppError::Invalid(
-                "MCP tool pagination exceeds limits".into(),
-            ))
-        };
-        let result = self.request(cancel, discover).await;
+        let _operation = self.lock_operation(cancel).await?;
+        let result = self.discover_tools(cancel).await;
         if result.is_err() {
             self.disconnect();
         }
         result
     }
 
+    async fn discover_tools(&self, cancel: &CancellationToken) -> AppResult<Vec<McpTool>> {
+        check_cancelled(cancel)?;
+        self.ensure_current()?;
+        let mut catalog = ToolCatalog::default();
+        let mut cursor = None;
+        loop {
+            let params = cursor.take().map(|cursor| {
+                let mut params = PaginatedRequestParams::default();
+                params.cursor = Some(cursor);
+                params
+            });
+            let page = self
+                .request(
+                    cancel,
+                    Some(TOOL_PAGE_TIMEOUT),
+                    self.session.service.peer().list_tools(params),
+                )
+                .await?;
+            let mut scratch = McpMemory::new();
+            let page_bytes = self.message_bytes(&page, "工具列表单页")?;
+            scratch.charge(page_bytes.saturating_mul(3))?;
+            catalog.memory.refresh();
+            if page.tools.is_empty() && page.next_cursor.is_some() {
+                return Err(AppError::Invalid("MCP 工具分页未取得进展".into()));
+            }
+            for tool in page.tools {
+                self.check_request_active(cancel)?;
+                let remote_name = tool.name.into_owned();
+                if remote_name.is_empty()
+                    || remote_name.len() > 256
+                    || remote_name.chars().any(char::is_control)
+                    || catalog.names.contains(&remote_name)
+                {
+                    return Err(AppError::Invalid("MCP 工具名称无效或重复".into()));
+                }
+                let secrets = &self.session.secrets;
+                let input_schema = Value::Object(Arc::unwrap_or_clone(tool.input_schema));
+                let description_bytes = tool.description.as_deref().map_or(0, str::len);
+                let mut filter = McpMemory::with_limit(scratch.limit, scratch.pool);
+                if self.session.has_secrets {
+                    let schema_wire = self.message_bytes(&input_schema, "工具参数定义")?;
+                    filter.charge(
+                        json_heap_bytes(&input_schema)
+                            .saturating_mul(2)
+                            .saturating_add(
+                                schema_wire
+                                    .saturating_add(description_bytes)
+                                    .saturating_mul(12),
+                            ),
+                    )?;
+                }
+                // Do not redact names/schemas into a different tool contract.
+                if secrets.contains(&remote_name)
+                    || secrets.redact_value(input_schema.clone()).ok().as_ref()
+                        != Some(&input_schema)
+                {
+                    return Err(AppError::Other(REMOTE_ERROR_MESSAGE.into()));
+                }
+                let description = secrets
+                    .redact_value(Value::String(
+                        tool.description.unwrap_or_default().into_owned(),
+                    ))
+                    .map_err(|_| AppError::Other(REMOTE_ERROR_MESSAGE.into()))?;
+                let Value::String(description) = description else {
+                    unreachable!("redacting a string yields a string");
+                };
+                let tool = McpTool {
+                    name: namespaced_tool_name(&self.config.id, &remote_name),
+                    remote_name,
+                    description,
+                    input_schema,
+                };
+                self.message_bytes(&tool, "工具定义")?;
+                catalog.push(tool)?;
+            }
+            self.check_request_active(cancel)?;
+            match page.next_cursor {
+                None => return Ok(catalog.tools),
+                Some(next) => {
+                    catalog.record_cursor(&next)?;
+                    cursor = Some(next);
+                }
+            }
+        }
+    }
+
     /// The desktop upload command supplies only its own staged file. Keep arbitrary tool calls private.
     pub(crate) async fn call_attachment_converter(
         &self,
         file: &tempfile::TempPath,
+        cancel: &CancellationToken,
     ) -> AppResult<Value> {
         let uri = url::Url::from_file_path(dunce::simplified(file))
             .ok()
@@ -477,21 +645,27 @@ impl McpClient {
                     "附件临时目录必须是本机的绝对路径，请检查系统临时目录设置。".into(),
                 )
             })?;
-        self.call_tool(
-            MARKDOWN_TOOL,
-            serde_json::json!({"uri": uri.as_str()}),
-            &CancellationToken::new(),
-        )
-        .await
-        .map_err(|err| match err {
-            AppError::Other(message) if message == TIMEOUT_MESSAGE => AppError::Other(format!(
-                "MarkItDown 转换超过 {} 秒。请拆分文档，在「设置 → 工具」中重新启动 MarkItDown 后重试。",
-                REQUEST_TIMEOUT.as_secs()
-            )),
-            AppError::Invalid(message) if message == RESULT_LIMIT_MESSAGE => AppError::Invalid(
-                "MarkItDown 返回的 MCP 消息超过 1 MiB。请拆分文档，在「设置 → 工具」中重新启动 MarkItDown 后重试。".into()
-            ),
-            _ => AppError::Other("MarkItDown MCP 调用失败。请在「设置 → 工具」中停止并重新启动 MarkItDown，然后重试。".into()),
+        // MarkItDown may not honor an MCP cancellation notification while a
+        // converter is running. call_tool closes the session on in-flight
+        // cancellation; waiting for the direct child also releases the file.
+        let result = self
+            .call_tool(
+                MARKDOWN_TOOL,
+                serde_json::json!({"uri": uri.as_str()}),
+                cancel,
+            )
+            .await;
+        if result.is_err() && self.session.lifetime.is_cancelled() {
+            // Wait for the direct child to release the staged file before the IPC
+            // tries to unlink it (in particular on Windows).
+            let _ = self.disconnect_and_wait().await;
+        }
+        result.map_err(|err| match err {
+            AppError::Conflict(_) if self.session.lifetime.is_cancelled() => AppError::Cancelled,
+            AppError::Other(ref reason) if reason == CONNECTION_CLOSED_MESSAGE => {
+                AppError::Cancelled
+            }
+            other => attachment_call_error(other),
         })
     }
 
@@ -503,60 +677,612 @@ impl McpClient {
         args: Value,
         cancel: &CancellationToken,
     ) -> AppResult<Value> {
+        let _operation = self.lock_operation(cancel).await?;
         self.ensure_current()?;
-        let arguments = args
-            .as_object()
-            .cloned()
-            .ok_or_else(|| AppError::Invalid("MCP arguments must be an object".into()))?;
-        if serde_json::to_vec(&args)?.len() > MAX_ARGUMENT_BYTES {
-            return Err(AppError::Invalid("MCP arguments exceed limits".into()));
-        }
+        let Value::Object(arguments) = args else {
+            return Err(AppError::Invalid("MCP 工具参数必须是 JSON 对象".into()));
+        };
+        let mut memory = McpMemory::new();
+        let args = Value::Object(arguments);
+        memory.charge(json_heap_bytes(&args))?;
+        let remaining = memory.limit.saturating_sub(memory.held);
+        let size = json_bytes(&args, remaining / 2).ok_or_else(memory_error)?;
+        memory.charge(size.saturating_mul(2))?;
+        let Value::Object(arguments) = args else {
+            unreachable!()
+        };
         let result = self
             .request(
                 cancel,
+                None,
                 self.session.service.peer().call_tool(
                     CallToolRequestParams::new(name.to_owned()).with_arguments(arguments),
                 ),
             )
             .await;
-        match result {
-            Ok(result) => {
-                let filtered = (|| {
-                    let value = serde_json::to_value(result)
-                        .map_err(|_| AppError::Other("Cannot serialize MCP result".into()))?;
-                    if serde_json::to_vec(&value)?.len() > MAX_RESULT_BYTES {
-                        return Err(AppError::Invalid(RESULT_LIMIT_MESSAGE.into()));
-                    }
-                    let value = self.session.secrets.redact_value(value)?;
-                    if serde_json::to_vec(&value)?.len() > MAX_RESULT_BYTES {
-                        return Err(AppError::Invalid(RESULT_LIMIT_MESSAGE.into()));
-                    }
-                    Ok(value)
-                })();
-                if filtered.is_err() {
-                    self.disconnect();
-                }
-                // Do not read resources, follow links, execute commands, or honor
-                // embedded tool calls/instructions from this untrusted result.
-                filtered
+        let filtered = result.and_then(|result| {
+            memory.refresh();
+            let bytes = self.message_bytes(&result, "工具结果")?;
+            // Redaction can replace a one-byte credential with ten bytes. Allow
+            // for the redacted tree and its encoded verification copy before
+            // doing that work, not just after allocation.
+            let copies = if self.session.has_secrets { 22 } else { 2 };
+            memory.charge(bytes.saturating_mul(copies))?;
+            let value = serde_json::to_value(result)
+                .map_err(|_| AppError::Other("无法序列化 MCP 结果".into()))?;
+            let heap = json_heap_bytes(&value);
+            memory.charge(heap.saturating_mul(if self.session.has_secrets { 2 } else { 1 }))?;
+            let value = self.session.secrets.redact_value(value)?;
+            self.message_bytes(&value, "脱敏后的工具结果")?;
+            memory.charge(json_heap_bytes(&value).saturating_sub(heap))?;
+            self.check_request_active(cancel)?;
+            // Untrusted data: do not follow links, read resources or honor tool calls.
+            Ok(value)
+        });
+        if filtered.is_err() {
+            self.disconnect();
+        }
+        filtered
+    }
+
+    fn message_bytes(&self, value: &impl Serialize, subject: &str) -> AppResult<usize> {
+        let max = self.session.frames.bytes;
+        json_bytes(value, max).ok_or_else(|| {
+            AppError::Invalid(format!(
+                "MCP {subject}超过本连接的单帧处理预算（{max} 字节）。请缩小单次结果或减少并发。"
+            ))
+        })
+    }
+
+    fn check_request_active(&self, cancel: &CancellationToken) -> AppResult<()> {
+        if self.session.frames.overflow.is_cancelled() {
+            Err(self.session.frames.error())
+        } else {
+            check_cancelled(cancel)?;
+            if self.session.lifetime.is_cancelled() {
+                return Err(connection_closed());
             }
-            Err(err) => {
-                self.disconnect();
-                Err(err)
-            }
+            Ok(())
         }
     }
-    async fn request<T, E>(
+
+    async fn lock_operation(&self, cancel: &CancellationToken) -> AppResult<MutexGuard<'_, ()>> {
+        tokio::select! {
+            biased;
+            _ = self.session.frames.overflow.cancelled() => Err(self.session.frames.error()),
+            _ = cancel.cancelled() => Err(AppError::Cancelled),
+            _ = self.session.lifetime.cancelled() => Err(AppError::Conflict(
+                "MCP 连接已关闭；请重新确认并连接".into(),
+            )),
+            guard = self.session.operation.lock() => Ok(guard),
+        }
+    }
+
+    async fn request<T>(
         &self,
         cancel: &CancellationToken,
-        operation: impl Future<Output = Result<T, E>>,
+        timeout: Option<Duration>,
+        operation: impl Future<Output = Result<T, ServiceError>>,
     ) -> AppResult<T> {
         tokio::select! {
             biased;
-            _ = self.session.lifetime.cancelled() => Err(AppError::Cancelled),
-            result = bounded(cancel, REQUEST_TIMEOUT, operation) => result,
+            _ = self.session.frames.overflow.cancelled() => Err(self.session.frames.error()),
+            _ = cancel.cancelled() => Err(AppError::Cancelled),
+            _ = self.session.lifetime.cancelled() => Err(connection_closed()),
+            result = bounded(cancel, timeout, async { operation.await.map_err(service_failure) }) => {
+                result.map_err(|err| self.session.frames.prefer_overflow(err))
+            }
         }
     }
+}
+
+fn connection_closed() -> AppError {
+    AppError::Other(CONNECTION_CLOSED_MESSAGE.into())
+}
+
+fn attachment_call_error(err: AppError) -> AppError {
+    const ADVICE: &str =
+        "MarkItDown 不支持转换结果分页。请按页或章节拆分源文档，或另存为 UTF-8 文本。";
+    match err {
+        AppError::Cancelled => AppError::Cancelled,
+        AppError::Invalid(message) => AppError::Invalid(format!("{message}{ADVICE}")),
+        _ => AppError::Other(format!(
+            "MarkItDown MCP 调用失败。{ADVICE}也可在「设置 → 工具」中重新启动 MarkItDown 后重试。"
+        )),
+    }
+}
+
+fn service_failure(error: ServiceError) -> AppError {
+    if let ServiceError::TransportSend(error) = error {
+        match error.error.downcast_ref::<HttpError>() {
+            Some(StreamableHttpError::ResponseBodyTooLarge { max_size }) => {
+                return http_body_limit(*max_size)
+            }
+            Some(StreamableHttpError::Io(error)) if is_http_memory_error(error) => {
+                return memory_error()
+            }
+            _ => {}
+        }
+    }
+    AppError::Other(REMOTE_ERROR_MESSAGE.into())
+}
+
+fn http_body_limit(max_size: usize) -> AppError {
+    AppError::Invalid(format!(
+        "MCP HTTP 响应超过 SDK 传输上限（{max_size} 字节），请缩小单次响应。"
+    ))
+}
+
+#[derive(Clone)]
+struct FrameLimit {
+    bytes: usize,
+    kind: &'static str,
+    overflow: CancellationToken,
+    overflow_bytes: Arc<AtomicUsize>,
+    lifetime: CancellationToken,
+}
+
+impl FrameLimit {
+    fn new(bytes: usize, kind: &'static str, lifetime: &CancellationToken) -> Self {
+        Self {
+            bytes,
+            kind,
+            overflow: CancellationToken::new(),
+            overflow_bytes: Arc::new(AtomicUsize::new(0)),
+            lifetime: lifetime.clone(),
+        }
+    }
+
+    fn exceeded(&self, bytes: usize) {
+        let _ = self
+            .overflow_bytes
+            .compare_exchange(0, bytes, Relaxed, Relaxed);
+        self.overflow.cancel();
+        self.lifetime.cancel();
+    }
+
+    fn error(&self) -> AppError {
+        let limit = self.overflow_bytes.load(Relaxed);
+        let limit = if limit == 0 { self.bytes } else { limit };
+        AppError::Invalid(format!(
+            "MCP {}超过本连接的传输上限（{limit} 字节），连接已关闭。",
+            self.kind
+        ))
+    }
+
+    fn prefer_overflow(&self, error: AppError) -> AppError {
+        if self.overflow.is_cancelled() {
+            self.error()
+        } else {
+            error
+        }
+    }
+}
+
+// Keep rmcp's real HTTP implementation (including its non-configurable JSON
+// and HTTP error body caps). Observe the SDK's locally generated SSE size error
+// before its worker turns the failed event stream into a generic transport EOF.
+#[derive(Clone)]
+struct BoundedHttp {
+    http: reqwest_mcp::Client,
+    frames: FrameLimit,
+}
+
+impl BoundedHttp {
+    fn observe_sse(
+        &self,
+        stream: BoxedSseResponse,
+        limit: usize,
+        memory: McpMemory<'static>,
+    ) -> BoxedSseResponse {
+        let frames = self.frames.clone();
+        let expected = format!("SSE event exceeded the maximum size of {limit} bytes");
+        stream
+            .map(move |event| {
+                let _lease = &memory; // Keep the reservation until this stream closes.
+                                      // The size-error type is private to pinned rmcp. Inspect only the
+                                      // local stream error, not an SSE payload or JSON-RPC error string.
+                if matches!(&event, Err(SseError::Body(error)) if error.to_string() == expected) {
+                    frames.exceeded(limit);
+                }
+                event
+            })
+            .boxed()
+    }
+}
+
+type HttpHeaders = HashMap<HeaderName, HeaderValue>;
+type HttpError = StreamableHttpError<reqwest_mcp::Error>;
+
+#[derive(Debug, thiserror::Error)]
+#[error("MCP HTTP response allocation was not admitted by the local memory budget")]
+struct HttpMemoryLimit;
+
+fn is_http_memory_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<HttpMemoryLimit>())
+}
+
+fn http_reservation_error(_: AppError) -> HttpError {
+    StreamableHttpError::Io(io::Error::other(HttpMemoryLimit))
+}
+
+impl StreamableHttpClient for BoundedHttp {
+    type Error = reqwest_mcp::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth: Option<String>,
+        headers: HttpHeaders,
+    ) -> Result<StreamableHttpPostResponse, HttpError> {
+        self.post_message_with_max_sse_event_size(
+            uri,
+            message,
+            session_id,
+            auth,
+            headers,
+            self.frames.bytes,
+        )
+        .await
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth: Option<String>,
+        headers: HttpHeaders,
+        limit: usize,
+    ) -> Result<StreamableHttpPostResponse, HttpError> {
+        let mut json_memory = McpMemory::new();
+        json_memory
+            .charge(RMCP_HTTP_JSON_CAP * 2)
+            .map_err(http_reservation_error)?;
+        let mut sse_memory = McpMemory::with_limit(json_memory.limit, json_memory.pool);
+        let limit = sse_memory
+            .frame_bytes(limit, 1)
+            .map_err(http_reservation_error)?;
+        Ok(
+            match self
+                .http
+                .post_message_with_max_sse_event_size(
+                    uri, message, session_id, auth, headers, limit,
+                )
+                .await?
+            {
+                StreamableHttpPostResponse::Sse(stream, session_id) => {
+                    StreamableHttpPostResponse::Sse(
+                        self.observe_sse(stream, limit, sse_memory),
+                        session_id,
+                    )
+                }
+                other => other,
+            },
+        )
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth: Option<String>,
+        headers: HttpHeaders,
+    ) -> Result<BoxedSseResponse, HttpError> {
+        self.get_stream_with_max_sse_event_size(
+            uri,
+            session_id,
+            last_event_id,
+            auth,
+            headers,
+            self.frames.bytes,
+        )
+        .await
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth: Option<String>,
+        headers: HttpHeaders,
+        limit: usize,
+    ) -> Result<BoxedSseResponse, HttpError> {
+        let mut memory = McpMemory::new();
+        let limit = memory
+            .frame_bytes(limit, 1)
+            .map_err(http_reservation_error)?;
+        let stream = self
+            .http
+            .get_stream_with_max_sse_event_size(
+                uri,
+                session_id,
+                last_event_id,
+                auth,
+                headers,
+                limit,
+            )
+            .await?;
+        Ok(self.observe_sse(stream, limit, memory))
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth: Option<String>,
+        headers: HttpHeaders,
+    ) -> Result<(), HttpError> {
+        self.http
+            .delete_session(uri, session_id, auth, headers)
+            .await
+    }
+}
+
+// rmcp's line bound drops an oversized line and leaves pending calls waiting.
+// Close this stdio session instead so a tool without an overall deadline fails.
+struct StdioFrameReader<R> {
+    inner: R,
+    line_bytes: usize,
+    frames: FrameLimit,
+    _memory: McpMemory<'static>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for StdioFrameReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let start = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                for &byte in &buf.filled()[start..] {
+                    self.line_bytes += 1;
+                    if self.line_bytes > self.frames.bytes {
+                        self.frames.exceeded(self.frames.bytes);
+                        buf.set_filled(start);
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "MCP stdio frame exceeds size limit",
+                        )));
+                    }
+                    if byte == b'\n' {
+                        self.line_bytes = 0;
+                    }
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+fn check_cancelled(cancel: &CancellationToken) -> AppResult<()> {
+    if cancel.is_cancelled() {
+        Err(AppError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn memory_error() -> AppError {
+    AppError::Invalid(MEMORY_MESSAGE.into())
+}
+
+/// Estimates working allocations across overlapping MCP connections and operations.
+/// The SDK's decoded messages and the published registry are not owned by the lease.
+struct McpMemory<'a> {
+    limit: usize,
+    pool: &'a AtomicUsize,
+    held: usize,
+}
+
+impl McpMemory<'static> {
+    fn new() -> Self {
+        Self::with_limit(Self::local_limit(), &RESERVED_MCP_MEMORY)
+    }
+}
+
+impl<'a> McpMemory<'a> {
+    fn local_limit() -> usize {
+        // Same conservative fallback as the model client, only if the OS probe
+        // is unsupported or cannot produce a reading (not when it reports zero).
+        available_memory().map_or(128 * 1024 * 1024, |bytes| bytes / 8)
+    }
+
+    fn with_limit(limit: usize, pool: &'a AtomicUsize) -> Self {
+        Self {
+            limit,
+            pool,
+            held: 0,
+        }
+    }
+
+    fn refresh(&mut self) {
+        self.limit = Self::local_limit();
+    }
+
+    fn charge(&mut self, bytes: usize) -> AppResult<()> {
+        self.pool
+            .fetch_update(Relaxed, Relaxed, |reserved| {
+                reserved
+                    .checked_add(bytes)
+                    .filter(|&total| total <= self.limit)
+            })
+            .map_err(|_| memory_error())?;
+        self.held += bytes;
+        Ok(())
+    }
+
+    fn frame_bytes(&mut self, sdk_default: usize, slots: usize) -> AppResult<usize> {
+        // Allow geometric growth of the receive buffer. Allocate at most half
+        // of the unreserved working budget to framing, leaving room to process
+        // the resulting JSON. The SDK default is a defensive ceiling, not a
+        // fixed application frame allowance. Future connections share the pool.
+        let mut frame = 0;
+        let copies = slots * 2;
+        self.pool
+            .fetch_update(Relaxed, Relaxed, |reserved| {
+                frame = (self.limit.saturating_sub(reserved) / 2 / copies).min(sdk_default);
+                // Below one typical I/O buffer, fail before launching a server that
+                // is unlikely to deliver even its initialization/tool schema.
+                (frame >= 8192).then(|| reserved + frame * copies)
+            })
+            .map_err(|_| memory_error())?;
+        self.held += frame * copies;
+        Ok(frame)
+    }
+}
+
+impl Drop for McpMemory<'_> {
+    fn drop(&mut self) {
+        self.pool.fetch_sub(self.held, Relaxed);
+    }
+}
+
+struct ToolCatalog<'a> {
+    tools: Vec<McpTool>,
+    names: HashSet<String>,
+    cursors: HashSet<String>,
+    memory: McpMemory<'a>,
+}
+
+impl Default for ToolCatalog<'static> {
+    fn default() -> Self {
+        Self {
+            tools: Vec::new(),
+            names: HashSet::new(),
+            cursors: HashSet::new(),
+            memory: McpMemory::new(),
+        }
+    }
+}
+
+impl ToolCatalog<'_> {
+    fn charge(&mut self, bytes: usize) -> AppResult<()> {
+        self.memory.charge(bytes).map_err(|_| {
+            AppError::Invalid(format!("MCP 工具目录超过当前内存预算。{MEMORY_MESSAGE}"))
+        })
+    }
+
+    fn record_cursor(&mut self, cursor: &str) -> AppResult<()> {
+        if cursor.is_empty() || cursor.len() > 4096 || self.cursors.contains(cursor) {
+            return Err(AppError::Invalid("MCP 分页游标无效或循环".into()));
+        }
+        self.charge(4 * std::mem::size_of::<String>() + cursor.len())?;
+        self.cursors.insert(cursor.to_owned());
+        Ok(())
+    }
+
+    fn push(&mut self, tool: McpTool) -> AppResult<()> {
+        self.charge(
+            // Allow for growing collection capacity, the name index and its copy.
+            2 * std::mem::size_of::<McpTool>()
+                + 4 * std::mem::size_of::<String>()
+                + tool.name.capacity()
+                + tool.remote_name.capacity()
+                + tool.remote_name.len()
+                + tool.description.capacity()
+                + json_heap_bytes(&tool.input_schema),
+        )?;
+        self.names.insert(tool.remote_name.clone());
+        self.tools.push(tool);
+        Ok(())
+    }
+}
+
+// Estimate retained JSON allocation, including structure overhead for dense schemas.
+fn json_heap_bytes(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.capacity(),
+        Value::Array(items) => {
+            items.capacity() * std::mem::size_of::<Value>()
+                + items.iter().map(json_heap_bytes).sum::<usize>()
+        }
+        Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| {
+                4 * std::mem::size_of::<(String, Value)>() + key.capacity() + json_heap_bytes(value)
+            })
+            .sum(),
+        _ => 0,
+    }
+}
+
+// Count serialized UTF-8 bytes without allocating another message-sized buffer.
+fn json_bytes(value: &impl Serialize, max_bytes: usize) -> Option<usize> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or_else(|| std::io::Error::other("JSON exceeds message size"))?;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(max_bytes);
+    serde_json::to_writer(&mut count, value).ok()?;
+    Some(max_bytes - count.0)
+}
+
+fn uses_managed_chromium(args: &[String]) -> bool {
+    let mut browser = None;
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        let (flag, value) = arg
+            .split_once('=')
+            .map_or((arg, None), |(k, v)| (k, Some(v)));
+        match flag {
+            "--browser" => browser = value.or_else(|| args.next()),
+            "--executable-path" | "--endpoint" | "--cdp-endpoint" | "--extension" => return false,
+            _ => (),
+        }
+    }
+    browser == Some("chromium")
+}
+
+async fn ensure_chromium(mut install: Command, cancel: &CancellationToken) -> AppResult<()> {
+    if cancel.is_cancelled() {
+        return Err(AppError::Cancelled);
+    }
+    install
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    install.process_group(0);
+    let mut child = install.spawn().map_err(|_| {
+        AppError::Other("无法启动内置 Chromium 安装程序，请检查应用运行时。".into())
+    })?;
+    let scope = StdioScope::new(&child, true)
+        .map_err(|_| AppError::Other("无法为 Chromium 安装程序建立可取消的进程范围。".into()))?;
+    let error = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => AppError::Cancelled,
+        result = tokio::time::timeout(Duration::from_secs(600), child.wait()) => match result {
+            Ok(Ok(status)) if status.success() => return Ok(()),
+            Ok(Ok(status)) => return Err(AppError::Other(format!(
+                "Playwright 自动安装 Chromium 失败（{status}）。请检查网络、磁盘空间和浏览器缓存的写入权限，然后重新启动该工具。"
+            ))),
+            Ok(Err(_)) => AppError::Other("无法读取 Chromium 安装结果。".into()),
+            Err(_) => AppError::Other("Playwright 自动安装 Chromium 超时，请检查网络后重新启动该工具。".into()),
+        }
+    };
+    scope.stop(&mut child);
+    reap_child(child).await?;
+    Err(error)
 }
 
 async fn reap_child(mut child: Child) -> AppResult<()> {
@@ -634,19 +1360,23 @@ pub(super) fn stdio_secret(
     Ok(value)
 }
 
-async fn bounded<T, E>(
+async fn bounded<T>(
     cancel: &CancellationToken,
-    timeout: Duration,
-    operation: impl Future<Output = Result<T, E>>,
+    timeout: Option<Duration>,
+    operation: impl Future<Output = AppResult<T>>,
 ) -> AppResult<T> {
+    let response = async {
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, operation)
+                .await
+                .map_err(|_| AppError::Other(TIMEOUT_MESSAGE.into()))?,
+            None => operation.await,
+        }
+    };
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(AppError::Cancelled),
-        result = tokio::time::timeout(timeout, operation) => match result {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(_)) => Err(AppError::Other("MCP request failed (remote details suppressed)".into())),
-            Err(_) => Err(AppError::Other(TIMEOUT_MESSAGE.into())),
-        }
+        result = response => result,
     }
 }
 
@@ -665,6 +1395,8 @@ fn startup_failure_hint(error: &ClientInitializeError, budget: StartupBudget) ->
     const UNAUTHORIZED: &str = "HTTP 401，身份验证失败，请检查此连接的密钥。";
     const FORBIDDEN: &str = "HTTP 403，服务拒绝访问，请检查密钥权限。";
     match http {
+        StreamableHttpError::ResponseBodyTooLarge { .. } => "握手 HTTP 响应超过 SDK 传输上限。",
+        StreamableHttpError::Io(error) if is_http_memory_error(error) => MEMORY_MESSAGE,
         StreamableHttpError::AuthRequired(_) => UNAUTHORIZED,
         StreamableHttpError::InsufficientScope(_) => FORBIDDEN,
         StreamableHttpError::UnexpectedServerResponse(message)
@@ -725,6 +1457,24 @@ mod timeout_tests {
     use super::*;
 
     #[test]
+    fn playwright_provisions_only_explicit_managed_chromium() {
+        let uses = |args: &[&str]| {
+            uses_managed_chromium(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert!(uses(&["--browser=chromium", "--headless"]));
+        assert!(uses(&["--browser", "chromium"]));
+        for args in [
+            vec![],
+            vec!["--browser=msedge"],
+            vec!["--browser=chromium", "--browser=firefox"],
+            vec!["--browser=chromium", "--executable-path", "custom"],
+            vec!["--cdp-endpoint=custom", "--browser=chromium"],
+        ] {
+            assert!(!uses(&args));
+        }
+    }
+
+    #[test]
     fn cold_start_budget_only_extends_uvx_launches() {
         for command in ["uvx", "uvx.exe", "/tools/UVX.EXE"] {
             let budget = StartupBudget::stdio(command);
@@ -748,6 +1498,107 @@ mod timeout_tests {
             assert_eq!(budget.hint.contains("npx"), command.starts_with("npx"));
         }
         assert_eq!(StartupBudget::HTTP.timeout, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn catalog_budget_accounts_for_retained_json_and_cursor_history() {
+        let tool = McpTool {
+            name: "local_name".into(),
+            remote_name: "remote_name".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"enum": vec![0; 128]}),
+        };
+        assert!(json_heap_bytes(&tool.input_schema) >= 128 * std::mem::size_of::<Value>());
+        let pool = AtomicUsize::new(0);
+        let mut catalog = ToolCatalog {
+            tools: Vec::new(),
+            names: HashSet::new(),
+            cursors: HashSet::new(),
+            memory: McpMemory::with_limit(1024, &pool),
+        };
+        assert!(catalog.push(tool).is_err());
+        assert!(catalog.tools.is_empty());
+        assert!(catalog.names.is_empty());
+        catalog.record_cursor("remaining").unwrap();
+        assert!(catalog.record_cursor("remaining").is_err());
+        assert!(catalog.record_cursor(&"x".repeat(1024)).is_err());
+        assert_eq!(catalog.cursors.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stdio_frame_reader_does_not_wait_for_newline_after_exceeding_the_limit() {
+        use tokio::io::AsyncReadExt;
+
+        let limit = 64 * 1024;
+        let lifetime = CancellationToken::new();
+        let frames = FrameLimit::new(limit, "stdio 单条消息", &lifetime);
+        let reader = |inner| StdioFrameReader {
+            inner,
+            line_bytes: 0,
+            frames: frames.clone(),
+            _memory: McpMemory::new(),
+        };
+        let mut data = vec![b'x'; limit - 1];
+        data.push(b'\n');
+        data.extend_from_slice(b"{}\n");
+        let mut read = Vec::new();
+        reader(data.as_slice())
+            .read_to_end(&mut read)
+            .await
+            .unwrap();
+        assert_eq!(read.len(), limit + 3);
+        assert!(!lifetime.is_cancelled());
+
+        let data = vec![b'x'; limit + 1];
+        assert_eq!(
+            reader(data.as_slice())
+                .read_to_end(&mut Vec::new())
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData,
+        );
+        assert!(lifetime.is_cancelled());
+        assert!(frames.error().to_string().contains(&limit.to_string()));
+    }
+
+    #[test]
+    fn transport_frames_adjust_to_available_memory_and_concurrent_reservations() {
+        let pool = AtomicUsize::new(0);
+        let budget = 16 * 1024 * 1024;
+        let mut first = McpMemory::with_limit(budget, &pool);
+        let mut concurrent = McpMemory::with_limit(budget, &pool);
+        assert_eq!(
+            first.frame_bytes(DEFAULT_MAX_LINE_LENGTH, 1).unwrap(),
+            budget / 4
+        );
+        assert_eq!(
+            concurrent.frame_bytes(DEFAULT_MAX_LINE_LENGTH, 1).unwrap(),
+            budget / 8
+        );
+        drop(first);
+        drop(concurrent);
+        assert_eq!(pool.load(Relaxed), 0);
+        let mut low = McpMemory::with_limit(1024, &pool);
+        assert!(low.frame_bytes(DEFAULT_MAX_LINE_LENGTH, 1).is_err());
+    }
+
+    #[test]
+    fn catalogue_can_grow_past_old_fixed_limit_but_contends_with_other_work() {
+        let pool = AtomicUsize::new(0);
+        let mib = 1024 * 1024;
+        let mut catalog = ToolCatalog {
+            tools: Vec::new(),
+            names: HashSet::new(),
+            cursors: HashSet::new(),
+            memory: McpMemory::with_limit(96 * mib, &pool),
+        };
+        catalog.charge(65 * mib).unwrap();
+        let mut concurrent = McpMemory::with_limit(96 * mib, &pool);
+        concurrent.charge(30 * mib).unwrap();
+        assert!(catalog.charge(2 * mib).is_err());
+        drop(concurrent);
+        catalog.charge(2 * mib).unwrap();
     }
 
     #[tokio::test]
@@ -785,10 +1636,10 @@ mod timeout_tests {
     }
 
     #[tokio::test]
-    async fn timeout_and_preexisting_cancellation_are_bounded_without_remote_error_leaks() {
+    async fn timeout_and_preexisting_cancellation_are_bounded() {
         let cancel = CancellationToken::new();
         let pending = std::future::pending::<Result<(), AppError>>();
-        let error = bounded(&cancel, Duration::from_millis(10), pending)
+        let error = bounded(&cancel, Some(Duration::from_millis(10)), pending)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("timed out"));
@@ -800,14 +1651,23 @@ mod timeout_tests {
             Ok::<(), AppError>(())
         };
         assert!(matches!(
-            bounded(&cancel, Duration::from_secs(1), operation).await,
+            bounded(&cancel, None, operation).await,
             Err(AppError::Cancelled)
         ));
-        let error = bounded(&CancellationToken::new(), Duration::from_secs(1), async {
-            Err::<(), _>(AppError::Other("remote-secret-should-not-leak".into()))
-        })
-        .await
-        .unwrap_err();
-        assert!(!error.to_string().contains("remote-secret"));
+    }
+
+    #[test]
+    fn attachment_errors_report_the_actual_guard_without_remote_details() {
+        assert!(matches!(
+            attachment_call_error(AppError::Cancelled),
+            AppError::Cancelled
+        ));
+        let error = attachment_call_error(
+            FrameLimit::new(123456, "stdio 单条消息", &CancellationToken::new()).error(),
+        )
+        .to_string();
+        assert!(error.contains("123456") && error.contains("不支持转换结果分页"));
+        let error = attachment_call_error(AppError::Other("remote-secret".into())).to_string();
+        assert!(!error.contains("remote-secret"));
     }
 }

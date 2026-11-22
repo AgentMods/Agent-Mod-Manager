@@ -55,26 +55,25 @@ export interface AgentModelSettings {
   display_name: string;
   /** The provider-facing model identifier sent with each request. */
   id: string;
-  context_budget: number;
   reasoning_levels: ReasoningEffort[];
 }
 export interface AppSettings {
   models?: AgentModelSettings[];
-  base_url: string; model: string; context_budget: number; permission_mode: PermissionMode; api_key_ref: string | null; onboarding_completed: boolean;
+  base_url: string; model: string; permission_mode: PermissionMode; api_key_ref: string | null; onboarding_completed: boolean;
 }
 /** Last-used per-turn choices, remembered across restarts and reinstalls. `null` = follow the defaults. */
 export interface ComposerPreferences {
   model: string | null; reasoning_effort: ReasoningEffort | null; permission_mode: PermissionMode | null;
 }
 export interface BootstrapState {
-  dataRoot: string; recoveredTransactions: string[]; recoveryError: string | null; onboardingCompleted: boolean; isFirstRun: boolean; resumeOnboarding: boolean;
+  dataRoot: string; storageMigrationError?: string | null; recoveredTransactions: string[]; recoveryError: string | null; onboardingCompleted: boolean; isFirstRun: boolean; resumeOnboarding: boolean;
 }
 export interface GameCandidate {
   status: "high_confidence" | "candidate" | "unidentified";
   rootPath: string; name: string; confidence: number; suggestedAdapterSlug: string | null; registeredGameId: string | null; platform: string; warnings: string[];
 }
 export interface ScanReport {
-  candidates: GameCandidate[]; warnings: {path: string; message: string}[]; directoriesChecked: number; entriesChecked: number; truncated: boolean;
+  candidates: GameCandidate[]; warnings: {path: string; message: string}[]; directoriesChecked: number; entriesChecked: number; truncated: boolean; nextCursor?: string | null;
 }
 export interface Plugin {
   slug: string; name: string; gameName: string; version: string; description: string;

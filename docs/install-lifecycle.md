@@ -1,5 +1,40 @@
 # Installation Lifecycle
 
+## Game Mod library and desktop Agent actions
+
+New downloads belong to a game category under the active manager data root's
+`Mods` directory. Each file has a stable artifact ID, original filename, size
+and SHA-256. A download can be filed under a game name before the game directory
+is registered. Choose the local game instance when installing. Existing download
+and staging folders are not scanned or migrated into the library on upgrade.
+
+The desktop install action sends the game and artifact IDs to the Agent. The
+embedded `system-mod-install` guide starts with `match_mod_install`, which reads
+the local adapter, archive listing, README and FOMOD configuration. If those leave
+the destination unclear, the Agent reads the author's description via the source
+MCP, then the verified project page via Playwright when necessary. Explicit
+mappings support individual mods with no installed adapter. Targets resolve under
+the selected game's registered directory, or an adapter's registered root.
+
+`install_library_mod` prepares the exact FileEngine plan that its approval commits.
+Single-file mods copy from the library's `archive` directory. Other layouts copy
+from a verified extraction in the entry's `payload` directory. Reinstall uses the
+same library entry. The game detail uninstall action uses `system-mod-uninstall`,
+`inspect_install` and the recorded install ID to select trash or restoration of
+the original files. Conflicts with shared or edited files are reported. The
+library archive is available after uninstall.
+
+In the game’s Mod 管理 tab, 已安装 means the files have been deployed.
+已卸载 keeps the install record and any associated library archive available for
+reinstallation. 删除 removes the selected mod from this game's management list.
+For an active installation, the Agent first uninstalls or restores overwritten
+files, then requests removal of the exact inactive record. Archived bytes and the
+transaction journal remain available on disk. A never-executed preview can be
+cancelled separately without touching a same-name installation. Restoring a
+previously uninstalled mod through the journal makes its active record visible again.
+
+## Path-based installation API
+
 `plan_install` accepts a registered game ID, an inert artifact under manager
 downloads/staging, its original filename, a declared mod type and display metadata.
 An optional expected SHA-256 is verified; a completed-download catalog record also

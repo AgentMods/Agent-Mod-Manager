@@ -203,12 +203,14 @@ fn migration_is_additive_and_idempotent() {
 }
 
 #[test]
-fn embedded_catalog_lists_three_readable_system_skills_with_persisted_preferences() {
+fn embedded_catalog_lists_readable_system_skills_with_persisted_preferences() {
     let f = Fixture::new();
     let guides = [
         ("system-adapter-authoring", "read_plugin_package"),
         ("system-web-search", "web_search"),
         ("system-mod-download", "GameBanana"),
+        ("system-mod-install", "match_mod_install"),
+        ("system-mod-uninstall", "inspect_install"),
     ];
     let listed = list_skills(&f.engine).unwrap();
     assert_eq!(listed.len(), guides.len());
@@ -346,7 +348,7 @@ fn installs_exactly_one_declared_file_only_after_review_and_commit() {
 }
 
 #[test]
-fn invalid_name_frontmatter_and_size_are_rejected_before_plan() {
+fn invalid_name_and_frontmatter_are_rejected_before_plan() {
     let f = Fixture::new();
     for name in ["", "../escape", "C:/escape", "Upper", "a--b", "nul", "a/b"] {
         assert!(plan_install_skill(&f.engine, name, &markdown(name, "one")).is_err());
@@ -361,12 +363,34 @@ fn invalid_name_frontmatter_and_size_are_rejected_before_plan() {
         ),
         format!("---\nname: {NAME}\ndescription: Test\ndescription: Duplicate\n---\nBody"),
         format!("---\nname: {NAME}\ndescription: Test\n---\n\0"),
-        format!("{}{}", markdown(NAME, "one"), "x".repeat(SKILL_LIMIT)),
     ] {
         assert!(plan_install_skill(&f.engine, NAME, &text).is_err());
     }
     assert_eq!(f.count("file_transactions"), 0);
     assert_eq!(f.count("skills_deployments"), 0);
+}
+
+#[test]
+fn large_standalone_skill_install_and_uninstall_rollback_are_replayable() {
+    let f = Fixture::new();
+    let text = format!(
+        "{}{}",
+        markdown(NAME, "one"),
+        "完整说明\n".repeat(96 * 1024)
+    );
+    let install = plan_install_skill(&f.engine, NAME, &text).unwrap();
+    assert!(install.plan.requires_review);
+    assert!(f.engine.apply_file_ops(&install.plan.id).is_err());
+    apply(&f.engine, &install.plan);
+    reconcile_deployments(&f.engine).unwrap();
+    assert_eq!(get_skill(&f.engine, NAME).unwrap().markdown, text);
+    let uninstall = plan_uninstall_skill(&f.engine, NAME).unwrap();
+    apply(&f.engine, &uninstall.plan);
+    reconcile_deployments(&f.engine).unwrap();
+    assert!(!install.location.exists());
+    f.engine.rollback_transaction(&uninstall.plan.id).unwrap();
+    reconcile_deployments(&f.engine).unwrap();
+    assert_eq!(get_skill(&f.engine, NAME).unwrap().markdown, text);
 }
 
 #[test]
@@ -661,12 +685,19 @@ fn incomplete_update_disables_known_skill_until_recovered() {
 
 #[test]
 fn tampered_oversize_binary_missing_and_extra_asset_fail_closed() {
-    for mode in ["changed", "oversized", "binary", "missing", "extra"] {
+    for mode in ["changed", "large-tamper", "binary", "missing", "extra"] {
         let f = Fixture::new();
         let p = f.install("one");
         match mode {
             "changed" => write(&p.location, markdown(NAME, "unapproved")),
-            "oversized" => write(&p.location, vec![b'x'; SKILL_LIMIT + 1]),
+            "large-tamper" => write(
+                &p.location,
+                format!(
+                    "{}{}",
+                    markdown(NAME, "tampered"),
+                    "新行\n".repeat(32 * 1024)
+                ),
+            ),
             "binary" => write(&p.location, [0xff, 0, 0x80]),
             "missing" => fs::remove_file(&p.location).unwrap(),
             "extra" => write(&p.location.parent().unwrap().join("run.sh"), "do not run"),
@@ -721,7 +752,14 @@ fn scratch_tamper_is_rejected_by_file_engine_before_commit() {
 
 #[test]
 fn deployment_record_path_hash_plan_and_review_tampering_are_rejected() {
-    for mode in ["path", "hash", "json", "record-limit", "plan", "review"] {
+    for mode in [
+        "path",
+        "hash",
+        "json",
+        "large-invalid-json",
+        "plan",
+        "review",
+    ] {
         let f = Fixture::new();
         let p = f.install("one");
         match mode {
@@ -755,13 +793,13 @@ fn deployment_record_path_hash_plan_and_review_tampering_are_rejected() {
                     .execute("UPDATE skills_deployments SET record_json='{}'", [])
                     .unwrap();
             }
-            "record-limit" => {
+            "large-invalid-json" => {
                 f.engine
                     .db
                     .conn()
                     .execute(
                         "UPDATE skills_deployments SET record_json=?1",
-                        [" ".repeat(RECORD_LIMIT + 1)],
+                        [" ".repeat(1024 * 1024 + 1)],
                     )
                     .unwrap();
             }

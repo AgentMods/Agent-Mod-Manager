@@ -20,9 +20,9 @@ use std::{
 
 fn validate_name(name: &str) -> AppResult<&str> {
     let name = name.trim();
-    if !(1..=80).contains(&name.chars().count()) || name.chars().any(char::is_control) {
+    if name.is_empty() || name.chars().any(char::is_control) {
         return Err(AppError::Invalid(
-            "游戏名称去除首尾空白后须为 1 到 80 个字符，且不能含有控制字符".into(),
+            "游戏名称去除首尾空白后不能为空，且不能含有控制字符".into(),
         ));
     }
     Ok(name)
@@ -74,6 +74,8 @@ pub(crate) fn update_game(
 pub(crate) struct GameAdapterBinding {
     pub game_id: String,
     pub game_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_game_name: Option<String>,
     pub root_path: String,
     pub current_adapter_slug: Option<String>,
     pub current_adapter_version: Option<String>,
@@ -93,12 +95,13 @@ pub(crate) fn prepare_game_adapter_binding(
     engine: &FileEngine,
     game_id: &str,
     slug: &str,
+    target_game_name: Option<&str>,
 ) -> AppResult<GameAdapterBinding> {
     let _guard = transaction::write_lock();
     let (root, selected) = inspect_registered_binding(engine, game_id, slug)?;
     let conn = engine.db.conn();
     let game = games::get_game_from(&conn, game_id)?;
-    binding_preview(&conn, &game, &root, &selected)
+    binding_preview(&conn, &game, &root, &selected, target_game_name)
 }
 
 pub(crate) fn apply_game_adapter_binding(
@@ -126,7 +129,8 @@ fn commit_game_adapter_binding(
     let mut conn = engine.db.conn();
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let game = games::get_game_from(&tx, game_id)?;
-    let current = binding_preview(&tx, &game, &root, &selected)?;
+    let requested_name = approved.and_then(|binding| binding.target_game_name.as_deref());
+    let current = binding_preview(&tx, &game, &root, &selected, requested_name)?;
     if approved.is_some_and(|reviewed| *reviewed != current) {
         return Err(AppError::Conflict(
             "游戏登记、适配包或匹配结果已改变，请重新预览并审批绑定".into(),
@@ -135,7 +139,7 @@ fn commit_game_adapter_binding(
     // The same selection supplies both the reviewed effects and the mutation.
     // Its exact adapter and selected match, not just their display fields,
     // have been checked against the approval. No binding input is taken from args.
-    let updated = games::rebind_game(&tx, game, &selected)?;
+    let updated = games::rebind_game(&tx, game, &selected, current.target_game_name.as_deref())?;
     tx.commit()?;
     Ok(updated)
 }
@@ -161,7 +165,9 @@ fn binding_preview(
     game: &Game,
     root: &Path,
     selected: &games::GameAdapterSelection,
+    target_game_name: Option<&str>,
 ) -> AppResult<GameAdapterBinding> {
+    let target_game_name = target_game_name.map(validate_name).transpose()?;
     if Path::new(&game.root_path) != root {
         return Err(AppError::Conflict("已登记的游戏目录已改变".into()));
     }
@@ -178,7 +184,7 @@ fn binding_preview(
     )?;
     // Only binding-relevant state can stale approval. Unrelated metadata and
     // user-root edits are preserved; the conflict check still uses live roots.
-    let state = serde_json::to_vec(&(
+    let mut state = serde_json::to_vec(&(
         &game.root_path,
         &game.created_at,
         &game.slug,
@@ -188,10 +194,16 @@ fn binding_preview(
         &selected.adapter,
         &selected.matched,
     ))?;
+    if let Some(target) = target_game_name {
+        // Bind the rename to the exact current and proposed names without
+        // changing the digest for legacy binding-only previews.
+        serde_json::to_writer(&mut state, &(&game.name, target))?;
+    }
     let state_sha256 = util::sha256_reader(&mut state.as_slice())?;
     Ok(GameAdapterBinding {
         game_id: game.id.clone(),
         game_name: game.name.clone(),
+        target_game_name: target_game_name.map(str::to_owned),
         root_path: paths::display_path(root),
         current_adapter_slug: game.adapter_slug.clone(),
         current_adapter_version: game.adapter_version.clone(),
