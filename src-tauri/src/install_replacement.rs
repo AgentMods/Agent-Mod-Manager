@@ -89,10 +89,11 @@ pub(super) fn verify_ownership(
     project: Option<(&str, &DownloadOrigin)>,
 ) -> AppResult<()> {
     let conn = engine.db.conn();
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT game_id,files_json,metadata_json FROM installs
-        WHERE status IN ('enabled','partially_restored') AND id<>?1 AND id<>COALESCE(?2,'')",
-    )?;
+        WHERE id<>?1 AND id<>COALESCE(?2,'') AND ({}) IN ('enabled','installed','partially_restored')",
+        super::effective_install_state(),
+    ))?;
     let mut rows = stmt.query(rusqlite::params![ignored.0, ignored.1])?;
     while let Some(row) = rows.next()? {
         let files: Vec<InstalledFile> = serde_json::from_str(&row.get::<_, String>(1)?)?;
@@ -240,9 +241,10 @@ impl Replacement {
                         )));
                     }
                 }
-                FileOp::Mkdir { .. } | FileOp::WriteText { .. } => {
-                    return Err(conflict("版本替换含未知变更"))
-                }
+                FileOp::Mkdir { .. }
+                | FileOp::WriteText { .. }
+                | FileOp::Compress { .. }
+                | FileOp::Extract { .. } => return Err(conflict("版本替换含未知变更")),
             }
         }
         if !original.is_empty() {
@@ -288,6 +290,14 @@ pub(crate) fn validate_apply(engine: &FileEngine, plan: &FilePlan) -> AppResult<
 pub(crate) fn validate_rollback(engine: &FileEngine, transaction_id: &str) -> AppResult<bool> {
     let (superseded, replacement): (bool, Option<(String, String)>) = {
         let conn = engine.db.conn();
+        let forgotten: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM install_transactions a
+            JOIN install_missing_removals m ON m.install_id=a.install_id WHERE a.transaction_id=?1)",
+            [transaction_id], |r| r.get(0))?;
+        if forgotten {
+            return Err(conflict(
+                "此安装在文件全部缺失后已从管理列表移除，不能再回滚其文件",
+            ));
+        }
         let superseded = conn.query_row("SELECT EXISTS(SELECT 1 FROM install_transactions i
             JOIN install_replacements r ON r.replaced_install_id=i.install_id
             JOIN file_transactions f ON f.id=r.transaction_id
@@ -339,9 +349,10 @@ pub(crate) fn validate_rollback(engine: &FileEngine, transaction_id: &str) -> Ap
                 }
                 touched.insert(path_key(src));
             }
-            FileOp::Mkdir { .. } | FileOp::WriteText { .. } => {
-                return Err(conflict("替换事务含未知变更"))
-            }
+            FileOp::Mkdir { .. }
+            | FileOp::WriteText { .. }
+            | FileOp::Compress { .. }
+            | FileOp::Extract { .. } => return Err(conflict("替换事务含未知变更")),
         }
     }
     verify_ownership(

@@ -113,6 +113,60 @@ fn restart_migrates_data_and_keeps_transactions_usable() {
 }
 
 #[test]
+fn moving_storage_updates_only_the_stock_playwright_download_folder() {
+    for custom in [false, true] {
+        let (temp, engine, _) = crate::transaction::tests::setup();
+        let location = StorageLocation::new(engine.paths.root.clone()).unwrap();
+        let servers = crate::mcp::McpServers::new(engine.db.clone());
+        servers.seed_presets().unwrap();
+        let mut config = servers.get("playwright").unwrap();
+        let old_output = engine.paths.downloads().join("Playwright");
+        assert_eq!(
+            config.args.last().unwrap(),
+            &crate::paths::display_path(&old_output)
+        );
+        fs::write(old_output.join("receipt.zip"), b"download").unwrap();
+        if custom {
+            *config.args.last_mut().unwrap() =
+                crate::paths::display_path(&temp.path().join("my browser"));
+        }
+        config.enabled = true;
+        servers.update(&config).unwrap();
+        servers.remember_start(&config).unwrap();
+        location.schedule(&engine, temp.path()).unwrap();
+        drop(servers);
+        drop(engine);
+
+        let target = location.startup_root().unwrap();
+        assert!(location.failure().unwrap().is_none());
+        let paths = AppPaths::new(target).unwrap();
+        let servers = crate::mcp::McpServers::new(Db::open(&paths.db_file()).unwrap());
+        servers.seed_presets().unwrap();
+        let new_output = paths.downloads().join("Playwright");
+        assert_eq!(
+            fs::read(new_output.join("receipt.zip")).unwrap(),
+            b"download"
+        );
+        if custom {
+            assert_eq!(servers.startup_requests().unwrap(), ["playwright"]);
+            assert!(crate::mcp::playwright_receipt_dir(&servers.db)
+                .unwrap()
+                .is_none());
+        } else {
+            *config.args.last_mut().unwrap() = crate::paths::display_path(&new_output);
+            assert!(servers.startup_requests().unwrap().is_empty());
+            assert_eq!(
+                crate::mcp::playwright_receipt_dir(&servers.db)
+                    .unwrap()
+                    .unwrap(),
+                crate::paths::user_path(&new_output).as_ref()
+            );
+        }
+        assert_eq!(servers.get("playwright").unwrap(), config);
+    }
+}
+
+#[test]
 fn a_conflicting_target_created_before_restart_preserves_active_storage() {
     let (temp, engine, game) = crate::transaction::tests::setup();
     let source = engine.paths.root.clone();

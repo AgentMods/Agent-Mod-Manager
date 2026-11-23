@@ -412,6 +412,29 @@ pub fn ingest_received(
     )
 }
 
+fn same_receipt_path(left: &Path, right: &Path) -> bool {
+    // The stock config can use ordinary Windows spelling while AppPaths is canonical.
+    let left = paths::user_path(left);
+    let right = paths::user_path(right);
+    paths::contains_path(&left, &right) && paths::contains_path(&right, &left)
+}
+
+/// Only advertise or ingest from the exact managed directory of the stock MCP.
+pub(crate) fn playwright_receipt_dir(engine: &FileEngine) -> AppResult<Option<PathBuf>> {
+    let expected = crate::storage::playwright_downloads(&engine.paths.root);
+    let configured = crate::mcp::playwright_receipt_dir(&engine.db)?;
+    Ok(configured
+        .filter(|root| same_receipt_path(&expected, root))
+        .filter(|_| {
+            engine.paths.stable_directory(&expected).is_ok()
+                && engine
+                    .paths
+                    .guard(&expected, &[])
+                    .is_ok_and(|resolved| resolved == expected)
+        })
+        .map(|_| expected))
+}
+
 fn received_path(engine: &FileEngine, receipt: &ApprovedArtifact<'_>) -> AppResult<()> {
     download::safe_filename(receipt.filename)?;
     let path = receipt.path;
@@ -421,27 +444,22 @@ fn received_path(engine: &FileEngine, receipt: &ApprovedArtifact<'_>) -> AppResu
         return Err(invalid_source());
     }
     let parent = path.parent().ok_or_else(invalid_source)?;
-    let permitted = engine.paths.downloads().join("incoming");
-    let inbox =
-        paths::contains_path(&permitted, parent) && paths::contains_path(parent, &permitted);
-    let playwright = !engine.paths.overlaps_storage(parent)
-        && crate::mcp::playwright_receipt_dir(&engine.db)?.is_some_and(|root| {
-            let root = paths::user_path(&root);
-            let parent = paths::user_path(parent);
-            paths::contains_path(&root, &parent) && paths::contains_path(&parent, &root)
-        });
-    if !inbox && !playwright {
-        return Err(invalid_source());
-    }
-    let resolved = engine.paths.guard_file_path(path, &[], playwright)?;
-    if playwright && engine.paths.overlaps_storage(&resolved) {
-        return Err(invalid_source());
-    }
-    // Configured Playwright paths use ordinary Windows spelling. Holding and
-    // checking the no-follow handle below still rejects any reparse points.
-    let resolved = paths::user_path(&resolved);
-    let supplied = paths::user_path(path);
-    if !paths::contains_path(&resolved, &supplied) || !paths::contains_path(&supplied, &resolved) {
+    let incoming = crate::storage::incoming_downloads(&engine.paths.root);
+    let permitted = if same_receipt_path(&incoming, parent) {
+        incoming
+    } else {
+        playwright_receipt_dir(engine)?
+            .filter(|root| same_receipt_path(root, parent))
+            .ok_or_else(invalid_source)?
+    };
+    let resolved = engine.paths.guard(path, &[])?;
+    // Compare the actual parent as well as the supplied spelling. The held
+    // no-follow handle checked below still rejects links and reparse points.
+    if !resolved
+        .parent()
+        .is_some_and(|dir| same_receipt_path(dir, &permitted))
+        || !same_receipt_path(&resolved, path)
+    {
         return Err(invalid_source());
     }
     Ok(())

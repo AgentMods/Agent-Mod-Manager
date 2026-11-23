@@ -163,7 +163,25 @@ fn tags_set(tags: &[String]) -> Option<BTreeSet<&str>> {
 }
 
 fn same_tags(a: &[String], b: &[String]) -> bool {
-    tags_set(a).is_some_and(|a| tags_set(b).is_some_and(|b| a == b))
+    // The site identifies tags by works.TagSlug: lowercase, split on
+    // whitespace and join with hyphens. Compare pre-hash keys; equal keys
+    // also produce equal hashes for long tags. Fold only ASCII here to avoid
+    // assuming Go and Rust use the same Unicode lowercase tables. Database
+    // aliases that change the key cannot be established by this comparison.
+    fn keys(tags: &[String]) -> Option<BTreeSet<String>> {
+        Some(
+            tags_set(tags)?
+                .into_iter()
+                .map(|tag| {
+                    tag.split_whitespace()
+                        .map(str::to_ascii_lowercase)
+                        .collect::<Vec<_>>()
+                        .join("-")
+                })
+                .collect(),
+        )
+    }
+    keys(a).is_some_and(|a| keys(b).is_some_and(|b| a == b))
 }
 
 fn invalid(message: &str) -> AppError {
@@ -208,6 +226,21 @@ fn preview(
 }
 
 impl PublicationPreview {
+    // Historical pixel-art receipts must stay byte-identical for audit/reconciliation.
+    // They are no longer eligible to authorize a new write, even if approved before upgrade.
+    fn require_current_cover(&self) -> AppResult<()> {
+        if self
+            .listing
+            .as_ref()
+            .is_some_and(|listing| !listing.cover_png.is_empty())
+        {
+            return Err(AppError::Conflict(
+                "这是旧版像素封面预览，请重新点击「发布插件」核对游戏封面".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn checked_digest(&self) -> AppResult<String> {
         if self.target.plugin_id().is_some_and(|id| !valid_id(id))
             || tags_set(&self.tags).is_none()
@@ -224,6 +257,11 @@ impl PublicationPreview {
             }
         }
         let package = plugins::parse_package(&self.slug, &self.files[0].text, &self.files[1].text)?;
+        if self.listing.as_ref().is_some_and(|listing| {
+            listing.cover_png.is_empty() && listing.cover_url != package.adapter.cover_url
+        }) {
+            return Err(stale());
+        }
         if package.adapter.version != self.version || self.destination != provenance::DESTINATION {
             return Err(stale());
         }
@@ -294,6 +332,12 @@ fn with_current_source<T>(
         };
         if !matches {
             return Err(stale());
+        }
+        // Historical digests and receipts stay readable. Only a new approval or
+        // write requires the source game's name in the already-reviewed tags.
+        if let Some(listing) = &preview.listing {
+            let adapter: plugins::GameAdapter = serde_json::from_str(&files[0].text)?;
+            listing.require_game_tag(&adapter.name)?;
         }
         f()
     })
@@ -387,7 +431,7 @@ fn load(conn: &Connection, id: &str) -> AppResult<PublicationRecord> {
         || (state == PublicationState::Completed) != remote.is_some()
         || remote
             .as_ref()
-            .is_some_and(|p| !matches_preview(p, &stored))
+            .is_some_and(|p| !matches_receipt(p, &stored))
     {
         return Err(stale());
     }
@@ -456,6 +500,7 @@ pub fn approve_publication(
     if record.state != PublicationState::Intended || digest != record.preview.digest {
         return Err(stale());
     }
+    record.preview.require_current_cover()?;
     with_current_source(engine, &record.preview, || {
         let mut conn = engine.db.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -474,9 +519,76 @@ pub fn approve_publication(
     })
 }
 
+// Check inside the same IMMEDIATE transaction that claims the send. Only the
+// authenticated preflight for this send can distinguish a new owned release
+// from a replay; a slug or a historical receipt alone grants no permission.
+fn check_duplicate(
+    conn: &Connection,
+    record: &PublicationRecord,
+    owner: Option<&PublishedPlugin>,
+) -> AppResult<()> {
+    let p = &record.preview;
+    let credential = p
+        .snapshot
+        .as_ref()
+        .map(automatic::Snapshot::credential_fingerprint);
+    let mut stmt = conn.prepare(
+        "SELECT state,version,target_plugin_id,json_extract(preview_json,'$.snapshot.credentialBinding'),
+                json_extract(remote_json,'$.id') FROM manager_publications
+         WHERE slug=?1 AND id<>?2 AND (state IN ('pending','unknown')
+            OR (state='completed' AND (?3 IS NULL OR version=?4)))",
+    )?;
+    let mut rows = stmt.query(params![p.slug, record.id, p.target.plugin_id(), p.version])?;
+    while let Some(row) = rows.next()? {
+        let state: String = row.get(0)?;
+        let version: String = row.get(1)?;
+        let target: Option<i64> = row.get(2)?;
+        let prior_credential: Option<String> = row.get(3)?;
+        let receipt_id: Option<i64> = row.get(4)?;
+        let same_plugin = owner.is_some_and(|plugin| Some(plugin.id) == receipt_id.or(target));
+        let unbound_uncertain = prior_credential.is_none() && state != "completed";
+        if credential.is_some()
+            && prior_credential.as_deref() != credential
+            && !same_plugin
+            && !unbound_uncertain
+        {
+            continue; // A different credential, with no evidence of a shared target.
+        }
+        let message = match state.as_str() {
+            "pending" => "该插件正在发布，请等待本次发布完成",
+            "unknown" => {
+                // A separately reviewed release above the verified cloud head
+                // cannot resend this older version. Leave its outcome unknown.
+                if prior_credential.is_some()
+                    && owner.is_some_and(|plugin| {
+                        target.is_none_or(|id| id == plugin.id)
+                            && plugins::validate_version(&version).is_ok()
+                            && !automatic::version_cmp(&version, &plugin.version).is_gt()
+                            && automatic::version_cmp(&p.version, &plugin.version).is_gt()
+                    })
+                {
+                    continue;
+                }
+                "该插件有尚未确认的发布，请打开发布记录查看状态"
+            }
+            "completed"
+                if owner.is_some_and(|plugin| receipt_id.is_some_and(|id| id != plugin.id)) =>
+            {
+                continue
+            }
+            "completed" if owner.is_some() => "该插件的此版本已发布，请重新预览新版本",
+            "completed" => "该插件已有发布记录，请重新预览并核对当前账号的插件归属",
+            _ => return Err(stale()),
+        };
+        return Err(AppError::Conflict(message.into()));
+    }
+    Ok(())
+}
+
 fn claim_checked(
     engine: &FileEngine,
     record: &PublicationRecord,
+    owner: Option<&PublishedPlugin>,
     check: impl FnOnce() -> AppResult<()>,
 ) -> AppResult<PublicationRecord> {
     with_current_source(engine, &record.preview, || {
@@ -486,35 +598,7 @@ fn claim_checked(
         if load(&tx, &record.id)? != *record {
             return Err(stale());
         }
-        // No differently-tagged preview, alternate source, or First/Release
-        // switch may send while a matching account's write for this slug is
-        // unconfirmed. v1 uncertain writes have no provable owner, so they
-        // block any automatic send for this slug until reconciled; completed
-        // v1 writes cannot override the present owner lookup.
-        let blocked: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM manager_publications
-            WHERE id<>?1 AND slug=?2 AND (
-                (state IN ('pending','unknown') AND (?5 IS NOT NULL OR version=?3 OR target_plugin_id IS NULL OR ?4 IS NULL OR target_plugin_id=?4))
-                OR (state='completed' AND (version=?3 OR ?4 IS NULL))
-            ) AND (
-                ?5 IS NULL
-                OR json_extract(preview_json,'$.snapshot.credentialBinding')=?5
-                OR (state IN ('pending','unknown') AND json_extract(preview_json,'$.snapshot.credentialBinding') IS NULL)
-            ))",
-            params![
-                record.id,
-                record.preview.slug,
-                record.preview.version,
-                record.preview.target.plugin_id(),
-                record.preview.snapshot.as_ref().map(automatic::Snapshot::credential_fingerprint)
-            ],
-            |r| r.get(0),
-        )?;
-        if blocked {
-            return Err(AppError::Conflict(
-                "该插件已有已提交或结果待核对的发布记录，不能重复发送".into(),
-            ));
-        }
+        check_duplicate(&tx, record, owner)?;
         tx.execute(
             "UPDATE manager_publications SET state='pending',updated_at=?2 WHERE id=?1",
             params![record.id, util::now()],
@@ -527,7 +611,7 @@ fn claim_checked(
 
 #[cfg(test)]
 fn claim(engine: &FileEngine, record: &PublicationRecord) -> AppResult<PublicationRecord> {
-    claim_checked(engine, record, || Ok(()))
+    claim_checked(engine, record, None, || Ok(()))
 }
 
 fn transition(
@@ -600,12 +684,16 @@ fn valid_plugin(plugin: &PublishedPlugin) -> bool {
         && plugin.reason.len() <= 64 * 1024
 }
 
-fn matches_preview(plugin: &PublishedPlugin, preview: &PublicationPreview) -> bool {
+fn matches_receipt(plugin: &PublishedPlugin, preview: &PublicationPreview) -> bool {
     valid_plugin(plugin)
         && plugin.slug == preview.slug
         && plugin.version == preview.version
         && preview.target.plugin_id().is_none_or(|id| id == plugin.id)
-        && same_tags(&plugin.tags, &preview.tags)
+        // The committed receipt returns site-canonical tag names, which can
+        // differ from the submitted names (existing tags and aliases). Each
+        // submitted tag can contribute at most one returned canonical tag.
+        && plugin.tags.len() <= preview.tags.len()
+        && plugin.tags.is_empty() == preview.tags.is_empty()
         && preview
             .listing
             .as_ref()
@@ -616,6 +704,12 @@ fn matches_preview(plugin: &PublishedPlugin, preview: &PublicationPreview) -> bo
             .is_none_or(|snapshot| snapshot.previous_release_id() != Some(plugin.release_id))
 }
 
+fn matches_preview(plugin: &PublishedPlugin, preview: &PublicationPreview) -> bool {
+    // Read-back is not a response to our write. Without a mapping from each
+    // requested tag to its canonical tag, require the same deterministic tag keys.
+    matches_receipt(plugin, preview) && same_tags(&plugin.tags, &preview.tags)
+}
+
 fn approved(engine: &FileEngine, id: &str, digest: &str) -> AppResult<PublicationRecord> {
     let record = get_publication(engine, id)?;
     if record.approved_digest.as_deref() != Some(digest) {
@@ -624,7 +718,7 @@ fn approved(engine: &FileEngine, id: &str, digest: &str) -> AppResult<Publicatio
     match record.state {
         PublicationState::Intended | PublicationState::Completed => Ok(record),
         _ => Err(AppError::Conflict(
-            "发布正在进行、结果待核对或已结束，不能重复发送".into(),
+            "此发布不能重复发送，请打开发布记录查看状态".into(),
         )),
     }
 }
@@ -643,6 +737,7 @@ pub async fn publish_approved(
     if record.state == PublicationState::Completed {
         return Ok(record);
     }
+    record.preview.require_current_cover()?;
     let binding = automatic::CredentialBinding::for_preview(&record.preview)?;
     with_current_source(engine, &record.preview, || Ok(()))?;
     let remote = binding.connect(settings, cancel).await?;
@@ -667,13 +762,14 @@ pub(crate) async fn publish_with(
     if record.preview.snapshot.is_some() {
         return Err(stale());
     }
-    send(engine, remote, &record, cancel, || Ok(())).await
+    send(engine, remote, &record, None, cancel, || Ok(())).await
 }
 
 async fn send(
     engine: &FileEngine,
     remote: &dyn Remote,
     record: &PublicationRecord,
+    owner: Option<&PublishedPlugin>,
     cancel: &CancellationToken,
     check: impl FnOnce() -> AppResult<()>,
 ) -> AppResult<PublicationRecord> {
@@ -689,7 +785,7 @@ async fn send(
             "publish_manager_plugin_release"
         }
     };
-    let pending = claim_checked(engine, record, check)?;
+    let pending = claim_checked(engine, record, owner, check)?;
     let mut guard = UnknownOnDrop {
         engine,
         pending: &pending,
@@ -702,7 +798,7 @@ async fn send(
     }
     let result = match response {
         Ok(raw) => match serde_json::from_value::<Receipt>(raw) {
-            Ok(receipt) if matches_preview(&receipt.plugin, p) => {
+            Ok(receipt) if matches_receipt(&receipt.plugin, p) => {
                 transition(engine, &pending, "completed", Some(&receipt.plugin))
             }
             _ => transition(engine, &pending, "unknown", None),

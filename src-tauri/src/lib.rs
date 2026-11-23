@@ -1,5 +1,6 @@
 pub mod agent;
 mod agent_attachment;
+mod agent_notifications;
 pub mod app;
 pub mod archive;
 pub mod artifacts;
@@ -38,6 +39,9 @@ pub mod plugins;
 pub(crate) mod publication_copy;
 mod safe_fs;
 pub mod settings;
+mod seven_zip;
+#[cfg(test)]
+mod seven_zip_roundtrip_tests;
 pub mod skills;
 pub mod snapshot;
 pub mod sources;
@@ -57,6 +61,7 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -84,6 +89,7 @@ pub fn run() {
             commands::bind_mod_library_entry,
             commands::preview_fomod,
             commands::set_plugin_enabled,
+            commands::remove_installed_plugin,
             commands::write_plugin_draft,
             commands::list_plugin_drafts,
             commands::delete_plugin_draft,
@@ -93,6 +99,7 @@ pub fn run() {
             commands::preview_manager_plugin,
             commands::get_manager_plugin_display,
             commands::prepare_manager_plugin_import,
+            commands::install_manager_plugin,
             commands::list_manager_publications,
             commands::get_manager_publication,
             commands::prepare_auto_manager_publication,
@@ -152,6 +159,7 @@ pub fn run() {
             commands::create_conversation,
             commands::list_conversations,
             commands::get_conversation,
+            commands::set_conversation_workspace,
             commands::archive_conversation,
             commands::rename_conversation,
             commands::set_conversation_pinned,
@@ -190,6 +198,7 @@ pub fn run() {
             commands::read_file
         ])
         .setup(|app| {
+            seven_zip::set_resource_dir(app.path().resource_dir()?);
             let location = storage_location::StorageLocation::new(app.path().app_data_dir()?)?;
             let credentials = encrypted_store::open(app.handle(), location.default_root())?;
             let root = location.startup_root()?;
@@ -208,6 +217,7 @@ pub fn run() {
                 services.runtime.clone(),
                 std::sync::Arc::new(move |event| {
                     use tauri::Emitter;
+                    agent_notifications::notify(&handle, event);
                     let _ = handle.emit(&format!("agent://{}", event.kind), event);
                 }),
             )?;

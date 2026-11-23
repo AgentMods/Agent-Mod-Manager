@@ -1,16 +1,21 @@
 //! Uncataloged archive downloads do not establish provider provenance.
 use super::validate_download_url;
-use crate::error::{AppError, AppResult};
+use crate::{
+    archive::{RAR4_MAGIC, RAR5_MAGIC},
+    error::{AppError, AppResult},
+};
 use percent_encoding::percent_decode_str;
 use url::Url;
 
 pub(crate) const MAX_WEB_URL_BYTES: usize = 2048;
 const MAX_ENDPOINT_BYTES: usize = 8192;
+pub(crate) const MAX_ARCHIVE_SIGNATURE_BYTES: usize = RAR5_MAGIC.len();
 
 #[derive(Clone, Copy)]
 pub(crate) enum ArchiveKind {
     Zip,
     SevenZip,
+    Rar,
     TarGzip,
 }
 
@@ -19,6 +24,7 @@ impl ArchiveKind {
         match self {
             Self::Zip => header.starts_with(b"PK\x03\x04") || header.starts_with(b"PK\x05\x06"),
             Self::SevenZip => header.starts_with(b"7z\xbc\xaf\x27\x1c"),
+            Self::Rar => header.starts_with(RAR4_MAGIC) || header.starts_with(RAR5_MAGIC),
             Self::TarGzip => header.starts_with(b"\x1f\x8b\x08"),
         }
     }
@@ -82,11 +88,13 @@ fn archive_for_filename(filename: &str) -> AppResult<ArchiveKind> {
         Ok(ArchiveKind::Zip)
     } else if lower.ends_with(".7z") {
         Ok(ArchiveKind::SevenZip)
+    } else if lower.ends_with(".rar") {
+        Ok(ArchiveKind::Rar)
     } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
         Ok(ArchiveKind::TarGzip)
     } else {
         Err(AppError::Unsupported(
-            "网页直链必须指向 ZIP、JAR、7z 或 tar.gz 归档".into(),
+            "网页直链必须指向 ZIP、JAR、7z、RAR 或 tar.gz 归档".into(),
         ))
     }
 }
@@ -138,6 +146,16 @@ mod tests {
                 &b"7z\xbc\xaf\x27\x1c"[..],
             ),
             (
+                "https://example.com/releases/Legacy.RAR",
+                "Legacy.RAR",
+                &b"Rar!\x1a\x07\x00"[..],
+            ),
+            (
+                "https://example.com/releases/Current.rar",
+                "Current.rar",
+                &b"Rar!\x1a\x07\x01\x00"[..],
+            ),
+            (
                 "https://example.com/file.tar.gz",
                 "file.tar.gz",
                 &b"\x1f\x8b\x08"[..],
@@ -161,6 +179,21 @@ mod tests {
         assert!(
             WebDownload::parse("https://example.com/resolve.zip?signature=marker-secret").is_err()
         );
+    }
+
+    #[test]
+    fn rar_requires_a_complete_rar4_or_rar5_signature() {
+        let raw = "https://example.com/resolve/opaque?signature=marker-secret";
+        let (_, archive) = parse_mcp_archive(raw, "Release.RaR").unwrap();
+        for magic in [&b"Rar!\x1a\x07\x00"[..], &b"Rar!\x1a\x07\x01\x00"[..]] {
+            assert!(archive.matches(magic));
+            for len in 0..magic.len() {
+                assert!(!archive.matches(&magic[..len]));
+            }
+        }
+        assert!(!archive.matches(b"Rar!\x1a\x07\x01\xff"));
+        assert!(!archive.matches(b"Rar!\x1a\x07\x02\x00"));
+        assert!(!archive.matches(b"PK\x03\x04"));
     }
 
     #[test]
@@ -216,6 +249,7 @@ mod tests {
             "https://example.com/a.zip?",
             "https://example.com/mods/download",
             "https://example.com/a.exe",
+            "https://example.com/a.rar.part",
             "https://example.com/x%2Fa.zip",
             "https://example.com/x%5Ca.zip",
             "https://example.com/CON.zip",

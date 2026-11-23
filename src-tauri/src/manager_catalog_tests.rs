@@ -540,3 +540,407 @@ async fn accepts_both_files_at_their_exact_limits_and_bounds_a_chunked_catalog()
         matches!(server.client.search("").await, Err(AppError::Invalid(s)) if s.contains("大小"))
     );
 }
+
+#[tokio::test]
+async fn catalog_artwork_is_the_validated_manifest_game_cover_even_without_a_skill_footer() {
+    let server = Server::new().await;
+    let (original, _) = files();
+    let mut manifest: Value = serde_json::from_str(&original).unwrap();
+    let cover = "https://assets.example.org/game/cover.jpg?edition=original";
+    manifest["coverUrl"] = json!(cover);
+    server.set_file("adapter.json", Reply::ok(manifest.to_string()));
+    let display = server.client.display(RELEASE_ID).await.unwrap().unwrap();
+    assert_eq!(display.cover_url.as_deref(), Some(cover));
+    assert!(display.description.is_empty());
+    assert!(!server
+        .requests()
+        .iter()
+        .any(|request| request.contains(cover)));
+    manifest["coverUrl"] = Value::Null;
+    server.set_file("adapter.json", Reply::ok(manifest.to_string()));
+    assert!(server.client.display(RELEASE_ID).await.unwrap().is_none());
+    manifest["coverUrl"] = json!("file:///private/cover.png");
+    server.set_file("adapter.json", Reply::ok(manifest.to_string()));
+    assert!(server.client.display(RELEASE_ID).await.is_err());
+}
+
+fn lifecycle_transaction(engine: &FileEngine, kind: &str) -> String {
+    engine.db.conn().query_row(
+        "SELECT id FROM file_transactions WHERE kind=?1 AND status='committed' ORDER BY rowid DESC LIMIT 1",
+        [kind], |row| row.get(0),
+    ).unwrap()
+}
+
+fn assert_no_catalog_drafts(engine: &FileEngine) {
+    let count: usize = engine
+        .db
+        .conn()
+        .query_row("SELECT count(*) FROM plugin_drafts", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    let scratch = engine.paths.staging().join("plugin-catalog");
+    assert!(!scratch.exists() || fs::read_dir(scratch).unwrap().next().is_none());
+}
+
+async fn add_with_catalog(
+    server: &Server,
+    engine: &FileEngine,
+    root: &std::path::Path,
+) -> AppResult<crate::games::Game> {
+    let request =
+        crate::games::CatalogGameRegistration::new(&engine.paths, root, Some("扫描到的游戏"))?;
+    let preview = server.client.preview(engine, PLUGIN_ID, RELEASE_ID).await?;
+    plugin_workflow::register_catalog_game(engine, preview, request)
+}
+
+fn fallout_root(root: &std::path::Path) {
+    fs::create_dir_all(root.join("Data")).unwrap();
+    fs::write(root.join("Fallout4.exe"), "fixture").unwrap();
+    fs::write(root.join("Data/Fallout4.esm"), "fixture").unwrap();
+}
+
+#[tokio::test]
+async fn discovered_cloud_release_registers_and_binds_once_and_reuses_exact_installed_package() {
+    let (temp, ctx) = context();
+    let engine = &ctx.engine;
+    let server = Server::new().await;
+    let path = temp.path().join("first");
+    fallout_root(&path);
+    let first = add_with_catalog(&server, engine, &path).await.unwrap();
+    assert_eq!(first.name, "扫描到的游戏");
+    assert_eq!(first.adapter_slug.as_deref(), Some("fallout4"));
+    assert_eq!(first.adapter_version.as_deref(), Some("1.0.0"));
+    assert_eq!(first.steam_app_id.as_deref(), Some("377160"));
+    assert_eq!(first.platform, "windows");
+    assert_eq!(
+        add_with_catalog(&server, engine, &path).await.unwrap().id,
+        first.id
+    );
+    let other = temp.path().join("second");
+    fallout_root(&other);
+    assert_ne!(
+        add_with_catalog(&server, engine, &other).await.unwrap().id,
+        first.id
+    );
+    let counts: (i64, i64, i64) = engine.db.conn().query_row(
+        "SELECT (SELECT count(*) FROM plugin_deployments), (SELECT count(*) FROM games), (SELECT count(*) FROM mcp_servers WHERE plugin_slug='fallout4' AND enabled=0)",
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).unwrap();
+    assert_eq!(counts, (1, 2, 1));
+    assert_no_catalog_drafts(engine);
+    // Neither an edited release with the same version nor a disabled local
+    // package is authorization to overwrite/re-enable that package.
+    let third = temp.path().join("third");
+    fallout_root(&third);
+    let (_, skill) = files();
+    server.set_file("SKILL.md", Reply::ok(format!("{skill}\nchanged")));
+    assert!(matches!(
+        add_with_catalog(&server, engine, &third).await,
+        Err(AppError::Conflict(_))
+    ));
+    server.set_file("SKILL.md", Reply::ok(skill));
+    plugin_workflow::set_enabled(engine, "fallout4", false).unwrap();
+    assert!(matches!(
+        add_with_catalog(&server, engine, &third).await,
+        Err(AppError::Conflict(_))
+    ));
+    assert_eq!(crate::games::list_games(&engine.db).unwrap().len(), 2);
+    assert!(!plugins::list_plugins(&engine.db).unwrap()[0].enabled);
+}
+
+#[tokio::test]
+async fn discovered_cloud_release_rolls_back_on_missing_markers_or_registration_failure() {
+    let (temp, ctx) = context();
+    let engine = &ctx.engine;
+    let server = Server::new().await;
+    let root = temp.path().join("Fallout4");
+    fs::create_dir(&root).unwrap();
+    assert!(matches!(
+        add_with_catalog(&server, engine, &root).await,
+        Err(AppError::Conflict(_))
+    ));
+    fallout_root(&root);
+    engine.db.conn().execute_batch("CREATE TRIGGER reject_game BEFORE INSERT ON games BEGIN SELECT RAISE(ABORT, 'test'); END;").unwrap();
+    assert!(add_with_catalog(&server, engine, &root).await.is_err());
+    assert!(crate::games::list_games(&engine.db).unwrap().is_empty());
+    assert!(plugins::list_plugins(&engine.db).unwrap().is_empty());
+    let target = engine.paths.plugins().join("games/fallout4");
+    assert!(!target.join("adapter.json").exists() && !target.join("SKILL.md").exists());
+    assert_no_catalog_drafts(engine);
+    engine
+        .db
+        .conn()
+        .execute_batch("DROP TRIGGER reject_game")
+        .unwrap();
+    add_with_catalog(&server, engine, &root).await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_install_commits_one_pinned_release_without_drafts_even_for_concurrent_clicks() {
+    let (_temp, ctx) = context();
+    let engine = &ctx.engine;
+    let server = Server::new().await;
+    assert!(matches!(
+        server.client.install(engine, PLUGIN_ID, "32").await,
+        Err(AppError::NotFound(_))
+    ));
+    let (a, b) = tokio::join!(
+        server.client.install(engine, PLUGIN_ID, RELEASE_ID),
+        server.client.install(engine, PLUGIN_ID, RELEASE_ID)
+    );
+    let err = match (a, b) {
+        (Ok(()), Err(error)) | (Err(error), Ok(())) => error,
+        result => panic!("expected exactly one install: {result:?}"),
+    };
+    assert!(
+        matches!(err, AppError::Conflict(message) if message.contains("1.0.0") && message.contains("先移除"))
+    );
+    assert_no_catalog_drafts(engine);
+    let target = engine.paths.plugins().join("games/fallout4");
+    let (adapter, skill) = files();
+    assert_eq!(
+        fs::read(target.join("adapter.json")).unwrap(),
+        adapter.as_bytes()
+    );
+    assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), skill.as_bytes());
+    let reopened = FileEngine::new(
+        Db::open(&engine.paths.db_file()).unwrap(),
+        (*engine.paths).clone(),
+    );
+    assert_eq!(
+        plugin_workflow::reconcile_deployments(&reopened)
+            .unwrap()
+            .registered,
+        ["fallout4"]
+    );
+    assert_eq!(
+        plugins::list_plugins(&reopened.db).unwrap()[0].version,
+        "1.0.0"
+    );
+    let id = lifecycle_transaction(engine, "catalog_plugin_install");
+    assert!(matches!(
+        engine.rollback_transaction(&id),
+        Err(AppError::Denied(_))
+    ));
+    engine.rollback_desktop_transaction(&id).unwrap();
+    assert!(plugins::list_plugins(&engine.db).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn direct_install_rolls_back_copy_failure_and_registry_failure_without_a_draft() {
+    let (_temp, ctx) = context();
+    let engine = &ctx.engine;
+    let server = Server::new().await;
+    engine.inject_failure_before(1);
+    assert!(server
+        .client
+        .install(engine, PLUGIN_ID, RELEASE_ID)
+        .await
+        .is_err());
+    engine.inject_failure_before(usize::MAX);
+    // Fail after both package files have been copied, while the terminal
+    // SQLite commit is registering the Skill next to its Plugin and MCP.
+    engine
+        .db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_plugin_skill BEFORE INSERT ON skills
+        WHEN NEW.name='fallout4' BEGIN SELECT RAISE(ABORT, 'injected registration failure'); END;",
+        )
+        .unwrap();
+    assert!(server
+        .client
+        .install(engine, PLUGIN_ID, RELEASE_ID)
+        .await
+        .is_err());
+    let target = engine.paths.plugins().join("games/fallout4");
+    assert!(!target.join("adapter.json").exists());
+    assert!(!target.join("SKILL.md").exists());
+    assert_no_catalog_drafts(engine);
+    assert!(plugins::list_plugins(&engine.db).unwrap().is_empty());
+    let unfinished: usize = engine
+        .db
+        .conn()
+        .query_row(
+            "SELECT count(*) FROM file_transactions WHERE status!='rolled_back'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(unfinished, 0);
+    engine
+        .db
+        .conn()
+        .execute_batch("DROP TRIGGER reject_plugin_skill")
+        .unwrap();
+    server
+        .client
+        .install(engine, PLUGIN_ID, RELEASE_ID)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn removal_retires_old_deployments_preserves_games_and_mods_and_allows_reinstall() {
+    let (temp, ctx) = context();
+    let engine = &ctx.engine;
+    let server = Server::new().await;
+    let (adapter, skill) = files();
+    let draft = plugin_workflow::plan_write_draft(engine, "fallout4", &adapter, &skill).unwrap();
+    apply(engine, &draft.plan);
+    // This reviewed manual deployment expects an empty destination.
+    let stale = plugin_workflow::plan_install_plugin(engine, &draft.draft.id).unwrap();
+    server
+        .client
+        .install(engine, PLUGIN_ID, RELEASE_ID)
+        .await
+        .unwrap();
+    let installed = lifecycle_transaction(engine, "catalog_plugin_install");
+    let dormant_mcp: bool = engine.db.conn().query_row("SELECT enabled=0 AND startup_digest IS NULL FROM mcp_servers WHERE plugin_slug='fallout4'", [], |r| r.get(0)).unwrap();
+    assert!(dormant_mcp);
+    let game = temp.path().join("game");
+    fs::create_dir(&game).unwrap();
+    let game = game.canonicalize().unwrap();
+    fs::write(game.join("existing-mod.bin"), "keep").unwrap();
+    engine.db.conn().execute("INSERT INTO games(id,name,slug,root_path,adapter_slug,adapter_version,created_at,updated_at)
+        VALUES ('keep-game','Existing Game','fallout4',?1,'fallout4','1.0.0','old','old')", [game.to_string_lossy()]).unwrap();
+    engine
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO mods(id,source_id,source_mod_id,game_id,name,created_at)
+        VALUES ('keep-mod','fixture','mod','keep-game','Existing Mod','old')",
+            [],
+        )
+        .unwrap();
+    engine
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO installs(id,game_id,mod_id,name,status,installed_at,updated_at)
+        VALUES ('keep-install','keep-game','keep-mod','Existing Mod','enabled','old','old')",
+            [],
+        )
+        .unwrap();
+    assert!(
+        matches!(plugin_workflow::remove_installed_plugin(engine, "fallout4"),
+        Err(AppError::Conflict(message)) if message.contains("Existing Game") && message.contains("游戏库 → 对应游戏更多操作 → 选择适配包 → 移除适配包"))
+    );
+    crate::game_actions::remove_game_adapter(engine, "keep-game").unwrap();
+
+    let target = engine.paths.plugins().join("games/fallout4");
+    let receipt = plugin_workflow::remove_installed_plugin(engine, "fallout4").unwrap();
+    let removed = lifecycle_transaction(engine, "plugin_remove");
+    assert_eq!(
+        serde_json::to_value(receipt).unwrap(),
+        json!({"transactionId": removed})
+    );
+    assert!(!target.exists());
+    let FileOp::Move { dst, .. } = &engine.get_plan(&removed).unwrap().entries[0].operation else {
+        panic!("removal must park the whole package");
+    };
+    assert_eq!(
+        fs::read(dst.join("adapter.json")).unwrap(),
+        adapter.as_bytes()
+    );
+    assert!(matches!(
+        engine.rollback_transaction(&removed),
+        Err(AppError::Denied(_))
+    ));
+    assert!(matches!(
+        engine.rollback_desktop_transaction(&installed),
+        Err(AppError::Conflict(_))
+    ));
+    engine.approve_plan(&stale.plan.id).unwrap();
+    assert!(
+        matches!(engine.apply_file_ops(&stale.plan.id), Err(AppError::Conflict(message)) if message.contains("属于已移除"))
+    );
+    // Even writing back identical bytes out of band must not make an older
+    // committed deployment eligible for restart reconciliation.
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("adapter.json"), adapter).unwrap();
+    fs::write(target.join("SKILL.md"), skill).unwrap();
+    let relocated_fixture = target.with_file_name("test-out-of-band");
+    let reopened = FileEngine::new(
+        Db::open(&engine.paths.db_file()).unwrap(),
+        (*engine.paths).clone(),
+    );
+    assert!(reopened.recover_interrupted().unwrap().is_empty());
+    assert!(plugin_workflow::reconcile_deployments(&reopened)
+        .unwrap()
+        .registered
+        .is_empty());
+    assert!(plugins::list_plugins(&reopened.db).unwrap().is_empty());
+    let counts: (usize, usize, usize, usize) = reopened
+        .db
+        .conn()
+        .query_row(
+            "SELECT (SELECT count(*) FROM skills WHERE name='fallout4'),
+                (SELECT count(*) FROM mcp_servers WHERE plugin_slug='fallout4'),
+                (SELECT count(*) FROM games WHERE id='keep-game' AND adapter_slug IS NULL),
+                (SELECT count(*) FROM mods WHERE id='keep-mod' AND game_id='keep-game')",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(counts, (0, 0, 1, 1));
+    let install: String = reopened
+        .db
+        .conn()
+        .query_row(
+            "SELECT status FROM installs WHERE id='keep-install'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(install, "enabled");
+    assert_eq!(fs::read(game.join("existing-mod.bin")).unwrap(), b"keep");
+    fs::rename(target, relocated_fixture).unwrap();
+    server
+        .client
+        .install(&reopened, PLUGIN_ID, RELEASE_ID)
+        .await
+        .unwrap();
+    assert_eq!(
+        plugins::list_plugins(&reopened.db).unwrap()[0].version,
+        "1.0.0"
+    );
+    assert!(matches!(
+        reopened.rollback_desktop_transaction(&removed),
+        Err(AppError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn direct_install_refuses_a_different_version_but_keeps_manual_overwrite_workflow() {
+    let (_temp, ctx) = context();
+    let engine = &ctx.engine;
+    let server = Server::new().await;
+    let (current, skill) = files();
+    let older = current.replace("1.0.0", "0.9.0");
+    assert_ne!(older, current);
+    let older = plugin_workflow::plan_write_draft(engine, "fallout4", &older, &skill).unwrap();
+    apply(engine, &older.plan);
+    let deployed = plugin_workflow::plan_install_plugin(engine, &older.draft.id).unwrap();
+    apply(engine, &deployed.plan);
+    assert!(
+        matches!(server.client.install(engine, PLUGIN_ID, RELEASE_ID).await,
+        Err(AppError::Conflict(message)) if message.contains("0.9.0") && message.contains("先移除"))
+    );
+    assert_eq!(
+        plugins::list_plugins(&engine.db).unwrap()[0].version,
+        "0.9.0"
+    );
+    let current = plugin_workflow::plan_write_draft(engine, "fallout4", &current, &skill).unwrap();
+    apply(engine, &current.plan);
+    let overwrite = plugin_workflow::plan_install_plugin(engine, &current.draft.id).unwrap();
+    assert!(
+        overwrite.plan.requires_review && overwrite.plan.entries.iter().all(|e| e.before.is_some())
+    );
+    apply(engine, &overwrite.plan);
+    plugin_workflow::reconcile_deployments(engine).unwrap();
+    assert_eq!(
+        plugins::list_plugins(&engine.db).unwrap()[0].version,
+        "1.0.0"
+    );
+}

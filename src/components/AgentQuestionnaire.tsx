@@ -10,6 +10,7 @@ import { Separator } from "@/components/ui/separator";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigger, TraceDescription, TraceIcon, TraceLine, TraceTitle } from "@/components/ui/trace";
+import { api } from "@/lib/api";
 import type { AgentEvent } from "@/lib/types";
 import { ErrorState } from "./ui";
 
@@ -80,6 +81,11 @@ export function describeQuestionnaire(request: AgentEvent, events: AgentEvent[],
 }
 
 type Questionnaire = ReturnType<typeof describeQuestionnaire>;
+
+export function respondToQuestionnaire({ request, structured }: Questionnaire, answers: Answer[]) {
+  return api("respond_approval", { conversationId: request.conversationId, approvalId: request.payload.approvalId,
+    response: { approved: structured || answers[0] !== null, answer: structured ? JSON.stringify(answers) : answers[0] } });
+}
 
 export function QuestionnaireTrace({ questionnaire, onReanswer, disabled }: {
   questionnaire: Questionnaire;

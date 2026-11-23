@@ -16,6 +16,9 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 
+#[path = "transaction_archive.rs"]
+mod archive_ops;
+
 // Stored only by the native desktop Agent planner, never taken from tool input.
 const LOCAL_AGENT_FILES: &str = "local_agent_files";
 
@@ -74,6 +77,8 @@ pub enum FileOp {
     Move { src: PathBuf, dst: PathBuf },
     Mkdir { dst: PathBuf },
     WriteText { dst: PathBuf, content: String },
+    Compress { src: PathBuf, dst: PathBuf },
+    Extract { src: PathBuf, dst: PathBuf },
 }
 
 impl FileOp {
@@ -81,19 +86,27 @@ impl FileOp {
         match self {
             Self::Copy { dst, .. }
             | Self::Move { dst, .. }
+            | Self::Compress { dst, .. }
+            | Self::Extract { dst, .. }
             | Self::Mkdir { dst }
             | Self::WriteText { dst, .. } => dst,
         }
     }
     pub(crate) fn src(&self) -> Option<&Path> {
         match self {
-            Self::Copy { src, .. } | Self::Move { src, .. } => Some(src),
+            Self::Copy { src, .. }
+            | Self::Move { src, .. }
+            | Self::Compress { src, .. }
+            | Self::Extract { src, .. } => Some(src),
             _ => None,
         }
     }
     fn set_user_paths(&mut self) {
         let dst = match self {
-            Self::Copy { src, dst } | Self::Move { src, dst } => {
+            Self::Copy { src, dst }
+            | Self::Move { src, dst }
+            | Self::Compress { src, dst }
+            | Self::Extract { src, dst } => {
                 *src = paths::user_path(src).into_owned();
                 dst
             }
@@ -101,12 +114,20 @@ impl FileOp {
         };
         *dst = paths::user_path(dst).into_owned();
     }
+    fn is_archive(&self) -> bool {
+        matches!(self, Self::Compress { .. } | Self::Extract { .. })
+    }
+    fn local_agent_only(&self) -> bool {
+        self.is_archive() || matches!(self, Self::WriteText { .. })
+    }
     fn name(&self) -> &'static str {
         match self {
             Self::Copy { .. } => "copy",
             Self::Move { .. } => "move",
             Self::Mkdir { .. } => "mkdir",
             Self::WriteText { .. } => "write_text",
+            Self::Compress { .. } => "compress",
+            Self::Extract { .. } => "extract",
         }
     }
 }
@@ -555,10 +576,7 @@ impl FileEngine {
         let mut plan = self.build_locked_plan(&guard, ops, summary, internal)?;
         if self.local_agent_files
             && !internal
-            && (plan
-                .entries
-                .iter()
-                .any(|e| matches!(e.operation, FileOp::WriteText { .. }))
+            && (plan.entries.iter().any(|e| e.operation.local_agent_only())
                 || self.has_external_paths(&plan)?)
         {
             plan.requires_review = true;
@@ -617,12 +635,17 @@ impl FileEngine {
         let mut touched = BTreeSet::new();
         let mut destinations = BTreeSet::new();
         for op in ops {
+            if op.local_agent_only() && (!self.local_agent_files || internal) {
+                return Err(AppError::Denied(format!(
+                    "只有桌面 Agent 的通用文件计划支持 {}",
+                    op.name()
+                )));
+            }
+            if op.is_archive() {
+                archive_ops::validate_names(op.dst())?;
+                archive_ops::validate_names(op.src().expect("archive source"))?;
+            }
             let inline_source = if let FileOp::WriteText { content, .. } = &op {
-                if !self.local_agent_files || internal {
-                    return Err(AppError::Denied(
-                        "只有桌面 Agent 的通用文件计划支持 write_text".into(),
-                    ));
-                }
                 Some(Fingerprint {
                     kind: "file".into(),
                     size: content.len() as u64,
@@ -648,10 +671,18 @@ impl FileEngine {
                     .map(|p| self.guard_with_roots(p, internal, &roots))
                     .transpose()?
             };
-            let before = fingerprint(&dst)?;
+            let before = if op.is_archive() {
+                archive_ops::require_new_destination(&dst)?;
+                None
+            } else {
+                fingerprint(&dst)?
+            };
             let source = src
                 .as_ref()
                 .map(|s| {
+                    if op.is_archive() {
+                        return archive_ops::source_fingerprint(&self.paths, &op, s, &dst, true);
+                    }
                     fingerprint_checked(s, self.local_agent_files && !internal)?
                         .ok_or_else(|| AppError::NotFound(paths::display_path(s)))
                 })
@@ -702,6 +733,14 @@ impl FileEngine {
                 },
                 FileOp::Mkdir { .. } => FileOp::Mkdir { dst },
                 FileOp::WriteText { content, .. } => FileOp::WriteText { dst, content },
+                FileOp::Compress { .. } => FileOp::Compress {
+                    src: src.unwrap(),
+                    dst,
+                },
+                FileOp::Extract { .. } => FileOp::Extract {
+                    src: src.unwrap(),
+                    dst,
+                },
             };
             total_bytes = total_bytes
                 .checked_add(source.as_ref().map_or(0, |s| s.size))
@@ -721,6 +760,7 @@ impl FileEngine {
                 impact,
             });
         }
+        archive_ops::validate_plan_overlaps(&entries)?;
         // A source may not be written by a different entry in the same plan.
         for entry in &entries {
             if let Some(src) = entry.operation.src() {
@@ -815,6 +855,18 @@ impl FileEngine {
         _guard: &MutexGuard<'static, ()>,
         id: &str,
     ) -> AppResult<FilePlan> {
+        self.apply_with_authority(id, false)
+    }
+
+    pub(crate) fn apply_desktop_plugin_locked(
+        &self,
+        _guard: &MutexGuard<'static, ()>,
+        id: &str,
+    ) -> AppResult<FilePlan> {
+        self.apply_with_authority(id, true)
+    }
+
+    fn apply_with_authority(&self, id: &str, desktop_plugin: bool) -> AppResult<FilePlan> {
         let interrupted:i64=self.db.conn().query_row("SELECT count(*) FROM file_transactions WHERE status IN ('applying','rolling_back','recovery_failed')",[],|r|r.get(0))?;
         if interrupted > 0 {
             return Err(AppError::Denied(
@@ -829,12 +881,18 @@ impl FileEngine {
         if status != "approved" {
             return Err(AppError::Denied("计划尚未批准，或已执行".into()));
         }
+        if crate::plugin_workflow::is_desktop_plugin_kind(&kind) != desktop_plugin {
+            return Err(AppError::Denied("适配包事务只能由专用桌面操作提交".into()));
+        }
         self.for_transaction(&kind)?.apply_approved(id, &kind)
     }
 
     fn apply_approved(&self, id: &str, kind: &str) -> AppResult<FilePlan> {
         let plan = self.get_plan(id)?;
-        let internal = kind == "internal";
+        let internal = matches!(
+            kind,
+            "internal" | crate::plugin_workflow::PLUGIN_REMOVE_KIND
+        );
         let library_install = kind == crate::install::LIBRARY_INSTALL_KIND;
         if library_install {
             crate::install::validate_library_apply(self, &plan)?;
@@ -844,6 +902,31 @@ impl FileEngine {
         let mut evidence = Vec::with_capacity(plan.entries.len());
         for e in &plan.entries {
             self.stable_path(e.operation.dst(), internal)?;
+            if e.operation.is_archive() {
+                if !self.local_agent_files || internal || e.before.is_some() {
+                    return Err(AppError::Denied("归档操作只支持桌面 Agent 的新目标".into()));
+                }
+                archive_ops::require_new_destination(e.operation.dst())?;
+                let src = e.operation.src().expect("archive source");
+                self.stable_path(src, false)?;
+                if Some(archive_ops::source_fingerprint(
+                    &self.paths,
+                    &e.operation,
+                    src,
+                    e.operation.dst(),
+                    false,
+                )?) != e.source
+                {
+                    return Err(AppError::Conflict(
+                        "预览之后源文件已变化，请重新生成计划".into(),
+                    ));
+                }
+                evidence.push(ApplyEvidence {
+                    original: None,
+                    source: None,
+                });
+                continue;
+            }
             let original = e
                 .before
                 .as_ref()
@@ -872,6 +955,7 @@ impl FileEngine {
         self.save_journal(id, "applying", &journal)?;
         for (index, (entry, evidence)) in journal.iter_mut().zip(&evidence).enumerate() {
             let operation = &plan.entries[index].operation;
+            let mut archive_cleanup = None;
             entry.state = "intent".into();
             self.save_entry(id, index, entry)?;
             #[cfg(test)]
@@ -880,26 +964,49 @@ impl FileEngine {
                     "injected filesystem failure",
                 )))
             } else {
-                self.execute_entry(id, index, operation, entry, evidence)
+                self.execute_entry(id, index, operation, entry, evidence, &mut archive_cleanup)
             };
             #[cfg(not(test))]
-            let result = self.execute_entry(id, index, operation, entry, evidence);
+            let result =
+                self.execute_entry(id, index, operation, entry, evidence, &mut archive_cleanup);
             match result {
                 Ok(()) => {
                     entry.state = "done".into();
                     self.save_entry(id, index, entry)?;
                 }
                 Err(error) => {
-                    self.db.conn().execute(
-                        "UPDATE file_transactions SET error=?1 WHERE id=?2",
-                        params![error.to_string(), id],
-                    )?;
-                    self.rollback_locked(id, &mut journal)?;
+                    let rollback = (|| {
+                        self.db.conn().execute(
+                            "UPDATE file_transactions SET error=?1 WHERE id=?2",
+                            params![error.to_string(), id],
+                        )?;
+                        self.rollback_locked(id, &mut journal)
+                    })();
+                    // A persisted rename intent may still refer to the staged
+                    // object. Keep it if rollback could not settle the intent.
+                    if rollback.is_err() {
+                        if let Some(cleanup) = &mut archive_cleanup {
+                            cleanup.keep();
+                        }
+                    }
+                    rollback?;
                     return Err(error);
                 }
             }
         }
-        self.save_journal(id, "committed", &journal)?;
+        if let Err(error) = self.save_journal(id, "committed", &journal) {
+            if !crate::plugin_workflow::is_desktop_plugin_kind(kind) {
+                return Err(error);
+            }
+            // The desktop registry write shares the journal's SQLite commit.
+            // If it fails (e.g. an MCP ID was claimed), undo the filesystem too.
+            self.db.conn().execute(
+                "UPDATE file_transactions SET error=?1 WHERE id=?2",
+                params![error.to_string(), id],
+            )?;
+            self.rollback_locked(id, &mut journal)?;
+            return Err(error);
+        }
         Ok(plan)
     }
 
@@ -967,6 +1074,7 @@ impl FileEngine {
         op: &FileOp,
         journal: &mut JournalEntry,
         evidence: &ApplyEvidence,
+        archive_cleanup: &mut Option<safe_fs::StagingCleanup>,
     ) -> AppResult<()> {
         self.stable_path(op.dst(), true)?;
         self.stable_path(&journal.backup, true)?;
@@ -984,6 +1092,25 @@ impl FileEngine {
             }
             Ok(work.join(name))
         };
+        let archive_step = if op.is_archive() {
+            self.stable_path(op.dst(), false)?;
+            self.stable_path(op.src().expect("archive source"), false)?;
+            archive_ops::require_new_destination(op.dst())?;
+            let archive_work = staging("archive")?;
+            let cleanup;
+            let output = {
+                let work_dir = safe_fs::StagingDirectory::create(&archive_work)?;
+                cleanup = work_dir.cleanup_guard()?;
+                let output =
+                    archive_ops::stage_output(&self.paths, op, &journal.entry.source, &work_dir)?;
+                work_dir.verify_path()?;
+                output
+            }; // Drop pinned directory handles before any cleanup (notably on Windows).
+            *archive_cleanup = Some(cleanup);
+            Some(output)
+        } else {
+            None
+        };
         for (i, dir) in journal.created_dirs.clone().into_iter().enumerate().rev() {
             self.stable_path(&dir, true)?;
             // Another entry may already have created this parent. Do not claim it twice.
@@ -995,6 +1122,16 @@ impl FileEngine {
             let mut step = JournalRename::move_to(staged.clone(), dir, require_identity(&staged)?);
             step.empty_dir_only = true;
             self.record_rename(id, index, journal, step, false)?;
+        }
+        if let Some((staged, output)) = archive_step {
+            self.stable_path(op.dst(), false)?;
+            let mut step =
+                JournalRename::move_to(staged.clone(), op.dst().into(), require_identity(&staged)?)
+                    .with_content(&Some(output));
+            step.retain_at = Some(journal.undo.clone());
+            return self
+                .record_rename(id, index, journal, step, false)
+                .map(|_| ());
         }
         if let Some(identity) = &evidence.original {
             let backup = journal.backup.clone();
@@ -1057,6 +1194,7 @@ impl FileEngine {
                 output.write_all(content.as_bytes())?;
                 output.sync_all()?;
             }
+            FileOp::Compress { .. } | FileOp::Extract { .. } => unreachable!("staged above"),
         }
         let mut step =
             JournalRename::move_to(staged.clone(), op.dst().into(), require_identity(&staged)?);
@@ -1202,9 +1340,11 @@ impl FileEngine {
                 entry_count: journal.len(),
             })?
         };
-        tx.execute(
-            "UPDATE file_transactions SET status=?1,journal_json=?2,finished_at=?3 WHERE id=?4",
-            params![status, json, terminal.then(util::now), id],
+        let finished_at = terminal.then(util::now);
+        let kind: String = tx.query_row(
+            "UPDATE file_transactions SET status=?1,journal_json=?2,finished_at=?3 WHERE id=?4 RETURNING kind",
+            params![status, json, finished_at, id],
+            |row| row.get(0),
         )?;
         tx.execute(
             "DELETE FROM file_transaction_journal WHERE transaction_id=?1",
@@ -1232,7 +1372,23 @@ impl FileEngine {
                 }
             }
         }
+        let plugin_changed = if let Some(finished_at) = finished_at.as_deref() {
+            crate::plugin_workflow::finalize_desktop_transaction(
+                self,
+                &tx,
+                id,
+                &kind,
+                status,
+                finished_at,
+            )?
+        } else {
+            None
+        };
         tx.commit()?;
+        drop(conn);
+        if let Some(slug) = plugin_changed {
+            self.notify_plugin_mcp_changed(&slug);
+        }
         Ok(())
     }
 
@@ -1240,11 +1396,20 @@ impl FileEngine {
         self.rollback_transaction_locked(&lock(), id)
     }
 
+    pub(crate) fn rollback_desktop_transaction(&self, id: &str) -> AppResult<()> {
+        let _guard = lock();
+        self.rollback_with_authority(id, true)
+    }
+
     pub(crate) fn rollback_transaction_locked(
         &self,
         _guard: &MutexGuard<'static, ()>,
         id: &str,
     ) -> AppResult<()> {
+        self.rollback_with_authority(id, false)
+    }
+
+    fn rollback_with_authority(&self, id: &str, desktop: bool) -> AppResult<()> {
         let purged: bool = self.db.conn().query_row("SELECT EXISTS(SELECT 1 FROM trash_items t JOIN trash_purges p ON p.item_id=t.id WHERE t.transaction_id=?1)",[id],|r|r.get(0))?;
         if purged {
             return Err(AppError::Conflict(
@@ -1256,6 +1421,11 @@ impl FileEngine {
             [id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
+        if crate::plugin_workflow::is_desktop_plugin_kind(&kind) && !desktop {
+            return Err(AppError::Denied(
+                "适配包事务只能在桌面事务历史中回滚".into(),
+            ));
+        }
         let engine = self.for_transaction(&kind)?;
         if status == "rolled_back" {
             return Ok(());
@@ -1268,6 +1438,7 @@ impl FileEngine {
         }
         let mut journal = Self::decode_journal(&self.db.conn(), id, &json)?;
         if status == "committed" {
+            crate::plugin_workflow::validate_plugin_rollback(&engine, id, &kind)?;
             if crate::install::validate_rollback(&engine, id)? {
                 engine.validate_replacement_rollback_payloads(&journal)?;
             }
@@ -1312,9 +1483,7 @@ impl FileEngine {
                         paths::display_path(&to)
                     )));
                 }
-                if step.expected_content.is_some() {
-                    check_fingerprint(&to, &step.expected_content)?;
-                }
+                self.check_rollback_content(entry, step, &to)?;
                 // Only overwritten payload paths are subsequently reused as inverse destinations.
                 vacated.insert(&step.to);
             }
@@ -1400,12 +1569,30 @@ impl FileEngine {
                 }
                 continue;
             }
-            if step.expected_content.is_some() {
-                check_fingerprint(&to, &step.expected_content)?;
-            }
+            self.check_rollback_content(j, step, &to)?;
             safe_fs::rename_checked(&to, &return_to, &step.identity)?;
             if safe_fs::identity(&return_to)?.as_ref() != Some(&step.identity) {
                 return Err(ownership_conflict(&return_to));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_rollback_content(
+        &self,
+        journal: &JournalEntry,
+        step: &JournalRename,
+        path: &Path,
+    ) -> AppResult<()> {
+        if let Some(expected) = &step.expected_content {
+            if journal.entry.operation.is_archive() {
+                if archive_ops::output_fingerprint(&self.paths, &journal.entry.operation, path)?
+                    != *expected
+                {
+                    return Err(ownership_conflict(path));
+                }
+            } else {
+                check_fingerprint(path, &step.expected_content)?;
             }
         }
         Ok(())
@@ -1420,7 +1607,7 @@ impl FileEngine {
         };
         let mut recovered = Vec::new();
         for id in ids {
-            self.for_local_agent().rollback_transaction(&id)?;
+            self.for_local_agent().rollback_desktop_transaction(&id)?;
             recovered.push(id);
         }
         Ok(recovered)
@@ -1430,6 +1617,10 @@ impl FileEngine {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 #[path = "transaction_path_tests.rs"]
 mod path_tests;
+
+#[cfg(test)]
+#[path = "transaction_archive_tests.rs"]
+mod archive_tests;
 
 #[cfg(test)]
 #[path = "transaction_recovery_tests.rs"]
@@ -1701,6 +1892,7 @@ pub(crate) mod tests {
             &p.entries[0].operation,
             &mut journal[0],
             &evidence,
+            &mut None,
         )
         .unwrap();
         let restarted = FileEngine::new(

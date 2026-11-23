@@ -687,3 +687,69 @@ async fn precommit_conflict_and_foreign_id_can_be_corrected_with_fresh_approval(
     assert_eq!(mock.calls.lock().unwrap().len(), 3);
     server.abort();
 }
+
+#[test]
+fn historical_pixel_cover_keeps_its_original_digest_but_cannot_authorize_a_write() {
+    // Reproduce the historical v2 serde field order independently of the current listing DTO.
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct OldListing<'a> {
+        title: &'a str,
+        summary: &'a str,
+        description: &'a str,
+        tags: &'a [String],
+        cover_png: &'a str,
+    }
+    let f = Fixture::new(false);
+    let p = f.prepare(PublicationTarget::First).preview;
+    let listing = OldListing {
+        title: "Old title",
+        summary: "Summary",
+        description: "Description",
+        tags: &p.tags,
+        cover_png: "iVBORw0KGgo=",
+    };
+    let snapshot: automatic::Snapshot = serde_json::from_value(json!({
+        "sourceSha256":[p.files[0].sha256,p.files[1].sha256], "credentialBinding":"b".repeat(64), "remoteReleaseId":null
+    })).unwrap();
+    let base = (
+        &p.source,
+        p.target,
+        &p.slug,
+        &p.version,
+        &p.tags,
+        &p.files,
+        &p.destination,
+    );
+    let mut hash = Sha256::new();
+    hash.update(b"amm.manager-plugin-publication.v2\0");
+    serde_json::to_writer(
+        &mut hash,
+        &(
+            base,
+            &listing,
+            &p.version,
+            Option::<String>::None,
+            &snapshot,
+        ),
+    )
+    .unwrap();
+    let digest = hex::encode(hash.finalize());
+    let mut json = serde_json::to_value(&p).unwrap();
+    json["digest"] = json!(digest);
+    json["listing"] = serde_json::to_value(listing).unwrap();
+    json["snapshot"] = serde_json::to_value(snapshot).unwrap();
+    json["originalVersion"] = json!(p.version);
+    let legacy: PublicationPreview = serde_json::from_value(json).unwrap();
+    assert_eq!(legacy.checked_digest().unwrap(), digest);
+    let record = create(&f.engine, &legacy).unwrap();
+    assert_eq!(
+        get_publication(&f.engine, &record.id)
+            .unwrap()
+            .preview
+            .digest,
+        digest
+    );
+    let error = approve_publication(&f.engine, &record.id, &digest).unwrap_err();
+    assert!(error.to_string().contains("旧版像素封面"));
+}

@@ -53,19 +53,8 @@ impl AgentTool for SetGameAdapter {
         let conversation = conversation.clone();
         let engine = context.engine.clone();
         let binding = tokio::task::spawn_blocking(move || {
-            let current: Option<String> = engine.db.conn().query_row(
-                "SELECT game_id FROM conversations WHERE id=?1",
-                [conversation],
-                |row| row.get(0),
-            )?;
-            if let (Some(current), Some(requested)) = (&current, &args.game_id) {
-                if current != requested {
-                    return Err(AppError::Invalid("目标游戏与当前对话的游戏不一致".into()));
-                }
-            }
-            let id = current.or(args.game_id).ok_or_else(|| {
-                AppError::Invalid("请提供目标游戏的登记 ID，或在该游戏的对话中绑定适配包".into())
-            })?;
+            let selected = super::workspace::selection(&engine.db, &conversation)?;
+            let id = super::workspace::resolve(selected.as_deref(), args.game_id.as_deref())?;
             game_actions::prepare_game_adapter_binding(
                 &engine,
                 &id,

@@ -62,12 +62,12 @@ fn filename(path: &Path) -> AppResult<String> {
     crate::plugins::validate_relative_path(name, false)?;
     paths::safe_join(Path::new("filename-check"), name)?;
     let lower = name.to_ascii_lowercase();
-    if ![".jar", ".zip", ".mrpack", ".7z", ".tar.gz", ".tgz"]
+    if ![".jar", ".zip", ".mrpack", ".7z", ".rar", ".tar.gz", ".tgz"]
         .iter()
         .any(|suffix| lower.ends_with(suffix))
     {
         return Err(AppError::Unsupported(
-            "Only jar/zip/mrpack/7z/tar.gz/tgz archives can be imported".into(),
+            "Only jar/zip/mrpack/7z/rar/tar.gz/tgz archives can be imported".into(),
         ));
     }
     Ok(name.into())

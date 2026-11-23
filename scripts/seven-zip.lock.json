@@ -1,0 +1,64 @@
+{
+  "version": "26.06",
+  "bootstrap": {
+    "asset": "7zr.exe",
+    "sha256": "e80db2dad715a6c5adabe292d31ed54e11f4e9b99ca349827b50573b175891bc"
+  },
+  "source": {
+    "asset": "7z2606-src.tar.xz",
+    "sha256": "a4e374c8f864f51df48c2cfd0e1413ec3b2ea030deae852d6a655402ebb61ac4",
+    "copyingSha256": "1e7e6bae5a5bde32f1ae5a7c37a082d1ab03cf89354f7f936ac40be9e39a6531"
+  },
+  "targets": {
+    "x86_64-pc-windows-msvc": {
+      "asset": "7z2606-x64.exe",
+      "sha256": "9b697f65ecc2d9b0152f5ee96d72dde522a7827690349d9307935dacf40f42ec",
+      "files": {
+        "7z.exe": "dc0493429fe28136fcb177a0e77c9875cbb3b0bff5f2f8eeba4df302e98cef76",
+        "7z.dll": "500db9eb17f3c21b729ba41dd02ecfe1823da05028c7e4ba129084cc74cc364e",
+        "License.txt": "519ac0a4bded9c18ea02e0afb71f663d8c47373bd9facd3ac96a79f51d77765d"
+      }
+    },
+    "aarch64-pc-windows-msvc": {
+      "asset": "7z2606-arm64.exe",
+      "sha256": "036a00d478ef81f4b4b85fb37b0f934d558341f3f51aa7d36d2a26454740e625",
+      "files": {
+        "7z.exe": "07cf11646461bcd50b81ed015db18af55d9f434126a08f30b8d92c3efaaa744e",
+        "7z.dll": "61812c2d4ab562c23d1ab0f39d8e591fe5bbf3bf80318652f5bc3e4e9e0c6611",
+        "License.txt": "519ac0a4bded9c18ea02e0afb71f663d8c47373bd9facd3ac96a79f51d77765d"
+      }
+    },
+    "x86_64-apple-darwin": {
+      "asset": "7z2606-mac-x64.tar.xz",
+      "sha256": "3af68b124052da7fc2a246c96b0bea6a68bfee389baa788f4cead1a133445586",
+      "files": {
+        "7zz": "d54aa0864244abeef158772fbde3dd9bac2b93a54c564a76c4334c5a8bcaf35a",
+        "License.txt": "1790374e5352329cedb46ee3808930a88e9ca2f08b82b10fcf5cf605d2c301b1"
+      }
+    },
+    "aarch64-apple-darwin": {
+      "asset": "7z2606-mac.tar.xz",
+      "sha256": "b6f17920b4240940461dac8ef4009891881ac44d2a5ead625ede2ec8472185dd",
+      "files": {
+        "7zz": "56cf8eb2fdc6f9c0ac5d7a3cd238505814ac8ed6b88a7c64a7e3256036252c60",
+        "License.txt": "1790374e5352329cedb46ee3808930a88e9ca2f08b82b10fcf5cf605d2c301b1"
+      }
+    },
+    "x86_64-unknown-linux-gnu": {
+      "asset": "7z2606-linux-x64.tar.xz",
+      "sha256": "2b539cf067b2ad48e1baa5093dbaa8818b73542d1222a0ffde9dc5f2922ea62e",
+      "files": {
+        "7zz": "0b58a64e71ebdf53751cd954cad1cc552c6a11ef51336bee6acafbdc54c28c1f",
+        "License.txt": "1790374e5352329cedb46ee3808930a88e9ca2f08b82b10fcf5cf605d2c301b1"
+      }
+    },
+    "aarch64-unknown-linux-gnu": {
+      "asset": "7z2606-linux-arm64.tar.xz",
+      "sha256": "edcc408aacce77da5223728f2eceb5e9f6dc713b8a9df934ad21e2a7f7560627",
+      "files": {
+        "7zz": "265e45b5847392c0cd97a84acb6b3f9933c3e43d698fb5a2979f5e9a80c05758",
+        "License.txt": "1790374e5352329cedb46ee3808930a88e9ca2f08b82b10fcf5cf605d2c301b1"
+      }
+    }
+  }
+}

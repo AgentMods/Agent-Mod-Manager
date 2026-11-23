@@ -24,8 +24,11 @@ pub enum Target {
 
 const ARTIFACT_ID: &str = "COALESCE(json_extract(metadata_json,'$.libraryEntryId'),json_extract(metadata_json,'$.downloadOrigin.artifactId'))";
 
-pub(crate) fn inactive(status: &str) -> bool {
-    matches!(status, "uninstalled" | "rolled_back" | "purged")
+fn inactive(status: &str) -> bool {
+    matches!(
+        status,
+        "uninstalled" | "rolled_back" | "purged" | "removed_missing"
+    )
 }
 
 // After a journal restore, the active install and its original archive belong
@@ -121,12 +124,83 @@ fn discard_preview(conn: &Connection, game: &str, id: &str) -> AppResult<()> {
     hide(conn, game, "install", id)
 }
 
+fn require_missing_files(engine: &FileEngine, game: &str, id: &str) -> AppResult<()> {
+    let report = install::inspect_install(engine, id)?;
+    if report.game_id != game
+        || report.reconciliation.recommended_action != install::FORGET_MISSING_FILES
+    {
+        return Err(AppError::Conflict(format!(
+            "不能仅删除这条安装记录：{}",
+            report.reconciliation.reasons.join("；")
+        )));
+    }
+    Ok(())
+}
+
+/// Return the name and exact state that a scoped Agent removal approval covers.
+pub(crate) fn preview_record_removal(
+    engine: &FileEngine,
+    game: &str,
+    id: &str,
+) -> AppResult<(String, String)> {
+    let (name, status): (String, String) = engine
+        .db
+        .conn()
+        .query_row(
+            &format!(
+                "SELECT name,{} FROM installs WHERE game_id=?1 AND id=?2",
+                install::effective_install_state()
+            ),
+            params![game, id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::NotFound("此游戏没有这条安装记录".into()))?;
+    if status == "enabled" {
+        require_missing_files(engine, game, id)?;
+    } else if !inactive(&status) {
+        return Err(AppError::Conflict(
+            "请先完成卸载或回滚，再从管理列表删除".into(),
+        ));
+    }
+    Ok((name, status))
+}
+
 pub fn remove(engine: &FileEngine, game_id: &str, target: &Target) -> AppResult<()> {
+    remove_inner(engine, game_id, target, None)
+}
+
+pub(crate) fn remove_reviewed_record(
+    engine: &FileEngine,
+    game: &str,
+    id: &str,
+    reviewed_status: &str,
+) -> AppResult<()> {
+    remove_inner(
+        engine,
+        game,
+        &Target::Record(id.into()),
+        Some(reviewed_status),
+    )
+}
+
+fn remove_inner(
+    engine: &FileEngine,
+    game_id: &str,
+    target: &Target,
+    reviewed_status: Option<&str>,
+) -> AppResult<()> {
     let _files = transaction::write_lock();
+    // Recheck the live manifest under the writer lock, before taking the database
+    // connection (inspection uses it too). A stale inactive approval is never
+    // upgraded to permission to relinquish an active install's ownership.
+    if let (Target::Record(id), Some("enabled")) = (target, reviewed_status) {
+        require_missing_files(engine, game_id, id)?;
+    }
     let mut conn = engine.db.conn();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let game = games::get_game_from(&tx, game_id)?;
-    let state = format!("CASE WHEN EXISTS(SELECT 1 FROM install_transactions a WHERE a.install_id=installs.id) THEN ({}) ELSE status END", install::INSTALL_STATE);
+    let state = install::effective_install_state();
     let artifact = match target {
         Target::Plan(id) => {
             discard_preview(&tx, game_id, id)?;
@@ -143,7 +217,18 @@ pub fn remove(engine: &FileEngine, game_id: &str, target: &Target) -> AppResult<
                 )
                 .optional()?
                 .ok_or_else(|| AppError::NotFound("此游戏没有这条安装记录".into()))?;
-            if !inactive(&status) {
+            if reviewed_status.is_some_and(|reviewed| reviewed != status) {
+                return Err(AppError::Conflict(
+                    "安装状态与批准时不符，请重新核对".into(),
+                ));
+            }
+            if reviewed_status == Some("enabled") {
+                tx.execute(
+                    "INSERT INTO install_missing_removals(install_id,removed_at) VALUES (?1,?2)",
+                    params![id, util::now()],
+                )?;
+                install::reconcile_from(&tx)?;
+            } else if !inactive(&status) {
                 return Err(AppError::Conflict(
                     "请先完成卸载或回滚，再从管理列表删除".into(),
                 ));
@@ -178,15 +263,19 @@ pub fn remove(engine: &FileEngine, game_id: &str, target: &Target) -> AppResult<
             let busy = related
                 .iter()
                 .any(|(_, state, hidden)| !(inactive(state) || *hidden && state == "planned"));
-            if !busy {
+            if matches!(target, Target::Archive(_)) {
+                if busy {
+                    return Err(AppError::Conflict(
+                        "此归档仍有关联安装或待处理计划，请先卸载或取消计划".into(),
+                    ));
+                }
                 for (id, _, _) in related {
                     hide(&tx, game_id, "install", &id)?;
                 }
                 hide(&tx, game_id, "archive", &artifact)?;
-            } else if matches!(target, Target::Archive(_)) {
-                return Err(AppError::Conflict(
-                    "此归档仍有关联安装或待处理计划，请先卸载或取消计划".into(),
-                ));
+            } else if !busy && related.iter().all(|(_, _, hidden)| *hidden) {
+                // Record removal must leave the archive available to other visible histories.
+                hide(&tx, game_id, "archive", &artifact)?;
             }
         } else if matches!(target, Target::Archive(_)) {
             return Err(AppError::NotFound("此游戏没有该归档".into()));

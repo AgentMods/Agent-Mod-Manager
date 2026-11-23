@@ -1,12 +1,16 @@
 import { createElement } from "react";
 import { toast } from "sonner";
 import { create } from "zustand";
-import type { FilePlan, PageName } from "./types";
+import type { FilePlan, GameWorkspace, PageName, PermissionMode } from "./types";
 
 interface UIState {
   view: PageName;
+  composerPermission: PermissionMode | "" | undefined;
+  setComposerPermission: (value: PermissionMode | "") => void;
   gameId: string | null;
   conversationId: string | null;
+  draftWorkspace: GameWorkspace;
+  setDraftWorkspace: (workspace: GameWorkspace) => void;
   adapterChat: { label: string; prompt: string; gameId: string | null } | null;
   theme: "light" | "dark";
   planReview: { plan: FilePlan; onApplied?: () => void } | null;
@@ -46,6 +50,10 @@ const adapterResearchPrompt = "请先使用已有的 Mod 平台 MCP，查找并�
 
 export const useUI = create<UIState>((set) => ({
   view: pendingOnboardingMigration() ? "onboarding" : "agent", gameId: null, conversationId: null, adapterChat: null, theme: initialTheme(), planReview: null,
+  draftWorkspace: null,
+  setDraftWorkspace: (draftWorkspace) => set({draftWorkspace}),
+  composerPermission: undefined,
+  setComposerPermission: (composerPermission) => set({composerPermission}),
   navigate: (view) => set({view}),
   selectGame: (gameId) => set({gameId, view: "detail"}),
   openConversation: (conversationId, fromGameId) => set(state => {
@@ -55,6 +63,7 @@ export const useUI = create<UIState>((set) => ({
   }),
   startAdapterChat: (target) => set({
     conversationId: null,
+    draftWorkspace: target?.gameId ? [target.gameId] : null,
     view: "agent",
     adapterChat: {
       label: target?.name ?? "创建适配包",
@@ -67,7 +76,7 @@ export const useUI = create<UIState>((set) => ({
     },
   }),
   setConversation: (conversationId, keepAdapterChat = false) => set((state) => ({
-    conversationId, adapterChat: keepAdapterChat ? state.adapterChat : null,
+    conversationId, ...(conversationId === null && {draftWorkspace: null}), adapterChat: keepAdapterChat ? state.adapterChat : null,
   })),
   toggleTheme: () => set((state) => {
     const theme = state.theme === "light" ? "dark" : "light";

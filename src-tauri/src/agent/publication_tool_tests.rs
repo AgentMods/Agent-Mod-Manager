@@ -56,11 +56,16 @@ impl Remote for FixtureRemote {
 fn generated_listing() -> PublicationListing {
     let (slug, adapter, skill) = plugins::test_fixtures::PACKAGES[0];
     let package = plugins::parse_package(slug, adapter, skill).unwrap();
-    crate::publication_copy::listing_from_reply(
+    let listing = crate::publication_copy::listing_from_reply(
         &package,
-        r#"{"title":"适配包发布测试","summary":"自动生成的测试摘要","description":"用于验证自动发布预览。","tags":["适配测试"],"design":{"palette":"grove","icon":"sprout"}}"#,
+        r#"{"title":"适配包发布测试","summary":"自动生成的测试摘要","description":"用于验证自动发布预览。","tags":["适配测试"]}"#,
     )
-    .unwrap()
+    .unwrap();
+    assert_eq!(listing.tags.first(), Some(&package.adapter.name));
+    assert_eq!(&listing.tags[1..], &[String::from("适配测试")]);
+    assert_eq!(listing.cover_url, package.adapter.cover_url);
+    assert!(listing.cover_png.is_empty());
+    listing
 }
 
 type Fixture = (
@@ -132,6 +137,7 @@ async fn preparation_returns_generated_files_and_listing_without_publication_con
         serde_json::from_value(prepared.preview.clone()).unwrap();
     let listing = generated_listing();
     assert_eq!(record.preview.listing.as_ref(), Some(&listing));
+    assert_eq!(record.preview.tags, listing.tags);
     assert_eq!(
         record.preview.target,
         manager_publication::PublicationTarget::First
@@ -149,8 +155,12 @@ async fn preparation_returns_generated_files_and_listing_without_publication_con
     assert!(record.preview.files[0].text.contains(&listing.title));
     assert!(record.preview.files[1]
         .text
-        .contains("amm-publication-display:v1"));
+        .contains("amm-publication-display:v2"));
     assert!(record.preview.files[1].text.contains(&listing.summary));
+    assert_eq!(
+        crate::publication_copy::read_display(&record.preview.files[1].text).as_deref(),
+        Some(listing.description.as_str())
+    );
     assert_eq!(record.preview.digest.len(), 64);
     assert!(record.approved_digest.is_none());
     assert!(record.remote.is_none());
@@ -189,7 +199,11 @@ async fn installed_source_automatically_matches_the_owned_plugin() {
     assert_eq!(prepared.preview["preview"]["slug"], slug);
     assert_eq!(
         prepared.preview["preview"]["listing"]["tags"],
-        json!(["适配测试"])
+        json!(["Minecraft Java Edition", "适配测试"])
+    );
+    assert_eq!(
+        prepared.preview["preview"]["tags"],
+        prepared.preview["preview"]["listing"]["tags"]
     );
     assert_eq!(remote.calls.lock().unwrap().len(), 1);
 }

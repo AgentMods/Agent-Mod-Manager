@@ -220,6 +220,46 @@ fn download_target_uses_registered_chat_game_and_rejects_conflicting_selection()
 }
 
 #[test]
+fn workspace_downloads_require_an_explicit_member_of_multi_and_never_assume_empty_is_all() {
+    let (dir, engine, _) = setup();
+    engine.db.conn().execute(
+        "INSERT INTO games(id,name,slug,root_path,created_at,updated_at) VALUES('other','Other','other',?1,'now','now')",
+        [dir.path().join("second").to_str().unwrap()],
+    ).unwrap();
+    let history = History::new(engine.db.clone());
+    let chat = history.create_conversation("download", None).unwrap();
+    let ctx = crate::agent::tools::ToolContext {
+        engine,
+        cancel: CancellationToken::new(),
+        progress: None,
+        resolution_scope: ResolutionScope::Agent(chat.id.clone()),
+    };
+    let by_name = || ClassificationInput {
+        game_name: Some("Unregistered".into()),
+        ..Default::default()
+    };
+    let by_id = |id: &str| ClassificationInput {
+        game_id: Some(id.into()),
+        ..Default::default()
+    };
+    assert!(by_name().for_agent(&ctx).is_ok()); // Legacy dynamic-all conversations.
+    history
+        .set_conversation_workspace(&chat.id, Some(&["g".into(), "other".into()]))
+        .unwrap();
+    assert!(ClassificationInput::default().for_agent(&ctx).is_err());
+    assert!(by_name().for_agent(&ctx).is_err());
+    assert_eq!(
+        by_id("other").for_agent(&ctx).unwrap().game_id.as_deref(),
+        Some("other")
+    );
+    history
+        .set_conversation_workspace(&chat.id, Some(&[]))
+        .unwrap();
+    assert!(by_id("g").for_agent(&ctx).is_err());
+    assert!(by_name().for_agent(&ctx).is_err());
+}
+
+#[test]
 fn metadata_that_resolves_to_a_transport_url_is_not_a_project_page() {
     for (project, transfer) in [
         (

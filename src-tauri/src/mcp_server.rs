@@ -750,6 +750,9 @@ impl DesktopSession {
             ));
         }
         let tool = runtime.registry.get(name)?;
+        // Only the host global setting authorizes inbound tools.
+        let mode: PermissionMode =
+            serde_json::from_value(json!(runtime.settings.load()?.permission_mode))?;
         let turn = util::new_id("mcp_turn");
         let call = ToolCall {
             id: util::new_id("mcp_call"),
@@ -775,7 +778,7 @@ impl DesktopSession {
             &conv,
             Some(&message.id),
             "turn-start",
-            json!({"origin":"mcp"}),
+            json!({"origin":"mcp","permissionMode":mode}),
         )?;
         runtime.events.emit(
             &turn,
@@ -814,7 +817,6 @@ impl DesktopSession {
             if prepared.effect == Effect::Forbidden {
                 return Err(AppError::Denied("Forbidden tools cannot run".into()));
             }
-            let mode: PermissionMode = serde_json::from_value(json!(runtime.settings.load()?.permission_mode))?;
             let response = if mode.needs_approval(prepared.effect) {
                 let preview = self.shared.secret.value(prepared.preview.clone())?;
                 runtime.engine.db.conn().execute("UPDATE tool_calls SET approval_status='pending' WHERE id=?1", [&call.id])?;
@@ -822,7 +824,15 @@ impl DesktopSession {
                 let response = runtime.approvals.request(&turn, &conv, &message.id, &call.id, name, preview, cancel).await?;
                 approval_status = if response.approved { "approved" } else { "rejected" };
                 Some(response)
-            } else { None };
+            } else {
+                // Keep the displayed snapshot authoritative, but never commit
+                // using automatic consent revoked while prepare was running.
+                let current: PermissionMode = serde_json::from_value(json!(runtime.settings.load()?.permission_mode))?;
+                if current.needs_approval(prepared.effect) {
+                    return Err(AppError::Denied("全局权限已收紧，请按新设置重试工具以请求审批".into()));
+                }
+                None
+            };
             if cancel.is_cancelled() { return Err(AppError::Cancelled); }
             if prepared.effect == Effect::AskUser {
                 return Ok(json!({"answer":response.map(|r|r.answer)}));

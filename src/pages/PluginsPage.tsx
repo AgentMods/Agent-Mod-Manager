@@ -4,6 +4,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2Icon, FileCode2Icon, PackageIcon, PlusIcon, RefreshCwIcon, SearchIcon, ShieldCheckIcon, SparklesIcon, Trash2Icon, UploadIcon } from 'lucide-react';
 import { api, backendAvailable, useBackendQuery } from '@/lib/api';
 import { useUI } from '@/lib/store';
+import { usePluginChange } from '@/lib/plugin-change';
 import type { FilePlan, Plugin } from '@/lib/types';
 import { Badge, date, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, PathText } from '@/components/ui';
 import { GameCover } from '@/components/GameCover';
@@ -24,9 +25,13 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { stagger } from "@/lib/motion";
 
-type Draft = { id: string; slug: string; path: string; writeTransactionId: string; createdAt: string };
+type Draft = { id: string; slug: string; path: string; writeTransactionId: string; createdAt: string; updatedAt: string | null };
 type Validation = { draft: Draft; transactionStatus: string; valid: boolean; package: { adapter: { name: string; version: string; platforms: string[]; mcpServers?: { id: string; name: string }[]; modTypes: { id: string; name: string }[] }; skill: { description: string } } | null; hashes: { adapterSha256: string; skillSha256: string } | null; issues: { code: string; message: string }[]; warnings: string[] };
-const pluginSourceLabel = (source: string) => source === 'external' ? '本地导入' : '已安装';
+type CatalogSlugIndex = { games: { plugins: Pick<Plugin, 'slug'>[] }[] };
+
+function UpdatedTime({ value }: { value: string | null }) {
+  return value ? <time dateTime={value}>{date(value)}</time> : '—';
+}
 
 export default function PluginsPage() {
   const client = useQueryClient();
@@ -37,6 +42,14 @@ export default function PluginsPage() {
   const reviewPlan = useUI(s => s.reviewPlan);
   const startAdapterChat = useUI(s => s.startAdapterChat);
   const [tab, setTab] = useState('installed');
+  // Reuse the public catalog tab's unfiltered cache. Only match slugs locally;
+  // a catalog outage or first load must not block the installed packages.
+  const catalog = useBackendQuery<CatalogSlugIndex>(['manager-plugin-games'], 'list_manager_plugin_games', {}, tab === 'installed' && !!plugins.data?.length);
+  const catalogSlugs = new Set(catalog.data?.games.flatMap(game => game.plugins.map(plugin => plugin.slug)));
+  function pluginSourceLabel(plugin: Plugin) {
+    if (plugin.hasCloudEvidence || catalogSlugs.has(plugin.slug)) return '云端插件';
+    return plugin.source === 'external' ? '本地导入' : '已安装';
+  }
   const [search, setSearch] = useState('');
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
   const [skillSlug, setSkillSlug] = useState<string | null>(null);
@@ -47,13 +60,16 @@ export default function PluginsPage() {
   const [deleteTarget, setDeleteTarget] = useState<Draft | null>(null);
   const deleteButton = useRef<HTMLButtonElement>(null);
   const draftsTab = useRef<HTMLButtonElement>(null);
+  const installedSearch = useRef<HTMLInputElement>(null);
   const [deleteError, setDeleteError] = useState<unknown>(null);
   const notify = useUI(s => s.notify);
   const [slug, setSlug] = useState('');
   const [adapterJson, setAdapterJson] = useState('');
   const [skillMarkdown, setSkillMarkdown] = useState('');
   const [validation, setValidation] = useState<Validation | null>(null);
-  const [busy, setBusy] = useState(false);
+  const change = usePluginChange();
+  const [localBusy, setBusy] = useState(false);
+  const busy = localBusy || !!change.pending;
   const [error, setError] = useState<unknown>(null);
   const selected = plugins.data?.find(plugin => plugin.slug === selectedSlug);
   const filtered = (plugins.data ?? []).filter(plugin => `${plugin.name} ${plugin.gameName} ${plugin.slug}`.toLowerCase().includes(search.toLowerCase()));
@@ -117,7 +133,7 @@ export default function PluginsPage() {
   const plural = (n: number) => `${n}`;
   return <Page data-testid="plugins-page">
     <PageHeader title="适配包" subtitle={backendAvailable ? `${plugins.data?.length ?? 0} 个已安装适配包` : '桌面能力未连接'} actions={<>
-      <IconButton title="刷新适配包" variant="outline" size="icon" disabled={!backendAvailable || busy} onClick={() => { void plugins.refetch(); void drafts.refetch(); }}><RefreshCwIcon /></IconButton>
+      <IconButton title="刷新适配包" variant="outline" size="icon" disabled={!backendAvailable || busy} onClick={() => { void plugins.refetch(); void drafts.refetch(); if (tab === 'installed') void catalog.refetch(); }}><RefreshCwIcon /></IconButton>
       <Button disabled={!writable || busy} onClick={() => startAdapterChat()}><SparklesIcon data-icon="inline-start" />用 Agent 创建</Button>
       <Button variant="outline" disabled={!writable || busy} onClick={() => { setDraftOpen(true); setError(null); }}><PlusIcon data-icon="inline-start" />新建草稿</Button>
     </>} />
@@ -132,12 +148,13 @@ export default function PluginsPage() {
     </Tabs>
     <ErrorState error={plugins.error} /><ErrorState error={drafts.error} /><ErrorState error={error} />
     {tab === 'installed' && <>
-      <InputGroup className="max-w-sm"><InputGroupAddon><SearchIcon /></InputGroupAddon><InputGroupInput placeholder="搜索适配包…" aria-label="搜索适配包" value={search} onChange={e => setSearch(e.target.value)} /></InputGroup>
+      <ErrorState error={change.error} />
+      <InputGroup className="max-w-sm"><InputGroupAddon><SearchIcon /></InputGroupAddon><InputGroupInput ref={installedSearch} placeholder="搜索适配包…" aria-label="搜索适配包" value={search} onChange={e => setSearch(e.target.value)} /></InputGroup>
       <div className="grid min-w-0 gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
         <section className="min-w-0">
           <div className="rounded-lg border">
             <Table>
-              <TableHeader><TableRow><TableHead>适配包</TableHead><TableHead>版本</TableHead><TableHead>来源</TableHead><TableHead>验证</TableHead><TableHead>状态</TableHead></TableRow></TableHeader>
+              <TableHeader><TableRow><TableHead>适配包</TableHead><TableHead>版本</TableHead><TableHead>更新时间</TableHead><TableHead>来源</TableHead><TableHead>验证</TableHead><TableHead>状态</TableHead><TableHead className="sticky right-0 bg-background text-right">操作</TableHead></TableRow></TableHeader>
               <TableBody>{filtered.map((plugin, index) => <TableRow key={plugin.slug} data-state={selectedSlug === plugin.slug ? 'selected' : undefined} className="cursor-pointer motion-safe:animate-soft-fade" style={stagger(index, 30)} onClick={() => setSelectedSlug(plugin.slug)}>
                 <TableCell>
                   <button type="button" className="flex items-center gap-3 rounded-md text-left outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" onClick={() => setSelectedSlug(plugin.slug)}>
@@ -146,13 +163,25 @@ export default function PluginsPage() {
                   </button>
                 </TableCell>
                 <TableCell>{plugin.version}</TableCell>
-                <TableCell>{pluginSourceLabel(plugin.source)}</TableCell>
-                <TableCell><Badge tone={plugin.validated ? 'success' : 'warning'}>{plugin.validated ? '已验证' : '未验证'}</Badge></TableCell>
-                <TableCell><Badge tone={plugin.enabled && plugin.validated ? 'success' : 'neutral'}>{plugin.enabled ? '已启用' : '已停用'}</Badge></TableCell>
+                <TableCell><UpdatedTime value={plugin.updatedAt} /></TableCell>
+                <TableCell>{pluginSourceLabel(plugin)}</TableCell>
+                <TableCell><Badge className="whitespace-nowrap" tone={plugin.validated ? 'success' : 'warning'}>{plugin.validated ? '已验证' : '未验证'}</Badge></TableCell>
+                <TableCell><Badge className="whitespace-nowrap" tone={plugin.enabled && plugin.validated ? 'success' : 'neutral'}>{plugin.enabled ? '已启用' : '已停用'}</Badge></TableCell>
+                <TableCell className="sticky right-0 bg-background text-right">
+                  <Button size="sm" variant="ghost" aria-label={`移除 ${plugin.name}`} disabled={!writable || busy || plugin.source !== 'external'} onClick={event => {
+                    event.stopPropagation();
+                    change.run({ action: 'remove', slug: plugin.slug, name: plugin.name }, () => {
+                      setSelectedSlug(current => current === plugin.slug ? null : current);
+                      if (document.activeElement === document.body) installedSearch.current?.focus();
+                    });
+                  }}>
+                    {change.pending?.action === 'remove' && change.pending.slug === plugin.slug ? <><Spinner data-icon="inline-start" />移除中…</> : <><Trash2Icon data-icon="inline-start" />移除</>}
+                  </Button>
+                </TableCell>
               </TableRow>)}</TableBody>
             </Table>
           </div>
-          {!filtered.length && <div className="mt-4"><EmptyState title={plugins.isLoading ? '正在读取适配包…' : search ? '没有匹配的适配包' : '暂无已安装适配包'} /></div>}
+          {!filtered.length && <div className="mt-4"><EmptyState title={plugins.isLoading ? '正在读取适配包…' : search ? '没有匹配的适配包' : '暂无已安装适配包'} action={backendAvailable && plugins.isSuccess && !search && <Button size="sm" variant="outline" onClick={() => setTab('catalog')}>浏览云端插件</Button>} /></div>}
         </section>
         <aside className="min-w-0">
           <Card>
@@ -164,7 +193,8 @@ export default function PluginsPage() {
                   <dt className="text-muted-foreground">标识</dt><dd className="break-all">{selected.slug}</dd>
                   <dt className="text-muted-foreground">游戏</dt><dd>{selected.gameName}</dd>
                   <dt className="text-muted-foreground">版本</dt><dd>{selected.version}</dd>
-                  <dt className="text-muted-foreground">来源</dt><dd>{pluginSourceLabel(selected.source)}</dd>
+                  <dt className="text-muted-foreground">更新时间</dt><dd><UpdatedTime value={selected.updatedAt} /></dd>
+                  <dt className="text-muted-foreground">来源</dt><dd>{pluginSourceLabel(selected)}</dd>
                   <dt className="text-muted-foreground">安装目录</dt><dd><PathText>{displayPath(selected.installPath)}</PathText></dd>
                 </dl>
                 <Label className="font-normal">
@@ -192,10 +222,11 @@ export default function PluginsPage() {
     {tab === 'drafts' && <>
       {!!drafts.data?.length && <div className="rounded-lg border">
         <Table>
-          <TableHeader><TableRow><TableHead>草稿</TableHead><TableHead>创建时间</TableHead><TableHead>事务</TableHead><TableHead className="text-right">操作</TableHead></TableRow></TableHeader>
+          <TableHeader><TableRow><TableHead>草稿</TableHead><TableHead>创建时间</TableHead><TableHead>更新时间</TableHead><TableHead>事务</TableHead><TableHead className="text-right">操作</TableHead></TableRow></TableHeader>
           <TableBody>{drafts.data.map(draft => <TableRow key={draft.id}>
             <TableCell className="whitespace-normal"><strong className="font-medium">{draft.slug}</strong><PathText className="block">{displayPath(draft.path)}</PathText></TableCell>
             <TableCell>{date(draft.createdAt)}</TableCell>
+            <TableCell><UpdatedTime value={draft.updatedAt} /></TableCell>
             <TableCell><PathText>{draft.writeTransactionId}</PathText></TableCell>
             <TableCell><div className="flex flex-wrap justify-end gap-2 xl:flex-nowrap">
               <Button variant="outline" size="sm" disabled={!backendAvailable || busy} onClick={() => { void validate(draft); }}><ShieldCheckIcon data-icon="inline-start" />验证</Button>

@@ -153,6 +153,7 @@ struct MockWrite {
     started: Arc<Notify>,
     barrier: Option<Arc<(StdMutex<bool>, Condvar)>>,
     echo: Option<String>,
+    prepare_gate: Option<(Arc<Notify>, Arc<Notify>)>,
 }
 
 #[async_trait::async_trait]
@@ -166,6 +167,10 @@ impl AgentTool for MockWrite {
         }
     }
     async fn prepare(&self, _: &ToolContext, args: &Value) -> AppResult<PreparedTool> {
+        if let Some((entered, release)) = &self.prepare_gate {
+            entered.notify_one();
+            release.notified().await;
+        }
         Ok(PreparedTool {
             preview: json!({"mockPlan":args}),
             effect: self.effect,
@@ -213,6 +218,7 @@ fn register_write(
             started: started.clone(),
             barrier,
             echo,
+            prepare_gate: None,
         }))
         .unwrap();
     (count, started)
@@ -357,6 +363,7 @@ async fn tools_are_allowlisted_and_real_reads_reuse_desktop_file_guards() {
                 started: Arc::new(Notify::new()),
                 barrier: None,
                 echo: None,
+                prepare_gate: None,
             }))
             .unwrap();
     }
@@ -1056,6 +1063,14 @@ async fn direct_tools_wait_for_shared_desktop_approval_and_persist_same_events()
     });
     let approval = next_event(&mut fixture.events, "approval-request").await;
     assert_eq!(approval.conversation_id, conv);
+    let recorded = call(&client, "amm_events", json!({"after":0,"limit":100}))
+        .await
+        .structured_content
+        .unwrap();
+    let events = recorded["events"].as_array().unwrap();
+    let start = events.iter().find(|e| e["kind"] == "turn-start").unwrap();
+    assert_eq!(start["payload"]["permissionMode"], "request_approval");
+    assert!(!events.iter().any(|e| e["kind"] == "permission-decision"));
     assert_eq!(count.load(Ordering::SeqCst), 0);
     assert!(!job.is_finished());
     assert_eq!(
@@ -1125,6 +1140,93 @@ async fn global_auto_and_full_trust_match_policy_but_forbidden_never_executes() 
         let result = call(&client, "apply_file_ops", json!({})).await;
         assert_eq!(count.load(Ordering::SeqCst), expected);
         assert_eq!(result.is_error, Some(expected == 0));
+        client.cancel().await.unwrap();
+        server.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn prepare_policy_changes_preserve_snapshot_without_stale_automatic_consent() {
+    for (initial, updated, needs_review) in [
+        ("full_trust", "request_approval", false),
+        ("request_approval", "full_trust", true),
+    ] {
+        let mut fixture = fixture();
+        set_mode(&fixture.runtime, initial);
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        fixture
+            .runtime
+            .registry
+            .register(Arc::new(MockWrite {
+                name: "apply_file_ops",
+                effect: Effect::ManagerWrite,
+                executions: count.clone(),
+                started: Arc::new(Notify::new()),
+                barrier: None,
+                echo: None,
+                prepare_gate: Some((entered.clone(), release.clone())),
+            }))
+            .unwrap();
+        let server = LocalMcpServer::new(fixture.runtime.clone());
+        server.start().await.unwrap();
+        let client = connect(&server, &fixture.runtime).await;
+        let peer = client.peer().clone();
+        let job = tokio::spawn(async move {
+            peer.call_tool(
+                CallToolRequestParams::new("apply_file_ops").with_arguments(serde_json::Map::new()),
+            )
+            .await
+            .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        set_mode(&fixture.runtime, updated);
+        release.notify_one();
+        if needs_review {
+            let approval = next_event(&mut fixture.events, "approval-request").await;
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert!(!job.is_finished());
+            fixture
+                .runtime
+                .respond_approval(
+                    &approval.conversation_id,
+                    approval.payload["approvalId"].as_str().unwrap(),
+                    ApprovalResponse {
+                        approved: true,
+                        answer: Value::Null,
+                    },
+                )
+                .unwrap();
+        }
+        let result = tokio::time::timeout(Duration::from_secs(5), job)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.is_error, Some(!needs_review));
+        assert_eq!(count.load(Ordering::SeqCst), usize::from(needs_review));
+        if !needs_review {
+            assert!(
+                result.structured_content.as_ref().unwrap()["result"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("按新设置重试")
+            );
+        }
+        let recorded = call(&client, "amm_events", json!({"after":0,"limit":100}))
+            .await
+            .structured_content
+            .unwrap();
+        let events = recorded["events"].as_array().unwrap();
+        let start = events.iter().find(|e| e["kind"] == "turn-start").unwrap();
+        assert_eq!(start["payload"]["permissionMode"], initial);
+        assert_eq!(
+            events.iter().any(|e| e["kind"] == "approval-request"),
+            needs_review
+        );
+        assert!(!events.iter().any(|e| e["kind"] == "permission-decision"));
         client.cancel().await.unwrap();
         server.stop().await.unwrap();
     }

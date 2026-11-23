@@ -48,7 +48,12 @@ impl Fixture {
         }
     }
     fn agent(&self) -> ToolContext {
-        self.context(ResolutionScope::Agent("local-chat".into()))
+        self.context(ResolutionScope::Agent(
+            crate::history::History::new(self.engine.db.clone())
+                .create_conversation("Local files", None)
+                .unwrap()
+                .id,
+        ))
     }
     fn restricted(&self) -> [ToolContext; 2] {
         [
@@ -149,6 +154,31 @@ async fn agent_can_inspect_game_parent_and_sibling_files_without_registering_the
             assert!(f.call(&ctx, name, json!({"path":path})).await.is_err());
         }
     }
+}
+
+#[tokio::test]
+async fn extract_preview_accepts_rar5_in_downloads_incoming() {
+    let fixture = Fixture::new();
+    let incoming = fixture.engine.paths.downloads().join("incoming");
+    fs::create_dir_all(&incoming).unwrap();
+    let archive = incoming.join("sample.rar");
+    fs::write(
+        &archive,
+        include_bytes!("../../tests/fixtures/archive-rar/rar5-mixed.rar"),
+    )
+    .unwrap();
+    let listing = fixture
+        .call(
+            &fixture.agent(),
+            "extract_preview",
+            json!({"path": archive}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listing["format"], "rar");
+    assert_eq!(listing["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(listing["total_size"], 307);
+    assert_eq!(fs::read_dir(incoming).unwrap().count(), 1);
 }
 
 #[tokio::test]
@@ -649,4 +679,52 @@ async fn local_file_access_still_protects_env_and_manager_credentials() {
         )
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn archive_file_ops_are_reviewed_in_registered_roots_and_unavailable_to_inbound_mcp() {
+    let f = Fixture::new();
+    let tool = f.registry.get("plan_file_ops").unwrap();
+    let local = tool.definition();
+    let inbound = tool.inbound_definition();
+    for new_op in ["compress", "extract"] {
+        let allowed = |definition: &super::tools::ToolDefinition| {
+            definition.parameters["properties"]["operations"]["items"]["properties"]["op"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == new_op)
+        };
+        assert!(allowed(&local));
+        assert!(!allowed(&inbound));
+    }
+
+    let src = f.game.join("folder");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("readme.txt"), "test payload").unwrap();
+    let archive = f.game.join("result.zip");
+    let dst = f.game.join("unpacked");
+    let agent = f.agent();
+    for (op, src, dst) in [("compress", &src, &archive), ("extract", &archive, &dst)] {
+        let operations = json!([{"op":op,"src":src,"dst":dst}]);
+        for ctx in f.restricted() {
+            assert!(f.plan(&ctx, operations.clone()).await.is_err());
+        }
+        let id = f.plan(&agent, operations).await.unwrap();
+        assert!(!dst.exists());
+        let apply_tool = f.registry.get("apply_file_ops").unwrap();
+        for ctx in f.restricted() {
+            assert!(apply_tool
+                .prepare(&ctx, &json!({"plan_id":id}))
+                .await
+                .is_err());
+        }
+        assert_eq!(f.status(&id), "planned");
+        f.apply_after_review(&id, Effect::ManagerWrite).await;
+    }
+    assert_eq!(
+        fs::read_to_string(dst.join("folder/readme.txt")).unwrap(),
+        "test payload"
+    );
+    assert!(src.is_dir() && archive.is_file());
 }

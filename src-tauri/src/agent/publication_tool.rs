@@ -54,7 +54,7 @@ impl AgentTool for PublishPlugin {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "publish_plugin".into(),
-            description: "准备发布到 Mod客栈。只提供 draft_id 或 slug 中的一项；先核对自动生成的发布信息和完整文件原文，再确认发布。".into(),
+            description: "准备发布到 Mod客栈。只提供 draft_id 或 slug 中的一项；管理器核对自动生成的发布信息和完整文件原文，并按当前权限模式提交。".into(),
             parameters: json!({"type":"object","properties":{"draft_id":{"type":"string","minLength":1},"slug":{"type":"string","minLength":1}},"oneOf":[{"required":["draft_id"]},{"required":["slug"]}],"additionalProperties":false}),
             effect: Effect::Publish,
         }

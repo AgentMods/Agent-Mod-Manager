@@ -4,7 +4,7 @@ use crate::{
     error::{AppError, AppResult},
     sources::{
         pinned_download_client, validate_download_url,
-        web_download::{self, ArchiveKind, WebDownload},
+        web_download::{self, ArchiveKind, WebDownload, MAX_ARCHIVE_SIGNATURE_BYTES},
         FileHashes, ResolvedMod,
     },
     storage::AppPaths,
@@ -917,7 +917,7 @@ struct ComputedHashes {
     sha512: String,
     sha1: Option<String>,
     md5: Option<String>,
-    prefix: [u8; 6],
+    prefix: [u8; MAX_ARCHIVE_SIGNATURE_BYTES],
     prefix_len: usize,
 }
 
@@ -948,7 +948,7 @@ async fn hash_open_file(
     let mut md5 = expected.md5.as_ref().map(|_| Md5::new());
     let mut bytes = vec![0u8; 128 * 1024];
     let mut total = 0u64;
-    let mut prefix = [0; 6];
+    let mut prefix = [0; MAX_ARCHIVE_SIGNATURE_BYTES];
     let mut prefix_len = 0;
     loop {
         let n = tokio::select! { biased; _ = cancel.cancelled() => return Err(AppError::Cancelled), n = file.read(&mut bytes) => n? };
@@ -1105,16 +1105,6 @@ mod tests {
             read_idle_timeout: Duration::from_secs(5),
             max_bytes: 1024,
         }
-    }
-    fn assert_no_transfer_cache(paths: &AppPaths) {
-        let downloads = paths.downloads();
-        assert_eq!(std::fs::read_dir(&downloads).unwrap().count(), 1);
-        assert_eq!(
-            std::fs::read_dir(downloads.join("incoming"))
-                .unwrap()
-                .count(),
-            0
-        );
     }
 
     fn setup(attempts: u32) -> (tempfile::TempDir, AppPaths, DownloadManager) {
@@ -1358,6 +1348,61 @@ mod tests {
             assert!(!request.contains("\r\nauthorization:"));
             assert!(!request.contains("\r\ncookie:"));
             assert!(!request.contains("\r\nreferer:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn web_and_mcp_downloads_require_complete_rar_signatures() {
+        for signed in [false, true] {
+            for (data, valid) in [
+                (&b"Rar!\x1a\x07\x00"[..], true),
+                (&b"Rar!\x1a\x07\x01\x00payload"[..], true),
+                (&b"Rar!\x1a\x07"[..], false),
+                (&b"Rar!\x1a\x07\x01"[..], false),
+                (&b"Rar!\x1a\x07\x01\xff"[..], false),
+            ] {
+                let server = mock(vec![Reply::new(200, data, data.len(), None)]).await;
+                let (_dir, paths, manager) = setup(1);
+                let cancel = CancellationToken::new();
+                let filename = "Mod.RAR";
+                let result = if signed {
+                    manager
+                        .download_mcp_archive(
+                            &mock_signed_url(&server),
+                            filename,
+                            None,
+                            cancel,
+                            None,
+                        )
+                        .await
+                } else {
+                    let origin = server.url.strip_suffix("/mod.zip").unwrap();
+                    let request = WebDownload::parse(&format!("{origin}/{filename}")).unwrap();
+                    manager.download_web(&request, cancel, None).await
+                };
+                if valid {
+                    // These fixtures exercise the transfer's signature gate, not archive parsing.
+                    let artifact = result.unwrap();
+                    assert_eq!(artifact.filename, filename);
+                    assert_eq!(std::fs::read(artifact.path).unwrap(), data);
+                    assert!(artifact.requires_review);
+                } else {
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("文件头与归档类型不匹配"));
+                    let files: Vec<_> = walkdir::WalkDir::new(paths.downloads())
+                        .into_iter()
+                        .map(|entry| entry.unwrap().into_path())
+                        .collect();
+                    assert!(files
+                        .iter()
+                        .any(|path| path.extension().is_some_and(|ext| ext == "rejected")));
+                    assert!(!files
+                        .iter()
+                        .any(|path| path.extension().is_some_and(|ext| ext == "RAR")));
+                }
+            }
         }
     }
 
@@ -1799,7 +1844,7 @@ mod tests {
                 );
             }
         }
-        assert_no_transfer_cache(&paths);
+        crate::storage::assert_downloads_empty(&paths);
         assert!(server.requests.lock().unwrap().is_empty());
     }
 
@@ -2253,7 +2298,7 @@ mod tests {
                 .await
                 .is_err());
         }
-        assert_no_transfer_cache(&paths);
+        crate::storage::assert_downloads_empty(&paths);
         let server = mock(vec![Reply::new(200, b"too long", 8, None)]).await;
         assert!(manager
             .download_with_progress(&input(&server.url, b"test"), CancellationToken::new(), None)

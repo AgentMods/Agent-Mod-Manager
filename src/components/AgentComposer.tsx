@@ -42,7 +42,7 @@ interface AgentComposerProps {
   disabled: boolean;
   busy: boolean;
   permission: PermissionMode | "";
-  inheritedPermission: PermissionMode;
+  inheritedPermission: PermissionMode | null | undefined;
   onPermissionChange: (value: PermissionMode | "") => void;
   model: string;
   models: AgentModelSettings[];
@@ -87,6 +87,7 @@ export function AgentComposer({
   const levels = selectedModel?.reasoning_levels ?? [];
   const modelLabel = selectedModel?.display_name?.trim() || model || "未配置模型";
   const effectivePermission = permission || inheritedPermission;
+  const permissionLabel = effectivePermission ? permissionLabels[effectivePermission] : inheritedPermission === null ? "权限未记录" : "会话设置 · 读取中";
   const elevated = effectivePermission === "full_trust";
   const PermissionIcon = elevated ? ShieldAlertIcon : ShieldIcon;
 
@@ -160,11 +161,11 @@ export function AgentComposer({
           <DropdownMenu modal={false}>
             <DropdownMenuTrigger asChild>
               <Button type="button" size="sm" variant="ghost" aria-label="本轮权限策略"
-                title={permission ? permissionLabels[permission] : `会话设置 · ${permissionLabels[effectivePermission]}`}
+                title={permission ? permissionLabels[permission] : permissionLabel}
                 className={cn("gap-1.5 rounded-full px-2 text-xs has-[>svg]:px-2", elevated && "text-warning")}
                 disabled={controlsDisabled}>
                 <PermissionIcon aria-hidden="true" className="size-4" />
-                <span>{permissionLabels[effectivePermission]}</span>
+                <span>{permissionLabel}</span>
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent {...popupPosition} align="start" className="min-w-44 rounded-xl">

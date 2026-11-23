@@ -14,6 +14,15 @@ use serde_json::{json, Value};
 const DEFAULT_TITLE: &str = "新对话";
 const TITLE_LIMIT: usize = 60;
 
+#[path = "history_categories.rs"]
+mod categories;
+pub(crate) use categories::backfill_conversation_categories;
+use categories::{fixed_title_category, request_category};
+
+#[path = "conversation_workspace.rs"]
+mod workspace;
+pub(crate) use workspace::{migrate_workspaces, remove_game_from_workspaces};
+
 type AgentMessages = Vec<(String, Value)>;
 
 fn first_message_title(content: &str) -> String {
@@ -76,7 +85,13 @@ fn message_title(content: &str, attachments: &[Attachment]) -> String {
 pub struct Conversation {
     pub id: String,
     pub title: String,
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Compatibility projection for callers that require exactly one game.
     pub game_id: Option<String>,
+    /// None is all registered games (dynamic); Some([]) selects no games.
+    #[serde(default)]
+    pub workspace_game_ids: Option<Vec<String>>,
     pub task_summary: Option<String>,
     pub archived: bool,
     pub pinned: bool,
@@ -210,6 +225,31 @@ impl History {
         title: &str,
         game_id: Option<&str>,
     ) -> AppResult<Conversation> {
+        self.create_conversation_with_category(title, game_id, None)
+    }
+
+    pub fn create_conversation_with_category(
+        &self,
+        title: &str,
+        game_id: Option<&str>,
+        category: Option<&str>,
+    ) -> AppResult<Conversation> {
+        self.create_conversation_with_workspace(title, game_id, category, None)
+    }
+
+    pub fn create_conversation_with_workspace(
+        &self,
+        title: &str,
+        game_id: Option<&str>,
+        category: Option<&str>,
+        workspace_game_ids: Option<&[String]>,
+    ) -> AppResult<Conversation> {
+        if category
+            .is_some_and(|value| !["install", "uninstall", "remove", "adapter"].contains(&value))
+        {
+            return Err(AppError::Invalid("无效的对话操作分类".into()));
+        }
+        let category = category.or_else(|| fixed_title_category(title));
         let id = new_id("conv");
         let timestamp = now();
         let title = title.trim();
@@ -219,12 +259,19 @@ impl History {
         } else {
             title
         };
-        let conn = self.db.conn();
-        conn.execute(
-            "INSERT INTO conversations(id,title,game_id,created_at,updated_at,auto_title_pending) VALUES(?1,?2,?3,?4,?4,?5)",
-            params![id, title, game_id, timestamp, auto_title_pending],
+        let legacy_workspace = game_id.map(|id| [id.to_owned()]);
+        let requested = workspace_game_ids.or(legacy_workspace.as_ref().map(|ids| &ids[..]));
+        let mut conn = self.db.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let workspace = workspace::Workspace::validated(&tx, requested)?;
+        tx.execute(
+            "INSERT INTO conversations(id,title,game_id,created_at,updated_at,auto_title_pending,category,workspace_game_ids_json)
+             VALUES(?1,?2,?3,?4,?4,?5,?6,?7)",
+            params![id, title, workspace.single_game_id(), timestamp, auto_title_pending, category, workspace.encode()?],
         )?;
-        read_conversation(&conn, &id)
+        let conversation = read_conversation(&tx, &id)?;
+        tx.commit()?;
+        Ok(conversation)
     }
 
     pub fn list_conversations(&self, archived: bool) -> AppResult<Vec<Conversation>> {
@@ -235,7 +282,8 @@ impl History {
              )
              SELECT c.id,c.title,c.game_id,c.task_summary,c.archived,c.pinned,c.message_count,c.created_at,c.updated_at,
                     t.id AS turn_id,t.status AS turn_status,
-                    COALESCE((SELECT MAX(seq) FROM agent_events WHERE conversation_id=c.id),0) AS event_seq
+                    COALESCE((SELECT MAX(seq) FROM agent_events WHERE conversation_id=c.id),0) AS event_seq,
+                    c.category,c.workspace_game_ids_json
              FROM conversations c
              LEFT JOIN latest_turns lt ON lt.conversation_id=c.id
              LEFT JOIN agent_turns t ON t.rowid=lt.turn_row
@@ -580,6 +628,17 @@ impl History {
             .transpose()?;
         let timestamp = now();
         ensure_conversation(tx, conversation_id)?;
+        // Classify the original request only. Later turns, retries, renames and
+        // archival must not turn an established conversation into another task.
+        if role == "user" {
+            if let Some(category) = request_category(content) {
+                tx.execute(
+                    "UPDATE conversations SET category=?2 WHERE id=?1 AND category IS NULL
+                     AND NOT EXISTS(SELECT 1 FROM messages WHERE conversation_id=?1 AND role='user')",
+                    params![conversation_id, category],
+                )?;
+            }
+        }
         tx.execute(
             "INSERT INTO messages(id,conversation_id,role,content,tool_calls_json,tool_call_id,created_at,attachments_json)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -814,7 +873,9 @@ fn conversation_from_row(row: &Row<'_>) -> rusqlite::Result<Conversation> {
     Ok(Conversation {
         id: row.get(0)?,
         title: row.get(1)?,
+        category: row.get("category")?,
         game_id: row.get(2)?,
+        workspace_game_ids: workspace::from_row(row)?,
         task_summary: row.get(3)?,
         archived: row.get(4)?,
         pinned: row.get(5)?,
@@ -828,7 +889,8 @@ fn conversation_from_row(row: &Row<'_>) -> rusqlite::Result<Conversation> {
 
 fn read_conversation(conn: &Connection, id: &str) -> AppResult<Conversation> {
     let mut conversation = conn.query_row(
-        "SELECT id,title,game_id,task_summary,archived,pinned,message_count,created_at,updated_at FROM conversations WHERE id=?1",
+        "SELECT id,title,game_id,task_summary,archived,pinned,message_count,created_at,updated_at,category,workspace_game_ids_json
+         FROM conversations WHERE id=?1",
         [id], conversation_from_row,
     ).optional()?.ok_or_else(|| AppError::NotFound("会话".into()))?;
     conversation.permission_mode = read_permission_mode(conn, id)?;
@@ -1043,6 +1105,15 @@ mod tests {
     fn fixture() -> (tempfile::TempDir, History) {
         let dir = tempfile::tempdir().unwrap();
         let history = History::new(Db::open(&dir.path().join("history.sqlite")).unwrap());
+        history
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO games(id,name,slug,root_path,created_at,updated_at)
+             VALUES('game_1','Game One','game-one','/game-one','now','now')",
+                [],
+            )
+            .unwrap();
         (dir, history)
     }
 

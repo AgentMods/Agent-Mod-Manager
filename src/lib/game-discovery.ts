@@ -3,7 +3,7 @@ import { gameDirectoryKey } from "./paths";
 
 /** Keep the scan's first spelling/ranking, but don't lose a backend registration on an alias row. */
 export function reconcileCandidates(candidates: GameCandidate[], games: Game[] = []): GameCandidate[] {
-  const registered = new Map(games.map((game) => [gameDirectoryKey(game.rootPath), game.id]));
+  const registered = new Map(games.map((game) => [gameDirectoryKey(game.rootPath), game]));
   const distinct = new Map<string, GameCandidate>();
   for (const candidate of candidates) {
     const key = gameDirectoryKey(candidate.rootPath);
@@ -13,7 +13,11 @@ export function reconcileCandidates(candidates: GameCandidate[], games: Game[] =
     }
   }
   return Array.from(distinct, ([key, candidate]) => {
-    const gameId = candidate.registeredGameId ?? registered.get(key);
-    return gameId ? { ...candidate, registeredGameId: gameId } : candidate;
+    const game = registered.get(key);
+    if (game) return {
+      ...candidate, registeredGameId: game.id, suggestedAdapterSlug: game.adapterSlug,
+      confidence: game.confidence, status: game.adapterSlug ? "high_confidence" : "unidentified",
+    };
+    return candidate;
   });
 }

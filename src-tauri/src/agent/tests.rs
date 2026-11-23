@@ -296,6 +296,7 @@ async fn edit_and_retry_replace_context_in_the_same_conversation() {
         let start = next(&mut rx, "turn-start").await;
         assert_eq!(start.message_id.as_deref(), Some(user.id.as_str()));
         assert_eq!(start.payload["historyThroughSeq"], 0);
+        assert_eq!(start.payload["permissionMode"], "request_approval");
         let done = next(&mut rx, "done").await;
         assert_eq!(done.conversation_id, source);
         assert_eq!(done.payload["status"], "done");
@@ -686,13 +687,64 @@ async fn reject_approval_does_not_touch_game_files() {
 }
 
 #[tokio::test]
+async fn full_trust_dispatches_publish_plugin_without_manual_consent() {
+    use crate::agent::{
+        mod_library_flow_tests::{model_tool_call, turn_request},
+        policy::PermissionMode,
+        tools::{AgentTool, PreparedTool, ToolContext, ToolDefinition},
+    };
+    // Exercise the real dispatcher's formerly name-specific exception without uploading anything.
+    struct OfflinePublish(ToolDefinition);
+    #[async_trait::async_trait]
+    impl AgentTool for OfflinePublish {
+        fn definition(&self) -> ToolDefinition {
+            self.0.clone()
+        }
+        async fn execute(
+            &self,
+            _: &ToolContext,
+            _: Value,
+            prepared: PreparedTool,
+        ) -> AppResult<Value> {
+            Ok(prepared.preview)
+        }
+    }
+    let (_dir, engine, _) = setup();
+    let args = json!({"slug":"offline-fixture"});
+    let (url, job) = server(vec![
+        model_tool_call("publish_plugin", "publish", args.clone()),
+        final_reply(),
+    ])
+    .await;
+    let (agent, conv, mut events) = runtime(engine, &url);
+    let definition = agent.registry.get("publish_plugin").unwrap().definition();
+    agent
+        .registry
+        .unregister(std::slice::from_ref(&definition.name));
+    agent
+        .registry
+        .register(Arc::new(OfflinePublish(definition)))
+        .unwrap();
+    agent
+        .start_turn(turn_request(&conv, "发布适配包", PermissionMode::FullTrust))
+        .unwrap();
+    let result = next(&mut events, "tool-result").await;
+    assert_eq!(result.payload["status"], "done");
+    assert_eq!(result.payload["result"], args);
+    assert_eq!(next(&mut events, "done").await.payload["status"], "done");
+    assert!(!agent
+        .events
+        .replay(&conv, 0, 100)
+        .unwrap()
+        .iter()
+        .any(|event| event.kind == "approval-request"));
+    job.await.unwrap();
+}
+
+#[tokio::test]
 async fn rejected_plugin_publication_never_grants_upload_consent_in_any_review_mode() {
     use crate::{agent::policy::PermissionMode, manager_publication, plugins};
-    for mode in [
-        PermissionMode::RequestApproval,
-        PermissionMode::AutoApprove,
-        PermissionMode::FullTrust,
-    ] {
+    for mode in [PermissionMode::RequestApproval, PermissionMode::AutoApprove] {
         let (_dir, engine, _) = setup();
         let draft = install_adapter_package(&engine, plugins::test_fixtures::PACKAGES[0]);
         let args = json!({"draft_id":draft.id});
@@ -2104,4 +2156,136 @@ fn runtime_with_fallback_regression_key(
     .unwrap();
     agent.set_test_context_window("mock-model", None);
     (agent, conversation.id, rx)
+}
+
+#[tokio::test]
+async fn turn_permission_snapshot_priority_and_committed_event() {
+    use super::policy::PermissionMode;
+    for (global, explicit, session, expected) in [
+        (
+            "request_approval",
+            None,
+            None,
+            PermissionMode::RequestApproval,
+        ),
+        ("full_trust", None, None, PermissionMode::FullTrust),
+        (
+            "full_trust",
+            None,
+            Some("auto_approve"),
+            PermissionMode::AutoApprove,
+        ),
+        (
+            "full_trust",
+            Some(PermissionMode::RequestApproval),
+            Some("full_trust"),
+            PermissionMode::RequestApproval,
+        ),
+        (
+            "request_approval",
+            Some(PermissionMode::FullTrust),
+            Some("auto_approve"),
+            PermissionMode::FullTrust,
+        ),
+    ] {
+        let (_dir, engine, game) = setup();
+        let file = game.join("permission-snapshot.txt");
+        std::fs::write(&file, b"retain until approved").unwrap();
+        let response = super::mod_library_flow_tests::model_tool_call(
+            "trash_paths",
+            "permission-trash",
+            json!({"paths":[file],"reason":"permission snapshot test"}),
+        );
+        // Only the in-process loopback model fixture is contacted.
+        let (url, job) = server(vec![response, final_reply()]).await;
+        let (agent, conv, mut rx) = runtime(engine, &url);
+        agent
+            .settings
+            .set("permission_mode", json!(global))
+            .unwrap();
+        if let Some(mode) = session {
+            agent
+                .settings
+                .set(
+                    &crate::settings::conversation_permission_key(&conv),
+                    json!(mode),
+                )
+                .unwrap();
+        }
+        agent
+            .start_turn(TurnRequest {
+                conversation_id: conv.clone(),
+                content: "移入回收站".into(),
+                attachments: None,
+                model: None,
+                permission_mode: explicit,
+                reasoning_effort: None,
+            })
+            .unwrap();
+        // Flip to a valid opposite policy before yielding to scheduled execution.
+        let opposite = if expected == PermissionMode::FullTrust {
+            "request_approval"
+        } else {
+            "full_trust"
+        };
+        agent
+            .settings
+            .set(
+                &crate::settings::conversation_permission_key(&conv),
+                json!(opposite),
+            )
+            .unwrap();
+        let start = next(&mut rx, "turn-start").await;
+        assert_eq!(start.payload["permissionMode"], json!(expected));
+        let replay = agent.events.replay(&conv, 0, 100).unwrap();
+        assert!(replay
+            .iter()
+            .any(|e| e.seq == start.seq && e.payload == start.payload));
+        let mut approvals = 0;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+                .await
+                .expect("turn stalled")
+                .expect("event stream closed");
+            if event.kind == "approval-request" {
+                approvals += 1;
+                assert_ne!(expected, PermissionMode::FullTrust);
+                assert!(file.exists());
+                agent
+                    .respond_approval(
+                        &conv,
+                        event.payload["approvalId"].as_str().unwrap(),
+                        ApprovalResponse {
+                            approved: true,
+                            answer: Value::Null,
+                        },
+                    )
+                    .unwrap();
+            }
+            if event.kind == "done" {
+                assert_eq!(event.payload["status"], "done");
+                break;
+            }
+        }
+        assert_eq!(
+            approvals,
+            usize::from(expected != PermissionMode::FullTrust)
+        );
+        assert!(!file.exists());
+        let requests = job.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let label = match expected {
+            PermissionMode::RequestApproval => "逐次审批",
+            PermissionMode::AutoApprove => "游戏内自动批准",
+            PermissionMode::FullTrust => "完全信任",
+        };
+        for request in requests {
+            let system = &request["messages"][0];
+            assert_eq!(system["role"], "system");
+            assert!(system["content"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("本轮权限：{label}")));
+        }
+    }
 }

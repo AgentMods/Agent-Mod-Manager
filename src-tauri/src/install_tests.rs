@@ -984,6 +984,76 @@ fn inspect_install_reports_a_safe_install_without_reconciling() {
 }
 
 #[test]
+fn inspect_install_recommends_forgetting_only_when_every_file_is_missing() {
+    let (_temp, engine, game) = fixture("stardew-valley");
+    let preview = plan_install(
+        &engine,
+        &release(&engine, &game, "project", "v1", RELEASE_ONE),
+    )
+    .unwrap();
+    apply(&engine, &preview.plan);
+
+    // Establish the completed install state before removing every manifest file.
+    let installed = get_install(&engine, &preview.install_id).unwrap();
+    assert_eq!(installed.status, "enabled");
+    assert_eq!(installed.files.len(), 2);
+    std::fs::remove_file(&installed.files[0].path).unwrap();
+    let partial = inspect_install(&engine, &preview.install_id).unwrap();
+    assert!(!partial.can_uninstall);
+    assert_eq!(
+        partial.reconciliation.recommended_action,
+        "review_file_state"
+    );
+    std::fs::remove_file(&installed.files[1].path).unwrap();
+
+    let report = inspect_install(&engine, &preview.install_id).unwrap();
+    assert_eq!(report.status, "enabled");
+    assert!(!report.can_uninstall);
+    assert_eq!(
+        report.reconciliation.recommended_action,
+        "forget_missing_files"
+    );
+    assert!(report.reconciliation.rollback_transaction_id.is_none());
+    assert!(report.reconciliation.successor_install_id.is_none());
+    assert!(report.files.iter().all(|file| {
+        file.state == "missing" && !file.replaced && file.other_install_ids.is_empty()
+    }));
+}
+
+#[test]
+fn missing_paths_in_an_incomplete_manifest_do_not_release_ownership() {
+    let (_temp, engine, game) = fixture("stardew-valley");
+    let preview = plan_install(
+        &engine,
+        &release(&engine, &game, "project", "v1", RELEASE_ONE),
+    )
+    .unwrap();
+    apply(&engine, &preview.plan);
+    let installed = get_install(&engine, &preview.install_id).unwrap();
+    std::fs::remove_file(&installed.files[0].path).unwrap();
+    // The remaining owned file was omitted from the manifest, not the install plan.
+    engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE installs SET files_json=?1 WHERE id=?2",
+            params![
+                serde_json::to_string(&installed.files[..1]).unwrap(),
+                preview.install_id
+            ],
+        )
+        .unwrap();
+    let report = inspect_install(&engine, &preview.install_id).unwrap();
+    assert!(!report.can_uninstall);
+    assert_eq!(
+        report.reconciliation.recommended_action,
+        "review_file_state"
+    );
+    assert_eq!(report.files[0].state, "missing");
+    assert!(installed.files[1].path.is_file());
+}
+
+#[test]
 fn inspect_install_distinguishes_modified_and_missing_files() {
     let (_temp, engine, game) = fixture("minecraft-java");
     let preview = plan_install(
@@ -1050,11 +1120,28 @@ fn inspect_install_reports_shared_paths_between_active_installs() {
     assert!(report.reconciliation.successor_install_id.is_none());
     assert_eq!(report.files[0].state, "owned");
     assert!(!report.files[0].replaced);
-    assert_eq!(report.files[0].other_install_ids, vec![second.install_id]);
+    assert_eq!(
+        report.files[0].other_install_ids,
+        vec![second.install_id.clone()]
+    );
     assert!(report.files[0]
         .reasons
         .iter()
         .any(|reason| reason.contains("共享路径")));
+
+    let shared_file = Path::new(&game.root_path).join("mods/Example.jar");
+    std::fs::remove_file(&shared_file).unwrap();
+    let missing_shared = inspect_install(&engine, &first.install_id).unwrap();
+    assert!(!missing_shared.can_uninstall);
+    assert_eq!(
+        missing_shared.reconciliation.recommended_action,
+        "review_shared_paths"
+    );
+    assert_eq!(missing_shared.files[0].state, "missing");
+    assert_eq!(
+        missing_shared.files[0].other_install_ids,
+        vec![second.install_id]
+    );
 }
 
 #[test]
@@ -1083,6 +1170,47 @@ fn inspect_install_reports_files_that_overwrote_existing_content() {
         .reasons
         .iter()
         .any(|reason| reason.contains("覆盖了既有文件")));
+
+    std::fs::remove_file(&target).unwrap();
+    let missing_replacement = inspect_install(&engine, &preview.install_id).unwrap();
+    assert!(!missing_replacement.can_uninstall);
+    assert_ne!(
+        missing_replacement.reconciliation.recommended_action,
+        "forget_missing_files"
+    );
+    assert_eq!(missing_replacement.files[0].state, "missing");
+    assert!(missing_replacement.files[0].replaced);
+}
+
+#[test]
+fn inspect_install_keeps_missing_replacement_versions_on_the_rollback_path() {
+    let (_temp, engine, game) = fixture("stardew-valley");
+    let first = plan_install(
+        &engine,
+        &release(&engine, &game, "project", "v1", RELEASE_ONE),
+    )
+    .unwrap();
+    apply(&engine, &first.plan);
+    let mut request = release(&engine, &game, "project", "v2", RELEASE_TWO);
+    request.replace_install_id = Some(first.install_id);
+    let successor = plan_install(&engine, &request).unwrap();
+    apply(&engine, &successor.plan);
+
+    let installed = get_install(&engine, &successor.install_id).unwrap();
+    for file in &installed.files {
+        std::fs::remove_file(&file.path).unwrap();
+    }
+    let report = inspect_install(&engine, &successor.install_id).unwrap();
+    assert!(!report.can_uninstall);
+    assert_eq!(
+        report.reconciliation.recommended_action,
+        "rollback_replacement"
+    );
+    assert_eq!(
+        report.reconciliation.rollback_transaction_id.as_deref(),
+        Some(successor.plan.id.as_str())
+    );
+    assert!(report.files.iter().all(|file| file.state == "missing"));
 }
 
 #[cfg(unix)]

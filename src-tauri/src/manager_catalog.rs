@@ -72,6 +72,12 @@ pub struct CatalogGame {
     pub steam_app_id: String,
     pub plugins: Vec<CatalogPlugin>,
 }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogReleaseSelection {
+    pub plugin_id: String,
+    pub release_id: String,
+}
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogSearch {
@@ -83,14 +89,15 @@ pub struct CatalogSearch {
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseDisplay {
     pub description: String,
-    pub cover_png: String,
+    pub cover_url: Option<String>,
 }
 
 impl ReleaseDisplay {
-    fn from_skill(skill: &str) -> Option<Self> {
-        crate::publication_copy::read_display(skill).map(|(description, cover_png)| Self {
-            description,
-            cover_png,
+    fn from_release(cover_url: Option<String>, skill: &str) -> Option<Self> {
+        let description = crate::publication_copy::read_display(skill);
+        (description.is_some() || cover_url.is_some()).then(|| Self {
+            description: description.unwrap_or_default(),
+            cover_url,
         })
     }
 }
@@ -350,6 +357,34 @@ impl CatalogClient {
         }
         Ok(result)
     }
+    async fn release_files(&self, release_id: &str) -> AppResult<(String, String)> {
+        if !positive_id(release_id) {
+            return Err(AppError::Invalid("云插件版本 ID 必须是正整数".into()));
+        }
+        let adapter_path = release_path(release_id, "adapter.json");
+        let skill_path = release_path(release_id, "SKILL.md");
+        tokio::try_join!(
+            self.get(
+                &adapter_path,
+                plugin_workflow::ADAPTER_LIMIT,
+                "application/json, text/plain"
+            ),
+            self.get(
+                &skill_path,
+                plugin_workflow::SKILL_LIMIT,
+                "text/markdown, text/plain"
+            )
+        )
+    }
+
+    async fn display(&self, release_id: &str) -> AppResult<Option<ReleaseDisplay>> {
+        let (manifest, skill) = self.release_files(release_id).await?;
+        let adapter: plugins::GameAdapter = serde_json::from_str(&manifest)?;
+        adapter.validate()?;
+        plugins::parse_skill(&skill, &adapter.slug)?;
+        Ok(ReleaseDisplay::from_release(adapter.cover_url, &skill))
+    }
+
     pub(crate) async fn preview(
         &self,
         engine: &FileEngine,
@@ -379,21 +414,10 @@ impl CatalogClient {
                     AppError::NotFound("所选云插件版本已更新、已下架或不存在，请刷新目录".into())
                 }
             })?;
-        let adapter_path = release_path(release_id, "adapter.json");
-        let skill_path = release_path(release_id, "SKILL.md");
-        let (adapter_json, skill_markdown) = tokio::try_join!(
-            self.get(
-                &adapter_path,
-                plugin_workflow::ADAPTER_LIMIT,
-                "application/json, text/plain"
-            ),
-            self.get(
-                &skill_path,
-                plugin_workflow::SKILL_LIMIT,
-                "text/markdown, text/plain"
-            )
-        )?;
+        let (adapter_json, skill_markdown) = self.release_files(release_id).await?;
         let package = plugins::parse_package(&plugin.slug, &adapter_json, &skill_markdown)?;
+        let display =
+            ReleaseDisplay::from_release(package.adapter.cover_url.clone(), &skill_markdown);
         let adapter = package.adapter;
         if adapter.version != plugin.version
             || adapter.name != plugin.name
@@ -418,7 +442,7 @@ impl CatalogClient {
             plugin,
             source: SOURCE,
             hashes: PackageHashes::of(&adapter_json, &skill_markdown),
-            display: ReleaseDisplay::from_skill(&skill_markdown),
+            display,
             adapter_json,
             skill_markdown,
             mcp_servers: adapter.mcp_servers,
@@ -449,6 +473,21 @@ impl CatalogClient {
         .await
         .map_err(|_| AppError::Other("准备云插件草稿失败".into()))?
     }
+
+    async fn install(
+        &self,
+        engine: &FileEngine,
+        plugin_id: &str,
+        release_id: &str,
+    ) -> AppResult<()> {
+        let preview = self.preview(engine, plugin_id, release_id).await?;
+        let engine = engine.clone();
+        tokio::task::spawn_blocking(move || {
+            plugin_workflow::install_catalog_release(&engine, preview)
+        })
+        .await
+        .map_err(|_| AppError::Other("安装云插件失败".into()))?
+    }
 }
 
 pub async fn search(query: &str) -> AppResult<CatalogSearch> {
@@ -456,18 +495,7 @@ pub async fn search(query: &str) -> AppResult<CatalogSearch> {
 }
 /// Immutable, anonymous same-origin release files. Hidden releases are checked by the provider.
 pub async fn release_display(release_id: &str) -> AppResult<Option<ReleaseDisplay>> {
-    if !positive_id(release_id) {
-        return Err(AppError::Invalid("云插件版本 ID 必须是正整数".into()));
-    }
-    let client = CatalogClient::new()?;
-    let skill = client
-        .get(
-            &release_path(release_id, "SKILL.md"),
-            plugin_workflow::SKILL_LIMIT,
-            "text/markdown, text/plain",
-        )
-        .await?;
-    Ok(ReleaseDisplay::from_skill(&skill))
+    CatalogClient::new()?.display(release_id).await
 }
 
 pub async fn preview(
@@ -486,6 +514,12 @@ pub async fn prepare_import(
 ) -> AppResult<CatalogImport> {
     CatalogClient::new()?
         .prepare_import(engine, plugin_id, release_id)
+        .await
+}
+
+pub async fn install(engine: &FileEngine, plugin_id: &str, release_id: &str) -> AppResult<()> {
+    CatalogClient::new()?
+        .install(engine, plugin_id, release_id)
         .await
 }
 

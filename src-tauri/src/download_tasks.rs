@@ -9,7 +9,6 @@ use crate::{
     },
     transaction::FileEngine,
 };
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{
@@ -69,21 +68,17 @@ impl ClassificationInput {
         context: &crate::agent::tools::ToolContext,
     ) -> AppResult<DownloadTarget> {
         if let ResolutionScope::Agent(conversation) = &context.resolution_scope {
-            let game = context.engine.db.conn().query_row(
-                "SELECT g.id,g.name FROM conversations c JOIN games g ON g.id=c.game_id WHERE c.id=?1",
-                [conversation],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            ).optional()?;
-            if let Some((id, name)) = game {
-                if self.game_id.as_ref().is_some_and(|value| value != &id)
-                    || self
-                        .game_name
-                        .as_ref()
-                        .is_some_and(|value| value.trim() != name)
-                {
-                    return Err(AppError::Invalid(
-                        "下载游戏与对话关联的登记游戏不一致".into(),
-                    ));
+            let selected = crate::history::History::new(context.engine.db.clone())
+                .conversation_workspace(conversation)?;
+            if let Some(ids) = selected.as_deref() {
+                let id = crate::agent::workspace::resolve(Some(ids), self.game_id.as_deref())?;
+                if let Some(name) = &self.game_name {
+                    let registered = crate::games::get_game(&context.engine.db, &id)?;
+                    if name.trim() != registered.name {
+                        return Err(AppError::Invalid(
+                            "下载游戏与对话关联的登记游戏不一致".into(),
+                        ));
+                    }
                 }
                 self.game_id = Some(id);
                 self.game_name = None;

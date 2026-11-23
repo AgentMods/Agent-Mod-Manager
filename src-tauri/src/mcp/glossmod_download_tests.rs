@@ -104,7 +104,10 @@ async fn approved_mod_inn_file_is_signed_once_and_saved_without_exposing_the_url
         args,
     );
     assert!(tool.prepare(&ctx, &args).await.is_err());
-    ctx.resolution_scope = ResolutionScope::Agent("test".into());
+    let chat = crate::history::History::new(ctx.engine.db.clone())
+        .create_conversation("download", None)
+        .unwrap();
+    ctx.resolution_scope = ResolutionScope::Agent(chat.id);
     let first = tool.prepare(&ctx, &args).await.unwrap();
     assert_eq!(first.effect, Effect::UncatalogedDownload);
     let mut changed = args.clone();

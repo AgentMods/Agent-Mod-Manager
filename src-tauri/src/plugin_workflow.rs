@@ -10,6 +10,7 @@ use crate::{
     trash::{self, TrashRequest},
     util,
 };
+use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,6 +26,11 @@ use std::{
 pub(crate) const ADAPTER_LIMIT: usize = 256 * 1024;
 pub(crate) const SKILL_LIMIT: usize = 128 * 1024;
 const SOURCE: &str = "external";
+mod desktop;
+pub(crate) use desktop::{
+    finalize_desktop_transaction, install_catalog_release, is_desktop_plugin_kind,
+    register_catalog_game, remove_installed_plugin, validate_plugin_rollback, PLUGIN_REMOVE_KIND,
+};
 static WORKFLOW_LOCK: Mutex<()> = Mutex::new(());
 
 fn lock() -> MutexGuard<'static, ()> {
@@ -43,6 +49,8 @@ pub struct DraftInfo {
     pub path: PathBuf,
     pub write_transaction_id: String,
     pub created_at: String,
+    /// Latest observed modification of the draft's two files, or its write commit.
+    pub updated_at: Option<String>,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -101,6 +109,13 @@ pub struct ReconcileReport {
     pub issues: Vec<WorkflowIssue>,
 }
 
+/// Identifies the committed removal for a later explicit desktop rollback.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRemovalReceipt {
+    pub transaction_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Content {
@@ -147,6 +162,8 @@ struct PreviousPackage {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct DeploymentRecord {
     schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registration: Option<crate::games::CatalogGameRegistration>,
     content: Content,
     previous: Option<PreviousPackage>,
     plugin_enabled: bool,
@@ -157,6 +174,8 @@ struct DeploymentRow {
     slug: String,
     install_path: PathBuf,
     status: String,
+    kind: String,
+    finished_at: Option<String>,
 }
 
 fn checked_path(engine: &FileEngine, path: &Path) -> AppResult<PathBuf> {
@@ -360,6 +379,7 @@ pub fn plan_write_draft(
         path: target,
         write_transaction_id: plan.id.clone(),
         created_at: util::now(),
+        updated_at: None,
     };
     engine.db.conn().execute("INSERT INTO plugin_drafts(id,slug,path,write_transaction_id,created_at) VALUES (?1,?2,?3,?4,?5)",
         params![draft.id,draft.slug,draft.path.to_string_lossy(),draft.write_transaction_id,draft.created_at])?;
@@ -371,21 +391,53 @@ fn get_draft(engine: &FileEngine, id: &str) -> AppResult<DraftInfo> {
         .db
         .conn()
         .query_row(
-            "SELECT id,slug,path,write_transaction_id,created_at FROM plugin_drafts WHERE id=?1",
+            "SELECT d.id,d.slug,d.path,d.write_transaction_id,d.created_at,
+                    CASE WHEN f.status='committed' THEN f.finished_at END
+             FROM plugin_drafts d LEFT JOIN file_transactions f ON f.id=d.write_transaction_id
+             WHERE d.id=?1",
             [id],
-            |r| {
-                Ok(DraftInfo {
-                    id: r.get(0)?,
-                    slug: r.get(1)?,
-                    path: PathBuf::from(r.get::<_, String>(2)?),
-                    write_transaction_id: r.get(3)?,
-                    created_at: r.get(4)?,
-                })
-            },
+            draft_row,
         )
         .optional()?
         .ok_or_else(|| AppError::NotFound(format!("插件草稿: {id}")))
 }
+fn draft_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DraftInfo> {
+    Ok(DraftInfo {
+        id: row.get(0)?,
+        slug: row.get(1)?,
+        path: PathBuf::from(row.get::<_, String>(2)?),
+        write_transaction_id: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+    })
+}
+
+fn recorded_time(value: Option<&str>) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value?).ok().map(Into::into)
+}
+
+fn format_update_time(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn set_draft_update_time(engine: &FileEngine, draft: &mut DraftInfo) {
+    // Call only for a committed draft at its checked location. Ignore other
+    // files and directory mtimes (moving the draft or adding notes is not an edit).
+    let modified = ["adapter.json", "SKILL.md"].into_iter().filter_map(|name| {
+        let path = checked_path(engine, &draft.path.join(name)).ok()?;
+        let entry = fs::symlink_metadata(path).ok()?;
+        if !entry.is_file() {
+            return None;
+        }
+        entry.modified().ok().map(DateTime::<Utc>::from)
+    });
+    draft.updated_at = recorded_time(draft.updated_at.as_deref())
+        .into_iter()
+        .chain(modified)
+        .max()
+        .map(format_update_time);
+}
+
 fn transaction_status(engine: &FileEngine, id: &str) -> AppResult<String> {
     engine
         .db
@@ -543,6 +595,7 @@ pub(crate) fn reconcile_after_apply(
 /// if identical bytes are put back out of band. Installed packages are not
 /// subject to this check during reconciliation or publication.
 pub(crate) fn validate_deployment_source(engine: &FileEngine, plan: &FilePlan) -> AppResult<()> {
+    desktop::ensure_deployment_not_retired(engine, &plan.id)?;
     let Some(FileOp::Copy { src, .. }) = plan.entries.first().map(|e| &e.operation) else {
         return Ok(());
     };
@@ -571,30 +624,23 @@ pub(crate) fn validate_deployment_source(engine: &FileEngine, plan: &FilePlan) -
 pub fn list_drafts(engine: &FileEngine) -> AppResult<Vec<DraftInfo>> {
     let _lock = lock();
     let _files = transaction::write_lock();
-    let conn = engine.db.conn();
-    let mut stmt = conn.prepare(
-        "SELECT d.id,d.slug,d.path,d.write_transaction_id,d.created_at
-        FROM plugin_drafts d JOIN file_transactions f ON f.id=d.write_transaction_id
-        WHERE f.status='committed' AND NOT EXISTS (
-            SELECT 1 FROM unavailable_plugin_drafts u WHERE u.draft_id=d.id
-        ) ORDER BY d.created_at DESC,d.rowid DESC",
-    )?;
-    let rows = stmt.query_map([], |r| {
-        Ok(DraftInfo {
-            id: r.get(0)?,
-            slug: r.get(1)?,
-            path: PathBuf::from(r.get::<_, String>(2)?),
-            write_transaction_id: r.get(3)?,
-            created_at: r.get(4)?,
-        })
-    })?;
-    let mut drafts = Vec::new();
-    for row in rows {
-        let draft = row?;
+    let mut drafts = {
+        let conn = engine.db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT d.id,d.slug,d.path,d.write_transaction_id,d.created_at,f.finished_at
+            FROM plugin_drafts d JOIN file_transactions f ON f.id=d.write_transaction_id
+            WHERE f.status='committed' AND NOT EXISTS (
+                SELECT 1 FROM unavailable_plugin_drafts u WHERE u.draft_id=d.id
+            ) ORDER BY d.created_at DESC,d.rowid DESC",
+        )?;
+        let rows = stmt.query_map([], draft_row)?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for draft in &mut drafts {
         if draft_path(engine, &draft.id, &draft.slug)? != draft.path {
             return Err(AppError::Denied("草稿记录路径与 ID 不一致".into()));
         }
-        drafts.push(draft);
+        set_draft_update_time(engine, draft);
     }
     Ok(drafts)
 }
@@ -659,6 +705,7 @@ fn validate_inner(engine: &FileEngine, id: &str) -> AppResult<DraftValidation> {
         if report.transaction_status != "committed" {
             return Err(AppError::Conflict("草稿写入事务尚未提交或已回滚".into()));
         }
+        set_draft_update_time(engine, &mut report.draft);
         let plan = engine.get_plan(&report.draft.write_transaction_id)?;
         let scratch = scratch_path(engine, id)?;
         let entries = package_copy_entries(
@@ -716,13 +763,15 @@ pub fn validate_draft(engine: &FileEngine, draft_id: &str) -> AppResult<DraftVal
 
 fn deployment_rows(engine: &FileEngine) -> AppResult<Vec<DeploymentRow>> {
     let conn = engine.db.conn();
-    let mut stmt = conn.prepare("SELECT p.transaction_id,p.slug,p.install_path,coalesce(f.status,'missing') FROM plugin_deployments p LEFT JOIN file_transactions f ON f.id=p.transaction_id ORDER BY p.rowid DESC")?;
+    let mut stmt = conn.prepare("SELECT p.transaction_id,p.slug,p.install_path,coalesce(f.status,'missing'),coalesce(f.kind,''),f.finished_at FROM active_plugin_deployments p LEFT JOIN file_transactions f ON f.id=p.transaction_id ORDER BY p.generation DESC")?;
     let rows = stmt.query_map([], |r| {
         Ok(DeploymentRow {
             transaction_id: r.get(0)?,
             slug: r.get(1)?,
             install_path: PathBuf::from(r.get::<_, String>(2)?),
             status: r.get(3)?,
+            kind: r.get(4)?,
+            finished_at: r.get(5)?,
         })
     })?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -756,6 +805,20 @@ fn deployment_record(engine: &FileEngine, row: &DeploymentRow) -> AppResult<Depl
             _ => None,
         })
         .ok_or_else(|| invalid("部署不是复制事务"))?;
+    if row.kind == desktop::CATALOG_INSTALL_KIND {
+        if record.previous.is_some() || !desktop::is_catalog_scratch(engine, source) {
+            return Err(invalid("云插件部署源或历史基线无效"));
+        }
+        verify_copy_plan(
+            &plan,
+            &row.transaction_id,
+            source,
+            &expected,
+            &record.content,
+            true,
+        )?;
+        return Ok(record);
+    }
     let slug = source
         .file_name()
         .and_then(|s| s.to_str())
@@ -827,7 +890,14 @@ fn registry_state(
     slug: &str,
     target: &Path,
 ) -> AppResult<Option<RegistryState>> {
-    let conn = engine.db.conn();
+    registry_state_from(&engine.db.conn(), slug, target)
+}
+
+fn registry_state_from(
+    conn: &Connection,
+    slug: &str,
+    target: &Path,
+) -> AppResult<Option<RegistryState>> {
     let plugin: Option<(String, String, bool, bool, String)> = conn
         .query_row(
             "SELECT source,install_path,enabled,validated,adapter_json FROM plugins WHERE slug=?1",
@@ -939,6 +1009,7 @@ pub fn plan_install_plugin(engine: &FileEngine, draft_id: &str) -> AppResult<Dep
     }
     let record = DeploymentRecord {
         schema_version: 1,
+        registration: None,
         content: content.clone(),
         previous,
         plugin_enabled: state.as_ref().is_none_or(|s| s.plugin_enabled),
@@ -979,8 +1050,8 @@ fn register(
     content: &Content,
     plugin_enabled: bool,
     skill_enabled: bool,
+    finished_at: Option<&str>,
 ) -> AppResult<()> {
-    let package = content.package(slug)?;
     external_slug(engine, slug)?;
     let state = registry_state(engine, slug, target)?;
     let preserve = state.as_ref().is_some_and(|s| s.validated);
@@ -996,16 +1067,43 @@ fn register(
     };
     let mut conn = engine.db.conn();
     let tx = conn.transaction()?;
-    let now = util::now();
-    tx.execute("INSERT INTO plugins(slug,name,game_name,version,description,source,enabled,validated,install_path,adapter_json,created_at,updated_at) VALUES (?1,?2,?2,?3,?4,'external',?5,1,?6,?7,?8,?8) ON CONFLICT(slug) DO UPDATE SET name=excluded.name,game_name=excluded.game_name,version=excluded.version,description=excluded.description,enabled=excluded.enabled,validated=1,install_path=excluded.install_path,adapter_json=excluded.adapter_json,updated_at=excluded.updated_at",params![slug,package.adapter.name,package.adapter.version,package.skill.description,plugin_enabled,target.to_string_lossy(),content.adapter_json,now])?;
-    tx.execute("INSERT INTO skills(name,description,location,source,enabled,created_at) VALUES (?1,?2,?3,'external',?4,?5) ON CONFLICT(name) DO UPDATE SET description=excluded.description,location=excluded.location,enabled=excluded.enabled",params![slug,package.skill.description,target.join("SKILL.md").to_string_lossy(),skill_enabled,now])?;
-    let mcp_changed = sync_plugin_servers(&tx, slug, &package.adapter.mcp_configs()?)?;
+    let package_updated_at = recorded_time(finished_at).map(format_update_time);
+    let mcp_changed = register_in(
+        &tx,
+        slug,
+        target,
+        content,
+        (plugin_enabled, skill_enabled),
+        package_updated_at.as_deref(),
+    )?;
     tx.commit()?;
     drop(conn);
     if mcp_changed {
         engine.notify_plugin_mcp_changed(slug);
     }
     Ok(())
+}
+
+fn register_in(
+    tx: &rusqlite::Transaction<'_>,
+    slug: &str,
+    target: &Path,
+    content: &Content,
+    (plugin_enabled, skill_enabled): (bool, bool),
+    package_updated_at: Option<&str>,
+) -> AppResult<bool> {
+    let package = content.package(slug)?;
+    let now = util::now();
+    tx.execute(
+        "INSERT INTO plugins(slug,name,game_name,version,description,source,enabled,validated,install_path,adapter_json,created_at,updated_at,package_updated_at)
+         VALUES (?1,?2,?2,?3,?4,'external',?5,1,?6,?7,?8,?8,?9)
+         ON CONFLICT(slug) DO UPDATE SET name=excluded.name,game_name=excluded.game_name,version=excluded.version,
+         description=excluded.description,enabled=excluded.enabled,validated=1,install_path=excluded.install_path,
+         adapter_json=excluded.adapter_json,updated_at=excluded.updated_at,package_updated_at=excluded.package_updated_at",
+        params![slug, package.adapter.name, package.adapter.version, package.skill.description, plugin_enabled, target.to_string_lossy(), content.adapter_json, now, package_updated_at],
+    )?;
+    tx.execute("INSERT INTO skills(name,description,location,source,enabled,created_at) VALUES (?1,?2,?3,'external',?4,?5) ON CONFLICT(name) DO UPDATE SET description=excluded.description,location=excluded.location,enabled=excluded.enabled",params![slug,package.skill.description,target.join("SKILL.md").to_string_lossy(),skill_enabled,now])?;
+    sync_plugin_servers(tx, slug, &package.adapter.mcp_configs()?)
 }
 fn disable(engine: &FileEngine, slug: &str, target: &Path) -> AppResult<bool> {
     // Never disable an unrelated Skill collision or delete any history/file.
@@ -1084,8 +1182,12 @@ fn reconcile_locked(engine: &FileEngine) -> AppResult<ReconcileReport> {
             for row in rows.iter().filter(|r| r.status == "committed") {
                 match deployment_record(engine, row) {
                     Ok(record) if record.content.hashes == disk.hashes => {
-                        selected =
-                            Some((record.content, record.plugin_enabled, record.skill_enabled));
+                        selected = Some((
+                            record.content,
+                            record.plugin_enabled,
+                            record.skill_enabled,
+                            row.finished_at.as_deref(),
+                        ));
                         break;
                     }
                     Ok(_) => {}
@@ -1113,6 +1215,7 @@ fn reconcile_locked(engine: &FileEngine) -> AppResult<ReconcileReport> {
                                 previous.content,
                                 previous.plugin_enabled,
                                 previous.skill_enabled,
+                                None,
                             ));
                             break;
                         }
@@ -1120,7 +1223,7 @@ fn reconcile_locked(engine: &FileEngine) -> AppResult<ReconcileReport> {
                 }
             }
         }
-        if let Some((content, plugin_enabled, skill_enabled)) = selected {
+        if let Some((content, plugin_enabled, skill_enabled, finished_at)) = selected {
             match register(
                 engine,
                 &slug,
@@ -1128,6 +1231,7 @@ fn reconcile_locked(engine: &FileEngine) -> AppResult<ReconcileReport> {
                 &content,
                 plugin_enabled,
                 skill_enabled,
+                finished_at,
             ) {
                 Ok(()) => report.registered.push(slug),
                 Err(AppError::Conflict(reason)) => {

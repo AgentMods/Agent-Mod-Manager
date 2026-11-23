@@ -65,19 +65,23 @@ The presets below appear in Settings → 工具.
 | GameBanana | `gamebanana-mcp@latest` | Anonymous |
 | Nexus Mods | `--upgrade --from glossmod-nexusmods-mcp nexusmods-mcp` | Anonymous public lookup, optional `NEXUSMODS_API_KEY` for account-authorized operations |
 
+The four stock uvx launchers above pass their provider-specific `*_DOWNLOAD_DIR`
+to the child process, set to `downloads/incoming` in the active storage directory.
+Custom launch commands and arguments do not receive this override.
+
 Schema v9 migrates the stock 3DM stdio preset to the remote endpoint and revokes the old launch consent. Reconnect from Settings to use the new transport.
 
 - [Playwright MCP](https://github.com/microsoft/playwright-mcp) uses the bundled
   Node.js and Playwright CLI on Windows, macOS and Linux. The preset command is
   `amm-playwright --browser=chromium --headless --sandbox --isolated --no-webmcp` with
-  `--file-paths=absolute` and an `--output-dir` under the user's Downloads folder
-  (`Agent Mod Manager/Playwright`) or the existing writable fallback.
+  `--file-paths=absolute` and `--output-dir` set to `downloads/Playwright` under
+  the active manager storage directory, not the system Downloads folder.
   Starting the tool prepares the matching Chromium build in the user's Playwright
   cache before the MCP handshake. The first download needs network access.
   Setup allows up to ten minutes, respects download proxy settings and can be retried from Settings.
   Later connections reuse that build. Sessions use a temporary browser profile.
-  Schema v17 migrates the previous stock launch command and expires its saved
-  startup consent. Click Start once in Settings → 工具 to authorize the new command.
+  Upgrading the stock preset or moving storage changes the output argument and
+  expires its saved startup consent. Click Start once in Settings → 工具 to authorize the new command.
   Custom launch commands and browser selections are preserved.
 - [MarkItDown MCP](https://github.com/microsoft/markitdown/tree/main/packages/markitdown-mcp):
   `uvx --prerelease allow markitdown-mcp@latest`. This preset accepts prereleases for MarkItDown and its dependencies.
@@ -123,7 +127,7 @@ HTTP timeout in the child environment. A failed start can be retried from Settin
   Agent registry registration never starts a process.
 - The official Mod 客栈 `get_work_file_download` has a desktop-only adapter. The approval
   names the work and file IDs and covers signing and transferring that one archive.
-  `Effect::UncatalogedDownload` always requires approval. Only the adapter consumes the
+  `Effect::UncatalogedDownload` requires approval unless the desktop Agent uses Full Trust. Only the adapter consumes the
   signed URL, using the bounded public HTTPS downloader with no MCP authorization header.
   The model and download catalog receive the resulting local artifact.
 - **stdio is NOT sandboxed.** Its command and descendants have the user's OS

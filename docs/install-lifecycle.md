@@ -27,11 +27,21 @@ library archive is available after uninstall.
 In the game’s Mod 管理 tab, 已安装 means the files have been deployed.
 已卸载 keeps the install record and any associated library archive available for
 reinstallation. 删除 removes the selected mod from this game's management list.
-For an active installation, the Agent first uninstalls or restores overwritten
-files, then requests removal of the exact inactive record. Archived bytes and the
+For an active installation, the Agent normally uninstalls or restores overwritten
+files, then requests removal of the exact inactive record. If the entire verified
+manifest is already absent and contains only exclusive additions, an explicit
+delete can instead release ownership of that record without touching game files.
+An ordinary uninstall request does not take this shortcut. Archived bytes and the
 transaction journal remain available on disk. A never-executed preview can be
 cancelled separately without touching a same-name installation. Restoring a
 previously uninstalled mod through the journal makes its active record visible again.
+
+Turn on **批量操作** in Mod 管理 to select individual rows or all actionable rows.
+Batch install and uninstall skip inapplicable items and do not submit an archive twice.
+Each submitted Agent task retains the existing permission, approval and readback flow.
+Batch deletion first lists the selected targets for confirmation. Removing one install
+record does not hide other visible histories that use the same archive. Turning batch
+mode off clears the selection without cancelling already submitted tasks.
 
 ## Path-based installation API
 
@@ -145,17 +155,23 @@ dependencies, merge shared file contents, or launch the game.
 and local MCP. In addition to current file fingerprints, it reports a
 `reconciliation` object with a conservative `recommendedAction`:
 `safe_uninstall`, `rollback_install`, `rollback_replacement`,
-`rollback_successor`, `review_shared_paths`, `review_file_state`, or
+`rollback_successor`, `forget_missing_files`, `review_shared_paths`, `review_file_state`, or
 `review_install_state`. A rollback recommendation is emitted only when the
 journal contains a committed replacement link or install transaction that can
 be identified without guessing.
 
 `blockingInstallIds`, `successorInstallId` and `rollbackTransactionId` are
 evidence for the next user-visible action, not an approval. The Agent must still
-call the existing rollback or uninstall flow; ownership, path, backup and
+call the recommended operation; ownership, path, backup and
 current-fingerprint checks run again immediately before mutation. Ordinary
 shared installs remain manual-review cases, and this preview never merges bytes,
 rewrites manifests, or changes database/file state.
+
+`forget_missing_files` is not a rollback recommendation. On an explicit removal,
+`forget_uninstalled_mod` rechecks the exact game, install, and missing-file evidence
+under the writer lock. It records a `removed_missing` disposition and hides the
+list entry atomically. The original install transaction stays committed; no
+uninstall, rollback or trash receipt is fabricated.
 
 ## Modrinth Dependency Review
 

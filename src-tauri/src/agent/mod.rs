@@ -27,3 +27,5 @@ mod tests;
 pub mod tools;
 mod web_download_tool;
 pub mod web_tools;
+
+pub(crate) mod workspace;

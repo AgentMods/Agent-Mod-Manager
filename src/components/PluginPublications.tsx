@@ -38,12 +38,12 @@ const legacyPhases: Record<string, string> = {
   awaitingScan: '等待安全扫描', uploadReady: '文件已就绪', publishWorkPending: '正在发布作品', completed: '已发布',
 };
 function status(record: HistoryRecord) {
-  if (record.state === 'unknown') return '结果待核对';
+  if (record.state === 'unknown') return '未能确认发布';
   if (record.state === 'error') return '发布失败';
   if (isLegacy(record)) return legacyPhases[record.phase] ?? record.phase;
   if (record.state === 'completed') {
     if (record.remote?.hidden) return record.preview.target.kind === 'release' ? '新版已提交，插件仍已下架' : '已提交，插件已下架';
-    return '已发布';
+    return '发布成功';
   }
   return record.state === 'pending' ? '正在发布' : record.preview.listing ? '待确认' : '历史预览';
 }
@@ -127,15 +127,23 @@ function ReviewDialog({record, writable, onClose, onChange, reload}: {
   const [reconciliation, setReconciliation] = useState<Reconciliation | null>(null);
   const busy = activity !== null;
   const legacy = isLegacy(record);
+  const managerUnknown = !legacy && record.state === 'unknown';
+  const autoCheck = managerUnknown && writable && !busy && !needsRefresh && !reconciliation && !error;
+  const checking = managerUnknown && (autoCheck || activity === 'reconcile');
   const pack = legacy ? record.preview.package : record.preview;
   const target = legacy ? null : record.preview.target;
   const listing = legacy ? null : record.preview.listing;
-  const publishable = !!listing && record.state === 'intended' && !needsRefresh;
+  const superseded = !!listing?.coverPng && record.state === 'intended';
+  const publishable = !!listing && !superseded && record.state === 'intended' && !needsRefresh;
   const previousVersion = !legacy && target?.kind === 'release' ? record.preview.remoteVersion : null;
   const heading = legacy ? 'Mod客栈 · 旧版普通作品' : `Mod客栈 · ${targetName(record.preview.target)}　${previousVersion ? `${previousVersion} → ` : ''}${pack.version}`;
 
   async function refresh() {
-    try { onChange(await reload(record)); setNeedsRefresh(false); }
+    try {
+      const latest = await reload(record);
+      onChange(latest); setNeedsRefresh(false);
+      return latest;
+    }
     catch (err) { setNeedsRefresh(true); throw err; }
   }
   async function act(action: 'publish' | 'reconcile' | 'refresh') {
@@ -150,9 +158,13 @@ function ReviewDialog({record, writable, onClose, onChange, reload}: {
         try {
           result = await api<PublicationRecord>('publish_manager_publication', {id: record.id, digest: record.preview.digest, confirmation: 'PUBLISH_PLUGIN'});
         } catch (err) {
-          // The request could have reached the server. Read the durable state before enabling another approval.
-          await refresh(); throw err;
+          // A lost IPC reply does not undo a committed publication.
+          const latest = await refresh();
+          if (latest.state === 'completed' || latest.state === 'unknown') return;
+          throw err;
         }
+        // A returned unknown has already had its automatic server-side check.
+        if (result.state === 'unknown') setReconciliation('unconfirmed');
         onChange(result);
       } else if (action === 'reconcile') {
         const outcome = await api<Reconciliation>(legacy ? 'reconcile_plugin_publication' : 'reconcile_manager_publication', {id: record.id});
@@ -160,6 +172,14 @@ function ReviewDialog({record, writable, onClose, onChange, reload}: {
       } else { await refresh(); }
     } catch (err) { setError(err); } finally { inFlight.current = false; setActivity(null); }
   }
+  // Recover interrupted publications on opening the dialog, without resending them.
+  const checkInterrupted = useEffectEvent(() => { void act('reconcile'); });
+  useEffect(() => {
+    if (!autoCheck) return;
+    let active = true;
+    queueMicrotask(() => { if (active) checkInterrupted(); });
+    return () => { active = false; };
+  }, [autoCheck]);
   const metadata = <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-sm">
     {!legacy && <>
       <dt className="text-muted-foreground">来源</dt><dd className="wrap-anywhere">{record.preview.source.kind === 'draft' ? `草稿 · ${record.preview.source.draftId}` : `已安装适配包 · ${record.preview.source.slug}`}</dd>
@@ -174,11 +194,12 @@ function ReviewDialog({record, writable, onClose, onChange, reload}: {
   return <Modal className={legacy ? undefined : 'sm:max-w-[600px]'} title={legacy ? '旧版作品发布记录' : '发布插件'} description={heading} onClose={() => { if (!inFlight.current) onClose(); }} actions={<>
     <Button variant="outline" disabled={busy} onClick={onClose}>{publishable ? '取消' : '关闭'}</Button>
     {needsRefresh && <Button variant="outline" disabled={busy} onClick={() => void act('refresh')}>{activity === 'refresh' ? <Spinner/> : <RefreshCwIcon data-icon="inline-start"/>}刷新发布状态</Button>}
-    {canReconcile(record) && !needsRefresh && <Button variant="outline" disabled={busy || !writable} onClick={() => void act('reconcile')}>{activity === 'reconcile' ? <Spinner/> : <RefreshCwIcon data-icon="inline-start"/>}核对远端状态</Button>}
+    {canReconcile(record) && !needsRefresh && !checking && <Button variant="outline" disabled={busy || !writable} onClick={() => void act('reconcile')}>{activity === 'reconcile' ? <Spinner/> : <RefreshCwIcon data-icon="inline-start"/>}{legacy ? '核对远端状态' : '刷新发布状态'}</Button>}
     {publishable && <Button disabled={busy || !writable} onClick={() => void act('publish')}>{activity === 'publish' && <Spinner/>}发布</Button>}
   </>}>
-    {listing && <PublicationListingPreview listing={listing}/>}
-    {(!listing || record.state !== 'intended') && <div className="flex flex-wrap items-center gap-2"><strong className="wrap-anywhere">{pack.slug}</strong><span className="text-sm">{pack.version}</span><StatusBadge record={record}/></div>}
+    {superseded && <p role="status" className="text-sm text-muted-foreground">这是旧版像素封面预览，请关闭后重新点击「发布插件」使用游戏封面。</p>}
+    {listing && <PublicationListingPreview listing={listing} files={pack.files}/>}
+    {(!listing || record.state !== 'intended') && <div className="flex flex-wrap items-center gap-2"><strong className="wrap-anywhere">{pack.slug}</strong><span className="text-sm">{pack.version}</span><span aria-live="polite">{checking ? <span className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner/>正在确认发布…</span> : <StatusBadge record={record}/>}</span></div>}
     {!legacy && record.remote && <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-sm">
       <dt className="text-muted-foreground">远端插件 ID</dt><dd>{record.remote.id}</dd>
       <dt className="text-muted-foreground">远端版本 ID</dt><dd>{record.remote.releaseId}</dd>
@@ -187,8 +208,9 @@ function ReviewDialog({record, writable, onClose, onChange, reload}: {
     {!listing && metadata}
     {legacy && <><Separator/><LegacyMetadata record={record}/></>}
     <ErrorState error={error}/>
-    {reconciliation && <Alert role="status" variant={reconciliation === 'verified' ? 'success' : 'warning'}>{reconciliation === 'verified' ? <CheckCircle2Icon/> : <CircleAlertIcon/>}<AlertDescription>{reconciliation === 'verified' ? '已核实远端状态' : '尚未核实，发布状态保持不变'}</AlertDescription></Alert>}
-    {record.state === 'unknown' && !reconciliation && <Alert variant="warning"><CircleAlertIcon/><AlertDescription>{canReconcile(record) ? '远端可能已经收到本次发布，请先核对结果。' : '请在 Mod客栈核对该作品的发布结果。'}</AlertDescription></Alert>}
+    {legacy && reconciliation && <Alert role="status" variant={reconciliation === 'verified' ? 'success' : 'warning'}>{reconciliation === 'verified' ? <CheckCircle2Icon/> : <CircleAlertIcon/>}<AlertDescription>{reconciliation === 'verified' ? '已核实远端状态' : '尚未核实，发布状态保持不变'}</AlertDescription></Alert>}
+    {legacy && record.state === 'unknown' && !reconciliation && <Alert variant="warning"><CircleAlertIcon/><AlertDescription>{canReconcile(record) ? '远端可能已经收到本次发布，请先核对结果。' : '请在 Mod客栈核对该作品的发布结果。'}</AlertDescription></Alert>}
+    {managerUnknown && !checking && !error && <Alert variant="warning"><CircleAlertIcon/><AlertDescription>暂时无法确认此版本是否已发布。可稍后刷新状态，无需重新发布。</AlertDescription></Alert>}
     {listing ? <details className="min-w-0 text-sm">
       <summary className="cursor-pointer font-medium text-muted-foreground">查看发布文件</summary>
       <div className="mt-3 flex flex-col gap-3">{metadata}<Files files={pack.files}/></div>
@@ -225,7 +247,10 @@ export function PluginPublications({draft, showHistory, writable, onDraftClose}:
     void client.invalidateQueries({queryKey: key});
     setSelected(record);
     if (record.state !== 'completed') return;
-    if (!legacy) void client.invalidateQueries({queryKey: ['manager-plugin-games']});
+    if (!legacy) {
+      void client.invalidateQueries({queryKey: ['plugins']});
+      void client.invalidateQueries({queryKey: ['manager-plugin-games']});
+    }
     if (record.preview.source?.kind === 'draft') {
       // Either publication flow can move a consumed Agent draft to Trash.
       void client.invalidateQueries({queryKey: ['plugin-drafts']});

@@ -85,7 +85,7 @@ fn playwright_v11_args() -> Vec<String> {
     args.into_iter().map(str::to_owned).collect()
 }
 
-fn expected_playwright_output() -> String {
+fn legacy_playwright_output() -> String {
     let base = dirs::download_dir()
         .or_else(dirs::data_local_dir)
         .or_else(dirs::home_dir)
@@ -100,12 +100,12 @@ fn playwright_v12_args() -> Vec<String> {
     args.extend([
         "--file-paths=absolute".into(),
         "--output-dir".into(),
-        expected_playwright_output(),
+        legacy_playwright_output(),
     ]);
     args
 }
 
-fn expected_playwright_args() -> Vec<String> {
+fn legacy_v17_playwright_args() -> Vec<String> {
     vec![
         "--browser=chromium".into(),
         "--headless".into(),
@@ -114,7 +114,27 @@ fn expected_playwright_args() -> Vec<String> {
         "--no-webmcp".into(),
         "--file-paths=absolute".into(),
         "--output-dir".into(),
-        expected_playwright_output(),
+        legacy_playwright_output(),
+    ]
+}
+
+fn expected_playwright_args(database_path: &std::path::Path) -> Vec<String> {
+    let output = database_path
+        .parent()
+        .unwrap()
+        .join("downloads")
+        .join("Playwright");
+    let output = crate::paths::user_path(&output);
+    assert!(output.is_absolute());
+    vec![
+        "--browser=chromium".into(),
+        "--headless".into(),
+        "--sandbox".into(),
+        "--isolated".into(),
+        "--no-webmcp".into(),
+        "--file-paths=absolute".into(),
+        "--output-dir".into(),
+        output.to_str().unwrap().into(),
     ]
 }
 
@@ -150,7 +170,7 @@ fn markitdown_legacy_mirror_args() -> Vec<String> {
 
 #[test]
 fn sqlite_crud_presets_markitdown_inherits_uvx_default_and_secret_references() {
-    let (_dir, servers, settings, _) = fixture();
+    let (_dir, servers, settings, context) = fixture();
     servers.seed_presets().unwrap();
     servers.seed_presets().unwrap();
     let presets = servers.list().unwrap();
@@ -167,7 +187,19 @@ fn sqlite_crud_presets_markitdown_inherits_uvx_default_and_secret_references() {
     assert_eq!(markitdown.command.as_deref(), Some("uvx"));
     assert_eq!(markitdown.args, markitdown_args());
     assert!(markitdown.credential_url.is_none());
-    assert!(servers.get("playwright").unwrap().credential_url.is_none());
+    let playwright = servers.get("playwright").unwrap();
+    assert!(playwright.credential_url.is_none());
+    assert_eq!(
+        playwright.args,
+        expected_playwright_args(&context.engine.paths.db_file())
+    );
+    assert_eq!(
+        config::playwright_receipt_dir(&servers.db).unwrap(),
+        Some(
+            crate::paths::user_path(&context.engine.paths.downloads().join("Playwright"))
+                .into_owned()
+        )
+    );
     let http = servers.get("glossmod_http").unwrap();
     assert_eq!(
         http.url.as_deref(),
@@ -930,7 +962,7 @@ fn credential_url_v6_migration_does_not_backfill_custom_rows_with_builtin_ids() 
 
 #[test]
 fn microsoft_mcp_presets_are_credential_free_and_preserve_existing_config() {
-    let (_dir, servers, _, _) = fixture();
+    let (_dir, servers, _, context) = fixture();
     // Simulate an existing database that already has a custom server with this ID.
     let existing = ServerConfig::http(
         "markitdown",
@@ -944,7 +976,10 @@ fn microsoft_mcp_presets_are_credential_free_and_preserve_existing_config() {
     let mut playwright = servers.get("playwright").unwrap();
     assert_eq!(playwright.transport, McpTransport::Stdio);
     assert_eq!(playwright.command.as_deref(), Some("amm-playwright"));
-    assert_eq!(playwright.args, expected_playwright_args());
+    assert_eq!(
+        playwright.args,
+        expected_playwright_args(&context.engine.paths.db_file())
+    );
     assert_eq!(
         playwright.description.as_deref(),
         Some(EXPECTED_PLAYWRIGHT_DESCRIPTION)
@@ -1094,7 +1129,7 @@ fn markitdown_v5_custom_launches_preserve_values_and_existing_consent() {
 }
 
 #[test]
-fn playwright_output_dir_prefers_downloads_and_never_creates_directories() {
+fn legacy_playwright_output_dir_prefers_downloads_and_never_creates_directories() {
     let dir = tempfile::tempdir().unwrap();
     let downloads = dir.path().join("Redirected Downloads");
     let local_data = dir.path().join("Local Data");
@@ -1110,13 +1145,13 @@ fn playwright_output_dir_prefers_downloads_and_never_creates_directories() {
         ),
         (vec![temp.clone()], &temp),
     ] {
-        let output = config::playwright_output_dir(bases).unwrap();
+        let output = config::legacy_playwright_output_dir(bases).unwrap();
         assert_eq!(
             std::path::Path::new(&output),
             expected.join("Agent Mod Manager").join("Playwright")
         );
     }
-    assert!(config::playwright_output_dir(["relative".into()]).is_none());
+    assert!(config::legacy_playwright_output_dir(["relative".into()]).is_none());
     assert_eq!(dir.path().read_dir().unwrap().count(), 0);
 }
 
@@ -1146,7 +1181,7 @@ fn playwright_v10_through_v12_migrations_keep_historical_launcher() {
 }
 
 #[test]
-fn playwright_v11_database_upgrades_through_v12_to_bundled_launcher() {
+fn playwright_v11_database_upgrades_through_v12_to_active_storage_root() {
     let (_dir, servers, _, context) = fixture();
     servers.seed_presets().unwrap();
     let mut legacy = servers.get("playwright").unwrap();
@@ -1170,7 +1205,7 @@ fn playwright_v11_database_upgrades_through_v12_to_bundled_launcher() {
     let upgraded = McpServers::new(Db::open(&path).unwrap());
     let mut expected = legacy.clone();
     expected.command = Some("amm-playwright".into());
-    expected.args = expected_playwright_args();
+    expected.args = expected_playwright_args(&path);
     assert_eq!(upgraded.get("playwright").unwrap(), expected);
     assert!(upgraded.startup_digest("playwright").unwrap().is_none());
     assert!(ConnectionConsent::from_remembered(&upgraded, &expected).is_err());
@@ -1236,26 +1271,25 @@ fn playwright_v12_upgrade_preserves_custom_launch_settings_and_consent() {
 }
 
 #[test]
-fn playwright_v17_migrates_stock_v12_once_and_requires_new_start_consent() {
-    for (enabled, legacy_description, expected_description) in [
-        (
-            false,
-            Some(LEGACY_PLAYWRIGHT_DESCRIPTION),
-            Some(EXPECTED_PLAYWRIGHT_DESCRIPTION),
-        ),
-        (
-            true,
-            Some("My browser description"),
-            Some("My browser description"),
-        ),
-        (true, None, None),
+fn playwright_v19_upgrades_stock_launches_once_and_requires_new_start_consent() {
+    for (version, enabled, description) in [
+        (16, false, Some(LEGACY_PLAYWRIGHT_DESCRIPTION)),
+        (16, true, Some("My browser description")),
+        (16, true, None),
+        (18, false, Some(EXPECTED_PLAYWRIGHT_DESCRIPTION)),
+        (18, true, Some("My browser description")),
+        (18, true, None),
     ] {
         let (_dir, servers, _, context) = fixture();
         servers.seed_presets().unwrap();
         let mut legacy = servers.get("playwright").unwrap();
-        legacy.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
-        legacy.args = playwright_v12_args();
-        legacy.description = legacy_description.map(str::to_owned);
+        if version == 16 {
+            legacy.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
+            legacy.args = playwright_v12_args();
+        } else {
+            legacy.args = legacy_v17_playwright_args();
+        }
+        legacy.description = description.map(str::to_owned);
         legacy.enabled = enabled;
         servers.update(&legacy).unwrap();
         if enabled {
@@ -1266,29 +1300,40 @@ fn playwright_v17_migrates_stock_v12_once_and_requires_new_start_consent() {
         servers
             .db
             .conn()
-            .pragma_update(None, "user_version", 16)
+            .pragma_update(None, "user_version", version)
             .unwrap();
 
         let path = context.engine.paths.db_file();
         let upgraded = McpServers::new(Db::open(&path).unwrap());
+        let migrated_version: i64 = upgraded
+            .db
+            .conn()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(migrated_version, crate::db::SCHEMA_VERSION);
         let mut expected = legacy.clone();
         expected.command = Some("amm-playwright".into());
-        expected.args = expected_playwright_args();
-        expected.description = expected_description.map(str::to_owned);
+        expected.args = expected_playwright_args(&path);
+        if version == 16 && description == Some(LEGACY_PLAYWRIGHT_DESCRIPTION) {
+            expected.description = Some(EXPECTED_PLAYWRIGHT_DESCRIPTION.into());
+        }
         assert_eq!(upgraded.get("playwright").unwrap(), expected);
         assert!(upgraded.startup_requests().unwrap().is_empty());
         assert!(upgraded.startup_digest("playwright").unwrap().is_none());
         assert!(ConnectionConsent::from_remembered(&upgraded, &expected).is_err());
         assert_eq!(
             config::playwright_receipt_dir(&upgraded.db).unwrap(),
-            Some(std::path::PathBuf::from(expected_playwright_output()))
+            Some(
+                crate::paths::user_path(&context.engine.paths.downloads().join("Playwright"))
+                    .into_owned()
+            )
         );
 
         if enabled {
             upgraded.remember_start(&expected).unwrap();
             assert!(ConnectionConsent::from_remembered(&upgraded, &expected).is_ok());
 
-            // An explicit restoration of the exact v12 launch is not overwritten on reopen.
+            // An explicit restoration of the exact historical launch is respected on reopen.
             upgraded.update(&legacy).unwrap();
             upgraded.remember_start(&legacy).unwrap();
             let reopened = McpServers::new(Db::open(&path).unwrap());
@@ -1301,57 +1346,64 @@ fn playwright_v17_migrates_stock_v12_once_and_requires_new_start_consent() {
 }
 
 #[test]
-fn playwright_v17_preserves_non_stock_launch_settings_and_consent() {
-    for customization in [
-        "name",
-        "command",
-        "browser",
-        "output",
-        "env",
-        "credential_url",
-        "transport",
-        "non_builtin",
-        "plugin_owner",
-    ] {
-        let (dir, servers, _, context) = fixture();
-        servers.seed_presets().unwrap();
-        let mut legacy = servers.get("playwright").unwrap();
-        legacy.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
-        legacy.args = playwright_v12_args();
-        legacy.enabled = true;
-        legacy.description = Some(LEGACY_PLAYWRIGHT_DESCRIPTION.into());
-        match customization {
-            "name" => legacy.name = "My browser".into(),
-            "command" => legacy.command = Some("custom-npx.cmd".into()),
-            "browser" => legacy.args.push("--browser=firefox".into()),
-            "output" => *legacy.args.last_mut().unwrap() = dir.path().to_str().unwrap().into(),
-            "env" => {
-                legacy
-                    .env_secret_refs
-                    .insert("BROWSER_API_KEY".into(), "mcp.personal.browser".into());
+fn playwright_v19_preserves_non_stock_launch_settings_and_consent() {
+    for version in [16, 18] {
+        for customization in [
+            "name",
+            "command",
+            "browser",
+            "output",
+            "env",
+            "credential_url",
+            "transport",
+            "non_builtin",
+            "plugin_owner",
+        ] {
+            let (dir, servers, _, context) = fixture();
+            servers.seed_presets().unwrap();
+            let mut legacy = servers.get("playwright").unwrap();
+            if version == 16 {
+                legacy.command = Some(LEGACY_PLAYWRIGHT_COMMAND.into());
+                legacy.args = playwright_v12_args();
+            } else {
+                legacy.args = legacy_v17_playwright_args();
             }
-            "credential_url" => legacy.credential_url = Some("https://example.test/keys".into()),
-            "transport" => {
-                legacy.transport = McpTransport::StreamableHttp;
-                legacy.command = None;
-                legacy.args.clear();
-                legacy.url = Some("https://example.test/mcp".into());
+            legacy.enabled = true;
+            legacy.description = Some(EXPECTED_PLAYWRIGHT_DESCRIPTION.into());
+            match customization {
+                "name" => legacy.name = "My browser".into(),
+                "command" => legacy.command = Some("custom-npx.cmd".into()),
+                "browser" => legacy.args.push("--browser=firefox".into()),
+                "output" => *legacy.args.last_mut().unwrap() = dir.path().to_str().unwrap().into(),
+                "env" => {
+                    legacy
+                        .env_secret_refs
+                        .insert("BROWSER_API_KEY".into(), "mcp.personal.browser".into());
+                }
+                "credential_url" => {
+                    legacy.credential_url = Some("https://example.test/keys".into())
+                }
+                "transport" => {
+                    legacy.transport = McpTransport::StreamableHttp;
+                    legacy.command = None;
+                    legacy.args.clear();
+                    legacy.url = Some("https://example.test/mcp".into());
+                }
+                "non_builtin" | "plugin_owner" => {}
+                _ => unreachable!(),
             }
-            "non_builtin" | "plugin_owner" => {}
-            _ => unreachable!(),
-        }
-        servers.update(&legacy).unwrap();
-        if customization == "non_builtin" {
-            servers
-                .db
-                .conn()
-                .execute("UPDATE mcp_servers SET builtin=0 WHERE id='playwright'", [])
-                .unwrap();
-            legacy.builtin = false;
-        }
-        if customization == "plugin_owner" {
-            register_test_plugin(&servers, "browser-fixture", true, true);
-            servers
+            servers.update(&legacy).unwrap();
+            if customization == "non_builtin" {
+                servers
+                    .db
+                    .conn()
+                    .execute("UPDATE mcp_servers SET builtin=0 WHERE id='playwright'", [])
+                    .unwrap();
+                legacy.builtin = false;
+            }
+            if customization == "plugin_owner" {
+                register_test_plugin(&servers, "browser-fixture", true, true);
+                servers
                 .db
                 .conn()
                 .execute(
@@ -1359,26 +1411,27 @@ fn playwright_v17_preserves_non_stock_launch_settings_and_consent() {
                     [],
                 )
                 .unwrap();
-            legacy.plugin_slug = Some("browser-fixture".into());
-        }
-        servers.remember_start(&legacy).unwrap();
-        let digest = servers.startup_digest("playwright").unwrap().unwrap();
-        servers
-            .db
-            .conn()
-            .pragma_update(None, "user_version", 16)
-            .unwrap();
+                legacy.plugin_slug = Some("browser-fixture".into());
+            }
+            servers.remember_start(&legacy).unwrap();
+            let digest = servers.startup_digest("playwright").unwrap().unwrap();
+            servers
+                .db
+                .conn()
+                .pragma_update(None, "user_version", version)
+                .unwrap();
 
-        let upgraded = McpServers::new(Db::open(&context.engine.paths.db_file()).unwrap());
-        upgraded.seed_presets().unwrap();
-        assert_eq!(
-            upgraded.get("playwright").unwrap(),
-            legacy,
-            "{customization}"
-        );
-        assert_eq!(upgraded.startup_digest("playwright").unwrap(), Some(digest));
-        assert_eq!(upgraded.startup_requests().unwrap(), ["playwright"]);
-        assert!(ConnectionConsent::from_remembered(&upgraded, &legacy).is_ok());
+            let upgraded = McpServers::new(Db::open(&context.engine.paths.db_file()).unwrap());
+            upgraded.seed_presets().unwrap();
+            assert_eq!(
+                upgraded.get("playwright").unwrap(),
+                legacy,
+                "{customization}"
+            );
+            assert_eq!(upgraded.startup_digest("playwright").unwrap(), Some(digest));
+            assert_eq!(upgraded.startup_requests().unwrap(), ["playwright"]);
+            assert!(ConnectionConsent::from_remembered(&upgraded, &legacy).is_ok());
+        }
     }
 }
 
@@ -1404,7 +1457,7 @@ fn playwright_v2_upgrade_selects_platform_defaults_and_respects_subsequent_edits
     let servers = McpServers::new(Db::open(&path).unwrap());
     let reopened = servers.get("playwright").unwrap();
     assert_eq!(reopened.command.as_deref(), Some("amm-playwright"));
-    assert_eq!(reopened.args, expected_playwright_args());
+    assert_eq!(reopened.args, expected_playwright_args(&path));
     assert!(reopened.enabled && reopened.builtin);
     assert!(servers.startup_requests().unwrap().is_empty());
     assert!(ConnectionConsent::from_remembered(&servers, &reopened).is_err());

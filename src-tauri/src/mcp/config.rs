@@ -7,7 +7,10 @@ use crate::{
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 // Historical Playwright launchers used the platform-specific npx shim.
 const LEGACY_PLAYWRIGHT_COMMAND: &str = if cfg!(windows) { "npx.cmd" } else { "npx" };
@@ -29,7 +32,9 @@ fn playwright_v11_args() -> Vec<String> {
     playwright_args("@playwright/mcp@latest", cfg!(windows))
 }
 
-pub(super) fn playwright_output_dir(bases: impl IntoIterator<Item = PathBuf>) -> Option<String> {
+pub(super) fn legacy_playwright_output_dir(
+    bases: impl IntoIterator<Item = PathBuf>,
+) -> Option<String> {
     bases
         .into_iter()
         .filter(|base| base.is_absolute())
@@ -42,10 +47,9 @@ pub(super) fn playwright_output_dir(bases: impl IntoIterator<Item = PathBuf>) ->
         })
 }
 
-fn default_playwright_output_dir() -> Option<String> {
-    // Resolve the user's Downloads known folder (which may be redirected), not
-    // an install/cwd-relative directory. Playwright creates the directory on use.
-    playwright_output_dir(
+fn legacy_default_playwright_output_dir() -> Option<String> {
+    // Only for recognizing historical stock launch arguments during upgrades.
+    legacy_playwright_output_dir(
         [
             dirs::download_dir(),
             dirs::data_local_dir(),
@@ -80,9 +84,22 @@ fn playwright_v17_args(output_dir: String) -> Vec<String> {
     ]
 }
 
-fn require_default_playwright_output_dir() -> AppResult<String> {
-    default_playwright_output_dir()
+fn managed_playwright_output_dir(root: &Path) -> AppResult<String> {
+    let output = crate::storage::playwright_downloads(root);
+    crate::paths::user_path(&output)
+        .to_str()
+        .filter(|_| output.is_absolute())
+        .map(str::to_owned)
         .ok_or_else(|| AppError::Invalid("无法确定 Playwright MCP 下载目录的绝对路径".into()))
+}
+
+/// manager.db lives directly in the active storage root. Never derive download
+/// destinations from editable MCP arguments or the system Downloads directory.
+pub(super) fn active_storage_root(conn: &Connection) -> AppResult<&Path> {
+    conn.path()
+        .and_then(|p| Path::new(p).parent())
+        .filter(|root| root.is_absolute())
+        .ok_or_else(|| AppError::Invalid("无法确定当前存储目录".into()))
 }
 
 fn stock_playwright_receipt_dir(config: &ServerConfig, expected_dir: String) -> Option<PathBuf> {
@@ -103,13 +120,11 @@ fn stock_playwright_receipt_dir(config: &ServerConfig, expected_dir: String) -> 
     .then(|| PathBuf::from(expected_dir))
 }
 
-/// Only stock Playwright may supply an external receipt folder. Customized
-/// launchers and relocated output require the explicit desktop picker.
+/// Only the stock launcher may supply the dedicated managed browser inbox.
 pub(crate) fn playwright_receipt_dir(db: &Db) -> AppResult<Option<PathBuf>> {
-    let Some(expected_dir) = default_playwright_output_dir() else {
-        return Ok(None);
-    };
-    match McpServers::new(db.clone()).get(PLAYWRIGHT_ID) {
+    let conn = db.conn();
+    let expected_dir = managed_playwright_output_dir(active_storage_root(&conn)?)?;
+    match McpServers::get_from(&conn, PLAYWRIGHT_ID) {
         Ok(config) => Ok(stock_playwright_receipt_dir(&config, expected_dir)),
         Err(AppError::NotFound(_)) => Ok(None),
         Err(error) => Err(error),
@@ -118,7 +133,10 @@ pub(crate) fn playwright_receipt_dir(db: &Db) -> AppResult<Option<PathBuf>> {
 
 /// Schema v12: only the stock v11 Playwright command gains an output path.
 pub(crate) fn migrate_playwright_downloads(conn: &Connection) -> AppResult<()> {
-    let args = playwright_v12_args(require_default_playwright_output_dir()?);
+    let Some(output_dir) = legacy_default_playwright_output_dir() else {
+        return Ok(());
+    };
+    let args = playwright_v12_args(output_dir);
     conn.execute(
         "UPDATE mcp_servers SET args_json=?1, startup_digest=NULL
          WHERE id='playwright' AND builtin=1 AND plugin_slug IS NULL AND name='Playwright MCP'
@@ -137,7 +155,7 @@ pub(crate) fn migrate_playwright_downloads(conn: &Connection) -> AppResult<()> {
 /// Keep enablement and custom descriptions, but require new auto-start consent.
 pub(crate) fn migrate_bundled_playwright(conn: &Connection) -> AppResult<()> {
     // Without an independently resolved default, there is no exact stock path to match.
-    let Some(output_dir) = default_playwright_output_dir() else {
+    let Some(output_dir) = legacy_default_playwright_output_dir() else {
         return Ok(());
     };
     let previous_args = playwright_v12_args(output_dir.clone());
@@ -158,6 +176,50 @@ pub(crate) fn migrate_bundled_playwright(conn: &Connection) -> AppResult<()> {
         ],
     )?;
     Ok(())
+}
+
+/// Update only a recognized stock configuration, inside the migration transaction.
+/// Changing a launch argument invalidates the previously confirmed command.
+fn move_stock_playwright_output(conn: &Connection, old: String, new: String) -> AppResult<()> {
+    let config = match McpServers::get_from(conn, PLAYWRIGHT_ID) {
+        Ok(config) => config,
+        Err(AppError::NotFound(_)) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if old != new && stock_playwright_receipt_dir(&config, old).is_some() {
+        conn.execute(
+            "UPDATE mcp_servers SET args_json=?1, startup_digest=NULL WHERE id=?2",
+            params![
+                serde_json::to_string(&playwright_v17_args(new))?,
+                PLAYWRIGHT_ID
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Schema v19: stop sending new browser downloads to the OS download folder.
+pub(crate) fn migrate_playwright_storage(conn: &Connection) -> AppResult<()> {
+    if let Some(old) = legacy_default_playwright_output_dir() {
+        move_stock_playwright_output(
+            conn,
+            old,
+            managed_playwright_output_dir(active_storage_root(conn)?)?,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn relocate_playwright_storage(
+    conn: &Connection,
+    source: &Path,
+    target: &Path,
+) -> AppResult<()> {
+    move_stock_playwright_output(
+        conn,
+        managed_playwright_output_dir(source)?,
+        managed_playwright_output_dir(target)?,
+    )
 }
 
 /// Schema v3: only the stock Windows launch changes; its old consent cannot be reused.
@@ -220,6 +282,7 @@ struct ModSourcePreset {
     name: &'static str,
     description: &'static str,
     args: &'static [&'static str],
+    download_dir_env: &'static str,
     credential_url: Option<&'static str>,
     // (environment variable, suffix of this preset's encrypted-Store reference)
     bindings: &'static [(&'static str, &'static str)],
@@ -229,6 +292,7 @@ const MOD_SOURCE_PRESETS: &[ModSourcePreset] = &[
     ModSourcePreset {
         id: MODIO_ID,
         name: "mod.io MCP",
+        download_dir_env: "MODIO_DOWNLOAD_DIR",
         description: "查找 mod.io 上的游戏与模组，查看模组和文件详情。",
         args: &["modio-mcp@latest"],
         credential_url: Some("https://mod.io/me/access"),
@@ -240,6 +304,7 @@ const MOD_SOURCE_PRESETS: &[ModSourcePreset] = &[
     ModSourcePreset {
         id: "curseforge",
         name: "CurseForge MCP",
+        download_dir_env: "CURSEFORGE_DOWNLOAD_DIR",
         description: "搜索 CurseForge 模组，查询项目、版本与文件信息。",
         args: &["curseforge-mcp@latest"],
         credential_url: Some("https://console.curseforge.com/#/api-keys"),
@@ -248,6 +313,7 @@ const MOD_SOURCE_PRESETS: &[ModSourcePreset] = &[
     ModSourcePreset {
         id: "gamebanana",
         name: "GameBanana MCP",
+        download_dir_env: "GAMEBANANA_DOWNLOAD_DIR",
         description: "浏览和搜索 GameBanana 模组，查看条目与下载文件。",
         args: &["gamebanana-mcp@latest"],
         credential_url: None,
@@ -256,6 +322,7 @@ const MOD_SOURCE_PRESETS: &[ModSourcePreset] = &[
     ModSourcePreset {
         id: NEXUSMODS_ID,
         name: "Nexus Mods MCP",
+        download_dir_env: "NEXUSMODS_DOWNLOAD_DIR",
         description: "查找 Nexus Mods 模组，查看项目和文件信息。",
         args: &[
             "--upgrade",
@@ -448,6 +515,20 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    pub(super) fn source_download_dir_env(&self) -> Option<&'static str> {
+        if !self.builtin
+            || self.plugin_slug.is_some()
+            || self.transport != McpTransport::Stdio
+            || self.command.as_deref() != Some("uvx")
+        {
+            return None;
+        }
+        MOD_SOURCE_PRESETS
+            .iter()
+            .find(|preset| self.id == preset.id && self.args == preset.args)
+            .map(|preset| preset.download_dir_env)
+    }
+
     pub(super) fn is_glossmod_endpoint(&self) -> bool {
         self.matches_http_endpoint(GLOSSMOD_HTTP_ENDPOINT)
     }
@@ -823,7 +904,8 @@ impl McpServers {
 
     /// Insert-only seeding never overwrites edits or re-enables a disabled server.
     pub fn seed_presets(&self) -> AppResult<()> {
-        let args = playwright_v17_args(require_default_playwright_output_dir()?);
+        let output_dir = managed_playwright_output_dir(active_storage_root(&self.db.conn())?)?;
+        let args = playwright_v17_args(output_dir);
         for config in builtin_presets(PLAYWRIGHT_COMMAND, args, PLAYWRIGHT_DESCRIPTION) {
             match self.insert(&config, true) {
                 Ok(()) => {}
@@ -1025,7 +1107,7 @@ mod receipt_tests {
     #[test]
     fn only_the_stock_launcher_and_independently_derived_output_path_are_trusted() {
         let dir = tempfile::tempdir().unwrap();
-        let expected = playwright_output_dir([dir.path().to_path_buf()]).unwrap();
+        let expected = managed_playwright_output_dir(dir.path()).unwrap();
         let args = playwright_v17_args(expected.clone());
         let mut stock = builtin_presets(PLAYWRIGHT_COMMAND, args, PLAYWRIGHT_DESCRIPTION)
             .find(|config| config.id == PLAYWRIGHT_ID)

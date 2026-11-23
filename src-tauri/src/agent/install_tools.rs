@@ -32,6 +32,16 @@ pub fn register(registry: &ToolRegistry) -> AppResult<()> {
     registry.register(Arc::new(VerifyInstallFiles))
 }
 
+fn check_workspace_target(context: &ToolContext, target: &str) -> AppResult<()> {
+    if let crate::sources::resolutions::ResolutionScope::Agent(conversation) =
+        &context.resolution_scope
+    {
+        let selected = super::workspace::selection(&context.engine.db, conversation)?;
+        super::workspace::resolve(selected.as_deref(), Some(target))?;
+    }
+    Ok(())
+}
+
 struct VerifyInstallFiles;
 
 #[derive(Deserialize)]
@@ -62,6 +72,16 @@ impl AgentTool for VerifyInstallFiles {
         }
     }
 
+    async fn prepare(&self, context: &ToolContext, args: &Value) -> AppResult<PreparedTool> {
+        let parsed: VerifyFileArgs = serde_json::from_value(args.clone())?;
+        check_workspace_target(context, &parsed.game_id)?;
+        Ok(PreparedTool {
+            preview: args.clone(),
+            effect: Effect::Read,
+            plan: None,
+        })
+    }
+
     async fn execute(
         &self,
         context: &ToolContext,
@@ -72,6 +92,7 @@ impl AgentTool for VerifyInstallFiles {
             game_id,
             install_id,
         } = serde_json::from_value(args)?;
+        check_workspace_target(context, &game_id)?;
         let engine = context.engine.clone();
         let cancel = context.cancel.clone();
         tokio::task::spawn_blocking(move || {
@@ -147,6 +168,7 @@ impl AgentTool for CheckModrinthDependencies {
             return Err(AppError::Cancelled);
         }
         let DependencyCheckArgs { request } = serde_json::from_value(args)?;
+        check_workspace_target(context, &request.game_id)?;
         let engine = context.engine.clone();
         let cancel = context.cancel.clone();
         tokio::task::spawn_blocking(move || {
@@ -211,7 +233,7 @@ impl AgentTool for InstallTool {
         let (description,properties,required,effect) = match self.name.as_str() {
             "list_mod_library" => ("列出当前已登记游戏可用的 Mods 原包、artifactId、来源和作者项目页。game_id 是本机登记 ID。gameId 为空的条目下载时按游戏名分类。", json!({"game_id":{"type":"string"}}),vec!["game_id"],Effect::Read),
             "match_mod_install" => ("只读核对目标游戏的本地适配规则、已校验原包、README、归档清单及 FOMOD。用候选状态判断安装方法；需要用户选择时询问具体选项。", json!({"game_id":{"type":"string"},"artifact_id":{"type":"string"}}),vec!["game_id","artifact_id"],Effect::Read),
-            "forget_uninstalled_mod" => ("仅在用户明确要求从管理列表删除时，在卸载或回滚成功后移除该游戏的记录。保留磁盘归档和审计历史。普通卸载结束后不要调用。",json!({"game_id":{"type":"string"},"install_id":{"type":"string"}}),vec!["game_id","install_id"],Effect::ManagerWrite),
+            "forget_uninstalled_mod" => ("仅用于用户明确要求从管理列表删除：卸载或回滚成功后，或 inspect_install 建议 forget_missing_files 时，移除同一游戏的记录。文件均已缺失时无需卸载、回滚或补回文件。保留磁盘归档和审计历史。普通卸载不要调用。",json!({"game_id":{"type":"string"},"install_id":{"type":"string"}}),vec!["game_id","install_id"],Effect::ManagerWrite),
             "bind_mod_library_entry" => ("把下载时尚未登记游戏的库条目关联到用户选定的本机游戏实例。同名候选先让用户指定目标。",json!({"game_id":{"type":"string"},"artifact_id":{"type":"string"}}),vec!["game_id","artifact_id"],Effect::ManagerWrite),
             "install_library_mod" => (
                 "从目标游戏的 Mods 库安装一个原包，准备并按审批提交同一份复制计划。先运行 match_mod_install。mode=adapter 使用已匹配的 modType；mode=approvedMappings 逐文件映射作者说明或用户选项，省略 modType 时目标相对已登记的游戏根。",
@@ -233,7 +255,7 @@ impl AgentTool for InstallTool {
                     "required":["gameId","artifactPath","filename","name","modType"],"additionalProperties":false}}),
                 vec!["request"], if self.name == "plan_install" {Effect::Read} else {Effect::ManagerWrite}),
             "list_installs" => ("读取游戏安装事务、逐文件清单和状态。downloadOrigin 记录部署时的来源、项目和精确版本 ID；null 表示未绑定，不要从显示版本推断。记录不证明来源真实性或加载器已启用",json!({"game_id":{"type":"string"}}),vec!["game_id"],Effect::Read),
-            "inspect_install" => ("只读检查一个安装的文件指纹、缺失或修改、覆盖过的原文件和与其他安装的路径重叠，并返回协调预览：安全卸载、回滚安装、回滚替换版本或人工审查。rollbackTransactionId 只是建议，不会自动执行；本工具不调用 reconcile、不创建计划、不修改文件或数据库",json!({"game_id":{"type":"string"},"install_id":{"type":"string"}}),vec!["game_id","install_id"],Effect::Read),
+            "inspect_install" => ("只读检查一个安装的文件指纹、缺失或修改、覆盖过的原文件和与其他安装的路径重叠。协调预览可能建议安全卸载、回滚、仅移除文件均缺失的记录（forget_missing_files）或人工审查。rollbackTransactionId 只是建议，不会自动执行；本工具不调用 reconcile、不创建计划、不修改文件或数据库",json!({"game_id":{"type":"string"},"install_id":{"type":"string"}}),vec!["game_id","install_id"],Effect::Read),
             "uninstall_mod" => ("按游戏与安装记录核对归属，将独占且未修改的文件移入回收站。覆盖过原文件时用带 game_id、install_id 的 rollback_transaction 恢复备份。",json!({"game_id":{"type":"string"},"install_id":{"type":"string"}}),vec!["install_id"],Effect::ManagerWrite),
             _ => ("回滚一个已提交文件事务，展示原计划影响；冲突时保留现场而非强行覆盖",json!({"transaction_id":{"type":"string"},"game_id":{"type":"string"},"install_id":{"type":"string"}}),vec!["transaction_id"],Effect::ManagerWrite),
         };
@@ -258,30 +280,25 @@ impl AgentTool for InstallTool {
         let cancel = context.cancel.clone();
         let scope = context.resolution_scope.clone();
         tokio::task::spawn_blocking(move || {
-            // Desktop actions open a conversation bound to the chosen game. Never
-            // apply a different game's library request in that conversation.
-            let target_game = match name.as_str() {
-                "install_library_mod" => args["request"]["gameId"].as_str(),
-                "forget_uninstalled_mod" | "bind_mod_library_entry" | "uninstall_mod" | "rollback_transaction" => args["game_id"].as_str(),
-                _ => None,
-            };
+            // Missing legacy game_id must not bypass the installation's actual owner.
+            let owner = if name == "uninstall_mod" || (name == "rollback_transaction" && args["install_id"].is_string()) {
+                Some(install::get_install(&engine, text(&args, "install_id")?)?.game_id)
+            } else { None };
+            let target_game = owner.as_deref().or_else(|| match name.as_str() {
+                "install_library_mod" | "install_mod" | "plan_install" => args["request"]["gameId"].as_str(),
+                _ => args["game_id"].as_str(),
+            });
             if let (crate::sources::resolutions::ResolutionScope::Agent(conversation), Some(target)) = (&scope, target_game) {
-                let bound: Option<String> = engine.db.conn().query_row(
-                    "SELECT game_id FROM conversations WHERE id=?1", [conversation], |row| row.get(0),
-                )?;
-                if bound.as_deref().is_some_and(|id| id != target) {
-                    return Err(AppError::Denied("操作的游戏与当前会话选定的游戏不符".into()));
-                }
+                let selected = super::workspace::selection(&engine.db, conversation)?;
+                super::workspace::resolve(selected.as_deref(), Some(target))?;
             }
             let (preview, plan) = match name.as_str() {
                 "forget_uninstalled_mod" => {
                     let game_id = text(&args, "game_id")?;
                     let install_id = text(&args, "install_id")?;
-                    let record = install::get_install(&engine, install_id)?;
-                    if record.game_id != game_id || !crate::mod_management::inactive(&record.status) {
-                        return Err(AppError::Conflict("请先核对目标游戏并完成卸载或回滚".into()));
-                    }
-                    (json!({"action":"从管理列表删除", "gameId":game_id,"installId":install_id,"name":record.name,"status":record.status}), None)
+                    let (name, status) = crate::mod_management::preview_record_removal(&engine, game_id, install_id)?;
+                    let action = if status == "enabled" { "安装文件均已缺失，仅移除管理记录，不修改游戏文件" } else { "从管理列表删除" };
+                    (json!({"action":action,"gameId":game_id,"installId":install_id,"name":name,"status":status}), None)
                 }
                 "install_library_mod" => {
                     let request = serde_json::from_value(args["request"].clone())?;
@@ -385,7 +402,8 @@ impl AgentTool for InstallTool {
                     if prepared.effect != Effect::ManagerWrite || prepared.preview["gameId"] != game || prepared.preview["installId"] != id {
                         return Err(AppError::Denied("目标与批准的记录不符".into()));
                     }
-                    crate::mod_management::remove(&engine,game,&crate::mod_management::Target::Record(id.into()))?;
+                    let status = text(&prepared.preview,"status")?;
+                    crate::mod_management::remove_reviewed_record(&engine,game,id,status)?;
                     Ok(json!({"status":"removed","gameId":game,"installId":id}))
                 }
                 "list_mod_library" => Ok(json!(crate::mod_library::list_for_game(&engine.db, text(&args, "game_id")?)?)),

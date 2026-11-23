@@ -388,9 +388,31 @@ pub async fn create_conversation(
     state: State<'_, AppServices>,
     title: String,
     game_id: Option<String>,
+    category: Option<String>,
+    workspace_game_ids: Option<Vec<String>>,
 ) -> AppResult<Conversation> {
     blocking(state.engine.clone(), move |e| {
-        History::new(e.db).create_conversation(&title, game_id.as_deref())
+        History::new(e.db).create_conversation_with_workspace(
+            &title,
+            game_id.as_deref(),
+            category.as_deref(),
+            workspace_game_ids.as_deref(),
+        )
+    })
+    .await
+}
+#[tauri::command]
+pub async fn set_conversation_workspace(
+    state: State<'_, AppServices>,
+    id: String,
+    game_ids: serde_json::Value,
+) -> AppResult<Conversation> {
+    // Require the IPC key even when it is null, so omitting it cannot
+    // silently widen the selection to all games.
+    let game_ids: Option<Vec<String>> = serde_json::from_value(game_ids)
+        .map_err(|_| AppError::Invalid("工作区游戏必须是游戏 ID 数组或 null".into()))?;
+    blocking(state.engine.clone(), move |e| {
+        History::new(e.db).set_conversation_workspace(&id, game_ids.as_deref())
     })
     .await
 }
@@ -629,7 +651,28 @@ pub async fn register_game(
     directory: std::path::PathBuf,
     adapter_slug: Option<String>,
     from_discovery: Option<bool>,
+    cloud_adapter: Option<crate::manager_catalog::CatalogReleaseSelection>,
+    discovery_name: Option<String>,
 ) -> AppResult<games::Game> {
+    if let Some(release) = cloud_adapter {
+        if from_discovery != Some(true) || adapter_slug.is_some() {
+            return Err(AppError::Invalid(
+                "只有未选本地适配包的扫描结果才能自动安装云端适配包".into(),
+            ));
+        }
+        let registration = blocking(state.engine.clone(), move |e| {
+            games::CatalogGameRegistration::new(&e.paths, &directory, discovery_name.as_deref())
+        })
+        .await?;
+        // No filesystem or DB lock spans the anonymous release revalidation/download.
+        let preview =
+            crate::manager_catalog::preview(&state.engine, &release.plugin_id, &release.release_id)
+                .await?;
+        return blocking(state.engine.clone(), move |e| {
+            crate::plugin_workflow::register_catalog_game(&e, preview, registration)
+        })
+        .await;
+    }
     blocking(state.engine.clone(), move |e| {
         let _guard = crate::transaction::write_lock();
         let directory = directory.canonicalize()?;
@@ -958,6 +1001,27 @@ pub async fn prepare_manager_plugin_import(
     release_id: String,
 ) -> AppResult<crate::manager_catalog::CatalogImport> {
     crate::manager_catalog::prepare_import(&state.engine, &plugin_id, &release_id).await
+}
+
+/// The desktop catalog's Install action authorizes only this selected release.
+#[tauri::command]
+pub async fn install_manager_plugin(
+    state: State<'_, AppServices>,
+    plugin_id: String,
+    release_id: String,
+) -> AppResult<()> {
+    crate::manager_catalog::install(&state.engine, &plugin_id, &release_id).await
+}
+
+#[tauri::command]
+pub async fn remove_installed_plugin(
+    state: State<'_, AppServices>,
+    slug: String,
+) -> AppResult<crate::plugin_workflow::PluginRemovalReceipt> {
+    blocking(state.engine.clone(), move |e| {
+        crate::plugin_workflow::remove_installed_plugin(&e, &slug)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1354,7 +1418,7 @@ pub async fn rollback_transaction(
     transaction_id: String,
 ) -> AppResult<()> {
     blocking(state.engine.for_local_agent(), move |e| {
-        e.rollback_transaction(&transaction_id)?;
+        e.rollback_desktop_transaction(&transaction_id)?;
         crate::install::reconcile(&e.db)?;
         crate::plugin_workflow::reconcile_deployments(&e)?;
         crate::skills::reconcile_deployments(&e)?;

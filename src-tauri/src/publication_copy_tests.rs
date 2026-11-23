@@ -12,14 +12,11 @@ use axum::{
     routing::post,
     Router,
 };
-use std::{
-    io::Read,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 fn reply() -> Value {
-    json!({"title":"Stardew Valley 模组适配", "summary":"SMAPI：安全管理模组。", "description":"识别游戏并核对模组类型。\n\n安装前可检查依赖和存档。", "tags":["SMAPI","模组管理"], "design":{"palette":"grove","icon":"sprout"}})
+    json!({"title":"Stardew Valley 模组适配", "summary":"SMAPI：安全管理模组。", "description":"识别游戏并核对模组类型。\n\n安装前可检查依赖和存档。", "tags":["SMAPI","模组管理"]})
 }
 fn fixture() -> (GamePackage, [PublicationFile; 2]) {
     let (slug, adapter, skill) = PACKAGES[3];
@@ -35,84 +32,104 @@ fn listing(p: &GamePackage) -> PublicationListing {
     listing_from_reply(p, &reply().to_string()).unwrap()
 }
 
-// Independent scanline decode for comparison, including the network-order chunk
-// lengths and PNG palette. Never use the generator's pixels as the test result.
-fn decode_rgb(encoded: &str) -> Vec<u8> {
-    let bytes = STANDARD.decode(encoded).unwrap();
-    assert!(bytes.len() < 2048);
-    assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
-    let mut pos = 8;
-    let mut palette = vec![];
-    let mut raw = vec![];
-    let mut dimensions = (0, 0);
-    while pos < bytes.len() {
-        let length = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
-        let data = &bytes[pos + 8..pos + 8 + length];
-        match &bytes[pos + 4..pos + 8] {
-            b"IHDR" => {
-                dimensions = (
-                    u32::from_be_bytes(data[..4].try_into().unwrap()) as usize,
-                    u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize,
-                );
-                assert_eq!(&data[8..], &[8, 3, 0, 0, 0]);
-            }
-            b"PLTE" => palette = data.to_vec(),
-            b"IDAT" => {
-                flate2::read::ZlibDecoder::new(data)
-                    .read_to_end(&mut raw)
-                    .unwrap();
-            }
-            b"IEND" => assert_eq!(pos + 12, bytes.len()),
-            _ => panic!("unexpected PNG chunk"),
-        }
-        pos += length + 12;
-    }
-    let (w, h) = dimensions;
-    assert_eq!((w, h), (192, 112));
-    assert_eq!(raw.len(), (w + 1) * h);
-    let mut rgb = Vec::with_capacity(w * h * 3);
-    for row in raw.chunks_exact(w + 1) {
-        assert_eq!(row[0], 0);
-        for index in &row[1..] {
-            let i = usize::from(*index) * 3;
-            rgb.extend_from_slice(&palette[i..i + 3]);
-        }
-    }
-    rgb
+// Fixed sample of the historical Stardew Valley v1 pixel cover (indexed 192×112).
+const LEGACY_PNG: &str = concat!(
+    "iVBORw0KGgoAAAANSUhEUgAAAMAAAABwCAMAAAB/yI9AAAAAGFBMVEUSLCsePzhEZUwqTT8XMSsMICGMw3fw7q57sW",
+    "6iAAACCElEQVR4nO3b4XKDIBAE4ESNff837hhDVTy4g4OShdt/bRX261wmzRQfDwtEpql1A2XgAVzggfAAy7cFfqTg",
+    "AS7r2rqBMuCAdV0WaAI4YKu/BZYADtjrv16wBHCAq78FkgAOONeHJIAD/PpwBHAAVR+KAA4I1ecI3Aegf/uABA6I1Y",
+    "cYI3AAV/9M0I5ElZFqBHhmZZr870jqH4S8XamMCvAjrV+e0AvAH4n7iJSqX5rQC0CT1PoSgvwXaICc+hKCAerWL0cY",
+    "GyCt//NJDcLIAPn4hAAlCOMCUsZn/YT6uZYwKiBtfGIALWFMAFf//KJ1gBhSQxgRwI9PKkBDwAdMGZGMkHvh0m9gVH",
+    "23+vyOtMuIgG35OCENcK4/X2IAuvweyVtZ+I84qv5MxgBUeSmBB7j6dHkJYhQAvbB0jOL14+U5xAiA2LKyMdLXDyN6",
+    "B/CLhgjcm1l6fRrRM0C6JE2IA3Lr3xG9AtIWzPsXU279KwIfcP4ip3w6oUT9A9EH4EDkL5Z21KBE/T39APSRH7cpt6",
+    "cBrpEdOSu5owH88Mcuy+7XJ2D5C3/7/dr40eP8dccALGS4Lfxrw8fvdevS1/YCoG+jl+CvpR9B0a9LXYsP4G/Lyf0x",
+    "rDr7GCCc66OItXYxQCzH47j19jBAPPsj6TV3MACX2vUN0D4GaB0DtI4BWscArWOA1oEH/AIJ+dClHAG6mAAAAABJRU",
+    "5ErkJggg==",
+);
+
+#[test]
+fn legacy_listing_serialization_keeps_v2_approval_digest_bytes() {
+    let historical = format!(
+        r#"{{"title":"旧标题","summary":"旧摘要","description":"旧介绍。","tags":["模组"],"coverPng":"{LEGACY_PNG}"}}"#
+    );
+    let listing: PublicationListing = serde_json::from_str(&historical).unwrap();
+    assert_eq!(listing.cover_png, LEGACY_PNG);
+    assert_eq!(listing.cover_url, None);
+    // checked_digest serializes the typed listing directly into the hash;
+    // JSON object order and the absence of coverUrl are both significant.
+    assert_eq!(serde_json::to_string(&listing).unwrap(), historical);
 }
 
 #[test]
-fn model_draws_different_pixels_for_the_same_package_and_palette() {
-    let (package, _) = fixture();
-    let mut output = reply();
-    output["design"]["rows"] = json!([
-        "00030000", "00233000", "02332100", "23222110", "02322100", "00221000", "00010000",
-        "00000000"
-    ]);
-    let first = listing_from_reply(&package, &output.to_string()).unwrap();
-    let rgb1 = decode_rgb(&first.cover_png);
-    output["design"]["rows"][0] = json!("00020000");
-    let second = listing_from_reply(&package, &output.to_string()).unwrap();
-    let rgb2 = decode_rgb(&second.cover_png);
-    assert_eq!(
-        rgb1.as_chunks::<3>()
-            .0
-            .iter()
-            .zip(rgb2.as_chunks::<3>().0.iter())
-            .filter(|(a, b)| a != b)
-            .count(),
-        16
+fn only_exact_manifest_cover_is_allowed_for_a_new_listing() {
+    let (p, originals) = fixture();
+    let manifest_url = "https://Example.org/game%20cover.png?v=%2F";
+    let with_cover = |url: Option<&str>| {
+        let mut adapter: Value = serde_json::from_str(&originals[0].text).unwrap();
+        match url {
+            Some(url) => adapter["coverUrl"] = json!(url),
+            None => {
+                adapter.as_object_mut().unwrap().remove("coverUrl");
+            }
+        }
+        let adapter = adapter.to_string();
+        let p = plugins::parse_package(&p.adapter.slug, &adapter, &originals[1].text).unwrap();
+        (p, [file("adapter.json", adapter), originals[1].clone()])
+    };
+    let (p, files) = with_cover(Some(manifest_url));
+    let generated = listing(&p);
+    assert_eq!(generated.cover_url.as_deref(), Some(manifest_url));
+    assert!(generated.cover_png.is_empty());
+    let serialized = serde_json::to_value(&generated).unwrap();
+    assert_eq!(serialized["coverUrl"], manifest_url);
+    assert!(serialized.get("coverPng").is_none());
+    let rendered = render_files(&p, &files, &generated, "1.0.1").unwrap();
+    assert!(rendered[0].text.contains(manifest_url));
+    assert!(!rendered[1].text.contains(manifest_url));
+    assert!(!rendered[1].text.contains("data:image/"));
+    for replacement in [
+        None,
+        Some("https://example.org/game%20cover.png?v=%2F"),
+        Some("https://example.org/other-game.png"),
+        Some("data:image/png;base64,AAAA"),
+    ] {
+        let mut tampered = generated.clone();
+        tampered.cover_url = replacement.map(str::to_owned);
+        assert!(render_files(&p, &files, &tampered, "1.0.1").is_err());
+    }
+    let mut pixel = generated.clone();
+    pixel.cover_png = LEGACY_PNG.into();
+    assert!(render_files(&p, &files, &pixel, "1.0.1").is_err());
+
+    let mut invalid = p.clone();
+    invalid.adapter.cover_url = Some("http://example.org/cover.png".into());
+    assert!(listing_from_reply(&invalid, &reply().to_string()).is_err());
+    let mut tampered = generated;
+    tampered.cover_url.clone_from(&invalid.adapter.cover_url);
+    assert!(render_files(&invalid, &files, &tampered, "1.0.1").is_err());
+
+    let (p, files) = with_cover(None);
+    assert!(
+        p.adapter.steam_app_id.is_some(),
+        "Steam ID is not a cover fallback"
     );
-    assert_ne!(decode_rgb(&listing(&package).cover_png), rgb1);
-    output["design"].as_object_mut().unwrap().remove("icon");
+    let missing_cover = listing(&p);
+    assert_eq!(missing_cover.cover_url, None);
+    let mut expected = reply();
+    expected["tags"] = json!([p.adapter.name, "SMAPI", "模组管理"]);
+    assert_eq!(serde_json::to_value(&missing_cover).unwrap(), expected);
     assert_eq!(
-        listing_from_reply(&package, &output.to_string()).unwrap(),
-        second
+        serde_json::from_value::<PublicationListing>(expected).unwrap(),
+        missing_cover
     );
+    let rendered = render_files(&p, &files, &missing_cover, "1.0.1").unwrap();
+    assert!(!rendered[0].text.contains("coverUrl"));
     assert_eq!(
-        serde_json::to_value(&first).unwrap()["coverPng"],
-        first.cover_png
+        read_display(&rendered[1].text),
+        Some(missing_cover.description.clone())
     );
+    let mut injected = missing_cover;
+    injected.cover_url = Some(manifest_url.into());
+    assert!(render_files(&p, &files, &injected, "1.0.1").is_err());
 }
 
 #[test]
@@ -136,6 +153,7 @@ fn overlay_preserves_source_bytes_rules_and_idempotence_across_the_provider_fixt
         let decoded = plugins::parse_package(slug, &rendered[0].text, &rendered[1].text).unwrap();
         assert_eq!(decoded.skill.description, l.summary);
         assert_eq!(decoded.adapter.name, l.title);
+        assert_eq!(decoded.adapter.cover_url, p.adapter.cover_url);
         assert_eq!(decoded.adapter.version, "23.0.1-beta.1+local");
         assert_eq!(orig, untouched);
         let mut expected: Value = serde_json::from_str(adapter).unwrap();
@@ -157,10 +175,7 @@ fn overlay_preserves_source_bytes_rules_and_idempotence_across_the_provider_fixt
             1,
         );
         assert_eq!(display(&rendered[1].text).unwrap().original, expected_skill);
-        assert_eq!(
-            read_display(&rendered[1].text),
-            Some((l.description.clone(), l.cover_png.clone()))
-        );
+        assert_eq!(read_display(&rendered[1].text), Some(l.description.clone()));
         for f in &rendered {
             assert_eq!(f.size, f.text.len() as u64);
             assert_eq!(f.sha256, hex::encode(Sha256::digest(f.text.as_bytes())));
@@ -180,7 +195,52 @@ fn overlay_preserves_source_bytes_rules_and_idempotence_across_the_provider_fixt
 }
 
 #[test]
-fn rejects_unsafe_model_copy_designs_and_ambiguous_tags() {
+fn listing_reserves_the_first_tag_for_the_source_game_not_the_generated_title() {
+    let (mut p, _) = fixture();
+    p.adapter.name = "Call of Duty: Black Ops III".into();
+    let mut r = reply();
+    let mut generate_tags = |tags: Value| {
+        r["tags"] = tags;
+        listing_from_reply(&p, &r.to_string()).unwrap().tags
+    };
+    assert_eq!(
+        generate_tags(json!(["Windows", "BO3模组"])),
+        ["Call of Duty: Black Ops III", "Windows", "BO3模组"]
+    );
+    assert_eq!(
+        generate_tags(json!([
+            "Windows",
+            "call-of-duty:-black-ops-iii",
+            "Call of Duty: Black Ops III"
+        ])),
+        ["Call of Duty: Black Ops III", "Windows"]
+    );
+    assert_eq!(
+        generate_tags(json!(["a", "b", "c", "d", "e", "f", "g", "h"])),
+        [
+            "Call of Duty: Black Ops III",
+            "a",
+            "b",
+            "c",
+            "d",
+            "e",
+            "f",
+            "g"
+        ]
+    );
+}
+
+#[test]
+fn full_game_name_is_not_subject_to_the_supplementary_tag_length_limit() {
+    let (mut p, _) = fixture();
+    p.adapter.name = "The Elder Scrolls V: Skyrim Special Edition".into();
+    assert_eq!(listing(&p).tags[0], p.adapter.name);
+    p.adapter.name = "使命召唤：黑色行动3".into();
+    assert_eq!(listing(&p).tags[0], p.adapter.name);
+}
+
+#[test]
+fn rejects_unsafe_model_copy_and_ambiguous_tags() {
     let (p, _) = fixture();
     for (key, value) in [
         ("title", json!("界".repeat(86))),
@@ -195,25 +255,10 @@ fn rejects_unsafe_model_copy_designs_and_ambiguous_tags() {
         ("tags", json!(["Game Mod", "game-mod"])),
         ("tags", json!(["İ", "i"])),
         ("tags", json!(["x".repeat(33)])),
-        (
-            "design",
-            json!({"palette":"grove","icon":"https://evil.test/cover"}),
-        ),
-        ("design", json!({"palette":"grove","rows":[]})),
     ] {
         let mut r = reply();
         r[key] = value;
         assert!(listing_from_reply(&p, &r.to_string()).is_err(), "{key}");
-    }
-    for rows in [
-        vec!["00000000"; 8],
-        vec!["00001111"; 7],
-        vec!["00000004"; 8],
-        vec!["111"; 8],
-    ] {
-        let mut r = reply();
-        r["design"]["rows"] = json!(rows);
-        assert!(listing_from_reply(&p, &r.to_string()).is_err());
     }
     for raw in [
         "not JSON".into(),
@@ -222,29 +267,116 @@ fn rejects_unsafe_model_copy_designs_and_ambiguous_tags() {
     ] {
         assert!(listing_from_reply(&p, &raw).is_err());
     }
-    let mut extra = reply();
-    extra["coverUrl"] = json!("https://example.org/");
-    assert!(listing_from_reply(&p, &extra.to_string()).is_err());
+    for (field, value) in [
+        ("design", json!({"palette":"grove","icon":"sprout"})),
+        ("coverPng", json!(LEGACY_PNG)),
+        ("coverUrl", json!(p.adapter.cover_url)),
+    ] {
+        let mut extra = reply();
+        extra[field] = value;
+        assert!(
+            listing_from_reply(&p, &extra.to_string()).is_err(),
+            "{field}"
+        );
+    }
 }
 
 #[test]
-fn imported_display_requires_a_complete_safe_footer_and_bounded_png() {
+fn imported_display_requires_one_complete_terminal_prose_footer() {
     let (p, orig) = fixture();
     let l = listing(&p);
     let rendered = render_files(&p, &orig, &l, "1.0.1").unwrap();
     let text = &rendered[1].text;
+    let display = display(text).unwrap();
+    assert_eq!(
+        text.strip_prefix(display.original).unwrap(),
+        format!("\n\n{BEGIN}\n\n{}\n{END}\n", l.description)
+    );
     assert_eq!(
         read_display(&text.replace("\r\n", "\n").replace('\n', "\r\n")),
-        Some((l.description.clone(), l.cover_png.clone()))
+        Some(l.description.clone())
     );
-    let png = STANDARD.decode(&l.cover_png).unwrap();
+    assert!(read_display(&text.replacen("name:", "unknown:", 1)).is_none());
+    for tampered in [
+        text.replace(END, "<!-- broken -->"),
+        text.replace(END, LEGACY_END),
+        format!("{text}\ninstall rule after footer"),
+        text.replace(END, &format!("\n{LEGACY_COVER}{LEGACY_PNG})\n{END}")),
+        text.replace(&l.description, "<img src=x>"),
+        format!("{text}{text}"),
+        format!(
+            "{}\n{LEGACY_BEGIN}{}",
+            display.original,
+            text.strip_prefix(display.original).unwrap()
+        ),
+        format!(
+            "---\nname: stardew-valley\ndescription: summary\n---{}",
+            text.strip_prefix(display.original).unwrap()
+        ),
+    ] {
+        assert!(read_display(&tampered).is_none());
+        let tampered_package =
+            plugins::parse_package(&p.adapter.slug, &orig[0].text, &tampered).unwrap();
+        assert!(render_files(
+            &tampered_package,
+            &[orig[0].clone(), file("SKILL.md", tampered)],
+            &l,
+            "1.2.3"
+        )
+        .is_err());
+    }
+}
+
+#[test]
+fn a_legacy_footer_supplies_prose_and_is_replaced_without_touching_body() {
+    let (p, orig) = fixture();
+    let l = listing(&p);
+    let head = format!(
+        "{}\n\n保存原操作正文及尾部空格。 \n",
+        p.skill_markdown.replace("\r\n", "\n")
+    )
+    .replace('\n', "\r\n");
+    let old_description = "这是旧版介绍。\n\n第二段。";
+    let legacy = format!("{head}\n\n{LEGACY_BEGIN}\n\n{old_description}\n\n{LEGACY_COVER}{LEGACY_PNG})\n{LEGACY_END}\n");
+    assert_eq!(read_display(&legacy).as_deref(), Some(old_description));
+    assert_eq!(display(&legacy).unwrap().original, head);
+    assert_eq!(
+        read_display(&legacy.replace("\r\n", "\n").replace('\n', "\r\n")).as_deref(),
+        Some(old_description)
+    );
+
+    let legacy_package = plugins::parse_package(&p.adapter.slug, &orig[0].text, &legacy).unwrap();
+    let rendered = render_files(
+        &legacy_package,
+        &[orig[0].clone(), file("SKILL.md", legacy.clone())],
+        &l,
+        "1.2.3",
+    )
+    .unwrap();
+    let expected_head = head.replacen(
+        head.lines()
+            .find(|line| line.starts_with("description:"))
+            .unwrap(),
+        &format!(
+            "description: {}",
+            serde_json::to_string(&l.summary).unwrap()
+        ),
+        1,
+    );
+    assert_eq!(display(&rendered[1].text).unwrap().original, expected_head);
+    assert_eq!(read_display(&rendered[1].text), Some(l.description.clone()));
+    assert!(!rendered[1].text.contains(LEGACY_BEGIN));
+    assert!(!rendered[1].text.contains(old_description));
+    assert!(!rendered[1].text.contains(LEGACY_PNG));
+
+    let png = STANDARD.decode(LEGACY_PNG).unwrap();
     let mut bad_crc = png.clone();
     bad_crc[29] ^= 1;
     let mut trailing = png.clone();
     trailing.push(42);
-    let mut fake_stream = png.clone();
-    let tag = png.windows(4).position(|s| s == b"IDAT").unwrap();
-    let len = u32::from_be_bytes(png[tag - 4..tag].try_into().unwrap()) as usize;
+    let mut fake_stream = png;
+    let tag = fake_stream.windows(4).position(|s| s == b"IDAT").unwrap();
+    let len = u32::from_be_bytes(fake_stream[tag - 4..tag].try_into().unwrap()) as usize;
     fake_stream[tag + 4..tag + 4 + len].fill(0);
     let crc = checksum(b"IDAT", &fake_stream[tag + 4..tag + 4 + len]);
     fake_stream[tag + 4 + len..tag + 8 + len].copy_from_slice(&crc.to_be_bytes());
@@ -256,25 +388,13 @@ fn imported_display_requires_a_complete_safe_footer_and_bounded_png() {
         "A".repeat(MAX_PNG_BYTES * 2),
         "data:image/svg+xml,x".into(),
     ] {
-        assert!(read_display(&text.replace(&l.cover_png, &bad)).is_none());
-        let mut hostile = l.clone();
-        hostile.cover_png = bad;
-        assert!(render_files(&p, &orig, &hostile, "1.0.1").is_err());
-    }
-    assert!(read_display(&text.replacen("name:", "unknown:", 1)).is_none());
-    for tampered in [
-        text.replace(END, "<!-- broken -->"),
-        format!("{text}\ninstall rule after footer"),
-        text.replace(COVER, "![x](https://"),
-        text.replace(&l.description, "<img src=x>"),
-        format!("{text}{text}"),
-    ] {
-        assert!(read_display(&tampered).is_none());
-        let tampered_package =
-            plugins::parse_package(&p.adapter.slug, &orig[0].text, &tampered).unwrap();
+        let damaged = legacy.replace(LEGACY_PNG, &bad);
+        assert!(read_display(&damaged).is_none());
+        let damaged_package =
+            plugins::parse_package(&p.adapter.slug, &orig[0].text, &damaged).unwrap();
         assert!(render_files(
-            &tampered_package,
-            &[orig[0].clone(), file("SKILL.md", tampered)],
+            &damaged_package,
+            &[orig[0].clone(), file("SKILL.md", damaged)],
             &l,
             "1.2.3"
         )
@@ -383,6 +503,12 @@ async fn configured_model_receives_only_bounded_structured_facts_and_no_tools() 
     let settings = settings(root.path(), format!("http://{addr}/v1"));
     let (mut p, _) = fixture();
     p.adapter.name = r"C:\Users\private\identity".into();
+    let err = generate(&settings, &p, &CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("游戏名称标签"));
+    assert!(received.lock().unwrap().is_none());
+    p.adapter.name = "Stardew Valley".into();
     p.skill.description = "PRIVATE_FRONTMATTER".into();
     p.skill_markdown = "PRIVATE_INSTRUCTIONS".into();
     p.adapter.cover_url = Some("https://private.example.test".into());
@@ -393,6 +519,8 @@ async fn configured_model_receives_only_bounded_structured_facts_and_no_tools() 
         .await
         .unwrap();
     assert_eq!(listing.title, reply()["title"]);
+    assert_eq!(listing.cover_url, p.adapter.cover_url);
+    assert!(listing.cover_png.is_empty());
     server.abort();
     let (headers, body) = received.lock().unwrap().take().unwrap();
     assert_eq!(headers["authorization"], "Bearer fake-model-key");
@@ -402,7 +530,7 @@ async fn configured_model_receives_only_bounded_structured_facts_and_no_tools() 
     assert_eq!(body["messages"].as_array().unwrap().len(), 2);
     let facts = body["messages"][1]["content"].as_str().unwrap();
     let facts: Value = serde_json::from_str(facts).unwrap();
-    assert!(facts["name"].is_null());
+    assert_eq!(facts["name"], "Stardew Valley");
     assert_eq!(facts["modTypes"].as_array().unwrap().len(), 16);
     assert_eq!(facts["slug"], p.adapter.slug);
     for needle in [
@@ -412,6 +540,10 @@ async fn configured_model_receives_only_bounded_structured_facts_and_no_tools() 
         "discoveryHints",
         "relativePath",
         "https://",
+        "design",
+        "palette",
+        "coverUrl",
+        "像素",
     ] {
         assert!(!body.to_string().contains(needle));
     }
@@ -493,11 +625,16 @@ async fn generation_reports_model_errors_cancellation_and_a_stalled_provider_dea
 }
 
 #[test]
-fn auto_publication_requires_tags_and_a_catalog_readable_release() {
+fn auto_publication_supplies_game_tag_and_requires_a_catalog_readable_release() {
     let (package, mut originals) = fixture();
     let mut data = reply();
     data["tags"] = json!([]);
-    assert!(listing_from_reply(&package, &data.to_string()).is_err());
+    assert_eq!(
+        listing_from_reply(&package, &data.to_string())
+            .unwrap()
+            .tags,
+        [package.adapter.name.as_str()]
+    );
     let mut skill = originals[1].text.clone();
     skill.extend(std::iter::repeat_n(
         ' ',

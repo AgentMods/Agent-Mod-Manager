@@ -76,7 +76,10 @@ fn explicit_rejection(tool: &str, message: &str) -> Option<AppError> {
             AppError::NotFound("该管理器插件不存在或不属于当前账号，请核对本人插件 ID".into())
         }
         "manager plugin slug or release version already exists" if publishing => {
-            AppError::Conflict("该插件或版本已存在：请选择本人已有插件并提交未发布的新版本".into())
+            AppError::Conflict(
+                "插件标识或新版本已存在。请重新预览，确认当前账号的更新权限和远端版本后再发布"
+                    .into(),
+            )
         }
         "invalid manager plugin input: cannot change a plugin slug" if publishing => {
             AppError::Invalid(

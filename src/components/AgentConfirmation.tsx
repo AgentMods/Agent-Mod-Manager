@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { api, errorText } from "@/lib/api";
 import { describeAgentTools, pendingToolApproval, replayConversation, useAgent } from "@/lib/agent-store";
 import { displayApprovalPreview, isFilePlanApproval } from "@/lib/agent-path-presentation";
+import { useModSwitch } from "@/lib/mod-switch-store";
 import { useUI } from "@/lib/store";
 import type { AgentEvent, FilePlan } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -21,7 +22,7 @@ function publicationReview(value: unknown) {
   const listing = preview.listing;
   if (!listing || typeof listing !== "object" || !("title" in listing) || typeof listing.title !== "string" ||
       !("summary" in listing) || typeof listing.summary !== "string" || !("description" in listing) || typeof listing.description !== "string" ||
-      !("coverPng" in listing) || typeof listing.coverPng !== "string" || !("tags" in listing) || !Array.isArray(listing.tags) ||
+      ("coverUrl" in listing && listing.coverUrl != null && typeof listing.coverUrl !== "string") || !("tags" in listing) || !Array.isArray(listing.tags) ||
       !listing.tags.every(tag => typeof tag === "string") || typeof preview.version !== "string") return null;
   const target = preview.target;
   if (!target || typeof target !== "object" || !("kind" in target)) return null;
@@ -30,7 +31,7 @@ function publicationReview(value: unknown) {
     label = `更新插件 #${target.pluginId}`;
   } else if (target.kind !== "first") return null;
   const version = "remoteVersion" in preview && typeof preview.remoteVersion === "string" ? `${preview.remoteVersion} → ${preview.version}` : preview.version;
-  return { listing: listing as PublicationListing, label, version };
+  return { listing: listing as PublicationListing, label, version, files: "files" in preview ? preview.files : undefined };
 }
 
 function findPlan(value: unknown): FilePlan | null {
@@ -53,7 +54,7 @@ export function AgentConfirmation({ request }: { request: AgentEvent }) {
     ? `绑定后，游戏库中的「${preview.gameName}」将改名为「${preview.targetGameName}」。` : null;
 
   async function respond(approved: boolean) {
-    if (submitting.current) return;
+    if (submitting.current || (approved && publication?.listing.coverPng)) return;
     submitting.current = true;
     setBusy(true);
     setError(null);
@@ -82,7 +83,8 @@ export function AgentConfirmation({ request }: { request: AgentEvent }) {
     <div className="flex min-w-0 basis-full flex-col gap-2">
       {renameSummary && <p className="wrap-anywhere text-sm">{renameSummary}</p>}
       {publication ? <>
-        <PublicationListingPreview listing={publication.listing} />
+        <PublicationListingPreview listing={publication.listing} files={publication.files} />
+        {publication.listing.coverPng && <p className="text-sm text-muted-foreground">请拒绝此旧预览，重新发起发布以使用游戏封面。</p>}
         <details><summary className="cursor-pointer text-xs text-muted-foreground">查看完整发布请求</summary>{jsonPreview}</details>
       </> : plan ? <>
         <PlanPreview plan={plan} />
@@ -92,7 +94,7 @@ export function AgentConfirmation({ request }: { request: AgentEvent }) {
     </div>
     <ItemActions className="ms-auto">
       <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void respond(false)}>拒绝</Button>
-      <Button type="button" size="sm" disabled={busy} onClick={() => void respond(true)}>{publication ? "发布" : "批准并执行"}</Button>
+      <Button type="button" size="sm" disabled={busy || !!publication?.listing.coverPng} onClick={() => void respond(true)}>{publication ? "发布" : "批准并执行"}</Button>
     </ItemActions>
   </Item>;
 }
@@ -100,12 +102,24 @@ export function AgentConfirmation({ request }: { request: AgentEvent }) {
 export function BackgroundApprovalLink({ visibleConversation }: { visibleConversation: string | null }) {
   const milestones = useAgent((state) => state.milestones);
   const openConversation = useUI((state) => state.openConversation);
+  const switches = useModSwitch(state => state.pending);
   const pending = useMemo(() => {
     for (const [id, events] of Object.entries(milestones)) {
-      if (id !== visibleConversation && describeAgentTools(events).some(pendingToolApproval)) return id;
+      if (id === visibleConversation) continue;
+      const request = describeAgentTools(events).map(pendingToolApproval).find(Boolean);
+      if (request) return { id, operation: Object.values(switches).find(entry =>
+        entry.conversationId === id && entry.turnId === request.turnId) };
     }
-  }, [milestones, visibleConversation]);
-  return pending ? <Button type="button" size="sm" variant="outline" onClick={() => openConversation(pending)}>
+  }, [milestones, visibleConversation, switches]);
+  function showPending() {
+    if (!pending) return;
+    if (!pending.operation) { openConversation(pending.id); return; }
+    // A Mod switch owns its own review on Game Details, not in the chat composer.
+    const panel = document.getElementById(pending.operation.id);
+    if (panel) { panel.focus({ preventScroll: true }); panel.scrollIntoView({ block: "nearest" }); }
+    else useUI.getState().selectGame(pending.operation.gameId);
+  }
+  return pending ? <Button type="button" size="sm" variant="outline" onClick={showPending}>
     <ShieldCheckIcon aria-hidden="true" data-icon="inline-start" />查看待授权操作
   </Button> : null;
 }

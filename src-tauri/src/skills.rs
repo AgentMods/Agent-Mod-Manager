@@ -378,7 +378,7 @@ fn standalone_owner(engine: &FileEngine, name: &str) -> AppResult<Option<SkillIn
         |r| r.get(0),
     )?;
     let pending: bool = engine.db.conn().query_row(
-        "SELECT EXISTS(SELECT 1 FROM plugin_deployments p JOIN file_transactions f ON f.id=p.transaction_id WHERE p.slug=?1 AND f.status NOT IN ('rolled_back','failed'))",
+        "SELECT EXISTS(SELECT 1 FROM active_plugin_deployments p JOIN file_transactions f ON f.id=p.transaction_id WHERE p.slug=?1 AND f.status NOT IN ('rolled_back','failed'))",
         [name], |r|r.get(0))?;
     if plugin || pending {
         return Err(AppError::Conflict("名称属于游戏插件或其待处理部署".into()));
@@ -654,7 +654,7 @@ fn reconcile_locked(engine: &FileEngine) -> AppResult<ReconcileReport> {
             // Recheck ownership under the same DB lock used by the upsert.
             let mut conn = engine.db.conn();
             let tx = conn.transaction()?;
-            let changed = tx.execute("INSERT INTO skills(name,description,location,source,enabled,created_at) SELECT ?1,?2,?3,'external',?4,?5 WHERE NOT EXISTS(SELECT 1 FROM plugins WHERE slug=?1) AND NOT EXISTS(SELECT 1 FROM plugin_deployments p JOIN file_transactions f ON f.id=p.transaction_id WHERE p.slug=?1 AND f.status NOT IN ('rolled_back','failed')) ON CONFLICT(name) DO UPDATE SET description=excluded.description,enabled=excluded.enabled WHERE skills.source='external' AND skills.location=excluded.location",params![name,metadata.description,target.to_string_lossy(),rows[0].desired_enabled,util::now()])?;
+            let changed = tx.execute("INSERT INTO skills(name,description,location,source,enabled,created_at) SELECT ?1,?2,?3,'external',?4,?5 WHERE NOT EXISTS(SELECT 1 FROM plugins WHERE slug=?1) AND NOT EXISTS(SELECT 1 FROM active_plugin_deployments p JOIN file_transactions f ON f.id=p.transaction_id WHERE p.slug=?1 AND f.status NOT IN ('rolled_back','failed')) ON CONFLICT(name) DO UPDATE SET description=excluded.description,enabled=excluded.enabled WHERE skills.source='external' AND skills.location=excluded.location",params![name,metadata.description,target.to_string_lossy(),rows[0].desired_enabled,util::now()])?;
             if changed != 1 {
                 return Err(AppError::Conflict("Skill 注册发生来源冲突".into()));
             }
@@ -1000,7 +1000,7 @@ pub fn set_enabled(engine: &FileEngine, name: &str, enabled: bool) -> AppResult<
     let mut conn = engine.db.conn();
     let tx = conn.transaction()?;
     if info.kind == SkillKind::Standalone {
-        let collision: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM plugins WHERE slug=?1) OR EXISTS(SELECT 1 FROM plugin_deployments p JOIN file_transactions f ON f.id=p.transaction_id WHERE p.slug=?1 AND f.status NOT IN ('rolled_back','failed'))",[name],|r|r.get(0))?;
+        let collision: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM plugins WHERE slug=?1) OR EXISTS(SELECT 1 FROM active_plugin_deployments p JOIN file_transactions f ON f.id=p.transaction_id WHERE p.slug=?1 AND f.status NOT IN ('rolled_back','failed'))",[name],|r|r.get(0))?;
         if collision {
             return Err(AppError::Conflict("Skill 名称被插件部署占用".into()));
         }

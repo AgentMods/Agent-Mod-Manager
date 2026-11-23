@@ -236,10 +236,14 @@ fn canonical_directory(path: &Path) -> AppResult<PathBuf> {
 
 /// Discovery only uses installed, enabled and validated adapters.
 fn active_adapters(db: &Db) -> AppResult<Vec<GameAdapter>> {
-    plugins::list_plugins(db)?
-        .into_iter()
-        .filter(|p| p.enabled && p.validated)
-        .map(|p| plugins::adapter_for(db, &p.slug))
+    active_adapters_from(&db.conn())
+}
+
+fn active_adapters_from(conn: &rusqlite::Connection) -> AppResult<Vec<GameAdapter>> {
+    let mut stmt =
+        conn.prepare("SELECT slug FROM plugins WHERE enabled AND validated ORDER BY slug")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    rows.map(|slug| plugins::adapter_for_from(conn, &slug?))
         .collect()
 }
 
@@ -482,6 +486,7 @@ enum AdapterSelection<'a> {
     Automatic,
     Explicit(&'a str),
     Discovered(Option<&'a str>),
+    Catalog { slug: &'a str, game_name: &'a str },
 }
 
 /// Evidence and the exact identity to persist for a manual selection. The
@@ -612,10 +617,101 @@ fn register_game_inner(
         &adapters,
         vec![DiscoverySource::simple(DiscoveryKind::User)],
     )?;
+    let mut conn = db.conn();
+    let tx = conn.transaction()?;
+    let game = persist_registration(&tx, &root, &adapters, &candidate, selection)?;
+    tx.commit()?;
+    Ok(game)
+}
+
+/// Stored in the release install intent so registration and package activation
+/// share its terminal SQLite commit (including rollback on a failed check).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct CatalogGameRegistration {
+    pub root: PathBuf,
+    pub name: String,
+}
+
+impl CatalogGameRegistration {
+    pub(crate) fn new(
+        paths: &crate::storage::AppPaths,
+        directory: &Path,
+        name: Option<&str>,
+    ) -> AppResult<Self> {
+        let root = canonical_directory(directory)?;
+        if root.parent().is_none() || paths.overlaps_storage(&root) {
+            return Err(AppError::Denied(
+                "不能登记文件系统根或与管理器数据重叠的游戏目录".into(),
+            ));
+        }
+        let name = name
+            .unwrap_or(
+                root.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default(),
+            )
+            .trim();
+        if name.is_empty() || name.chars().any(char::is_control) {
+            return Err(invalid("游戏名称不能为空或包含控制字符"));
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            root,
+        })
+    }
+
+    pub(crate) fn register(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        paths: &crate::storage::AppPaths,
+        slug: &str,
+    ) -> AppResult<Game> {
+        // Re-open the exact canonical directory at commit, not an alias remembered by the UI.
+        if canonical_directory(&self.root)? != self.root
+            || paths.overlaps_storage(&self.root)
+            || self.root.parent().is_none()
+        {
+            return Err(AppError::Conflict("游戏目录已变更，请重新扫描".into()));
+        }
+        let adapters = active_adapters_from(tx)?;
+        let candidate = identify_at(
+            &self.root,
+            &adapters,
+            vec![DiscoverySource::simple(DiscoveryKind::User)],
+        )?;
+        persist_registration(
+            tx,
+            &self.root,
+            &adapters,
+            &candidate,
+            AdapterSelection::Catalog {
+                slug,
+                game_name: &self.name,
+            },
+        )
+    }
+}
+
+fn persist_registration(
+    tx: &rusqlite::Transaction<'_>,
+    root: &Path,
+    adapters: &[GameAdapter],
+    candidate: &GameCandidate,
+    selection: AdapterSelection<'_>,
+) -> AppResult<Game> {
     let suggested = candidate.suggested_adapter_slug.as_deref();
     let selected_slug = match selection {
         AdapterSelection::Automatic => suggested,
         AdapterSelection::Explicit(slug) => Some(slug),
+        AdapterSelection::Catalog { slug, .. } => {
+            if suggested != Some(slug) {
+                return Err(AppError::Conflict(
+                    "游戏目录的磁盘标记未能唯一确认此云端适配包，未自动安装或绑定".into(),
+                ));
+            }
+            Some(slug)
+        }
         AdapterSelection::Discovered(reviewed) => suggested.filter(|slug| Some(*slug) == reviewed),
     };
     let selected = if let Some(slug) = selected_slug {
@@ -624,14 +720,12 @@ fn register_game_inner(
             .iter()
             .find(|a| a.slug == slug)
             .ok_or_else(|| AppError::NotFound(format!("未启用的适配包: {slug}")))?;
-        Some(explicit_adapter_match(&candidate, slug)?)
+        Some(explicit_adapter_match(candidate, slug)?)
     } else {
         None
     };
-    let root_text = path_text(&root)?;
+    let root_text = path_text(root)?;
     let now = chrono::Utc::now().to_rfc3339();
-    let mut conn = db.conn();
-    let tx = conn.transaction()?;
     let existing = tx
         .query_row(
             &format!("SELECT {GAME_COLUMNS} FROM games WHERE root_path=?1"),
@@ -639,6 +733,16 @@ fn register_game_inner(
             game_from_row,
         )
         .optional()?;
+    if let (AdapterSelection::Catalog { slug, .. }, Some(game)) = (&selection, &existing) {
+        if game.adapter_slug.as_deref() == Some(*slug)
+            && game.adapter_version.as_deref() == selected.map(|m| m.version.as_str())
+        {
+            return Ok(game.clone());
+        }
+        return Err(AppError::Conflict(
+            "该目录已在游戏库中，不会更改其适配包".into(),
+        ));
+    }
     let retain_identity = !matches!(selection, AdapterSelection::Explicit(_))
         && existing.as_ref().is_some_and(|g| g.adapter_slug.is_some());
     let old = existing.as_ref();
@@ -649,6 +753,9 @@ fn register_game_inner(
         adapter.map_or_else(|| "unknown".into(), |a| a.slug.clone())
     };
     let name = old.map(|g| g.name.clone()).unwrap_or_else(|| {
+        if let AdapterSelection::Catalog { game_name, .. } = selection {
+            return game_name.to_owned();
+        }
         adapter.map_or_else(
             || root.file_name().unwrap().to_string_lossy().to_string(),
             |a| a.name.clone(),
@@ -685,20 +792,18 @@ fn register_game_inner(
         adapter.and_then(|a| a.steam_app_id.clone())
     };
     let mut metadata = old.map_or_else(|| json!({}), |g| g.metadata.clone());
-    update_registration_metadata(&mut metadata, serde_json::to_value(&candidate)?, &now)?;
+    update_registration_metadata(&mut metadata, serde_json::to_value(candidate)?, &now)?;
     tx.execute(
         "INSERT INTO games (id,name,slug,root_path,platform,adapter_slug,adapter_version,confidence,steam_app_id,last_scanned_at,metadata_json,created_at,updated_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?10,?10)
          ON CONFLICT(root_path) DO UPDATE SET name=excluded.name,slug=excluded.slug,platform=excluded.platform,adapter_slug=excluded.adapter_slug,adapter_version=excluded.adapter_version,confidence=excluded.confidence,steam_app_id=excluded.steam_app_id,last_scanned_at=excluded.last_scanned_at,metadata_json=excluded.metadata_json,updated_at=excluded.updated_at",
         params![id,name,slug,root_text,platform,adapter_slug,version,confidence,app_id,now,metadata.to_string()],
     )?;
-    let game = tx.query_row(
+    Ok(tx.query_row(
         &format!("SELECT {GAME_COLUMNS} FROM games WHERE root_path=?1"),
         [&root_text],
         game_from_row,
-    )?;
-    tx.commit()?;
-    Ok(game)
+    )?)
 }
 
 /// Called inside the identity evidence transaction while holding write_lock.

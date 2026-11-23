@@ -9,13 +9,15 @@ use super::{
 use crate::{
     download::safe_filename,
     error::{AppError, AppResult},
-    games, mcp,
+    games,
     mod_library::{self, ApprovedArtifact, ReceivedChecks},
     paths,
     safe_fs::{self, FileIdentity},
     sources::{
         resolutions::ResolutionScope,
-        web_download::{validated_endpoint, ArchiveKind, MAX_WEB_URL_BYTES},
+        web_download::{
+            validated_endpoint, ArchiveKind, MAX_ARCHIVE_SIGNATURE_BYTES, MAX_WEB_URL_BYTES,
+        },
     },
     transaction::FileEngine,
 };
@@ -87,22 +89,30 @@ impl Args {
         Ok(self)
     }
 
-    fn target(&self, engine: &FileEngine) -> AppResult<Target> {
+    fn target(&self, engine: &FileEngine, selected: Option<&[String]>) -> AppResult<Target> {
         if let Some(id) = &self.game_id {
+            super::workspace::resolve(selected, Some(id))?;
             let game = games::get_game(&engine.db, id)?;
             return Ok(Target {
                 id: Some(game.id),
                 name: game.name,
             });
         }
+        if selected.is_some_and(|ids| ids.len() != 1) {
+            return Err(AppError::Invalid("请提供当前工作区中的目标游戏 ID".into()));
+        }
         let requested = self.game_name.as_deref().unwrap_or_default();
         let key = target_key(requested);
         let mut matches = games::list_games(&engine.db)?
             .into_iter()
+            .filter(|game| selected.is_none_or(|ids| ids.contains(&game.id)))
             .filter(|game| target_key(&game.name) == key);
         let game = matches.next();
         if matches.next().is_some() {
             return Err(AppError::Conflict("存在重名的游戏，请指定 gameId".into()));
+        }
+        if selected.is_some() && game.is_none() {
+            return Err(AppError::Invalid("游戏名称与当前工作区选择不符".into()));
         }
         Ok(game.map_or_else(
             || Target {
@@ -165,6 +175,8 @@ fn archive_kind(filename: &str) -> AppResult<ArchiveKind> {
         Ok(ArchiveKind::Zip)
     } else if lower.ends_with(".7z") {
         Ok(ArchiveKind::SevenZip)
+    } else if lower.ends_with(".rar") {
+        Ok(ArchiveKind::Rar)
     } else if lower.ends_with(".gz") || lower.ends_with(".tgz") {
         // Playwright sanitizes all dots before the final extension, so
         // release.tar.gz may actually be saved as release-tar-1.gz.
@@ -172,7 +184,7 @@ fn archive_kind(filename: &str) -> AppResult<ArchiveKind> {
         Ok(ArchiveKind::TarGzip)
     } else {
         Err(AppError::Unsupported(
-            "只接收 ZIP、JAR、MRPACK、7z 和 gzip 压缩的 TAR 归档".into(),
+            "只接收 ZIP、JAR、MRPACK、7z、RAR 和 gzip 压缩的 TAR 归档".into(),
         ))
     }
 }
@@ -225,32 +237,14 @@ fn same_path(a: &Path, b: &Path) -> bool {
 
 impl Folders {
     fn configured(engine: &FileEngine) -> AppResult<Self> {
-        let incoming = engine.paths.downloads().join("incoming");
+        let incoming = crate::storage::incoming_downloads(&engine.paths.root);
         engine.paths.stable_directory(&incoming)?;
         engine.paths.guard_file_path(&incoming, &[], false)?;
-        let playwright = mcp::playwright_receipt_dir(&engine.db)?
-            .filter(|folder| Self::playwright_allowed(engine, folder));
+        let playwright = mod_library::playwright_receipt_dir(engine)?;
         Ok(Self {
             incoming,
             playwright,
         })
-    }
-
-    fn playwright_allowed(engine: &FileEngine, folder: &Path) -> bool {
-        // Check protected storage before advertising a destination. The non-link
-        // file open is still required on every receipt, even after this check.
-        match std::fs::symlink_metadata(folder) {
-            Ok(meta) if !meta.is_dir() => return false,
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return false,
-            _ => {}
-        }
-        engine
-            .paths
-            .guard_file_path(folder, &[], true)
-            .is_ok_and(|resolved| {
-                same_path(&paths::user_path(folder), &paths::user_path(&resolved))
-                    && !engine.paths.overlaps_storage(&resolved)
-            })
     }
 
     fn preview(&self) -> Value {
@@ -364,7 +358,7 @@ impl Receipt {
         let mut input = (&mut self.file).take(before.len() + 1);
         let mut digest = Sha256::new();
         let mut buffer = [0; 64 * 1024];
-        let mut prefix = [0; 6];
+        let mut prefix = [0; MAX_ARCHIVE_SIGNATURE_BYTES];
         let mut size = 0u64;
         loop {
             if cancel.is_cancelled() {
@@ -425,8 +419,9 @@ fn inspect(
     engine: &FileEngine,
     args: &Args,
     cancel: &CancellationToken,
+    selected: Option<&[String]>,
 ) -> AppResult<(Target, Receipt, ReceiptFingerprint)> {
-    let game = args.target(engine)?;
+    let game = args.target(engine, selected)?;
     let mut receipt = Folders::configured(engine)?.find(&args.filename)?;
     let fingerprint = receipt.fingerprint(archive_kind(&args.filename)?, cancel)?;
     Ok((game, receipt, fingerprint))
@@ -539,7 +534,7 @@ impl AgentTool for ReceivedModTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: NAME.into(),
-            description: "将已下载完成的归档收入管理器 Mods，不会安装。只传已登记游戏的 gameId 或准确的游戏名称 gameName（也可用于未登记游戏）。仅使用 list_mod_receipt_folders 中的 incoming 或原厂 Playwright 输出目录；提供下载完成事件所报告的实际保存文件名（不是建议文件名，不含任何目录或 URL），仅从目录直属文件验证收件。其他保存位置须用桌面文件选择器，不能通过此工具导入。projectPage 仅为可选的公开项目网页（无凭据、查询参数或片段），不是下载 URL 或来源/版本证据。".into(),
+            description: "将已下载完成的归档收入管理器 Mods，不会安装。RAR 仅支持非加密单卷归档。只传已登记游戏的 gameId 或准确的游戏名称 gameName（也可用于未登记游戏）。仅使用 list_mod_receipt_folders 中的 incoming 或原厂 Playwright 输出目录；提供下载完成事件所报告的实际保存文件名（不是建议文件名，不含任何目录或 URL），仅从目录直属文件验证收件。其他保存位置须用桌面文件选择器，不能通过此工具导入。projectPage 仅为可选的公开项目网页（无凭据、查询参数或片段），不是下载 URL 或来源/版本证据。".into(),
             parameters: json!({
                 "type":"object",
                 "properties":{
@@ -561,9 +556,15 @@ impl AgentTool for ReceivedModTool {
         require_desktop_agent(context)?;
         let args = Args::parse(args.clone())?;
         let engine = context.engine.clone();
+        let scope = context.resolution_scope.clone();
         let cancel = context.cancel.clone();
         blocking(move || {
-            let (game, receipt, fingerprint) = inspect(&engine, &args, &cancel)?;
+            let ResolutionScope::Agent(conversation) = &scope else {
+                unreachable!()
+            };
+            let selected = super::workspace::selection(&engine.db, conversation)?;
+            let (game, receipt, fingerprint) =
+                inspect(&engine, &args, &cancel, selected.as_deref())?;
             Ok(PreparedTool {
                 preview: receipt_preview(&args, &game, &receipt, &fingerprint),
                 effect: EFFECT,
@@ -585,9 +586,15 @@ impl AgentTool for ReceivedModTool {
             return Err(changed());
         }
         let engine = context.engine.clone();
+        let scope = context.resolution_scope.clone();
         let cancel = context.cancel.clone();
         blocking(move || {
-            let (game, receipt, fingerprint) = inspect(&engine, &args, &cancel)?;
+            let ResolutionScope::Agent(conversation) = &scope else {
+                unreachable!()
+            };
+            let selected = super::workspace::selection(&engine.db, conversation)?;
+            let (game, receipt, fingerprint) =
+                inspect(&engine, &args, &cancel, selected.as_deref())?;
             if prepared.preview != receipt_preview(&args, &game, &receipt, &fingerprint) {
                 return Err(changed());
             }

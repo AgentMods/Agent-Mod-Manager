@@ -288,16 +288,16 @@ test.describe("首次启动引导", () => {
 
     const registrations = () => page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "register_game"));
     expect(await registrations()).toHaveLength(0);
-    await expect(fixture.getByRole("button", {name: "添加"})).toBeDisabled();
+    await expect(fixture.getByRole("button", {name: "添加", exact: true})).toBeDisabled();
     await broken.getByRole("checkbox", {name: "选择 Broken Fixture"}).check();
-    await broken.getByRole("button", {name: "添加"}).click();
+    await broken.getByRole("button", {name: "添加", exact: true}).click();
     await expect(broken.getByRole("alert")).toContainText("目录已变化，请重新扫描");
     await expect(fixture).toBeVisible();
 
     await fixture.getByRole("checkbox", {name: "选择 Fixture Game"}).check();
-    await fixture.getByRole("button", {name: "添加"}).click();
+    await fixture.getByRole("button", {name: "添加", exact: true}).click();
     await expect(fixture.getByText("管理中", {exact: true})).toBeVisible();
-    await expect(broken.getByRole("button", {name: "添加"})).toBeEnabled();
+    await expect(broken.getByRole("button", {name: "添加", exact: true})).toBeEnabled();
     const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls.map((call: any) => call.command));
     expect(calls.filter((command: string) => command === "start_onboarding")).toHaveLength(1);
     expect((await registrations()).map((call: any) => call.args)).toEqual([

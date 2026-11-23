@@ -269,7 +269,7 @@ test("plugin details and draft validation list declared MCP services", async ({ 
   });
   await page.getByRole("button", { name: "游戏库", exact: true }).click();
   await page.getByRole("button", { name: "插件中心", exact: true }).click();
-  await page.getByRole("row").getByRole("button", { name: /Catalog Game/ }).click();
+  await page.getByRole("row").filter({hasText: "Catalog Game"}).getByRole("cell").first().getByRole("button").click();
   await expect(page.getByText("Local catalog", { exact: true })).toBeVisible();
   await page.getByRole("tab", { name: /^草稿/ }).click();
   await page.getByRole("button", { name: "验证", exact: true }).first().click();

@@ -268,7 +268,7 @@ fn check_adapter_change(
 pub(crate) fn remove_game(engine: &FileEngine, id: &str) -> AppResult<()> {
     let _guard = transaction::write_lock();
     let mut conn = engine.db.conn();
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let root_path: String = tx
         .query_row("SELECT root_path FROM games WHERE id=?1", [id], |row| {
             row.get(0)
@@ -311,10 +311,7 @@ pub(crate) fn remove_game(engine: &FileEngine, id: &str) -> AppResult<()> {
     // Preserve the journal and related historical records. A user root grants
     // access only through a live registration keyed by (game_id, root_id).
     tx.execute("DELETE FROM game_user_roots WHERE game_id=?1", [id])?;
-    tx.execute(
-        "UPDATE conversations SET game_id=NULL WHERE game_id=?1",
-        [id],
-    )?;
+    crate::history::remove_game_from_workspaces(&tx, id)?;
     tx.execute("DELETE FROM games WHERE id=?1", [id])?;
     tx.commit()?;
     Ok(())
@@ -718,6 +715,8 @@ fn plan_detail(detail: Option<String>, plan: Option<&FilePlan>) -> Option<String
             FileOp::Move { .. } => "移动 (move)",
             FileOp::Mkdir { .. } => "新建目录 (mkdir)",
             FileOp::WriteText { .. } => "写入文本 (write_text)",
+            FileOp::Compress { .. } => "压缩文件夹 (compress)",
+            FileOp::Extract { .. } => "解压归档 (extract)",
         };
         *operations.entry(label).or_insert(0) += 1;
     }

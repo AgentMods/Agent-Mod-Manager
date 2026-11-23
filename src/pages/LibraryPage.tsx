@@ -1,3 +1,4 @@
+import { useCloudGameMatch } from '@/lib/cloud-game-match';
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -36,7 +37,7 @@ function GameCard({ game, index, coverUrl, disabled, busy, onOpen, onLaunch, onL
   const working = busy === game.id;
   return <Card className="gap-0 overflow-hidden py-0 motion-safe:animate-rise-in motion-safe:transition-[box-shadow,border-color] motion-safe:duration-300 motion-safe:ease-out hover:border-primary/40 hover:shadow-md" style={stagger(index)}>
     <button type="button" onClick={onOpen} className="flex flex-col text-left outline-none transition-colors hover:bg-muted/40 focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:ring-inset">
-      <GameCover name={game.name} url={coverUrl} />
+      <GameCover name={game.name} url={coverUrl} decorative />
       <CardHeader className="gap-1 px-5 pt-4 pb-4">
         <CardTitle className="truncate text-base">{game.name}</CardTitle>
         <CardDescription>{game.platform} · {game.installedModCount} 个 Mod</CardDescription>
@@ -224,9 +225,11 @@ export default function LibraryPage() {
   useEffect(() => () => {
     const requestId = scanRequest.current;
     scanRequest.current = null;
-    if (requestId) void api("scan_games", { options: { page: { requestId, cancel: true } } }).catch(() => {});
+    if (requestId) void api("scan_games", { options: { page: { requestId, cancel: true } } }).catch(() => { });
   }, []);
   const [scanOpen, setScanOpen] = useState(false);
+  const cloud = useCloudGameMatch(scanOpen);
+  const [failedRegistrations, setFailedRegistrations] = useState<Record<string, boolean>>({});
   const [directory, setDirectory] = useState("");
   const [candidates, setCandidates] = useState<GameCandidate[]>([]);
   const [report, setReport] = useState<ScanReport | null>(null);
@@ -250,7 +253,7 @@ export default function LibraryPage() {
   function stopScan() {
     const requestId = scanRequest.current;
     scanRequest.current = null;
-    if (requestId) void api("scan_games", { options: { page: { requestId, cancel: true } } }).catch(() => {});
+    if (requestId) void api("scan_games", { options: { page: { requestId, cancel: true } } }).catch(() => { });
     setReport((current) => current && { ...current, nextCursor: null });
   }
   async function scan(root?: string, cursor?: string) {
@@ -283,18 +286,22 @@ export default function LibraryPage() {
       await scan(selected);
     }
   }
-  async function finishRegistration(directory: string, game: Game) {
+  function finishRegistration(directory: string, game: Game) {
     const key = gameDirectoryKey(directory);
     setCandidates((items) => items.map((item) => gameDirectoryKey(item.rootPath) === key
-      ? { ...item, registeredGameId: game.id } : item));
+      ? { ...item, registeredGameId: game.id, suggestedAdapterSlug: game.adapterSlug } : item));
     notify(`已将「${game.name}」添加到游戏库`);
-    await games.refetch();
   }
-  async function register(candidate: GameCandidate) {
+  async function register(candidate: GameCandidate, localOnly = false) {
     if (!writable || candidate.registeredGameId) return;
     await discover(async () => {
-      const game = await api<Game>("register_game", { directory: candidate.rootPath, adapterSlug: candidate.suggestedAdapterSlug, fromDiscovery: true });
-      await finishRegistration(candidate.rootPath, game);
+      setFailedRegistrations(previous => ({ ...previous, [candidate.rootPath]: false }));
+      try {
+        finishRegistration(candidate.rootPath, await cloud.register(candidate, localOnly));
+      } catch (failure) {
+        setFailedRegistrations(previous => ({ ...previous, [candidate.rootPath]: true }));
+        throw failure;
+      }
     });
   }
   /** Runs one card action. Failures are shown on the page; the native error text is already user-facing Chinese. */
@@ -359,26 +366,32 @@ export default function LibraryPage() {
         {report.warnings.map((warning, index) => <PathText className="text-warning" key={index}>{displayPath(warning.path)}：{warning.message}</PathText>)}
       </div>}
       {discoveryRows.length > 0 && <ItemGroup aria-label="扫描候选游戏" className="gap-2">
-        {discoveryRows.map((candidate, index) => <Item variant="outline" key={gameDirectoryKey(candidate.rootPath)} className="motion-safe:animate-rise-in" style={stagger(index)}>
-          <ItemMedia variant="icon"><Gamepad2Icon /></ItemMedia>
-          <ItemContent className="min-w-0">
-            <ItemTitle className="max-w-full break-all">{candidate.name}</ItemTitle>
-            <ItemDescription className="line-clamp-none"><PathText>{displayPath(candidate.rootPath)}</PathText></ItemDescription>
-            {candidate.warnings.map((warning) => <p key={warning} className="text-xs text-warning">{warning}</p>)}
-          </ItemContent>
-          <ItemActions className="w-full flex-wrap sm:w-auto">
-            <GameMatchBadge candidate={candidate} />
-            {!candidate.suggestedAdapterSlug && !candidate.registeredGameId && <Button variant="outline" size="sm" disabled={!backendAvailable || busy || games.isLoading} onClick={(event) => setIdentity({ directory: candidate.rootPath, trigger: event.currentTarget })}><GlobeIcon data-icon="inline-start" />联网识别</Button>}
-            <Button size="sm" variant={candidate.registeredGameId ? "outline" : "default"} disabled={!writable || busy || games.isLoading || !!candidate.registeredGameId} onClick={() => { void register(candidate); }}>{candidate.registeredGameId ? "管理中" : "添加"}</Button>
-          </ItemActions>
-        </Item>)}
+        {discoveryRows.map((candidate, index) => {
+          const matched = cloud.match(candidate);
+          const waiting = cloud.waiting(candidate);
+          return <Item role="listitem" variant="outline" key={gameDirectoryKey(candidate.rootPath)} className="motion-safe:animate-rise-in" style={stagger(index)}>
+            <ItemMedia variant="icon"><Gamepad2Icon /></ItemMedia>
+            <ItemContent className="min-w-0">
+              <ItemTitle className="max-w-full break-all">{candidate.name}</ItemTitle>
+              <ItemDescription className="line-clamp-none"><PathText>{displayPath(candidate.rootPath)}</PathText></ItemDescription>
+              {matched && <p className="wrap-anywhere text-xs text-muted-foreground">{matched.name} · {matched.reusable ? "将校验并复用已安装适配包" : "适配包将随添加安装"}</p>}
+              {candidate.warnings.map((warning) => <p key={warning} className="text-xs text-warning">{warning}</p>)}
+            </ItemContent>
+            <ItemActions className="w-full flex-wrap sm:w-auto">
+              <GameMatchBadge loading={waiting} candidate={candidate} cloudName={matched?.name} />
+              {!matched && !waiting && !candidate.suggestedAdapterSlug && !candidate.registeredGameId && <Button variant="outline" size="sm" disabled={!backendAvailable || busy || games.isLoading} onClick={(event) => setIdentity({ directory: candidate.rootPath, trigger: event.currentTarget })}><GlobeIcon data-icon="inline-start" />联网识别</Button>}
+              <Button size="sm" variant={candidate.registeredGameId ? "outline" : "default"} disabled={!writable || busy || cloud.pending || waiting || games.isLoading || !!candidate.registeredGameId} onClick={() => { void register(candidate); }}>{candidate.registeredGameId ? "管理中" : waiting ? "正在匹配…" : "添加"}</Button>
+              {!candidate.registeredGameId && (waiting || failedRegistrations[candidate.rootPath]) && <Button variant="outline" size="sm" disabled={!writable || busy || cloud.pending || games.isLoading} onClick={() => void register(candidate, true)}>仅添加本地</Button>}
+            </ItemActions>
+          </Item>;
+        })}
       </ItemGroup>}
       {identity && <GameIdentityDialog key={identity.directory} directory={identity.directory} writable={writable} onClose={() => setIdentity(null)}
         onCloseAutoFocus={(event) => {
           event.preventDefault();
           (identity.trigger.isConnected ? identity.trigger : directoryInput.current)?.focus();
         }}
-        onConfirmed={(game) => finishRegistration(identity.directory, game)} />}
+        onConfirmed={async (game) => { finishRegistration(identity.directory, game); await games.refetch(); }} />}
     </Modal>}
 
     {editing && <EditGameDialog key={editing.id} game={editing} onClose={() => setEditing(null)} onSaved={async () => { await games.refetch(); notify("已保存游戏设置"); }} />}

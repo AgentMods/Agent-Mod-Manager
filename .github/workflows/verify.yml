@@ -71,6 +71,7 @@ jobs:
           workspaces: src-tauri -> target
       - run: yarn install --frozen-lockfile
       - run: yarn build
+      - run: yarn prepare:seven-zip
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
       - run: node scripts/test-rust.mjs --locked --lib
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
@@ -79,6 +80,8 @@ jobs:
         run: node node_modules/@tauri-apps/cli/tauri.js build --ci --bundles "${{ matrix.bundles }}" -- --locked
       - name: Verify Native MCP Runtime Offline
         run: python scripts/verify-mcp-runtime.py src-tauri/resources
+      - name: Verify Native 7-Zip CLI Offline
+        run: python scripts/prepare-mcp-runtime.py --verify-seven-zip src-tauri/resources
       - name: Verify Bundled npx MCP Connection Offline
         run: node scripts/test-rust.mjs --locked --lib bundled_npx_connects_offline -- --ignored
       - name: Install Linux WebDriver Bridge
@@ -94,8 +97,9 @@ jobs:
           test "${#packages[@]}" -eq 1
           sudo dpkg --install "${packages[0]}"
           python scripts/verify-mcp-runtime.py '/usr/lib/Agent Mod Manager'
+          python scripts/prepare-mcp-runtime.py --verify-seven-zip '/usr/lib/Agent Mod Manager'
           bash scripts/run-linux-package-smoke.sh /usr/bin/agent-mod-manager output/linux-package-smoke/deb
-      - name: Verify Packaged AppImage MCP Runtime
+      - name: Verify Packaged AppImage Runtimes
         if: runner.os == 'Linux'
         timeout-minutes: 5
         run: |
@@ -105,6 +109,9 @@ jobs:
           work=$(mktemp -d)
           (cd "$work" && "${packages[0]}" --appimage-extract 'usr/lib/Agent Mod Manager/mcp-runtime/runtime.zip')
           python scripts/verify-mcp-runtime.py "$work/squashfs-root/usr/lib/Agent Mod Manager"
+          mkdir "$work/verify-7zip"
+          (cd "$work/verify-7zip" && "${packages[0]}" --appimage-extract 'usr/lib/Agent Mod Manager/seven-zip/*')
+          python scripts/prepare-mcp-runtime.py --verify-seven-zip "$work/verify-7zip/squashfs-root/usr/lib/Agent Mod Manager"
       - name: Smoke Test AppImage In Extraction Mode
         if: ${{ !cancelled() && runner.os == 'Linux' && steps.webdriver.outcome == 'success' }}
         timeout-minutes: 4
@@ -113,6 +120,21 @@ jobs:
           packages=(src-tauri/target/release/bundle/appimage/*.AppImage)
           test "${#packages[@]}" -eq 1
           bash scripts/run-linux-package-smoke.sh "${packages[0]}" output/linux-package-smoke/appimage
+      - name: Verify 7-Zip In macOS DMG
+        if: runner.os == 'macOS'
+        timeout-minutes: 4
+        run: |
+          shopt -s nullglob
+          images=(src-tauri/target/release/bundle/dmg/*.dmg)
+          test "${#images[@]}" -eq 1
+          mount_point=$(mktemp -d)
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_point" "${images[0]}"
+          trap 'hdiutil detach "$mount_point"' EXIT
+          applications=("$mount_point"/*.app)
+          test "${#applications[@]}" -eq 1
+          resource_dir="${applications[0]}/Contents/Resources"
+          test -x "$resource_dir/seven-zip/7zz"
+          python scripts/prepare-mcp-runtime.py --verify-seven-zip "$resource_dir"
       - name: Smoke Test macOS App Launch
         if: runner.os == 'macOS'
         timeout-minutes: 4
@@ -188,6 +210,8 @@ jobs:
           if ($target.Count -ne 1) { throw 'Expected one fresh install target in the smoke evidence.' }
           python scripts/verify-mcp-runtime.py $target[0].Matches[0].Groups[1].Value
           if ($LASTEXITCODE -ne 0) { throw 'Installed MCP runtime verification failed.' }
+          python scripts/prepare-mcp-runtime.py --verify-seven-zip $target[0].Matches[0].Groups[1].Value
+          if ($LASTEXITCODE -ne 0) { throw 'Installed 7-Zip verification failed.' }
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:

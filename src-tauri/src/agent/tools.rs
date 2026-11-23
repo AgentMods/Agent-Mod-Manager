@@ -72,6 +72,10 @@ pub struct PreparedTool {
 #[async_trait::async_trait]
 pub trait AgentTool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
+    /// Host-owned provenance, independent of remote names and receipts.
+    fn host_tool_kind(&self) -> Option<&'static str> {
+        None
+    }
     fn inbound_definition(&self) -> ToolDefinition {
         self.definition()
     }
@@ -281,7 +285,7 @@ impl Builtin {
                 Effect::Read,
             ),
             "extract_preview" => (
-                "只读检查归档并列出内部条目。分析 Mod 样本时传 limit 分页，按 next_offset 继续；省略分页参数返回完整目录。",
+                "只读检查归档并列出内部条目；RAR 仅支持非加密单卷。分析 Mod 样本时传 limit 分页，按 next_offset 继续；省略分页参数返回完整目录。",
                 schema(json!({"path":string,"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":MAX_ARCHIVE_PAGE}}), &["path"]),
                 Effect::Read,
             ),
@@ -298,11 +302,11 @@ impl Builtin {
                 Effect::Read,
             ),
             "plan_file_ops" => (
-                "生成文件变更预览，不立即写入。桌面 Agent 可使用未登记的源或目标，或以 write_text 在指定路径新建/完整覆盖 UTF-8 文本。不能永久删除文件",
+                "生成文件变更预览，不立即写入。桌面 Agent 可使用未登记的源或目标。write_text 在指定路径新建/完整覆盖 UTF-8 文本；compress 将普通文件夹打包为新的 .zip 或 .7z；extract 将支持的归档（RAR 仅支持非加密单卷）解压到不存在的目录，不去掉归档顶层目录。压缩与解压不会删除、移动或覆盖源，也不能覆盖目标；用 apply_file_ops 提交审批并执行。",
                 schema(
                     json!({"operations":{"type":"array","minItems":1,"items":{"type":"object","properties":{
-                        "op":{"type":"string","enum":["copy","move","mkdir","write_text"]},
-                        "dst":string,"src":{"type":"string","description":"copy / move 的源路径"},
+                        "op":{"type":"string","enum":["copy","move","mkdir","write_text","compress","extract"]},
+                        "dst":string,"src":{"type":"string","description":"copy / move / compress / extract 必填的源路径：compress 是文件夹，extract 是归档文件"},
                         "content":{"type":"string","description":"write_text 的完整新文本（仅桌面 Agent）"}
                     },"required":["op","dst"]}},"summary":string}),
                     &["operations", "summary"],
@@ -444,6 +448,7 @@ impl AgentTool for Builtin {
         let engine = self.engine_for(context);
         let local_agent = context.is_local_agent();
         let page_scope = context.read_page_scope();
+        let scope = context.resolution_scope.clone();
         let cancel = context.cancel.clone();
         let name = self.name.clone();
         tokio::task::spawn_blocking(move || {
@@ -504,6 +509,17 @@ impl AgentTool for Builtin {
                 "read_skill" => {
                     let name = text(&args, "name")?;
                     let detail = crate::skills::get_skill(&engine, name)?;
+                    if detail.skill.kind == crate::skills::SkillKind::Plugin {
+                        if let crate::sources::resolutions::ResolutionScope::Agent(conversation) = &scope {
+                            let selected = super::workspace::selection(&engine.db, conversation)?;
+                            let adapters: Vec<_> = crate::games::list_games(&engine.db)?.into_iter()
+                                .filter(|game| selected.as_ref().is_none_or(|ids| ids.contains(&game.id)))
+                                .filter_map(|game| game.adapter_slug).collect();
+                            if !super::workspace::plugin_visible(selected.as_deref(), &adapters, name) {
+                                return Err(AppError::Denied("该游戏 Skill 不在当前工作区选择中".into()));
+                            }
+                        }
+                    }
                     if !detail.skill.enabled || !detail.skill.valid {
                         return Err(AppError::Denied("Skill 未启用或未通过完整性校验".into()));
                     }

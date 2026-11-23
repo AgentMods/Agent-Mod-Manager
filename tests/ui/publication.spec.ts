@@ -1,12 +1,13 @@
 import { createHash } from 'node:crypto';
-import { expect, test, type Locator, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page, type Route } from '@playwright/test';
 import { installMockTauri } from './mock-tauri';
-import { attachPublicationHandlers, installPublicationHandlers } from './publication-fixture';
+import { attachPublicationHandlers, GAME_COVER_BASE64, GAME_COVER_BYTES, GAME_COVER_URL, installPublicationHandlers } from './publication-fixture';
 
 const prepare = 'prepare_auto_manager_publication';
 const publish = 'publish_manager_publication';
 const button = (scope: Page | Locator, name: string) => scope.getByRole('button', {name, exact: true});
 const dialog = (page: Page) => page.getByRole('dialog', {name: '发布插件', exact: true});
+const fulfillGameCover = (route: Route) => route.fulfill({status: 200, contentType: 'image/png', body: GAME_COVER_BYTES});
 const calls = (page: Page, command: string) => page.evaluate(name => (window as any).__AMM_TEST__.calls
   .filter((call: {command: string}) => call.command === name).map((call: {args: unknown}) => call.args), command);
 
@@ -17,9 +18,18 @@ async function openDraft(page: Page) {
 }
 async function openInstalled(page: Page) {
   await page.getByRole('tab', {name: '已安装', exact: true}).click();
-  await page.getByRole('row').filter({hasText: 'Minecraft Java Edition'}).getByRole('button').click();
+  await page.getByRole('row').filter({hasText: 'Minecraft Java Edition'}).getByRole('cell').first().getByRole('button').click();
   await button(page, '发布插件').click();
   return dialog(page);
+}
+async function selectInstalled(page: Page) {
+  await page.getByRole('tab', {name: '已安装', exact: true}).click();
+  await page.getByRole('row').filter({hasText: 'Minecraft Java Edition'}).getByRole('cell').first().getByRole('button').click();
+}
+async function expectInstalledSource(page: Page, source: string) {
+  const row = page.getByRole('row').filter({hasText: 'Minecraft Java Edition'});
+  await expect(row.getByRole('cell', {name: source, exact: true})).toBeVisible();
+  await expect(page.locator('aside dd').getByText(source, {exact: true})).toBeVisible();
 }
 async function openHistory(page: Page, name: string) {
   await page.getByRole('tab', {name: '发布记录', exact: true}).click();
@@ -36,7 +46,8 @@ async function expectAutomaticReview(review: Locator) {
 
 test.beforeEach(async ({page}) => {
   await installMockTauri(page, {withExternalAdapter: true});
-  await page.addInitScript(installPublicationHandlers);
+  await page.route(GAME_COVER_URL, fulfillGameCover);
+  await page.addInitScript(installPublicationHandlers, {coverUrl: GAME_COVER_URL, legacyCoverPng: GAME_COVER_BASE64});
   await page.goto('/');
   await page.evaluate(attachPublicationHandlers);
   await button(page, '游戏库').click();
@@ -49,10 +60,11 @@ test('草稿首次发布一次生成，展示完整的公开内容，第二次�
   await expect(review.getByRole('heading', {name: '测试游戏 · 游戏适配包'})).toBeVisible();
   await expect(review.getByText('按已验证的规则识别并安装模组。', {exact: true})).toBeVisible();
   await expect(review.getByText(/自动定位模组目录。/)).toHaveText('自动定位模组目录。\n安装前请核对 <em>文件变更</em>。');
-  await expect(review.getByRole('list', {name: '标签'}).getByRole('listitem')).toHaveText(['游戏适配', '中文']);
-  const cover = review.getByRole('img', {name: /封面/});
-  await expect(cover).toHaveAttribute('src', /^data:image\/png;base64,iVBORw0KGgo/);
+  await expect(review.getByRole('list', {name: '标签'}).getByRole('listitem')).toHaveText(['测试游戏', '游戏适配', '中文']);
+  const cover = review.getByRole('img', {name: /游戏封面/});
+  await expect(cover).toHaveAttribute('src', GAME_COVER_URL);
   await expect.poll(() => cover.evaluate(el => (el as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+  await expect(review.locator('img[src^="data:"]')).toHaveCount(0);
   await expect(review.locator('em')).toHaveCount(0);
   await expectAutomaticReview(review);
   for (const theme of ['light', 'dark']) {
@@ -70,7 +82,7 @@ test('草稿首次发布一次生成，展示完整的公开内容，第二次�
   for (const name of ['adapter.json', 'SKILL.md']) await review.locator('summary').filter({hasText: name}).click();
   const contents = await review.locator('pre').allTextContents();
   expect(contents).toEqual([
-    '{\r\n  "slug": "fixture-game", "name": "测试游戏", "version": "1.1.0"\r\n}\r\n',
+    `{\r\n  "slug": "fixture-game", "name": "测试游戏", "version": "1.1.0", "coverUrl": "${GAME_COVER_URL}"\r\n}\r\n`,
     '---\nname: fixture-game\ndescription: 公开测试\n---\nReview <em>before</em> installing.\n',
   ]);
   for (const raw of contents) await expect(review.getByText(`SHA-256 ${createHash('sha256').update(raw).digest('hex')}`, {exact: true})).toBeVisible();
@@ -78,15 +90,62 @@ test('草稿首次发布一次生成，展示完整的公开内容，第二次�
   expect(await calls(page, prepare)).toEqual([{draftId: 'draft-fixture'}]);
   expect(await calls(page, publish)).toEqual([]);
   await button(review, '发布').click();
-  await expect(review.getByText('已发布', {exact: true})).toBeVisible();
+  await expect(review.getByText('发布成功', {exact: true})).toBeVisible();
   await expect(button(review, '发布')).toHaveCount(0);
   expect(await calls(page, publish)).toEqual([{id: 'manager_1', digest, confirmation: 'PUBLISH_PLUGIN'}]);
+  expect(await calls(page, 'reconcile_manager_publication')).toEqual([]);
 });
 
-for (const scenario of ['直接发布', '管理器发布核对', '旧版作品核对'] as const) {
+test('发布 IPC 报错但本地记录已完成时仍显示成功且不保留旧错误', async ({page}) => {
+  await page.evaluate(() => { window.__publicationFixture.outcome = 'completed_error'; });
+  const review = await openDraft(page);
+  await button(review, '发布').click();
+  await expect(review.getByText('发布成功', {exact: true})).toBeVisible();
+  await expect(review.getByRole('alert')).toHaveCount(0);
+  await expect(review.getByText('模拟发布响应中断', {exact: true})).toHaveCount(0);
+  expect(await calls(page, publish)).toHaveLength(1);
+  expect(await calls(page, 'reconcile_manager_publication')).toEqual([]);
+});
+
+test('发布 IPC 正常返回 unknown 时不重复自动核实，可手动刷新状态', async ({page}) => {
+  await page.evaluate(() => {
+    window.__publicationFixture.outcome = 'unknown';
+    window.__publicationFixture.reconciliation = 'verified';
+  });
+  const review = await openDraft(page);
+  await button(review, '发布').click();
+  await expect(review.getByText('未能确认发布', {exact: true})).toBeVisible();
+  await expect(button(review, '刷新发布状态')).toBeVisible();
+  await expect(button(review, '核对远端状态')).toHaveCount(0);
+  await expect(review.getByText('结果待核对', {exact: true})).toHaveCount(0);
+  expect(await calls(page, 'reconcile_manager_publication')).toEqual([]);
+  expect(await calls(page, publish)).toHaveLength(1);
+
+  await button(review, '刷新发布状态').click();
+  await expect(review.getByText('发布成功', {exact: true})).toBeVisible();
+  expect(await calls(page, 'reconcile_manager_publication')).toEqual([{id: 'manager_1'}]);
+  expect(await calls(page, publish)).toHaveLength(1);
+});
+
+test('发布 IPC 报错且本地状态为 unknown 时自动只读核实一次', async ({page}) => {
+  await page.evaluate(() => {
+    window.__publicationFixture.outcome = 'unknown_error';
+    window.__publicationFixture.reconciliation = 'unconfirmed';
+  });
+  const review = await openDraft(page);
+  await button(review, '发布').click();
+  await expect(review.getByText('未能确认发布', {exact: true})).toBeVisible();
+  await expect(button(review, '刷新发布状态')).toBeVisible();
+  await expect(button(review, '核对远端状态')).toHaveCount(0);
+  await expect(review.getByText('结果待核对', {exact: true})).toHaveCount(0);
+  expect(await calls(page, 'reconcile_manager_publication')).toEqual([{id: 'manager_1'}]);
+  expect(await calls(page, publish)).toHaveLength(1);
+});
+
+for (const scenario of ['直接发布', '旧版作品核对'] as const) {
   test(`Agent 草稿${scenario}完成后刷新草稿和回收站`, async ({page}) => {
     const legacy = scenario === '旧版作品核对';
-    const reconcile = scenario !== '直接发布';
+    const reconcile = legacy;
     // Prime a fresh Trash cache; revisiting without invalidation would reuse it.
     await page.clock.setFixedTime(new Date());
     await button(page, '回收站').click();
@@ -96,7 +155,7 @@ for (const scenario of ['直接发布', '管理器发布核对', '旧版作品�
     await page.evaluate(({legacy, reconcile}) => {
       const fixture = window.__publicationFixture;
       fixture.agentDraftId = 'draft-fixture';
-      if (reconcile) { fixture.outcome = 'unknown'; fixture.reconciliation = 'unconfirmed'; }
+      if (reconcile) fixture.reconciliation = 'unconfirmed';
       if (legacy) fixture.legacyState = 'unknown';
     }, {legacy, reconcile});
     if (legacy) await openHistory(page, '旧版测试作品');
@@ -104,14 +163,14 @@ for (const scenario of ['直接发布', '管理器发布核对', '旧版作品�
     const draftReads = (await calls(page, 'list_plugin_drafts')).length;
     if (!legacy) await button(review, '发布').click();
     if (reconcile) {
-      await expect(review.getByText('结果待核对', {exact: true})).toBeVisible();
+      await expect(review.getByText('未能确认发布', {exact: true})).toBeVisible();
       await button(review, '核对远端状态').click();
       await expect(review.getByRole('status')).toContainText('尚未核实');
       expect(await calls(page, 'list_plugin_drafts')).toHaveLength(draftReads);
       await page.evaluate(() => { window.__publicationFixture.reconciliation = 'verified'; });
       await button(review, '核对远端状态').click();
     }
-    await expect(review.getByText('已发布', {exact: true})).toBeVisible();
+    await expect(review.getByText(legacy ? '已发布' : '发布成功', {exact: true})).toBeVisible();
     await button(review, '关闭').last().click();
     const drafts = page.getByRole('tab', {name: '草稿 0', exact: true});
     await expect(drafts).toBeVisible();
@@ -126,10 +185,23 @@ test('已安装适配包自动匹配本人插件，审核实际版本并更新�
   await page.clock.setFixedTime(new Date());
   await page.evaluate(() => { window.__publicationFixture.exposeCatalog = true; window.__publicationFixture.matched = true; });
   const catalog = page.getByRole('tab', {name: '云端插件', exact: true});
+  await selectInstalled(page);
+  await expectInstalledSource(page, '本地导入');
+  await expect.poll(() => calls(page, 'list_manager_plugin_games')).toEqual([{}]);
   await catalog.click();
   await expect(page.getByText('暂无已发布插件', {exact: true})).toBeVisible();
-  expect(await calls(page, 'list_manager_plugin_games')).toHaveLength(1);
-  const review = await openInstalled(page);
+  expect(await calls(page, 'list_manager_plugin_games')).toEqual([{}]);
+  await selectInstalled(page);
+  const rightCover = page.locator('aside').getByRole('img', {name: /游戏封面/});
+  await expect(rightCover).toHaveAttribute('src', GAME_COVER_URL);
+  await expect.poll(() => rightCover.evaluate(el => (el as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+  const rightCoverUrl = await rightCover.getAttribute('src');
+  await button(page, '发布插件').click();
+  const review = dialog(page);
+  await expect(review.getByRole('list', {name: '标签'}).getByRole('listitem').first()).toHaveText('Minecraft Java Edition');
+  const listingCover = review.getByRole('img', {name: /游戏封面/});
+  await expect(listingCover).toHaveAttribute('src', rightCoverUrl!);
+  await expect(review.locator('img[src^="data:"]')).toHaveCount(0);
   await expect(review).toHaveAccessibleDescription(/发布新版本\s+1\.3\.0 → 1\.3\.1/);
   await expect(review.getByRole('heading', {name: 'Minecraft Java · 游戏适配包'})).toBeVisible();
   await showFiles(review);
@@ -140,13 +212,96 @@ test('已安装适配包自动匹配本人插件，审核实际版本并更新�
   await expect(review.locator('pre').last()).toContainText('已审核的安装指引。');
   expect(await calls(page, prepare)).toEqual([{slug: 'minecraft-java'}]);
   await button(review, '发布').click();
-  await expect(review.getByText('已发布', {exact: true})).toBeVisible();
+  await expect(review.getByText('发布成功', {exact: true})).toBeVisible();
   await button(review, '关闭').last().click();
+  await expectInstalledSource(page, '云端插件');
   await catalog.click();
-  await expect(page.getByRole('button', {name: /查看并导入 Minecraft Java Edition/})).toBeVisible();
+  await expect(page.getByRole('button', {name: /(?=.*查看详情)(?=.*Minecraft Java Edition)/})).toBeVisible();
   await expect(page.getByText('1.3.1', {exact: false}).first()).toBeVisible();
-  expect(await calls(page, 'list_manager_plugin_games')).toHaveLength(2);
+  expect(await calls(page, 'list_manager_plugin_games')).toEqual([{}, {}]);
   expect(await calls(page, publish)).toHaveLength(1);
+});
+
+for (const outcome of ['hidden', 'unknown'] as const) {
+  test(`已安装来源在${outcome === 'hidden' ? '确认下架发布' : '核对成功'}后读取持久回执`, async ({page}) => {
+    // Keep the public directory empty to isolate the locally confirmed receipt.
+    await page.evaluate(value => {
+      window.__publicationFixture.outcome = value;
+      window.__publicationFixture.reconciliation = 'unconfirmed';
+    }, outcome);
+    await selectInstalled(page);
+    await expectInstalledSource(page, '本地导入');
+    const before = (await calls(page, 'list_plugins')).length;
+    const review = await openInstalled(page);
+    await button(review, '发布').click();
+    if (outcome === 'unknown') {
+      await expect(review.getByText('未能确认发布', {exact: true})).toBeVisible();
+      await button(review, '刷新发布状态').click();
+      await expect.poll(() => calls(page, 'reconcile_manager_publication')).toEqual([{id: 'manager_1'}]);
+      await expect(button(review, '刷新发布状态')).toBeEnabled();
+      expect(await calls(page, 'list_plugins')).toHaveLength(before);
+      await page.evaluate(() => { window.__publicationFixture.reconciliation = 'verified'; });
+      await button(review, '刷新发布状态').click();
+    }
+    await expect(review.getByText(outcome === 'hidden' ? '已提交，插件已下架' : '发布成功', {exact: true})).toBeVisible();
+    await button(review, '关闭').last().click();
+    await expectInstalledSource(page, '云端插件');
+    expect(await calls(page, 'list_plugins')).toHaveLength(before + 1);
+  });
+}
+
+test('已安装刷新使用公共目录的精确插件标识，目录不可用时仍可查看本地包', async ({page}) => {
+  await page.clock.setFixedTime(new Date());
+  await selectInstalled(page);
+  await expectInstalledSource(page, '本地导入');
+  await expect.poll(() => calls(page, 'list_manager_plugin_games')).toEqual([{}]);
+  await page.evaluate(() => { window.__publicationFixture.exposeCatalog = true; window.__publicationFixture.catalogUnavailable = true; });
+  await button(page, '刷新适配包').click();
+  await expect.poll(() => calls(page, 'list_manager_plugin_games')).toEqual([{}, {}]);
+  await expectInstalledSource(page, '本地导入');
+  await expect(page.getByText('模拟云端目录不可用')).toHaveCount(0);
+
+  await page.evaluate(() => {
+    window.__publicationFixture.catalogUnavailable = false;
+    window.__publicationFixture.catalogEntrySlug = 'minecraft-java-other';
+  });
+  await button(page, '刷新适配包').click();
+  const catalog = page.getByRole('tab', {name: '云端插件', exact: true});
+  await expect.poll(() => calls(page, 'list_manager_plugin_games')).toEqual([{}, {}, {}]);
+  await catalog.click();
+  await expect(page.getByRole('button', {name: /(?=.*查看详情)(?=.*Minecraft Java Edition)/})).toBeVisible();
+  await selectInstalled(page);
+  await expectInstalledSource(page, '本地导入');
+
+  await page.evaluate(() => { window.__publicationFixture.catalogEntrySlug = 'minecraft-java'; });
+  await button(page, '刷新适配包').click();
+  await expectInstalledSource(page, '云端插件');
+  await expect(page.locator('aside dd').getByText('1.0.0', {exact: true})).toBeVisible();
+  expect(await calls(page, 'list_manager_plugin_games')).toEqual([{}, {}, {}, {}]);
+  expect(await calls(page, 'list_my_manager_plugins')).toEqual([]);
+});
+
+test('Agent 在当前回合确认发布后刷新已安装来源，不依赖回合结束或云端目录', async ({page}) => {
+  await selectInstalled(page);
+  await expectInstalledSource(page, '本地导入');
+  await expect.poll(async () => (await calls(page, 'plugin:event|listen')).length).toBeGreaterThanOrEqual(11);
+  const before = (await calls(page, 'list_plugins')).length;
+  const cursor = (await calls(page, 'replay_agent_events')).length;
+  await page.evaluate(() => {
+    const fixture = (window as any).__AMM_TEST__;
+    fixture.emit('turn-start', {}, 'conversation-fixture', null);
+    fixture.persistOnly('tool-result', {name: 'publish_plugin', toolCallId: 'cloud-unknown', status: 'done', result: {state: 'unknown'}}, 'conversation-fixture', null);
+  });
+  await expect.poll(async () => (await calls(page, 'replay_agent_events')).length).toBeGreaterThan(cursor);
+  expect(await calls(page, 'list_plugins')).toHaveLength(before);
+  await expectInstalledSource(page, '本地导入');
+  await page.evaluate(() => {
+    const fixture = (window as any).__AMM_TEST__;
+    fixture.cloudPluginSlugs.add('minecraft-java');
+    fixture.persistOnly('tool-result', {name: 'publish_plugin', toolCallId: 'cloud-completed', status: 'done', result: {state: 'completed'}}, 'conversation-fixture', null);
+  });
+  await expectInstalledSource(page, '云端插件');
+  expect(await calls(page, 'list_plugins')).toHaveLength(before + 1);
 });
 
 test('生成中可退出，迟到的草稿不能覆盖后开的已安装适配包', async ({page}) => {
@@ -200,38 +355,66 @@ for (const failure of ['listDenied', 'ambiguous'] as const) {
   });
 }
 
-test('不加载任意远程封面', async ({page}) => {
-  let requests = 0;
-  await page.route('https://covers.invalid/**', route => { requests++; return route.abort(); });
-  await page.evaluate(() => { window.__publicationFixture.invalidCover = true; });
+test('缺少游戏封面时显示统一占位', async ({page}) => {
+  await page.evaluate(() => { window.__publicationFixture.missingCover = true; });
   const review = await openDraft(page);
-  await expect(review.getByText('封面无法显示')).toBeVisible();
+  await expect(review.getByText('无游戏封面')).toBeVisible();
   await expect(review.locator('img')).toHaveCount(0);
-  expect(requests).toBe(0);
+  await expect(review.locator('img[src^="data:"]')).toHaveCount(0);
 });
 
-test('历史中的自动生成预览可继续发布，未知结果只读核对', async ({page}) => {
+test('封面请求失败显示统一占位且不回退到 data 图片', async ({page}) => {
+  await page.unroute(GAME_COVER_URL, fulfillGameCover);
+  let requests = 0;
+  await page.route(GAME_COVER_URL, route => { requests++; return route.abort(); });
+  const review = await openDraft(page);
+  await expect.poll(() => requests).toBeGreaterThan(0);
+  await expect(review.getByText('无游戏封面')).toBeVisible();
+  await expect(review.locator('img')).toHaveCount(0);
+  await expect(review.locator('img[src^="data:"]')).toHaveCount(0);
+});
+
+test('旧待确认记录从不可变 adapter.json 恢复游戏封面并要求重新发布预览', async ({page}) => {
+  await page.evaluate(() => window.__publicationFixture.seedLegacyCoverIntent());
+  const review = await openHistory(page, 'fixture-game');
+  const cover = review.getByRole('img', {name: /游戏封面/});
+  await expect(cover).toHaveAttribute('src', GAME_COVER_URL);
+  await expect.poll(() => cover.evaluate(el => (el as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+  await expect(review.locator('img[src^="data:"]')).toHaveCount(0);
+  await expect(button(review, '发布')).toHaveCount(0);
+  await expect(review).toContainText(/重新点击.*发布/);
+  expect(await calls(page, publish)).toEqual([]);
+});
+
+test('自动生成预览发布后，历史 unknown 自动核实并可刷新重试', async ({page}) => {
   await page.evaluate(() => { window.__publicationFixture.outcome = 'unknown'; window.__publicationFixture.reconciliation = 'unconfirmed'; });
   const review = await openDraft(page);
   await expect(button(review, '发布')).toBeEnabled();
-  await button(review, '取消').click();
-  await openHistory(page, 'fixture-game');
   await button(review, '发布').click();
-  await expect(review.getByText('结果待核对', {exact: true})).toBeVisible();
+  await expect(review.getByText('未能确认发布', {exact: true})).toBeVisible();
+  await expect(button(review, '刷新发布状态')).toBeVisible();
+  await expect(button(review, '核对远端状态')).toHaveCount(0);
+  await expect(review.getByText('结果待核对', {exact: true})).toHaveCount(0);
   await expect(button(review, '发布')).toHaveCount(0);
-  const reconcile = button(review, '核对远端状态');
+  expect(await calls(page, 'reconcile_manager_publication')).toEqual([]);
+  await button(review, '关闭').last().click();
+  await openHistory(page, 'fixture-game');
+  await expect.poll(() => calls(page, 'reconcile_manager_publication')).toEqual([{id: 'manager_1'}]);
+  await expect(review.getByText('未能确认发布', {exact: true})).toBeVisible();
+  await expect(button(review, '刷新发布状态')).toBeVisible();
+
   await page.evaluate(() => { window.__publicationFixture.listDenied = true; });
-  await reconcile.click();
+  await button(review, '刷新发布状态').click();
   await expect(review).toContainText('manager_plugins.read');
   await page.evaluate(() => { window.__publicationFixture.listDenied = false; });
-  await reconcile.click();
-  await expect(review.getByRole('status')).toContainText('尚未核实');
+  await button(review, '刷新发布状态').click();
+  await expect(review.getByText('未能确认发布', {exact: true})).toBeVisible();
   await page.evaluate(() => { window.__publicationFixture.reconciliation = 'verified'; });
-  await reconcile.click();
-  await expect(review.getByRole('status')).toContainText('已核实');
-  await expect(review.getByText('已发布', {exact: true})).toBeVisible();
-  await expect(reconcile).toHaveCount(0);
-  expect(await calls(page, 'reconcile_manager_publication')).toEqual(Array(3).fill({id: 'manager_1'}));
+  await button(review, '刷新发布状态').click();
+  await expect(review.getByText('发布成功', {exact: true})).toBeVisible();
+  await expect(button(review, '刷新发布状态')).toHaveCount(0);
+  await expect(button(review, '核对远端状态')).toHaveCount(0);
+  expect(await calls(page, 'reconcile_manager_publication')).toEqual(Array(4).fill({id: 'manager_1'}));
   expect(await calls(page, prepare)).toHaveLength(1);
   expect(await calls(page, publish)).toHaveLength(1);
 });
@@ -252,13 +435,37 @@ test('历史分页读取缺少 listing 的旧管理器记录，原待审核记�
   expect(await calls(page, publish)).toEqual([]);
 });
 
-test('旧管理器记录仍能核对未知远端状态', async ({page}) => {
+test('历史 unknown 管理器记录打开后自动只读核实并显示进度', async ({page}) => {
   await page.evaluate(() => window.__publicationFixture.seedManagerV1(1, 'unknown'));
+  await page.evaluate(() => window.__publicationFixture.holdNext('reconcile_manager_publication'));
   const review = await openHistory(page, 'v1-0');
-  await button(review, '核对远端状态').click();
-  await expect(review.getByRole('status')).toContainText('已核实');
+  await expect.poll(() => calls(page, 'reconcile_manager_publication')).toEqual([{id: 'v1-0'}]);
+  await expect.poll(async () => (await review.getByText('正在发布', {exact: true}).count()) > 0 || (await review.locator('svg.animate-spin').count()) > 0).toBe(true);
+  await expect(button(review, '核对远端状态')).toHaveCount(0);
+  await expect(review.getByText('结果待核对', {exact: true})).toHaveCount(0);
+  await page.evaluate(() => window.__publicationFixture.resume());
+  await expect(review.getByText('发布成功', {exact: true})).toBeVisible();
   await expect(button(review, '发布')).toHaveCount(0);
   expect(await calls(page, 'reconcile_manager_publication')).toEqual([{id: 'v1-0'}]);
+  expect(await calls(page, publish)).toEqual([]);
+});
+
+test('历史 unknown 管理器记录未能确认时可刷新重试只读核实', async ({page}) => {
+  await page.evaluate(async () => {
+    window.__publicationFixture.reconciliation = 'unconfirmed';
+    await window.__publicationFixture.seedManagerV1(1, 'unknown');
+  });
+  const review = await openHistory(page, 'v1-0');
+  await expect.poll(() => calls(page, 'reconcile_manager_publication')).toEqual([{id: 'v1-0'}]);
+  await expect(review.getByText('未能确认发布', {exact: true})).toBeVisible();
+  await expect(button(review, '刷新发布状态')).toBeVisible();
+  await expect(button(review, '核对远端状态')).toHaveCount(0);
+  await expect(review.getByText('结果待核对', {exact: true})).toHaveCount(0);
+
+  await page.evaluate(() => { window.__publicationFixture.reconciliation = 'verified'; });
+  await button(review, '刷新发布状态').click();
+  await expect(review.getByText('发布成功', {exact: true})).toBeVisible();
+  expect(await calls(page, 'reconcile_manager_publication')).toEqual([{id: 'v1-0'}, {id: 'v1-0'}]);
   expect(await calls(page, publish)).toEqual([]);
 });
 
@@ -273,9 +480,14 @@ for (const state of ['prepared', 'unknown', 'awaitingScan'] as const) {
     await expect(button(review, '发布')).toHaveCount(0);
     await expect(review.getByRole('checkbox')).toHaveCount(0);
     if (state !== 'prepared') {
+      if (state === 'unknown') {
+        await expect(review.getByText('未能确认发布', {exact: true})).toBeVisible();
+        await expect(button(review, '核对远端状态')).toBeVisible();
+      }
       await button(review, '核对远端状态').click();
       await expect(review.getByRole('status')).toContainText('已核实');
       await expect(review).toContainText(state === 'unknown' ? '作品 99' : '文件已就绪');
+      if (state === 'unknown') await expect(review.getByText('已发布', {exact: true})).toBeVisible();
       await expect(button(review, '发布')).toHaveCount(0);
       await expect(review.getByRole('checkbox')).toHaveCount(0);
       expect(await calls(page, 'reconcile_plugin_publication')).toEqual([{id: 'legacy_fixture'}]);

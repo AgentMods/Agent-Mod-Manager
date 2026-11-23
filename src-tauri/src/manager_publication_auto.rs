@@ -101,6 +101,10 @@ pub(super) struct Snapshot {
     source_sha256: [String; 2],
     credential_binding: CredentialBinding,
     remote_release_id: Option<i64>,
+    // An older release can become current again. Keep the higher confirmed
+    // version in the approval, omitting it for historical digest compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    historical_version_floor: Option<String>,
 }
 
 impl Snapshot {
@@ -109,13 +113,22 @@ impl Snapshot {
         let original_version = preview.original_version.as_deref().ok_or_else(stale)?;
         let remote_version = preview.remote_version.as_deref();
         let is_release = preview.target.plugin_id().is_some();
+        let floor = self.historical_version_floor.as_deref();
+        if let Some(floor) = floor {
+            let remote = remote_version.ok_or_else(stale)?;
+            plugins::validate_version(remote)?;
+            plugins::validate_version(floor)?;
+            if !version_cmp(floor, remote).is_gt() {
+                return Err(stale());
+            }
+        }
         if preview.tags != listing.tags
             || is_release != remote_version.is_some()
             || is_release != self.remote_release_id.is_some()
             || self.remote_release_id.is_some_and(|id| !valid_id(id))
             || !valid_sha256(&self.credential_binding.0)
             || !self.source_sha256.iter().all(|hash| valid_sha256(hash))
-            || preview.version != published_version(original_version, remote_version)?
+            || preview.version != published_version(original_version, floor.or(remote_version))?
         {
             return Err(stale());
         }
@@ -247,10 +260,21 @@ async fn prepare_with(
     let slug = &source.package.adapter.slug;
     let owner = owned_slug(remote, slug, cancel).await?;
     let remote_version = owner.as_ref().map(|plugin| plugin.version.clone());
+    let historical_version_floor = owner
+        .as_ref()
+        .map(|plugin| higher_confirmed_version(engine, plugin))
+        .transpose()?
+        .flatten();
     let original_version = &source.package.adapter.version;
-    let version = published_version(original_version, remote_version.as_deref())?;
+    let version = published_version(
+        original_version,
+        historical_version_floor
+            .as_deref()
+            .or(remote_version.as_deref()),
+    )?;
     let listing = generate(&source.package).await?;
     check_cancel(cancel)?;
+    listing.require_game_tag(&source.package.adapter.name)?;
     let files = publication_copy::render_files(&source.package, &source.files, &listing, &version)?;
     let mut preview = PublicationPreview {
         source: source.source,
@@ -272,6 +296,7 @@ async fn prepare_with(
             source_sha256: source.files.map(|file| file.sha256),
             credential_binding: credential.clone(),
             remote_release_id: owner.as_ref().map(|plugin| plugin.release_id),
+            historical_version_floor,
         }),
     };
     preview.digest = preview.checked_digest()?;
@@ -285,6 +310,28 @@ async fn prepare_with(
         check_cancel(cancel)?;
         create(engine, &preview)
     })
+}
+
+fn higher_confirmed_version(
+    engine: &FileEngine,
+    owner: &super::PublishedPlugin,
+) -> AppResult<Option<String>> {
+    let conn = engine.db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT version FROM manager_publications
+         WHERE slug=?1 AND state='completed' AND json_extract(remote_json,'$.id')=?2 ORDER BY version",
+    )?;
+    let mut highest = None;
+    for version in stmt.query_map(rusqlite::params![owner.slug, owner.id], |r| {
+        r.get::<_, String>(0)
+    })? {
+        let version = version?;
+        plugins::validate_version(&version)?;
+        if version_cmp(&version, highest.as_deref().unwrap_or(&owner.version)).is_gt() {
+            highest = Some(version);
+        }
+    }
+    Ok(highest)
 }
 
 fn contains_key(value: &serde_json::Value, key: &str) -> bool {
@@ -340,7 +387,7 @@ pub(super) async fn publish_with(
     let binding = CredentialBinding::for_preview(preview)?;
     binding.check(settings)?;
     let owner = owned_slug(remote, &preview.slug, cancel).await?;
-    let unchanged = match (preview.target, owner) {
+    let unchanged = match (preview.target, owner.as_ref()) {
         (PublicationTarget::First, None) => true,
         (PublicationTarget::Release { plugin_id }, Some(plugin)) => {
             plugin.id == plugin_id
@@ -358,11 +405,25 @@ pub(super) async fn publish_with(
             "Mod 客栈插件归属或最新版本已更改，请重新预览".into(),
         ));
     }
-    send(engine, remote, record, cancel, || {
+    let written = send(engine, remote, record, owner.as_ref(), cancel, || {
         binding.check(settings)?;
         check_cancel(cancel)
     })
+    .await?;
+    // Persist uncertainty first. A failed or cancelled read-back cannot hide
+    // the durable record or trigger a second write.
+    if written.state != PublicationState::Unknown || cancel.is_cancelled() {
+        return Ok(written);
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        confirm_with(engine, settings, remote, &written, cancel),
+    )
     .await
+    {
+        Ok(Ok(Some(verified))) => Ok(verified),
+        _ => Ok(written),
+    }
 }
 
 pub(super) async fn reconcile_with(
@@ -372,9 +433,27 @@ pub(super) async fn reconcile_with(
     record: &PublicationRecord,
     cancel: &CancellationToken,
 ) -> AppResult<ReconciliationOutcome> {
-    use ReconciliationOutcome::{Unconfirmed, Verified};
+    Ok(
+        if confirm_with(engine, settings, remote, record, cancel)
+            .await?
+            .is_some()
+        {
+            ReconciliationOutcome::Verified
+        } else {
+            ReconciliationOutcome::Unconfirmed
+        },
+    )
+}
+
+async fn confirm_with(
+    engine: &FileEngine,
+    settings: &Settings,
+    remote: &dyn Remote,
+    record: &PublicationRecord,
+    cancel: &CancellationToken,
+) -> AppResult<Option<PublicationRecord>> {
     if record.state != PublicationState::Unknown {
-        return Ok(Unconfirmed);
+        return Ok(None);
     }
     let preview = &record.preview;
     let binding = CredentialBinding::for_preview(preview)?;
@@ -383,14 +462,14 @@ pub(super) async fn reconcile_with(
         .await?
         .filter(|plugin| matches_preview(plugin, preview))
     else {
-        return Ok(Unconfirmed);
+        return Ok(None);
     };
     let texts = own_texts(remote, expected.id, false, cancel).await?;
     if texts.adapter != preview.files[0].text
         || texts.skill != preview.files[1].text
         || !super::same_tags(&texts.tags, &preview.tags)
     {
-        return Ok(Unconfirmed);
+        return Ok(None);
     }
     // The text endpoint has no release ID. Confirm that the same release was
     // current on both sides of the text read.
@@ -402,12 +481,11 @@ pub(super) async fn reconcile_with(
                 && matches_preview(plugin, preview)
         })
     else {
-        return Ok(Unconfirmed);
+        return Ok(None);
     };
     binding.check(settings)?;
     check_cancel(cancel)?;
-    transition(engine, record, "completed", Some(&actual))?;
-    Ok(Verified)
+    transition(engine, record, "completed", Some(&actual)).map(Some)
 }
 
 fn check_cancel(cancel: &CancellationToken) -> AppResult<()> {
@@ -453,7 +531,7 @@ fn decimal_cmp(a: &str, b: &str) -> Ordering {
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
 
-fn version_cmp(a: &str, b: &str) -> Ordering {
+pub(super) fn version_cmp(a: &str, b: &str) -> Ordering {
     let (a, a_pre) = precedence_parts(a);
     let (b, b_pre) = precedence_parts(b);
     for (a, b) in a.split('.').zip(b.split('.')) {

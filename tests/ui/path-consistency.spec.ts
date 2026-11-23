@@ -256,14 +256,17 @@ test("Agent 审批和工具详情只转换原生结构化路径，不改文本�
   expect(original.entries[0].operation).toEqual({ op: "move", src: verbatimDrive, dst });
 });
 
-test("本地归档导入保留原生选择的路径", async ({ page }) => {
+test("本地归档选择器允许 RAR 并保留原生选择的路径", async ({ page }) => {
   await openLibrary(page);
-  const path = verbatimUnc + "\\ Map Pack.zip ";
+  const path = verbatimUnc + "\\ Map Pack.RAR ";
   await page.evaluate((selected) => {
     const target = window as any;
     const invoke = target.__TAURI_INTERNALS__.invoke;
     target.__TAURI_INTERNALS__.invoke = async (command: string, args: any) => {
-      if (command === "plugin:dialog|open") return selected;
+      if (command === "plugin:dialog|open") {
+        target.__AMM_TEST__.calls.push({ command, args });
+        return selected;
+      }
       if (command === "plan_import_archive") {
         target.__AMM_TEST__.calls.push({ command, args });
         throw new Error("仅校验请求参数");
@@ -274,6 +277,11 @@ test("本地归档导入保留原生选择的路径", async ({ page }) => {
   await page.getByRole("button").filter({ has: page.getByRole("heading", { name: "Minecraft Java Edition", exact: true }) }).click();
   await page.getByRole("button", { name: "导入本地归档", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText("仅校验请求参数");
+  expect(await argsFor(page, "plugin:dialog|open")).toEqual([expect.objectContaining({
+    options: expect.objectContaining({
+      filters: [{ name: "Mod 归档", extensions: ["zip", "jar", "mrpack", "7z", "rar", "gz", "tgz"] }],
+    }),
+  })]);
   expect(await argsFor(page, "plan_import_archive")).toEqual([{ path }]);
   expect(await argsFor(page, "register_imported_mod")).toHaveLength(0);
   expect(await argsFor(page, "start_turn")).toHaveLength(0);
@@ -324,4 +332,42 @@ test("启动程序输入框显示普通路径，未编辑的已有值和选择�
   await save.click();
   await expect(dialog).toBeHidden();
   expect((await argsFor(page, "update_game")).map((args: any) => args.launchPath)).toEqual([stored, picked, special]);
+});
+
+test("归档计划沿用现有审批和路径展示", async ({ page }) => {
+  await installMockTauri(page, { holdAgentTurn: true });
+  await page.goto("/");
+  await page.getByRole("button", { name: /^Agent( 对话)?$/ }).click();
+  await page.getByRole("textbox", { name: "告诉 Agent 你想做什么" }).fill("预览压缩和解压计划");
+  await page.getByRole("button", { name: "发送消息", exact: true }).click();
+  await expect(page.locator('[data-message-id="assistant-fixture"]')).toContainText("正在检查模组文件。");
+  const operations = [
+    { op: "compress", src: `${verbatimDrive}\\folder`, dst: `${verbatimUnc}\\new.zip` },
+    { op: "extract", src: `${verbatimDrive}\\source.7z`, dst: `${verbatimUnc}\\output` },
+  ];
+  await page.evaluate((operations) => {
+    const mock = (window as any).__AMM_TEST__;
+    const preview = {
+      id: "archive-file-ops", summary: "归档操作", total_bytes: 128, requires_review: true,
+      entries: operations.map((operation) => ({ operation, impact: "add", before: null, source: null })),
+    };
+    mock.emit("tool-start", { toolCallId: "archive-planner", name: "plan_file_ops", arguments: { operations } });
+    mock.emit("tool-result", { toolCallId: "archive-planner", status: "done", result: preview });
+    mock.emit("tool-start", { toolCallId: "tool-fixture", name: "apply_file_ops", arguments: { plan_id: preview.id } });
+    mock.emit("approval-request", { title: "apply_file_ops", toolCallId: "tool-fixture", approvalId: "approval-fixture", preview });
+  }, operations);
+  const approval = page.getByRole("group", { name: "操作审批", exact: true });
+  const shownDrive = String.raw`C:\Games\Fixture`;
+  const expected = [
+    { op: "compress", src: `${shownDrive}\\folder`, dst: `${ordinaryUnc}\\new.zip` },
+    { op: "extract", src: `${shownDrive}\\source.7z`, dst: `${ordinaryUnc}\\output` },
+  ];
+  for (const op of expected) {
+    for (const value of [op.op, op.src, op.dst]) await expect(approval.getByText(value, { exact: true })).toBeVisible();
+  }
+  await approval.getByText("完整请求", { exact: true }).click();
+  const preview = JSON.parse(await approval.locator("pre").innerText());
+  expect(preview.entries.map((entry: any) => entry.operation)).toEqual(expected);
+  const original = await page.evaluate(() => (window as any).__AMM_TEST__.events.find((event: any) => event.kind === "approval-request").payload.preview);
+  expect(original.entries.map((entry: any) => entry.operation)).toEqual(operations);
 });

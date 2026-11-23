@@ -38,9 +38,9 @@ downloads. `download_mod` does not accept uncataloged links.
 
 ## Agent downloads from Mod sites
 
-The Agent checks the selected file against the connected source MCP first. The native catalog is independent of the connected services. On Mod 客栈, `list_works` and `list_work_files` identify the exact attachment. The official MCP's `get_work_file_download` issues a short-lived link and counts the download. The desktop adapter requests the signed link and transfers the selected attachment under one approval, returning the local archive receipt for later review. Signed URLs stay out of the conversation and the database.
+The Agent checks the selected file against the connected source MCP first. The native catalog is independent of the connected services. On Mod 客栈, `list_works` and `list_work_files` identify the exact attachment. The official MCP's `get_work_file_download` issues a short-lived link and counts the download. The desktop adapter requests the signed link and transfers the selected attachment in one operation (reviewed unless the Agent uses Full Trust), returning the local archive receipt for later review. Signed URLs stay out of the conversation and the database.
 
-When the source cannot deliver the attachment, the Agent uses the connected Playwright MCP to download the same file through the official page and checks the saved file. A denied approval stops the operation. The stock browser reports absolute file paths and writes under `Agent Mod Manager/Playwright` in the user’s downloads directory (or a user-writable fallback). For new library downloads, `list_mod_receipt_folders` returns the managed incoming folder and the stock Playwright download folder. `file_received_mod` files the verified download under its game in `Mods`. A file saved elsewhere goes through the desktop picker and reviewed import. The Agent installs from the resulting library artifact ID.
+When the source cannot deliver the attachment, the Agent uses the connected Playwright MCP to download the same file through the official page and checks the saved file. A denied approval stops the operation. The stock browser reports absolute file paths and writes to `downloads/Playwright` under the active manager storage directory. The stock mod.io, CurseForge, GameBanana and Nexus Mods launchers set their child process’s download directory to `downloads/incoming` under the same root. For new library downloads, `list_mod_receipt_folders` returns the managed incoming folder and the stock Playwright download folder. `file_received_mod` files the verified download under its game in `Mods`. A file saved elsewhere goes through the desktop picker and reviewed import. The Agent installs from the resulting library artifact ID.
 
 ### Downloads with proxy DNS
 
@@ -51,14 +51,14 @@ The downloader validates and pins the IPs for each HTTPS hop. If the OS resolver
 For an explicitly requested native direct-link transfer, the desktop Agent can use
 `download_web_mod` with `{"url":"https://…/release.zip"}`. The link must be
 explicitly provided or present in evidence; a search hit on a project page is
-not a direct download. The tool requires per-transfer approval even in Full
-Trust, shows the canonical URL, filename, and disk-space policy, and makes no
-download request before approval. It is not a desktop IPC command or an exported local
+not a direct download. In Request Approval and Auto Approve, the tool shows the canonical URL, filename,
+and disk-space policy and makes no download request until approved. In Full
+Trust it performs the same checks and transfers without prompting. It is not a desktop IPC command or an exported local
 MCP tool.
 
 The starting link must be public HTTPS on the standard port, without userinfo,
 query parameters, or a fragment. Supported suffixes are `.zip`, `.jar`, `.7z`,
-`.tar.gz`, and `.tgz`. The filename comes from the approved URL, not response
+`.rar`, `.tar.gz`, and `.tgz`. The filename comes from the approved URL, not response
 headers. Public HTTPS redirects may go to another host. Each hop is checked and
 DNS-pinned; server-provided CDN query parameters are used for transport, not
 included in returned download data. Invalid tool arguments, including signed
@@ -69,6 +69,13 @@ Downloads are capped, record local hashes, and check the expected archive
 signature before promotion. A mismatched payload retains its `.part` bytes and
 a rejection marker, not an installable artifact. The header check is not a full
 archive preflight, publisher verification, malware scan, or compatibility check.
+Public links, signed MCP transfers, and completed-download receipt previews
+check the full 7-byte RAR4 or 8-byte RAR5 signature for `.rar`. The desktop
+local archive picker also accepts `.rar`. A signature alone cannot establish
+that a RAR is usable: archive inspection and extraction support only
+unencrypted, single-volume RAR4/5. RAR is read-only; archive creation remains
+ZIP or 7z only.
+
 Valid artifacts appear in Downloads as unverified and review-required; the record
 has source `web` and no catalog project or version. Installing goes through the
 existing archive and file-plan workflow; a web artifact cannot claim a provider

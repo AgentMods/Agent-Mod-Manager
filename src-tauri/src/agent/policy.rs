@@ -23,13 +23,20 @@ pub enum Effect {
 }
 
 impl PermissionMode {
+    /// Forbidden is rejected by the dispatcher; AskUser waits for an answer, not write consent.
     pub fn needs_approval(self, effect: Effect) -> bool {
         match effect {
             Effect::Read => false,
-            Effect::AskUser | Effect::Forbidden | Effect::UncatalogedDownload => true,
-            _ if self == Self::FullTrust => false,
-            Effect::GameWrite if self == Self::AutoApprove => false,
-            _ => true,
+            Effect::AskUser | Effect::Forbidden => true,
+            Effect::GameWrite
+            | Effect::ManagerWrite
+            | Effect::ExternalWrite
+            | Effect::Publish
+            | Effect::UncatalogedDownload => match self {
+                Self::RequestApproval => true,
+                Self::AutoApprove => effect != Effect::GameWrite,
+                Self::FullTrust => false,
+            },
         }
     }
 }
@@ -46,12 +53,16 @@ mod tests {
             assert!(!mode.needs_approval(Effect::Read));
             assert!(mode.needs_approval(Effect::AskUser));
             assert!(mode.needs_approval(Effect::Forbidden));
-            assert!(mode.needs_approval(Effect::UncatalogedDownload));
             assert_eq!(
                 mode.needs_approval(Effect::GameWrite),
                 mode == PermissionMode::RequestApproval
             );
-            for effect in [Effect::ManagerWrite, Effect::ExternalWrite, Effect::Publish] {
+            for effect in [
+                Effect::ManagerWrite,
+                Effect::ExternalWrite,
+                Effect::Publish,
+                Effect::UncatalogedDownload,
+            ] {
                 assert_eq!(
                     mode.needs_approval(effect),
                     mode != PermissionMode::FullTrust

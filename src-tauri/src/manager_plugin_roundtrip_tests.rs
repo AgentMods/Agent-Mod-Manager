@@ -20,7 +20,6 @@ use axum::{
     routing::get,
     Router,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
@@ -34,6 +33,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 const SLUG: &str = "minecraft-java";
+const COVER_URL: &str = "https://www.glossmod.com/manager-plugins/covers/minecraft-java.png";
 const ADAPTER_BYTES: &[u8] =
     include_bytes!("../tests/fixtures/game-adapters/minecraft-java/adapter.json");
 const SKILL_BYTES: &[u8] =
@@ -261,10 +261,13 @@ async fn published_manager_plugin_is_listed_imported_installed_byte_exact() {
     let importer_temp = tempfile::tempdir().unwrap();
     let publisher = engine(publisher_temp.path(), "publisher");
     let importer = engine(importer_temp.path(), "importer");
+    let mut authoring_adapter: Value = serde_json::from_slice(ADAPTER_BYTES).unwrap();
+    authoring_adapter["coverUrl"] = json!(COVER_URL);
+    let authoring_adapter = serde_json::to_vec_pretty(&authoring_adapter).unwrap();
     let source_draft = plugin_workflow::plan_write_draft(
         &publisher,
         SLUG,
-        std::str::from_utf8(ADAPTER_BYTES).unwrap(),
+        std::str::from_utf8(&authoring_adapter).unwrap(),
         std::str::from_utf8(SKILL_BYTES).unwrap(),
     )
     .unwrap();
@@ -278,7 +281,6 @@ async fn published_manager_plugin_is_listed_imported_installed_byte_exact() {
         .unwrap();
     let remote = MockPublisher::default();
     let cancel = CancellationToken::new();
-    let mut previous_cover = None;
     // Publish the same committed 1.0.0 source twice. Only the first receipt can
     // identify the existing remote plugin when preparing the second release.
     let cases = [
@@ -289,7 +291,7 @@ async fn published_manager_plugin_is_listed_imported_installed_byte_exact() {
             json!({
                 "title": "Minecraft Java 模组管理", "summary": "按实例管理模组和资源包。",
                 "description": "识别游戏实例目录。\n\n查看加载器模组和资源包的安装布局。",
-                "tags": ["模组", "资源包"], "design": {"palette": "grove", "icon": "sprout"}
+                "tags": ["模组", "资源包"]
             }),
         ),
         (
@@ -301,11 +303,7 @@ async fn published_manager_plugin_is_listed_imported_installed_byte_exact() {
             json!({
                 "title": "Minecraft Java 世界与模组", "summary": "按世界区分数据包。",
                 "description": "为选定世界管理数据包。\n\n查看世界存档与实例资源目录的区别。",
-                "tags": ["数据包", "世界存档"],
-                "design": {"palette": "dusk", "rows": [
-                    "00000000", "00333300", "03222230", "03233230",
-                    "03211230", "03211230", "00111100", "00000000"
-                ]}
+                "tags": ["数据包", "世界存档"]
             }),
         ),
     ];
@@ -314,13 +312,13 @@ async fn published_manager_plugin_is_listed_imported_installed_byte_exact() {
         assert_eq!(listing.title, reply["title"]);
         assert_eq!(listing.summary, reply["summary"]);
         assert_eq!(listing.description, reply["description"]);
-        assert_eq!(json!(listing.tags), reply["tags"]);
-        assert!(STANDARD
-            .decode(&listing.cover_png)
-            .unwrap()
-            .starts_with(b"\x89PNG\r\n\x1a\n"));
-        assert_ne!(previous_cover.as_ref(), Some(&listing.cover_png));
-        previous_cover = Some(listing.cover_png.clone());
+        assert_eq!(listing.tags.first(), Some(&package.adapter.name));
+        assert_eq!(json!(listing.tags[1..].to_vec()), reply["tags"]);
+        assert_eq!(listing.cover_url.as_deref(), Some(COVER_URL));
+        assert!(
+            listing.cover_png.is_empty(),
+            "new listings do not generate a PNG cover"
+        );
 
         let reads_before = remote.owner_reads.load(Ordering::Relaxed);
         let intended = manager_publication::prepare_automatic_with(
@@ -343,6 +341,7 @@ async fn published_manager_plugin_is_listed_imported_installed_byte_exact() {
         assert_eq!(intended.preview.remote_version.as_deref(), previous_version);
         assert_eq!(intended.preview.version, version);
         assert_eq!(intended.preview.listing.as_ref(), Some(&listing));
+        assert_eq!(intended.preview.tags, listing.tags);
         let approved = manager_publication::approve_publication(
             &publisher,
             &intended.id,
@@ -361,6 +360,14 @@ async fn published_manager_plugin_is_listed_imported_installed_byte_exact() {
         .await
         .unwrap();
         assert_eq!(published.state, PublicationState::Completed);
+        assert_eq!(
+            published
+                .preview
+                .listing
+                .as_ref()
+                .and_then(|listing| listing.cover_url.as_deref()),
+            Some(COVER_URL)
+        );
         let release = {
             let releases = remote.releases.lock().unwrap();
             assert_eq!(releases.len(), index + 1);
@@ -368,11 +375,19 @@ async fn published_manager_plugin_is_listed_imported_installed_byte_exact() {
         };
         assert_eq!(published.remote.as_ref(), Some(&release.plugin));
         assert_eq!(release.plugin.version, version);
+        assert_eq!(release.plugin.tags, approved.preview.tags);
+        assert_eq!(published.preview.tags, release.plugin.tags);
         assert_eq!(release.adapter, approved.preview.files[0].text);
         assert_eq!(release.skill, approved.preview.files[1].text);
+        let published_adapter: Value = serde_json::from_str(&release.adapter).unwrap();
+        assert_eq!(published_adapter["coverUrl"], COVER_URL);
+        assert_eq!(
+            crate::publication_copy::read_display(&release.skill).as_deref(),
+            Some(listing.description.as_str())
+        );
         assert_eq!(
             std::fs::read(source.path.join("adapter.json")).unwrap(),
-            ADAPTER_BYTES
+            authoring_adapter
         );
         assert_eq!(
             std::fs::read(source.path.join("SKILL.md")).unwrap(),
@@ -415,12 +430,14 @@ async fn assert_catalog_install(
         .as_ref()
         .expect("published release display");
     assert_eq!(display.description, listing.description);
-    assert_eq!(display.cover_png, listing.cover_png);
+    assert_eq!(display.cover_url.as_deref(), Some(COVER_URL));
     assert_eq!(
         imported.preview.installed_version.as_deref(),
         previous_version
     );
     assert_eq!(imported.preview.adapter_json, release.adapter);
+    let imported_adapter: Value = serde_json::from_str(&imported.preview.adapter_json).unwrap();
+    assert_eq!(imported_adapter["coverUrl"], COVER_URL);
     assert_eq!(imported.preview.skill_markdown, release.skill);
     assert_eq!(
         imported.preview.hashes,
@@ -434,10 +451,10 @@ async fn assert_catalog_install(
     apply(importer, &install.plan);
     let reconcile = plugin_workflow::reconcile_deployments(importer).unwrap();
     assert_eq!(reconcile.registered, vec![SLUG.to_owned()]);
-    assert_eq!(
-        std::fs::read(install.install_path.join("adapter.json")).unwrap(),
-        release.adapter.as_bytes()
-    );
+    let installed_adapter = std::fs::read(install.install_path.join("adapter.json")).unwrap();
+    assert_eq!(installed_adapter, release.adapter.as_bytes());
+    let installed_adapter: Value = serde_json::from_slice(&installed_adapter).unwrap();
+    assert_eq!(installed_adapter["coverUrl"], COVER_URL);
     assert_eq!(
         std::fs::read(install.install_path.join("SKILL.md")).unwrap(),
         release.skill.as_bytes()

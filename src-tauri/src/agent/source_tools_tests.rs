@@ -29,11 +29,14 @@ fn fixture() -> (tempfile::TempDir, Settings, ToolContext, Arc<Secrets>) {
     let (dir, engine, _) = setup();
     let secrets = Arc::new(Secrets::default());
     let settings = Settings::with_secret_store(engine.db.clone(), secrets.clone());
+    let conversation = crate::history::History::new(engine.db.clone())
+        .create_conversation("Fixture", None)
+        .unwrap();
     let context = ToolContext {
         engine,
         cancel: CancellationToken::new(),
         progress: None,
-        resolution_scope: crate::sources::resolutions::ResolutionScope::Agent("fixture".into()),
+        resolution_scope: crate::sources::resolutions::ResolutionScope::Agent(conversation.id),
     };
     (dir, settings, context, secrets)
 }

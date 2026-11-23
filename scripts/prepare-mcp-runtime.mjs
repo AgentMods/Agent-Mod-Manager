@@ -26,5 +26,5 @@ for (const [command, ...prefix] of candidates) {
   process.exit(result.status ?? 1);
 }
 
-console.error('Preparing the MCP runtime requires Python 3.11+. Install it or set AMM_BUILD_PYTHON to its absolute path.');
+console.error('Preparing desktop runtime resources requires Python 3.11+. Install it or set AMM_BUILD_PYTHON to its absolute path.');
 process.exit(1);

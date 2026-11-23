@@ -108,6 +108,194 @@ fn legacy(f: &Fixture) -> PathBuf {
     target
 }
 
+fn set_finished_at(engine: &FileEngine, id: &str, timestamp: Option<&str>) {
+    let changed = engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE file_transactions SET finished_at=?2 WHERE id=?1 AND status='committed'",
+            params![id, timestamp],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+}
+
+fn set_modified(path: &Path, timestamp: &str) {
+    let time = DateTime::parse_from_rfc3339(timestamp).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(time.into()))
+        .unwrap();
+}
+
+fn installed_plugin(engine: &FileEngine) -> plugins::PluginInfo {
+    plugins::list_plugins(&engine.db)
+        .unwrap()
+        .into_iter()
+        .find(|plugin| plugin.slug == SLUG)
+        .unwrap()
+}
+
+#[test]
+fn draft_update_time_tracks_each_package_file_but_not_unrelated_changes() {
+    const COMMITTED: &str = "2024-01-02T00:00:00.000Z";
+    const ADAPTER_EDITED: &str = "2024-01-03T00:00:00.000Z";
+    const SKILL_EDITED: &str = "2024-01-04T00:00:00.000Z";
+    let f = Fixture::new();
+    let (adapter, skill) = content(SLUG, "1.0.0");
+    let preview = plan_write_draft(&f.engine, SLUG, &adapter, &skill).unwrap();
+    let draft = &preview.draft;
+    assert_eq!(json!(draft).get("updatedAt"), Some(&Value::Null));
+    assert!(list_drafts(&f.engine).unwrap().is_empty());
+
+    apply(&f.engine, &preview.plan);
+    assert!(list_drafts(&f.engine).unwrap()[0].updated_at.is_some());
+    set_finished_at(&f.engine, &preview.plan.id, Some(COMMITTED));
+    let adapter_path = draft.path.join("adapter.json");
+    let skill_path = draft.path.join("SKILL.md");
+    for path in [&adapter_path, &skill_path] {
+        set_modified(path, "2024-01-01T00:00:00.000Z");
+    }
+    let listed = || list_drafts(&f.engine).unwrap().remove(0);
+    assert_eq!(json!(listed())["updatedAt"], COMMITTED);
+    assert_eq!(listed().created_at, draft.created_at);
+    let validation = validate_draft(&f.engine, &draft.id).unwrap();
+    assert!(validation.valid);
+    assert_eq!(validation.draft.updated_at.as_deref(), Some(COMMITTED));
+
+    write(&adapter_path, "changed adapter");
+    set_modified(&adapter_path, ADAPTER_EDITED);
+    assert_eq!(json!(listed())["updatedAt"], ADAPTER_EDITED);
+    write(&skill_path, "changed skill");
+    set_modified(&skill_path, SKILL_EDITED);
+    let notes = draft.path.join("notes.txt");
+    write(&notes, "not part of the package");
+    set_modified(&notes, "2024-01-05T00:00:00.000Z");
+    assert_eq!(json!(listed())["updatedAt"], SKILL_EDITED);
+    let validation = validate_draft(&f.engine, &draft.id).unwrap();
+    assert!(!validation.valid);
+    assert_eq!(validation.draft.updated_at.as_deref(), Some(SKILL_EDITED));
+}
+
+#[test]
+fn legacy_draft_with_no_commit_time_can_use_file_metadata_or_return_null() {
+    const EDITED: &str = "2024-01-02T00:00:00.000Z";
+    let f = Fixture::new();
+    let preview = f.draft("1.0.0");
+    set_finished_at(&f.engine, &preview.plan.id, None);
+    let adapter = preview.draft.path.join("adapter.json");
+    fs::remove_file(preview.draft.path.join("SKILL.md")).unwrap();
+    set_modified(&adapter, EDITED);
+    let listed = || list_drafts(&f.engine).unwrap().remove(0);
+    assert_eq!(json!(listed())["updatedAt"], EDITED);
+    fs::remove_file(adapter).unwrap();
+    assert_eq!(json!(listed()).get("updatedAt"), Some(&Value::Null));
+}
+
+#[test]
+fn installed_update_time_changes_with_the_verified_payload_not_toggles_or_reads() {
+    const FIRST: &str = "2024-01-01T00:00:00.000Z";
+    const UPGRADE: &str = "2024-01-02T00:00:00.000Z";
+    const SKILL_UPDATE: &str = "2024-01-03T00:00:00.000Z";
+    let f = Fixture::new();
+    let engine = &f.engine;
+    let first = f.deployed("1.0.0");
+    let actual_commit: String = engine
+        .db
+        .conn()
+        .query_row(
+            "SELECT finished_at FROM file_transactions WHERE id=?1 AND status='committed'",
+            [&first.plan.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(json!(installed_plugin(engine))["updatedAt"], actual_commit);
+    set_finished_at(engine, &first.plan.id, Some(FIRST));
+    reconcile_deployments(engine).unwrap();
+    assert_eq!(json!(installed_plugin(engine))["updatedAt"], FIRST);
+
+    assert_eq!(
+        json!(set_enabled(engine, SLUG, false).unwrap())["updatedAt"],
+        FIRST
+    );
+    assert_eq!(json!(installed_plugin(engine))["updatedAt"], FIRST);
+    assert_eq!(
+        json!(set_enabled(engine, SLUG, true).unwrap())["updatedAt"],
+        FIRST
+    );
+    crate::skills::set_enabled(engine, SLUG, false).unwrap();
+    reconcile_deployments(&f.reopened()).unwrap();
+    assert_eq!(json!(installed_plugin(engine))["updatedAt"], FIRST);
+
+    let draft = f.draft("2.0.0");
+    let planned = plan_install_plugin(engine, &draft.draft.id).unwrap();
+    reconcile_deployments(engine).unwrap();
+    assert_eq!(json!(installed_plugin(engine))["updatedAt"], FIRST);
+    apply(engine, &planned.plan);
+    set_finished_at(engine, &planned.plan.id, Some(UPGRADE));
+    reconcile_deployments(engine).unwrap();
+    let upgraded = installed_plugin(engine);
+    assert_eq!(upgraded.version, "2.0.0");
+    assert_eq!(json!(upgraded)["updatedAt"], UPGRADE);
+
+    // Identical adapter bytes and version but a new Skill: only both content
+    // hashes distinguish this deployment from the previous one.
+    let (adapter, mut skill) = content(SLUG, "2.0.0");
+    skill.push_str("New instructions.\n");
+    let updated = f.install_content(SLUG, &adapter, &skill);
+    set_finished_at(engine, &updated.plan.id, Some(SKILL_UPDATE));
+    reconcile_deployments(engine).unwrap();
+    let plugin = installed_plugin(engine);
+    assert_eq!(plugin.version, "2.0.0");
+    assert_eq!(json!(plugin)["updatedAt"], SKILL_UPDATE);
+
+    engine.rollback_transaction(&updated.plan.id).unwrap();
+    reconcile_deployments(engine).unwrap();
+    assert_eq!(json!(installed_plugin(engine))["updatedAt"], UPGRADE);
+    write(
+        &planned.install_path.join("SKILL.md"),
+        "unverified replacement",
+    );
+    reconcile_deployments(engine).unwrap();
+    let plugin = installed_plugin(engine);
+    assert!(!plugin.validated);
+    assert_eq!(json!(plugin).get("updatedAt"), Some(&Value::Null));
+}
+
+#[test]
+fn upgraded_database_backfills_only_commit_provenance_not_old_registry_timestamps() {
+    const COMMITTED: &str = "2024-01-01T00:00:00.000Z";
+    let f = Fixture::new();
+    let install = f.deployed("1.0.0");
+    set_finished_at(&f.engine, &install.plan.id, Some(COMMITTED));
+    // Recreate the relevant on-disk state of a version 17 database.
+    f.engine
+        .db
+        .conn()
+        .execute_batch(
+            "ALTER TABLE plugins DROP COLUMN package_updated_at;
+         UPDATE plugins SET updated_at='2024-01-09T00:00:00.000Z';
+         PRAGMA user_version=17;",
+        )
+        .unwrap();
+    let migrated = f.reopened();
+    assert_eq!(
+        json!(installed_plugin(&migrated)).get("updatedAt"),
+        Some(&Value::Null)
+    );
+    reconcile_deployments(&migrated).unwrap();
+    assert_eq!(json!(installed_plugin(&migrated))["updatedAt"], COMMITTED);
+
+    set_finished_at(&migrated, &install.plan.id, None);
+    reconcile_deployments(&migrated).unwrap();
+    assert_eq!(
+        json!(installed_plugin(&migrated)).get("updatedAt"),
+        Some(&Value::Null)
+    );
+}
+
 #[test]
 fn draft_writes_are_reviewed_and_discoverable_only_after_persistent_commit() {
     let f = Fixture::new();
@@ -407,6 +595,10 @@ fn pending_upgrade_leaves_active_committed_version_and_user_disable_flags_intact
 fn preexisting_external_baseline_survives_pending_update_and_rollback() {
     let f = Fixture::new();
     legacy(&f);
+    assert_eq!(
+        json!(installed_plugin(&f.engine)).get("updatedAt"),
+        Some(&Value::Null)
+    );
     let draft = f.draft("1.0.0");
     let preview = plan_install_plugin(&f.engine, &draft.draft.id).unwrap();
     reconcile_deployments(&f.reopened()).unwrap();
@@ -414,9 +606,14 @@ fn preexisting_external_baseline_survives_pending_update_and_rollback() {
     apply(&f.engine, &preview.plan);
     reconcile_deployments(&f.engine).unwrap();
     assert_eq!(f.flags().0, "1.0.0");
+    assert!(installed_plugin(&f.engine).updated_at.is_some());
     f.engine.rollback_transaction(&preview.plan.id).unwrap();
     reconcile_deployments(&f.reopened()).unwrap();
     assert_eq!(f.flags(), ("0.5.0".into(), true, true, true));
+    assert_eq!(
+        json!(installed_plugin(&f.engine)).get("updatedAt"),
+        Some(&Value::Null)
+    );
 }
 
 #[test]
@@ -1278,4 +1475,85 @@ async fn plugin_mcp_upgrade_disable_reenable_removal_and_rollback_stay_owner_sco
     assert!(owned_mcp_servers(&f, SLUG).is_empty());
     assert!(servers.startup_requests().unwrap().is_empty());
     stop_server.cancel();
+}
+
+#[test]
+fn legacy_managed_adapter_can_be_removed_and_restored_from_desktop_history() {
+    let f = Fixture::new();
+    let target = legacy(&f);
+    let adapter = fs::read(target.join("adapter.json")).unwrap();
+    let skill = fs::read(target.join("SKILL.md")).unwrap();
+    f.engine
+        .db
+        .conn()
+        .execute("UPDATE skills SET enabled=0 WHERE name=?1", [SLUG])
+        .unwrap();
+    remove_installed_plugin(&f.engine, SLUG).unwrap();
+    assert!(!target.exists());
+    let reopened = f.reopened();
+    assert!(reconcile_deployments(&reopened)
+        .unwrap()
+        .registered
+        .is_empty());
+    assert!(plugins::list_plugins(&reopened.db).unwrap().is_empty());
+    let txn: String = reopened
+        .db
+        .conn()
+        .query_row("SELECT transaction_id FROM plugin_removals", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    reopened.rollback_desktop_transaction(&txn).unwrap();
+    assert_eq!(fs::read(target.join("adapter.json")).unwrap(), adapter);
+    assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), skill);
+    assert_eq!(f.flags(), ("0.5.0".into(), true, true, false));
+}
+
+#[test]
+fn failed_removal_registry_commit_restores_package_and_keeps_its_registration() {
+    let f = Fixture::new();
+    let deployed = f.deployed("1.0.0");
+    f.engine
+        .db
+        .conn()
+        .execute_batch(
+            "CREATE TRIGGER reject_plugin_remove BEFORE DELETE ON plugins
+        WHEN OLD.slug='test-game' BEGIN SELECT RAISE(ABORT, 'injected removal failure'); END;",
+        )
+        .unwrap();
+    assert!(remove_installed_plugin(&f.engine, SLUG).is_err());
+    assert!(deployed.install_path.join("adapter.json").is_file());
+    assert!(deployed.install_path.join("SKILL.md").is_file());
+    assert_eq!(f.flags(), ("1.0.0".into(), true, true, true));
+    assert_eq!(f.count("active_plugin_deployments"), 1);
+    assert!(f.reopened().recover_interrupted().unwrap().is_empty());
+}
+
+#[test]
+fn startup_finishes_an_interrupted_desktop_removal_undo() {
+    let f = Fixture::new();
+    let deployment = f.deployed("1.0.0");
+    remove_installed_plugin(&f.engine, SLUG).unwrap();
+    let id: String = f
+        .engine
+        .db
+        .conn()
+        .query_row("SELECT transaction_id FROM plugin_removals", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    // Model a process stop after writing the active rollback journal but
+    // before reversing the move. The removal tombstone is still committed.
+    {
+        let conn = f.engine.db.conn();
+        conn.execute("INSERT INTO file_transaction_journal(transaction_id,seq,entry_json)
+            SELECT f.id,j.key,j.value FROM file_transactions f, json_each(f.journal_json) j WHERE f.id=?1", [&id]).unwrap();
+        conn.execute("UPDATE file_transactions SET status='rolling_back',
+            journal_json=json_object('entry_count',json_array_length(journal_json)),finished_at=NULL WHERE id=?1", [&id]).unwrap();
+    }
+    let reopened = f.reopened();
+    assert_eq!(reopened.recover_interrupted().unwrap(), [id]);
+    assert_eq!(reconcile_deployments(&reopened).unwrap().registered, [SLUG]);
+    assert!(deployment.install_path.join("adapter.json").is_file());
+    assert_eq!(f.flags(), ("1.0.0".into(), true, true, true));
 }

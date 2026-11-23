@@ -167,7 +167,7 @@ pub struct GamePackage {
     pub skill_markdown: String,
 }
 
-fn valid_cover_url(value: &str) -> bool {
+pub(crate) fn valid_cover_url(value: &str) -> bool {
     if value.len() > 2048
         || !value.starts_with("https://")
         || value
@@ -668,18 +668,43 @@ pub struct PluginInfo {
     pub version: String,
     pub description: String,
     pub source: String,
+    /// Known cloud presence by slug, not proof about these bytes or the current owner.
+    pub has_cloud_evidence: bool,
     pub enabled: bool,
     pub validated: bool,
     #[serde(serialize_with = "crate::paths::serialize_user_path")]
     pub install_path: String,
     pub cover_url: Option<String>,
+    /// Commit time for the verified installed content, if it has deployment provenance.
+    pub updated_at: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub mcp_server_names: Vec<String>,
 }
 
 pub fn list_plugins(db: &Db) -> AppResult<Vec<PluginInfo>> {
     let conn = db.conn();
-    let mut statement = conn.prepare("SELECT slug,name,game_name,version,description,source,enabled,validated,install_path,adapter_json FROM plugins ORDER BY name,slug")?;
+    // The publication writer commits only confirmed receipts. This lookup is
+    // keyed by the release slug, deliberately not the installed version.
+    let mut statement = conn.prepare(
+        "SELECT p.slug,p.name,p.game_name,p.version,p.description,p.source,p.enabled,
+               p.validated,p.install_path,p.adapter_json,
+               EXISTS (
+                   SELECT 1 FROM manager_publications AS m
+                   WHERE m.slug=p.slug AND m.state='completed' AND m.approved_digest=m.digest
+                     AND CASE WHEN json_valid(m.remote_json) THEN
+                         json_extract(m.remote_json, '$.slug')=m.slug
+                         AND json_extract(m.remote_json, '$.version')=m.version
+                         AND json_type(m.remote_json, '$.id')='integer'
+                         AND json_extract(m.remote_json, '$.id')>0
+                         AND (m.target_plugin_id IS NULL OR json_extract(m.remote_json, '$.id')=m.target_plugin_id)
+                         AND json_type(m.remote_json, '$.releaseId')='integer'
+                         AND json_extract(m.remote_json, '$.releaseId')>0
+                     ELSE 0 END
+
+               ),
+               CASE WHEN p.validated THEN p.package_updated_at END
+        FROM plugins AS p ORDER BY p.name,p.slug",
+    )?;
     let rows = statement.query_map([], |r| {
         let slug: String = r.get(0)?;
         let version: String = r.get(3)?;
@@ -708,10 +733,12 @@ pub fn list_plugins(db: &Db) -> AppResult<Vec<PluginInfo>> {
             version,
             description: r.get(4)?,
             source: r.get(5)?,
+            has_cloud_evidence: r.get(10)?,
             enabled: r.get(6)?,
             validated,
             install_path: r.get(8)?,
             cover_url,
+            updated_at: r.get(11)?,
             mcp_server_names,
         })
     })?;
@@ -728,8 +755,11 @@ pub(crate) fn matches_registered_adapter(json: &str, adapter: &GameAdapter) -> A
 
 /// Revalidate stored JSON at use time; a database boolean alone is not trust.
 pub fn adapter_for(db: &Db, slug: &str) -> AppResult<GameAdapter> {
+    adapter_for_from(&db.conn(), slug)
+}
+
+pub(crate) fn adapter_for_from(conn: &rusqlite::Connection, slug: &str) -> AppResult<GameAdapter> {
     validate_slug(slug)?;
-    let conn = db.conn();
     let row: Option<(String, bool, bool, String)> = conn
         .query_row(
             "SELECT adapter_json,enabled,validated,version FROM plugins WHERE slug=?1",
@@ -759,6 +789,67 @@ mod tests {
         let paths = AppPaths::new(temp.path().join("manager")).unwrap();
         let db = Db::open(&paths.db_file()).unwrap();
         (temp, paths, db)
+    }
+
+    fn seed_installed_cloud_test_plugin(db: &Db) {
+        db.conn()
+            .execute(
+                "INSERT INTO plugins(slug,name,game_name,version,source,install_path,adapter_json,created_at,updated_at)
+                 VALUES ('local-game','Game','Game','1.0.0','external','local-game','{}','now','now')",
+                [],
+            )
+            .unwrap();
+    }
+
+    fn assert_installed_cloud_evidence(db: &Db, expected: bool) {
+        let installed = list_plugins(db).unwrap();
+        let plugin = &installed[0];
+        assert_eq!(plugin.source, "external");
+        assert_eq!(plugin.version, "1.0.0");
+        assert_eq!(plugin.has_cloud_evidence, expected);
+    }
+
+    #[test]
+    fn installed_cloud_evidence_requires_a_confirmed_publication_for_the_exact_slug() {
+        let (_temp, paths, db) = fixture();
+        seed_installed_cloud_test_plugin(&db);
+        assert_installed_cloud_evidence(&db, false);
+        let remote = serde_json::json!({
+            "id": 42, "releaseId": 71, "slug": "local-game", "version": "2.0.0",
+            "tags": [], "hidden": true
+        })
+        .to_string();
+        db.conn().execute(
+            "INSERT INTO manager_publications(id,preview_json,digest,slug,version,approved_digest,state,remote_json,created_at,updated_at)
+             VALUES ('publication','{}','digest','local-game-other','2.0.0','digest','completed',?1,'now','now')",
+            [&remote],
+        ).unwrap();
+        assert_installed_cloud_evidence(&db, false);
+        for state in ["intended", "pending", "unknown", "error"] {
+            db.conn()
+                .execute(
+                    "UPDATE manager_publications SET slug='local-game',state=?1,remote_json=NULL",
+                    [state],
+                )
+                .unwrap();
+            assert_installed_cloud_evidence(&db, false);
+        }
+        for invalid_receipt in [None, Some("not json"), Some(r#"{"id":42}"#)] {
+            db.conn()
+                .execute(
+                    "UPDATE manager_publications SET state='completed',remote_json=?1",
+                    [invalid_receipt],
+                )
+                .unwrap();
+            assert_installed_cloud_evidence(&db, false);
+        }
+        db.conn()
+            .execute("UPDATE manager_publications SET remote_json=?1", [remote])
+            .unwrap();
+        assert_installed_cloud_evidence(&db, true);
+        drop(db);
+        // A hidden but confirmed release for a different version is still durable slug evidence.
+        assert_installed_cloud_evidence(&Db::open(&paths.db_file()).unwrap(), true);
     }
 
     #[test]

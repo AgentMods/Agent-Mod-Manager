@@ -80,3 +80,62 @@ test("background pending approval shortcut returns to its inline authorization",
   expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "respond_approval").at(-1)?.args.response))
     .toEqual({approved: true, answer: null});
 });
+
+test("returning to a running turn shows its backend permission instead of the Full Trust composer preference", async ({page}) => {
+  await installMockTauri(page, {holdAgentTurn: true});
+  await page.addInitScript(() => {
+    const target = window as any;
+    const invoke = target.__TAURI_INTERNALS__.invoke;
+    target.__TAURI_INTERNALS__.invoke = async (command: string, args: Record<string, unknown> = {}) => {
+      if (command === "get_composer_preferences") {
+        return {model: null, reasoning_effort: null, permission_mode: "full_trust"};
+      }
+      return invoke(command, args);
+    };
+  });
+  await page.goto("/");
+  await page.getByRole("button", {name: "检查 Minecraft 模组", exact: true}).click();
+  const permission = page.getByRole("button", {name: "本轮权限策略", exact: true});
+  await expect(permission).toContainText("完全信任");
+
+  await page.getByRole("textbox", {name: "告诉 Agent 你想做什么", exact: true}).fill("检查模组权限显示");
+  await page.getByRole("button", {name: "发送消息", exact: true}).click();
+  await expect(page.getByRole("button", {name: "停止生成", exact: true})).toBeVisible();
+  await expect(permission).toContainText("完全信任");
+  expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls.find((call: any) => call.command === "start_turn")?.args.request.permissionMode))
+    .toBe("full_trust");
+
+  await page.getByRole("button", {name: "游戏库", exact: true}).click();
+  await page.evaluate(() => {
+    (window as any).__AMM_TEST__.emit("turn-start", {permissionMode: "request_approval"}, "conversation-fixture", null);
+  });
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
+  await expect(page.getByRole("button", {name: "停止生成", exact: true})).toBeVisible();
+  await expect(permission).toContainText("逐次审批");
+  await expect(permission).not.toContainText("完全信任");
+  await expect(permission).toBeDisabled();
+});
+
+for (const recorded of [null, "unknown_future_policy"]) {
+test(`running legacy or external turn with ${recorded} permission does not inherit Full Trust`, async ({page}) => {
+  await installMockTauri(page, {holdAgentTurn: true});
+  await page.addInitScript(() => {
+    const target = window as any;
+    const invoke = target.__TAURI_INTERNALS__.invoke;
+    target.__TAURI_INTERNALS__.invoke = async (command: string, args: any = {}) => command === "get_composer_preferences"
+      ? {model: null, reasoning_effort: null, permission_mode: "full_trust"} : invoke(command, args);
+  });
+  await page.goto("/");
+  await page.getByRole("button", {name: "检查 Minecraft 模组", exact: true}).click();
+  const permission = page.getByRole("button", {name: "本轮权限策略", exact: true});
+  await expect(permission).toContainText("完全信任");
+  await page.getByRole("button", {name: "游戏库", exact: true}).click();
+  await page.evaluate((recorded) => (window as any).__AMM_TEST__.emit("turn-start", recorded === null ? {} : {permissionMode: recorded}, "conversation-fixture", null), recorded);
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
+  await expect(page.getByRole("button", {name: "停止生成", exact: true})).toBeVisible();
+  await expect(permission).toContainText("权限未记录");
+  await expect(permission).not.toContainText("完全信任");
+  await expect(permission).toBeDisabled();
+});
+
+}

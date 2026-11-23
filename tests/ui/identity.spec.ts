@@ -56,6 +56,7 @@ test('built-in Bing identity search needs no API key or configurable Playwright 
   await expect(candidate.getByRole('button', {name: '管理中', exact: true})).toBeDisabled();
   const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
   expect(calls.filter((call: any) => call.command === 'register_game')).toHaveLength(0);
+  expect(calls.filter((call: any) => call.command === 'install_manager_plugin')).toHaveLength(0);
   expect(calls.find((call: any) => call.command === 'search_game_identity').args).toEqual({directory: '/sandbox/unknown-game', expectedFingerprint: 'e'.repeat(64), publicQuery, confirmation: 'SEARCH_GAME_IDENTITY'});
   expect(calls.filter((call: any) => call.command === 'set_secret' && call.args.key === 'sources.brave')).toHaveLength(0);
   expect(calls.filter((call: any) => call.command === 'mcp_connect')).toHaveLength(0);

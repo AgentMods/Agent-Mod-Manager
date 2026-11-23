@@ -422,6 +422,7 @@ fn rebase_database(
     target: &Path,
 ) -> AppResult<()> {
     let tx = db.transaction()?;
+    crate::mcp::config::relocate_playwright_storage(&tx, source, target)?;
     for &(table, column) in PATH_COLUMNS.iter().chain(JSON_COLUMNS) {
         let json = JSON_COLUMNS.contains(&(table, column));
         let mut read = tx.prepare(&format!(

@@ -270,6 +270,22 @@ pub struct McpClient {
     session: Arc<Session>,
 }
 
+/// The stock source MCPs configure their local destination at process startup,
+/// not via a download_file argument. Keep this out of the parent environment.
+pub(super) fn configure_source_download_dir(
+    command: &mut Command,
+    config: &ServerConfig,
+    db: &crate::db::Db,
+) -> AppResult<()> {
+    if let Some(key) = config.source_download_dir_env() {
+        let inbox =
+            crate::storage::incoming_downloads(super::config::active_storage_root(&db.conn())?);
+        crate::safe_fs::create_dir_all(&inbox)?;
+        command.env(key, crate::paths::user_path(&inbox).as_os_str());
+    }
+    Ok(())
+}
+
 impl McpClient {
     pub async fn connect(
         servers: McpServers,
@@ -379,6 +395,7 @@ impl McpClient {
                         command.env(key, value);
                     }
                 }
+                configure_source_download_dir(&mut command, &config, &servers.db)?;
                 for (env, key) in &config.env_secret_refs {
                     let Some(value) = stdio_secret(settings, &config, env, key)? else {
                         continue;

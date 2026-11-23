@@ -2,12 +2,24 @@ import { useState } from "react";
 import { Gamepad2Icon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-export function GameCover({ name, url }: { name: string; url?: string | null }) {
+// Mirror the manifest cover contract without rewriting CDN paths or query parameters.
+function publicCoverUrl(value: unknown): string | null {
+  if (typeof value !== "string" || !value.startsWith("https://") || value.length > 2048 || /[\s\\#\p{Cc}]/u.test(value)) return null;
+  try {
+    const url = new URL(value);
+    const host = url.hostname.replace(/\.$/, "");
+    if (!host.includes(".") || /^[\d.]+$/.test(host) || /\.(?:localhost|local|internal)$/.test(host) || url.username || url.password || url.port) return null;
+    return value;
+  } catch { return null; }
+}
+
+export function GameCover({ name, url, decorative = false, className }: { name: string; url?: string | null; decorative?: boolean; className?: string }) {
   const [failedUrl, setFailedUrl] = useState<string | null>(null);
   const [loadedUrl, setLoadedUrl] = useState<string | null>(null);
-  return <div className="group/cover relative flex aspect-[16/8] w-full items-center justify-center overflow-hidden bg-gradient-to-br from-accent via-muted to-secondary">
-    <Gamepad2Icon className="size-12 text-primary/40" aria-hidden="true" />
-    <span aria-hidden="true" className="absolute bottom-2 left-4 text-3xl font-semibold tracking-tight text-foreground/60">{Array.from(name).slice(0, 2).join("")}</span>
-    {url && url !== failedUrl && <img key={url} src={url} alt="" loading="lazy" decoding="async" referrerPolicy="no-referrer" className={cn("absolute inset-0 size-full object-cover motion-safe:transition-[opacity,scale] motion-safe:duration-500 motion-safe:ease-out", loadedUrl === url ? "scale-100 opacity-100 motion-safe:group-hover/cover:scale-105" : "motion-safe:scale-105 motion-safe:opacity-0")} onLoad={() => setLoadedUrl(url)} onError={() => setFailedUrl(url)} />}
+  const src = url !== failedUrl ? publicCoverUrl(url) : null;
+  return <div aria-hidden={decorative || undefined} className={cn("group/cover relative flex aspect-[16/8] w-full flex-col items-center justify-center overflow-hidden bg-gradient-to-br from-accent via-muted to-secondary", className)}>
+    <Gamepad2Icon className="max-h-[35%] size-12 text-primary/40" aria-hidden="true" />
+    {!src && <span className="text-xs text-muted-foreground">无游戏封面</span>}
+    {src && <img key={src} src={src} alt={decorative ? "" : `${name}的游戏封面`} loading="lazy" decoding="async" referrerPolicy="no-referrer" className={cn("absolute inset-0 size-full object-cover motion-safe:transition-[opacity,scale] motion-safe:duration-500 motion-safe:ease-out", loadedUrl === src ? "scale-100 opacity-100 motion-safe:group-hover/cover:scale-105" : "motion-safe:scale-105 motion-safe:opacity-0")} onLoad={() => setLoadedUrl(src)} onError={() => setFailedUrl(src)} />}
   </div>;
 }

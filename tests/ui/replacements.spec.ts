@@ -67,6 +67,10 @@ async function openGameMods(page: Page) {
   await page.getByRole('tab', {name: 'Mod 管理', exact: true}).click();
 }
 
+function modTable(page: Page) {
+  return page.getByTestId('game-detail-page').getByRole('table', {name: 'Mod 管理', exact: true});
+}
+
 async function calls(page: Page, command: string) {
   return page.evaluate(name => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === name).map((call: any) => call.args), command);
 }
@@ -84,12 +88,12 @@ test('rollback reads the original replacement, then confirms separately and refr
   await setup(page, 'dark');
   await openGameMods(page);
 
-  const old = page.getByRole('row').filter({ hasText: '旧版 Fixture' });
-  const replacement = page.getByRole('row').filter({ hasText: '新版 Fixture' });
+  const old = modTable(page).getByRole('row').filter({ hasText: '旧版 Fixture' });
+  const replacement = modTable(page).getByRole('row').filter({ hasText: '新版 Fixture' });
   const openRollback = replacement.getByRole('button', { name: '预览回滚替换', exact: true });
   await expect(old).toContainText('已被替换');
-  await expect(old.getByRole('button', { name: '使用 Agent 卸载', exact: true })).toBeDisabled();
-  await expect(page.getByRole('button', { name: '预览回滚替换', exact: true })).toHaveCount(1);
+  await expect(old.getByRole('switch', { name: '使用 Agent 安装', exact: true })).toBeDisabled();
+  await expect(modTable(page).getByRole('button', { name: '预览回滚替换', exact: true })).toHaveCount(1);
   await openRollback.click();
 
   const rollback = page.getByRole('dialog', { name: '回滚版本替换', exact: true });
@@ -124,7 +128,7 @@ test('rollback reads the original replacement, then confirms separately and refr
 test('rollback refuses a replacement superseded while its original plan is open', async ({ page }) => {
   await setup(page, 'light');
   await openGameMods(page);
-  await page.getByRole('button', { name: '预览回滚替换', exact: true }).click();
+  await modTable(page).getByRole('button', { name: '预览回滚替换', exact: true }).click();
   const rollback = page.getByRole('dialog', { name: '回滚版本替换', exact: true });
   const confirm = rollback.getByRole('button', { name: '确认回滚', exact: true });
   await page.evaluate(() => { (window as any).__AMM_TEST__.replacements.blockGame = 'game-fixture'; });

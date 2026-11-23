@@ -729,6 +729,74 @@ async fn local_library_install_uninstall_and_reinstall_use_one_reviewed_game_pat
 }
 
 #[tokio::test]
+async fn full_trust_game_detail_removal_uninstalls_and_forgets_without_approval() {
+    use crate::install;
+    let (_temp, engine, game_root) = transaction::tests::setup();
+    let (artifact, _) = ingest_library_fixture(
+        &engine,
+        "g",
+        "Game",
+        "offline.zip",
+        &[("OfflineMod/mod.dat", b"fixture")],
+    );
+    let request = approved_archive_request("g", &artifact.artifact_id);
+    let preview = install::plan_library_install(
+        &engine,
+        &serde_json::from_value(request["request"].clone()).unwrap(),
+    )
+    .unwrap();
+    engine.approve_plan(&preview.plan.id).unwrap();
+    engine.apply_file_ops(&preview.plan.id).unwrap();
+    install::reconcile(&engine.db).unwrap();
+    let installed_file = game_root.join("mods/OfflineMod/mod.dat");
+    assert!(installed_file.is_file());
+
+    let args = json!({"game_id":"g","install_id":preview.install_id});
+    let tools = ["inspect_install", "uninstall_mod", "forget_uninstalled_mod"];
+    let (agent, conv, mut events, model) =
+        scripted_agent(engine, Some("g"), tools.len() + 1, move |step, _| {
+            tools.get(step).map_or_else(final_reply, |name| {
+                model_tool_call(name, name, args.clone())
+            })
+        })
+        .await;
+    agent
+        .start_turn(turn_request(
+            &conv,
+            "卸载并从管理列表删除",
+            PermissionMode::FullTrust,
+        ))
+        .unwrap();
+    for name in tools {
+        let result = next_event(&mut events, "tool-result").await;
+        assert_eq!(result.payload["name"], name);
+        assert_eq!(result.payload["status"], "done", "{}", result.payload);
+    }
+    assert_eq!(
+        next_event(&mut events, "done").await.payload["status"],
+        "done"
+    );
+    assert!(!agent
+        .events
+        .replay(&conv, 0, 200)
+        .unwrap()
+        .iter()
+        .any(|e| e.kind == "approval-request"));
+    assert!(!installed_file.exists());
+    assert_eq!(
+        install::get_install(&agent.engine, &preview.install_id)
+            .unwrap()
+            .status,
+        "uninstalled"
+    );
+    assert!(!crate::mod_management::visible_installs(&agent.engine, "g")
+        .unwrap()
+        .iter()
+        .any(|i| i.id == preview.install_id));
+    model.await.unwrap();
+}
+
+#[tokio::test]
 async fn cancelling_library_install_approval_never_writes_the_game_file() {
     let (_temp, engine, game_root) = transaction::tests::setup();
     let game_id = "g".to_owned();

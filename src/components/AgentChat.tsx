@@ -21,9 +21,10 @@ import {
   TriangleAlertIcon,
 } from "lucide-react";
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
-import { activeTurn, describeAgentTools, isQuestionRequest, latestHistoryRewrite, pendingToolApproval, replayConversation, trackAgentTurn, useAgent, type AgentToolActivity } from "../lib/agent-store";
+import { composerPreferencesQuery, rememberComposerPreferences, resolveComposerPermission, turnPermission } from "@/lib/composer-preferences";
+import { activeTurnStart, describeAgentTools, isQuestionRequest, latestHistoryRewrite, pendingToolApproval, replayConversation, trackAgentTurn, useAgent, type AgentToolActivity } from "../lib/agent-store";
 import { useUI } from "../lib/store";
-import type { AgentAttachment, AgentEvent, AppSettings, ComposerPreferences, Conversation, Game, Message as ChatMessage, PermissionMode, ReasoningEffort } from "../lib/types";
+import type { AgentAttachment, AgentEvent, AppSettings, ComposerPreferences, Conversation, Game, GameWorkspace, Message as ChatMessage, ReasoningEffort } from "../lib/types";
 import { readyAttachment, usePrepareAttachments, type DraftAttachment } from "@/lib/agent-attachments";
 import { AttachmentGroup } from "@/components/ui/attachment";
 import { MessageAttachment } from "./AgentAttachments";
@@ -45,9 +46,11 @@ import {
 } from "@/components/ui/trace";
 import { cn } from "@/lib/utils";
 import { AgentConfirmation } from "./AgentConfirmation";
+import { AgentWorkspaceDialog } from "./AgentWorkspaceDialog";
+import { conversationWorkspace, workspaceLabel } from "@/lib/game-workspace";
 import { AgentComposer } from "./AgentComposer";
 import { AgentConversationList } from "./AgentConversationList";
-import { AgentQuestionnaire, describeQuestionnaire, QuestionnaireTrace, type Answer } from "./AgentQuestionnaire";
+import { AgentQuestionnaire, describeQuestionnaire, respondToQuestionnaire, QuestionnaireTrace, type Answer } from "./AgentQuestionnaire";
 import { useDidChange } from "@/lib/motion";
 
 const EMPTY_EVENTS: AgentEvent[] = [];
@@ -68,8 +71,9 @@ function groupByMessage<T>(items: T[], messageId: (item: T) => string | null) {
 export function AgentChat() {
   const conversationId = useUI((s) => s.conversationId);
   const adapterChat = useUI((s) => s.adapterChat);
-  const selectedGameId = useUI((s) => s.gameId);
-  const gameId = adapterChat ? adapterChat.gameId : selectedGameId;
+  const draftWorkspace = useUI((s) => s.draftWorkspace);
+  const setDraftWorkspace = useUI((s) => s.setDraftWorkspace);
+  const [picker, setPicker] = useState<{ id: string | null; adapter: typeof adapterChat; opener: HTMLButtonElement } | null>(null);
   const setConversation = useUI((s) => s.setConversation);
   const client = useQueryClient();
   const [composer, setComposer] = useState(() => emptyDraft(adapterChat?.prompt));
@@ -80,12 +84,16 @@ export function AgentChat() {
   const [reanswerRequest, setReanswerRequest] = useState<AgentEvent | null>(null);
   const [submittedAnswers, setSubmittedAnswers] = useState(() => new Map<AgentEvent, Answer[]>());
   const [error, setError] = useState<unknown>(null);
-  const [permission, setPermission] = useState<PermissionMode | "">("");
+  const permissionSelection = useUI((s) => s.composerPermission);
+  const setPermission = useUI((s) => s.setComposerPermission);
   const [effortSelection, setEffortSelection] = useState<{ model: string; level: ReasoningEffort } | null>(null);
   const [modelSelection, setModelSelection] = useState("");
   const stream = useAgent((s) => conversationId ? s.streams[conversationId] || EMPTY_EVENTS : EMPTY_EVENTS);
   const milestones = useAgent((s) => conversationId ? s.milestones[conversationId] || EMPTY_EVENTS : EMPTY_EVENTS);
-  const turn = activeTurn(milestones);
+  const running = activeTurnStart(milestones);
+  const turn = running?.turnId;
+  const mode = running?.payload.permissionMode;
+  const runningMode = mode === "request_approval" || mode === "auto_approve" || mode === "full_trust" ? mode : null;
   const conversations = useBackendQuery<Conversation[]>(["conversations", false], "list_conversations", { archived: false });
   const rewrite = useMemo(() => latestHistoryRewrite(milestones), [milestones]);
   const detail = useQuery({
@@ -103,8 +111,28 @@ export function AgentChat() {
     },
   });
   const games = useBackendQuery<Game[]>(["games"], "list_games");
+  const currentConversation = detail.data?.conversation ?? conversations.data?.find(row => row.id === conversationId);
+  const workspace = conversationId ? (currentConversation ? conversationWorkspace(currentConversation) : undefined) : draftWorkspace;
+  const gameName = workspace === undefined ? "正在读取工作区…" : workspaceLabel(workspace, games.data);
+  const openPicker = (opener: HTMLButtonElement) => setPicker({ id: conversationId, adapter: adapterChat, opener });
+
+  async function applyWorkspace(next: GameWorkspace) {
+    if (!conversationId) { setDraftWorkspace(next); return; }
+    const id = conversationId;
+    const updated = await api<Conversation>("set_conversation_workspace", { id, gameIds: next });
+    // Abandon older in-flight reads before publishing the committed native selection.
+    const detailKey = ["conversation", id], listKey = ["conversations"];
+    await Promise.all([client.cancelQueries({ queryKey: detailKey }), client.cancelQueries({ queryKey: listKey })]);
+    client.setQueriesData<{conversation: Conversation; messages: ChatMessage[]}>({ queryKey: detailKey },
+      previous => previous && { ...previous, conversation: updated });
+    client.setQueriesData<Conversation[]>({ queryKey: listKey }, previous => previous?.map(row => row.id === id ? { ...row, ...updated } : row));
+    void client.invalidateQueries({ queryKey: detailKey });
+    void client.invalidateQueries({ queryKey: listKey });
+  }
+
   const settings = useBackendQuery<AppSettings>(["settings"], "get_settings");
-  const preferences = useBackendQuery<ComposerPreferences>(["composer-preferences"], "get_composer_preferences");
+  const preferences = useQuery({ ...composerPreferencesQuery, enabled: backendAvailable });
+  const permission = turnPermission(permissionSelection, preferences.data);
   const model = settings.data?.model ?? "";
   const models = settings.data?.models ?? [];
   const selectedModel = models.some((entry) => entry.id === modelSelection) ? modelSelection : model;
@@ -116,6 +144,7 @@ export function AgentChat() {
     ? effortSelection.level : null;
   const end = useRef<HTMLDivElement>(null);
   const busy = !!submitting || !!turn;
+  const workspaceDisabled = !backendAvailable || busy || workspace === undefined || !!currentConversation?.archived;
   const activeEdit = edit?.conversationId === conversationId ? edit : null;
   const draft = activeEdit ?? composer;
   function updateAttachments(apply: (items: DraftAttachment[]) => DraftAttachment[]) {
@@ -125,14 +154,13 @@ export function AgentChat() {
   usePrepareAttachments(draft.attachments, updateAttachments);
   const restoredPreferences = useRef(false);
 
-  // Restore the last-used model, reasoning level and permission policy once per
+  // Restore the last-used model and reasoning level once per
   // launch. Stale values fall back safely: `selectedModel` ignores unknown models
   // and `reasoningEffort` ignores levels the model no longer enables.
   useEffect(() => {
     const saved = preferences.data;
     if (!saved || restoredPreferences.current) return;
     restoredPreferences.current = true;
-    if (saved.permission_mode) setPermission((current) => current || saved.permission_mode!);
     if (saved.model) {
       setModelSelection((current) => current || (saved.model === model ? "" : saved.model!));
       if (saved.reasoning_effort) setEffortSelection((current) => current ?? { model: saved.model!, level: saved.reasoning_effort! });
@@ -211,17 +239,22 @@ export function AgentChat() {
     const stillSelected = () => useUI.getState().conversationId === selectedAtSubmit &&
       useUI.getState().adapterChat === adapterChat;
     try {
+      const { permissionMode: permission } = await resolveComposerPermission(client, permissionSelection);
       let id = conversationId;
       if (!id) {
-        const conversation = await api<Conversation>("create_conversation", { title: "", gameId });
+        const conversation = await api<Conversation>("create_conversation", {
+          title: "", gameId: draftWorkspace?.length === 1 ? draftWorkspace[0] : null,
+          workspaceGameIds: draftWorkspace, ...(adapterChat && { category: "adapter" }),
+        });
         id = conversation.id;
+        client.setQueryData(["conversation", id], { conversation, messages: [] });
         if (stillSelected()) {
           setConversation(id, true);
           selectedAtSubmit = id;
         }
         void client.invalidateQueries({ queryKey: ["conversations"] });
       }
-      const request = { conversationId: id, content, ...(attachments && { attachments }), permissionMode: permission || null, model: selectedModel && selectedModel !== model ? selectedModel : null, reasoningEffort };
+      const request = { conversationId: id, content, ...(attachments && { attachments }), permissionMode: permission, model: selectedModel && selectedModel !== model ? selectedModel : null, reasoningEffort };
       if (restart) {
         await api<string>("restart_turn", { request, ...restart });
         trackAgentTurn(id);
@@ -231,11 +264,9 @@ export function AgentChat() {
       }
       started = true;
       const remembered: ComposerPreferences = {
-        model: selectedModel || null, reasoning_effort: reasoningEffort, permission_mode: permission || null,
+        model: selectedModel || null, reasoning_effort: reasoningEffort, permission_mode: permission,
       };
-      client.setQueryData(["composer-preferences"], remembered);
-      // Remembering the choice must never fail an already-started turn.
-      api("set_composer_preferences", { preferences: remembered }).catch(() => undefined);
+      rememberComposerPreferences(client, remembered);
       if (stillSelected() && !questionnaire) {
         setEdit(null);
         // Restarting rewrites the current chat, not the unrelated unsent draft.
@@ -286,7 +317,7 @@ export function AgentChat() {
   }, [activeRequest, conversationId]);
 
   async function submitAnswers(questionnaire: (typeof questions)[number], answers: Answer[]) {
-    const { request, outcome, structured, questions: steps, title } = questionnaire;
+    const { request, outcome, questions: steps, title } = questionnaire;
     if (outcome) {
       // Historical answers start a new turn in the same chat. The original approval is final.
       const lines = steps.map((item, index) => {
@@ -299,8 +330,7 @@ export function AgentChat() {
       setReanswerRequest((current) => current === request ? null : current);
       return;
     }
-    await api("respond_approval", { conversationId: request.conversationId, approvalId: request.payload.approvalId,
-      response: { approved: structured || answers[0] !== null, answer: structured ? JSON.stringify(answers) : answers[0] } });
+    await respondToQuestionnaire(questionnaire, answers);
     // The approval is final even if its tool result arrives on a later replay.
     setSubmittedAnswers((current) => new Map(current).set(request, answers));
     void replayConversation(request.conversationId).catch((failure) => toast.error(errorText(failure)));
@@ -316,8 +346,6 @@ export function AgentChat() {
     key={questionnaire.request.seq} questionnaire={questionnaire} disabled={busy || !!activeQuestion}
     onReanswer={writableChat ? () => setReanswerRequest(questionnaire.request) : undefined} />;
   const title = detail.data?.conversation.title || "Agent 对话";
-  const conversationGame = detail.data ? detail.data.conversation.game_id : gameId;
-  const gameName = adapterChat?.label ?? (games.data?.find((game) => game.id === conversationGame)?.name || "全部游戏");
   const hasMessages = messages.length > 0 || tools.length > 0 || unlinkedErrors.length > 0 || questions.length > 0;
 
   return <div className="agent-chat-shell flex h-full min-h-0 flex-col overflow-hidden bg-background motion-safe:animate-soft-fade md:flex-row">
@@ -338,14 +366,16 @@ export function AgentChat() {
         </Button>
         <AgentConversationList conversations={conversations.data ?? EMPTY_CONVERSATIONS} selectedId={conversationId}
           disabled={submitting === "start"} onSelect={selectConversation} />
-        <div className="mt-auto hidden flex-col gap-2 border-t pt-3 md:flex">
-          <div className="flex items-center gap-2 px-2 text-xs font-medium text-muted-foreground"><FolderIcon className="size-3.5" />工作区</div>
-          <div className="flex items-center gap-2 rounded-md bg-sidebar-accent/60 px-2.5 py-2 text-sm">
-            <span className="size-1.5 rounded-full bg-sidebar-primary" />
-            <span className="min-w-0 flex-1 truncate">{gameName}</span>
-            <Settings2Icon className="size-3.5 text-muted-foreground" />
-          </div>
-        </div>
+      </div>
+      <div className="hidden shrink-0 flex-col gap-2 border-t p-3 md:flex">
+        <div className="flex items-center gap-2 px-2 text-xs font-medium text-muted-foreground"><FolderIcon className="size-3.5" />工作区</div>
+        <Button variant="ghost" size="sm" aria-label={`切换工作区：${gameName}`} aria-haspopup="dialog"
+          className="w-full justify-start gap-2 bg-sidebar-accent/60" disabled={workspaceDisabled}
+          onClick={event => openPicker(event.currentTarget)}>
+          <span className="size-1.5 rounded-full bg-sidebar-primary" />
+          <span className="min-w-0 flex-1 truncate text-left">{gameName}</span>
+          <Settings2Icon aria-hidden="true" className="size-3.5 text-muted-foreground" />
+        </Button>
       </div>
       <ErrorState error={conversations.error} className="m-3 mt-0" />
     </aside>
@@ -354,7 +384,12 @@ export function AgentChat() {
       <header className="chat-header flex shrink-0 items-center justify-between gap-3 border-b px-4 py-3 sm:px-8">
         <div className="flex min-w-0 flex-col gap-0.5">
           <h1 className="truncate text-base font-semibold tracking-tight sm:text-lg">{title}</h1>
-          <span className="truncate text-xs text-muted-foreground">{gameName}</span>
+          <span className="hidden truncate text-xs text-muted-foreground md:block">{gameName}</span>
+          <Button variant="ghost" size="xs" aria-label={`切换工作区：${gameName}`} aria-haspopup="dialog"
+            disabled={workspaceDisabled} className="min-w-0 max-w-full justify-start self-start md:hidden"
+            onClick={event => openPicker(event.currentTarget)}>
+            <Settings2Icon aria-hidden="true" /><span className="truncate">{gameName}</span>
+          </Button>
         </div>
         <div className="flex max-w-[45%] flex-col items-end gap-0.5">
           <Badge className="min-w-0" tone={busy ? "warning" : "neutral"}>
@@ -435,7 +470,7 @@ export function AgentChat() {
             onSubmit={(answers) => submitAnswers(activeQuestion, answers)}
             onCancel={pendingQuestion ? () => void cancel(pendingQuestion.request.turnId) : () => setReanswerRequest(null)}
           /> : <AgentComposer
-            libraryGameName={adapterChat?.gameId && !activeEdit ? adapterChat.label : undefined}
+            libraryGameName={adapterChat?.gameId && workspace?.length === 1 && workspace[0] === adapterChat.gameId && !activeEdit ? adapterChat.label : undefined}
             input={draft.text}
             inputRef={composerInput}
             attachments={draft.attachments}
@@ -453,10 +488,10 @@ export function AgentChat() {
               void send(content, { attachments: attachments.length || activeEdit ? attachments : undefined, restart });
             }}
             onCancel={turn ? () => { void cancel(); } : undefined}
-            disabled={!backendAvailable || archivedConversation}
+            disabled={!backendAvailable || archivedConversation || (permissionSelection === undefined && preferences.isLoading)}
             busy={busy}
-            permission={permission}
-            inheritedPermission={detail.data?.conversation.permission_mode ?? settings.data?.permission_mode ?? "request_approval"}
+            permission={(running ? runningMode : permission) ?? ""}
+            inheritedPermission={running ? null : conversationId && !detail.data ? undefined : detail.data?.conversation.permission_mode ?? settings.data?.permission_mode}
             onPermissionChange={setPermission}
             model={selectedModel}
             models={models}
@@ -470,6 +505,10 @@ export function AgentChat() {
         </div>
       </div>
     </section>
+    {picker && picker.id === conversationId && picker.adapter === adapterChat && workspace !== undefined &&
+      <AgentWorkspaceDialog workspace={workspace} games={games.data} gamesError={games.error}
+        onRetry={() => void games.refetch()} disabled={workspaceDisabled} onApply={applyWorkspace}
+        onClose={() => setPicker(null)} opener={picker.opener} />}
   </div>;
 }
 

@@ -8,6 +8,7 @@ import platform
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -19,6 +20,8 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = ROOT / 'scripts/mcp-runtime.lock.json'
 OUTPUT = ROOT / 'src-tauri/resources/mcp-runtime/runtime.zip'
+SEVEN_ZIP_LOCK = ROOT / 'scripts/seven-zip.lock.json'
+SEVEN_ZIP_OUTPUT = ROOT / 'src-tauri/resources/seven-zip'
 CACHE = ROOT / 'src-tauri/target/mcp-runtime-downloads'
 MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
 BING_HELPER = 'bin/bing-search.cjs'
@@ -245,14 +248,136 @@ def prepare(target):
     print(f'{OUTPUT.relative_to(ROOT)}: SHA-256 {digest}')
 
 
-def main():
-    parser = argparse.ArgumentParser(description='Prepare the pinned Node/npm/uv and Bing search runtime ZIP.')
-    parser.add_argument('--target', help='Rust target triple; defaults to TAURI_ENV_TARGET_TRIPLE or native host')
-    args = parser.parse_args()
+def seven_zip_files(lock, target):
+    if target not in lock['targets']:
+        raise ValueError(f'Unsupported 7-Zip target {target!r}. Supported: {", ".join(lock["targets"])}')
+    source = lock['source']
+    return {
+        **lock['targets'][target]['files'],
+        source['asset']: source['sha256'],
+        'COPYING.txt': source['copyingSha256'],
+    }
+
+
+def check_seven_zip(directory, files):
+    for name, digest in files.items():
+        path = directory / name
+        if path.is_symlink() or not path.is_file() or hash_file(path) != digest:
+            raise ValueError(f'Missing or unofficial 7-Zip resource: {path}')
+        if name == '7zz' and os.name != 'nt' and not os.access(path, os.X_OK):
+            raise ValueError(f'7-Zip resource is not executable: {path}')
+
+
+def copy_seven_zip_tar_files(archive, directory, members):
+    with tarfile.open(archive, 'r:xz') as source:
+        for entry, name in members.items():
+            member = source.getmember(entry)
+            if not member.isfile():
+                raise ValueError(f'Expected regular file {entry!r} in {archive.name}')
+            path = directory / name
+            with source.extractfile(member) as stream, path.open('wb') as output:
+                shutil.copyfileobj(stream, output)
+            if name == '7zz':
+                path.chmod(0o755)
+
+
+def seven_zip_asset(lock, asset):
+    # These hashes correspond to the versioned ip7z/7zip release assets, not /latest.
+    return download(f'https://github.com/ip7z/7zip/releases/download/{lock["version"]}/{asset["asset"]}',
+                    asset['sha256'])
+
+
+def unix_seven_zip_cli(target):
+    return '7zzs' if '-linux-' in target else '7zz'
+
+
+def run_seven_zip(program, args, cwd):
+    result = subprocess.run([str(program), *args], cwd=cwd, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60,
+                            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    if result.returncode:
+        raise ValueError(f'{program.name} exited {result.returncode}: {result.stdout.decode(errors="replace")}')
+    return result.stdout
+
+
+def prepare_seven_zip(lock, target):
+    files = seven_zip_files(lock, target)
     try:
-        prepare(args.target or os.environ.get('TAURI_ENV_TARGET_TRIPLE') or host_target())
-    except (OSError, ValueError, RuntimeError, tarfile.TarError, zipfile.BadZipFile) as error:
-        parser.exit(1, f'MCP runtime preparation failed: {error}\n')
+        check_seven_zip(SEVEN_ZIP_OUTPUT, files)
+    except ValueError:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        # Build outside the resources directory. Publish only locally verified output.
+        with tempfile.TemporaryDirectory(prefix='seven-zip-', dir=CACHE) as work:
+            stage = Path(work)
+            asset = seven_zip_asset(lock, lock['targets'][target])
+            if '7z.exe' in files:
+                # The upstream Windows installer is a self-extracting 7z archive.
+                # Extract selected files without running the installer or installing anything.
+                if os.name == 'nt':
+                    extractor = seven_zip_asset(lock, lock['bootstrap'])
+                else:
+                    host = host_target()
+                    host_asset = seven_zip_asset(lock, lock['targets'][host])
+                    copy_seven_zip_tar_files(host_asset, stage, {unix_seven_zip_cli(host): '7zz'})
+                    extractor = stage / '7zz'
+                run_seven_zip(extractor, ['e', '-y', '-spd', f'-o{stage}', '--', str(asset),
+                                          '7z.exe', '7z.dll', 'License.txt'], cwd=stage)
+            else:
+                copy_seven_zip_tar_files(asset, stage, {unix_seven_zip_cli(target): '7zz', 'License.txt': 'License.txt'})
+            source = lock['source']
+            source_archive = seven_zip_asset(lock, source)
+            shutil.copyfile(source_archive, stage / source['asset'])
+            copy_seven_zip_tar_files(source_archive, stage, {'DOC/copying.txt': 'COPYING.txt'})
+            check_seven_zip(stage, files)
+            SEVEN_ZIP_OUTPUT.mkdir(parents=True, exist_ok=True)
+            for name in files:
+                (stage / name).replace(SEVEN_ZIP_OUTPUT / name)
+    # A switched target must not include the other platform's binaries in the bundle.
+    for name in {'7z.exe', '7z.dll', '7zz'} - files.keys():
+        (SEVEN_ZIP_OUTPUT / name).unlink(missing_ok=True)
+    print(f'{SEVEN_ZIP_OUTPUT.relative_to(ROOT)}: verified 7-Zip {lock["version"]} for {target}')
+
+
+def verify_seven_zip(lock, target, resource_dir):
+    directory = resource_dir.resolve(strict=True) / 'seven-zip'
+    files = seven_zip_files(lock, target)
+    check_seven_zip(directory, files)
+    cli = '7z.exe' if '7z.exe' in files else '7zz'
+    info = run_seven_zip(directory / cli, ['i'], cwd=directory).decode(errors='replace')
+    # Unix builds identify themselves as "7-Zip (z)" rather than "7-Zip".
+    banner = rf'^7-Zip(?: \(z\))? {re.escape(lock["version"])} '
+    if not re.search(banner, info, re.MULTILINE) or 'Formats:' not in info:
+        raise ValueError(f'Unexpected 7-Zip CLI output from {directory / cli}')
+    # Some 7-Zip distributions omit the RAR unpackers. Check the packaged binary.
+    for handler in ('Rar', 'Rar5'):
+        if not re.search(rf'^\s*\d+\s+\S+\s+{handler}\s+rar\s', info, re.MULTILINE):
+            raise ValueError(f'Missing {handler} unpacker in {directory / cli}')
+    print(f'{directory}: ran verified 7-Zip {lock["version"]} for {target}')
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Prepare pinned desktop CLI runtime resources.')
+    parser.add_argument('--target', help='Rust target triple; defaults to TAURI_ENV_TARGET_TRIPLE or native host')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--seven-zip-only', action='store_true', help='Prepare 7-Zip instead of the default MCP runtime')
+    mode.add_argument('--verify-seven-zip', type=Path, metavar='RESOURCE_DIR',
+                      help='Check installed 7-Zip files and run the native CLI offline')
+    args = parser.parse_args()
+    use_seven_zip = args.seven_zip_only or args.verify_seven_zip is not None
+    runtime = '7-Zip' if use_seven_zip else 'MCP runtime'
+    try:
+        target = args.target or os.environ.get('TAURI_ENV_TARGET_TRIPLE') or host_target()
+        if use_seven_zip:
+            lock = json.loads(SEVEN_ZIP_LOCK.read_text(encoding='utf-8'))
+            if args.verify_seven_zip is not None:
+                verify_seven_zip(lock, target, args.verify_seven_zip)
+            else:
+                prepare_seven_zip(lock, target)
+        else:
+            prepare(target)
+    except (OSError, ValueError, RuntimeError, tarfile.TarError, zipfile.BadZipFile,
+            subprocess.TimeoutExpired) as error:
+        parser.exit(1, f'{runtime} setup failed: {error}\n')
 
 
 if __name__ == '__main__':

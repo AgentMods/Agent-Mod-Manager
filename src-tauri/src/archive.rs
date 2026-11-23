@@ -16,8 +16,18 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "archive_compress.rs"]
+mod archive_compress;
+pub(crate) use archive_compress::compress_snapshot;
+#[path = "archive_extract.rs"]
+mod archive_extract;
+#[path = "archive_rar.rs"]
+mod archive_rar;
 #[path = "archive_zip.rs"]
 mod archive_zip;
+#[cfg(test)]
+#[path = "archive_rar_tests.rs"]
+mod rar_tests;
 
 // Metadata consumes memory even for empty files; charge names and parents
 // separately from the byte limit for streamed payloads.
@@ -170,6 +180,9 @@ fn is_root_directory(entry: &ArchiveEntry) -> bool {
         && name.split('/').all(|part| part.is_empty() || part == ".")
 }
 
+pub(crate) const RAR4_MAGIC: &[u8] = b"Rar!\x1a\x07\x00";
+pub(crate) const RAR5_MAGIC: &[u8] = b"Rar!\x1a\x07\x01\x00";
+
 pub fn detect_format(path: &Path) -> AppResult<&'static str> {
     detect_format_from(path, &mut safe_fs::open_regular(path)?)
 }
@@ -194,12 +207,22 @@ fn detect_format_from(path: &Path, file: &mut File) -> AppResult<&'static str> {
     {
         return Ok("tar");
     }
-    let mut buf = [0; 6];
-    if file.read_exact(&mut buf).is_ok() {
+    file.rewind()?;
+    let mut buf = [0; 8];
+    let length = file.metadata()?.len().min(buf.len() as u64) as usize;
+    file.read_exact(&mut buf[..length])?;
+    let buf = &buf[..length];
+    if buf.starts_with(RAR4_MAGIC) || buf.starts_with(RAR5_MAGIC) {
+        return Ok("rar");
+    }
+    if name.ends_with(".rar") {
+        return Err(unsafe_archive("RAR 文件头无效、已截断或不受支持"));
+    }
+    if length >= 6 {
         if &buf[..4] == b"PK\x03\x04" || &buf[..4] == b"PK\x05\x06" {
             return Ok("zip");
         }
-        if &buf == b"7z\xbc\xaf\x27\x1c" {
+        if buf.starts_with(b"7z\xbc\xaf\x27\x1c") {
             return Ok("7z");
         }
         if buf.starts_with(b"\x1f\x8b") || buf.starts_with(b"BZh") {
@@ -712,6 +735,10 @@ fn process_tar(file: &mut (impl Read + Seek), processing: &mut Processing<'_>) -
     } else {
         Box::new(file)
     };
+    process_tar_stream(&mut *reader, processing)
+}
+
+fn process_tar_stream(mut reader: &mut dyn Read, processing: &mut Processing<'_>) -> AppResult<()> {
     let mut framing = TAR_FRAMING_BYTES;
     let mut charge_framing = |bytes| {
         framing = framing
@@ -846,39 +873,70 @@ fn process<'a>(
     limit: u64,
     work: &'a Work<'a>,
 ) -> AppResult<Processing<'a>> {
-    process_with_capture(file, format, dest, strip_root, limit, work, None)
+    process_with_capture(
+        file,
+        format,
+        Processing::new(dest, strip_root, limit, work)?,
+        None,
+        None,
+    )
+}
+
+fn archive_slot(work: &Work<'_>) -> AppResult<std::sync::MutexGuard<'static, ()>> {
+    // ZIP indexes and 7z dictionaries have bounded but nontrivial memory.
+    // Do not let concurrent previews multiply that budget without bound.
+    loop {
+        work.check()?;
+        match ARCHIVE_WORK.try_lock() {
+            Ok(slot) => return Ok(slot),
+            Err(std::sync::TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+        }
+    }
 }
 
 fn process_with_capture<'a>(
     file: &mut File,
     format: &str,
-    dest: Option<&'a StagingDirectory>,
-    strip_root: Option<&'a str>,
-    limit: u64,
-    work: &'a Work<'a>,
+    processing: Processing<'a>,
     capture: Option<&'a BTreeMap<PathBuf, usize>>,
+    expected: Option<&str>,
 ) -> AppResult<Processing<'a>> {
-    // ZIP indexes and 7z dictionaries have bounded but nontrivial memory.
-    // Do not let concurrent previews multiply that budget without bound.
-    let _slot = loop {
-        work.check()?;
-        match ARCHIVE_WORK.try_lock() {
-            Ok(slot) => break slot,
-            Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => {
-                std::thread::sleep(Duration::from_millis(10))
-            }
-        }
-    };
+    let slot = archive_slot(processing.work)?;
+    // RAR needs the CLI even for the read-only payload verification. Never
+    // follow the source pathname again, and bind a verified request to the
+    // digest of the actual bytes admitted to the child process.
+    let snapshot = (format == "rar")
+        .then(|| archive_extract::Snapshot::create(file, expected, processing.work))
+        .transpose()?;
+    process_locked(file, format, processing, capture, &slot, snapshot.as_ref())
+}
+
+fn process_locked<'a>(
+    file: &mut File,
+    format: &str,
+    mut processing: Processing<'a>,
+    capture: Option<&'a BTreeMap<PathBuf, usize>>,
+    _slot: &std::sync::MutexGuard<'_, ()>,
+    snapshot: Option<&archive_extract::Snapshot>,
+) -> AppResult<Processing<'a>> {
+    let work = processing.work;
     file.rewind()?;
     let length = file.metadata()?.len();
-    let mut input = CheckedInput::new(&mut *file, work, length);
-    let mut processing = Processing::new(dest, strip_root, limit, work)?;
     processing.capture = capture;
-    let result = match format {
-        "zip" => process_zip(&mut input, &mut processing),
-        "7z" => process_7z(&mut input, length, &mut processing, SEVENZ_DICTIONARY_KIB),
-        _ => process_tar(&mut input, &mut processing),
+    let result = if format == "rar" {
+        let snapshot = snapshot.ok_or_else(|| unsafe_archive("缺少已验证的 RAR 副本"))?;
+        archive_extract::process_rar(snapshot, &mut processing)
+    } else {
+        let mut input = CheckedInput::new(&mut *file, work, length);
+        match format {
+            "zip" => process_zip(&mut input, &mut processing),
+            "7z" => process_7z(&mut input, length, &mut processing, SEVENZ_DICTIONARY_KIB),
+            "tar" => process_tar(&mut input, &mut processing),
+            _ => Err(unsafe_archive("不支持的归档格式")),
+        }
     };
     work.check()?;
     result?;
@@ -960,7 +1018,14 @@ pub(crate) fn list_verified_archive(
     let format = detect_format_from(path, &mut file)?;
     let listing = build_listing(
         format,
-        process(&mut file, format, None, None, disk_space_for(path)?, &work)?.entries,
+        process_with_capture(
+            &mut file,
+            format,
+            Processing::new(None, None, disk_space_for(path)?, &work)?,
+            None,
+            Some(expected),
+        )?
+        .entries,
     )?;
     verify_open_file_with_work(&mut file, expected, &work)?;
     Ok(listing)
@@ -1003,11 +1068,9 @@ pub(crate) fn verify_archive_members(
     let proof = process_with_capture(
         &mut file,
         format,
-        None,
-        None,
-        disk_space_for(path)?,
-        &work,
+        Processing::new(None, None, disk_space_for(path)?, &work)?,
         Some(capture),
+        Some(expected),
     )?;
     verify_open_file_with_work(&mut file, expected, &work)?;
     safe_fs::verify_regular_at(&file, path)?;
@@ -1087,8 +1150,23 @@ fn extract_open_file_with_work(
     expected: Option<&str>,
     work: &Work<'_>,
 ) -> AppResult<(ArchiveListing, WrittenFiles, safe_fs::StagingCleanup)> {
+    let slot = archive_slot(work)?;
     let limit = disk_space_for(dest)?;
-    let preflight = process(file, format, None, strip_root, limit, work)?;
+    // Give the CLI a private copy of the held file, not a path that can be
+    // replaced between parsing and extraction. Verify the exact bytes of that
+    // copy and retain per-member hashes as the contract for the CLI stream.
+    let snapshot = archive_extract::Snapshot::create(file, expected, work)?;
+    let mut input = File::open(&snapshot.path)?;
+    let capture = BTreeMap::new();
+    let preflight = process_locked(
+        &mut input,
+        format,
+        Processing::new(None, strip_root, limit, work)?,
+        Some(&capture),
+        &slot,
+        Some(&snapshot),
+    )?;
+    drop(input);
     let listing = build_listing(format, preflight.entries)?;
     let path_count = preflight.names.len() as u64;
     drop(preflight.names);
@@ -1104,11 +1182,22 @@ fn extract_open_file_with_work(
     let cleanup;
     let staging = StagingDirectory::create(dest)?;
     cleanup = staging.cleanup_guard()?;
-    let output = process(file, format, Some(&staging), strip_root, limit, work)?;
-    if listing.entries != output.entries {
-        return Err(AppError::Conflict("归档内容在预检和解压之间已变化".into()));
-    }
+    let mut output = Processing::new(Some(&staging), strip_root, limit, work)?;
+    archive_extract::extract(&snapshot, format, &listing.entries, &mut output)?;
     let written = output.written;
+    if listing.entries != output.entries
+        || written.len() != preflight.written.len()
+        || written
+            .iter()
+            .zip(&preflight.written)
+            .any(|((path, hash), (relative, proof))| {
+                path.strip_prefix(dest).ok() != Some(relative.as_path()) || hash != proof
+            })
+    {
+        return Err(unsafe_archive(
+            "7-Zip 解压结果与预检的文件清单或 SHA-256 不符",
+        ));
+    }
     if let Some(expected) = expected {
         verify_open_file_with_work(file, expected, work)?;
     }
@@ -1556,6 +1645,41 @@ mod tests {
             ],
             placeholders
         );
+    }
+
+    #[test]
+    fn seven_zip_stream_assigns_content_to_the_preflight_member() {
+        let temp = fixture_dir();
+        let zip = temp.path().join("测试 归档.zip");
+        // Same length, deliberately not alphabetical: checking size or exit
+        // status alone would not catch a swapped stream.
+        zip_file(&zip, &[("Z/data", b"last"), ("A/data", b"1st!")], true);
+        let dest = temp.path().join("out");
+        extract_archive(&zip, &dest, None).unwrap();
+        assert_eq!(std::fs::read(dest.join("Z/data")).unwrap(), b"last");
+        assert_eq!(std::fs::read(dest.join("A/data")).unwrap(), b"1st!");
+    }
+
+    #[test]
+    fn seven_zip_extracts_bzip2_tar_into_guarded_directories() {
+        let temp = fixture_dir();
+        let tar = temp.path().join("raw.tar");
+        tar_file(
+            &tar,
+            "folder/file",
+            tar::EntryType::Regular,
+            4,
+            b"data",
+            false,
+        );
+        let path = temp.path().join("file.tar.bz2");
+        let mut encoder =
+            bzip2::write::BzEncoder::new(File::create(&path).unwrap(), bzip2::Compression::fast());
+        std::io::copy(&mut File::open(tar).unwrap(), &mut encoder).unwrap();
+        encoder.finish().unwrap();
+        let dest = temp.path().join("out");
+        extract_archive(&path, &dest, Some("folder")).unwrap();
+        assert_eq!(std::fs::read(dest.join("file")).unwrap(), b"data");
     }
 
     #[test]

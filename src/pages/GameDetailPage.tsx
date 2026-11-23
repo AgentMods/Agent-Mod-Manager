@@ -1,11 +1,16 @@
 import { displayPath, pathBasename } from "@/lib/paths";
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { open } from '@tauri-apps/plugin-dialog';
-import { ArrowLeftIcon, CameraIcon, FolderOpenIcon, Gamepad2Icon, InboxIcon, PackagePlusIcon, ShieldCheckIcon, PackageMinusIcon, Trash2Icon, TriangleAlertIcon, Undo2Icon } from 'lucide-react';
+import { ArrowLeftIcon, CameraIcon, FolderOpenIcon, Gamepad2Icon, InboxIcon, ShieldCheckIcon, TriangleAlertIcon, Undo2Icon } from 'lucide-react';
 import { BethesdaPluginEvidence, type BethesdaEvidence } from '@/components/BethesdaPluginEvidence';
 import { FabricDiskEvidence, type FabricDisk } from '@/components/FabricDiskEvidence';
 import { FabricStartupEvidence, type FabricStartup } from '@/components/FabricStartupEvidence';
+import { ModActionReview } from '@/components/ModActionReview';
+import { ModManagementTable } from '@/components/ModManagementTable';
+import { Switch } from '@/components/ui/switch';
+import { Label } from '@/components/ui/label';
+import { batchIntent, buildModRows, replacementTransaction, type BatchAction, type Installed, type LibraryMod, type ModAction, type ModRow, type Removal } from '@/lib/mod-management';
 import { GameFileBrowser } from '@/components/GameFileBrowser';
 import { Badge, ErrorState, IconButton, Modal, Page, PageHeader, PathText, bytes, date } from '@/components/ui';
 import { Alert, AlertDescription } from '@/components/ui/alert';
@@ -19,17 +24,14 @@ import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Spinner } from '@/components/ui/spinner';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { bindModSwitch, findPendingModSwitch, releaseModSwitch, reserveModSwitch, retryModSwitchReadback, useModSwitch, type ModSwitchTarget } from '@/lib/mod-switch-store';
 import { trackAgentTurn } from '@/lib/agent-store';
+import { conversationCategoryLabels } from '@/lib/conversation-groups';
+import { rememberComposerPreferences, resolveComposerPermission } from '@/lib/composer-preferences';
 import { api, backendAvailable, errorText, useBackendQuery } from '@/lib/api';
 import { useUI } from '@/lib/store';
 import type { AppSettings, Conversation, FilePlan, Game } from '@/lib/types';
 
-type DownloadOrigin = { artifactId: string; sourceId: string; projectId: string; versionId: string };
-type Installed = {
-  id: string; name: string; version: string | null; status: string; source: string; downloadOrigin?: DownloadOrigin | null;
-  installRoot: string; files: { path: string; size: number }[]; installedAt: string;
-  metadata?: { libraryEntryId?: string; transactionId?: string | null; replacesInstallId?: string | null } | null;
-};
 type ReplacementRollback = { installId: string; name: string; version: string | null; plan: FilePlan };
 type Snapshot = { id: string; label: string; file_count: number; total_size: number; created_at: string };
 const legacyLogEncodings = ['windows-1252', 'windows-1251', 'gbk', 'big5', 'shift_jis'] as const;
@@ -50,19 +52,6 @@ type Diagnosis = {
   fabricDisk?: FabricDisk;
   bethesdaPlugins?: BethesdaEvidence;
 };
-type LibraryMod = {
-  artifactId: string; gameId: string | null; gameName: string; name: string; filename: string; version: string | null;
-  sha256: string; projectPage?: string | null;
-};
-type Removal = { kind: 'archive' | 'plan' | 'record' | 'installed'; id: string; name: string };
-type ModAction = Pick<LibraryMod, 'artifactId' | 'gameId' | 'name'> | { installId: string; name: string; remove?: boolean };
-const statuses: Record<string, string> = { installed: '已安装', enabled: '已安装', superseded: '已被替换', uninstalled: '已卸载', rolled_back: '已卸载（已回滚）', partially_restored: '部分文件已恢复', pending: '待执行', planned: '待审批', purged: '已永久删除' };
-
-function replacementTransaction(mod?: Installed) {
-  const { replacesInstallId, transactionId } = mod?.metadata ?? {};
-  return mod?.status === 'enabled' && replacesInstallId && transactionId ? transactionId : null;
-}
-
 function clipSourceText(text: string, limit: number) {
   return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
 }
@@ -130,6 +119,8 @@ function GameDetails({ gameId }: { gameId: string }) {
   const reviewPlan = useUI(s => s.reviewPlan);
   const notify = useUI(s => s.notify);
   const [tab, setTab] = useState('mods');
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchBusy, setBatchBusy] = useState(false);
   const [fileRootPath, setFileRootPath] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -138,10 +129,11 @@ function GameDetails({ gameId }: { gameId: string }) {
   const [removalError, setRemovalError] = useState<unknown>(null);
   const [rollbackError, setRollbackError] = useState<unknown>(null);
   const [unindexedImport, setUnindexedImport] = useState<string | null>(null);
-  const startingModAction = useRef(false);
-  const [modActionError, setModActionError] = useState<{ actionKey: string; message: string } | null>(null);
+  const pendingSwitches = useModSwitch(s => s.pending);
+  const startingRemoval = useRef(false);
+  const [modActionError, setModActionError] = useState<string | null>(null);
   const modActionErrorRef = useRef<HTMLDivElement>(null);
-  const unstartedConversation = useRef<{ actionKey: string; id: string } | null>(null);
+  const unstartedConversations = useRef(new Map<string, string>());
   const [snapshotLabel, setSnapshotLabel] = useState('');
   const [rootId, setRootId] = useState('');
   const [rootPath, setRootPath] = useState('');
@@ -154,9 +146,10 @@ function GameDetails({ gameId }: { gameId: string }) {
   const bootstrap = useBackendQuery<{ recoveryError: string | null }>(['bootstrap'], 'get_bootstrap_state');
   const writable = backendAvailable && !!bootstrap.data && !bootstrap.data.recoveryError;
   const installs = useBackendQuery<Installed[]>(['installs', gameId], 'list_installs', { gameId }, !!gameId);
-  const archiveFor = (mod: Installed) => mod.metadata?.libraryEntryId ?? mod.downloadOrigin?.artifactId;
-  const archivesById = new Map((library.data ?? []).map(archive => [archive.artifactId, archive]));
-  const ownedArchives = new Set((installs.data ?? []).filter(mod => ['enabled', 'installed', 'partially_restored'].includes(mod.status)).map(archiveFor));
+  const modRows = useMemo(() => buildModRows(gameId, installs.data, library.data), [gameId, installs.data, library.data]);
+  const gameSwitches = Object.values(pendingSwitches).filter(entry => entry.gameId === gameId);
+  const modWritesDisabled = !writable || busy || installs.isError || library.isError;
+  const modsLoading = installs.isLoading || library.isLoading;
   const rollbackCurrent = !!rollback && replacementTransaction(installs.data?.find(mod => mod.id === rollback.installId)) === rollback.plan.id;
   const snapshots = useBackendQuery<Snapshot[]>(['snapshots', gameId], 'list_snapshots', { gameId }, !!gameId);
   const roots = useBackendQuery<Record<string, string>>(['user-roots', gameId], 'list_user_roots', { gameId }, !!gameId);
@@ -171,13 +164,13 @@ function GameDetails({ gameId }: { gameId: string }) {
   function stopDiagnosis() {
     const requestId = diagnosisRequest.current;
     diagnosisRequest.current = null;
-    if (requestId) void api('diagnose_game', { gameId, options: { page: { requestId, cancel: true } } }).catch(() => {});
+    if (requestId) void api('diagnose_game', { gameId, options: { page: { requestId, cancel: true } } }).catch(() => { });
     setDiagnosis((current) => current?.logs && { ...current, logs: { ...current.logs, nextCursor: null } } || current);
   }
   useEffect(() => () => {
     const requestId = diagnosisRequest.current;
     diagnosisRequest.current = null;
-    if (requestId) void api('diagnose_game', { gameId, options: { page: { requestId, cancel: true } } }).catch(() => {});
+    if (requestId) void api('diagnose_game', { gameId, options: { page: { requestId, cancel: true } } }).catch(() => { });
   }, [gameId]);
   async function runDiagnosis(cursor?: string) {
     await run(async () => {
@@ -235,56 +228,108 @@ function GameDetails({ gameId }: { gameId: string }) {
   useEffect(() => {
     if (modActionError) modActionErrorRef.current?.scrollIntoView({ block: 'nearest' });
   }, [modActionError]);
-  async function startModAction(action: ModAction) {
-    if (!writable || busy || startingModAction.current) return;
-    startingModAction.current = true;
-    setModActionError(null);
+  async function startModAction(action: ModAction, row: ModSwitchTarget, batch = false) {
+    if (modWritesDisabled || startingRemoval.current) return false;
+    const selection = useUI.getState().composerPermission;
     const installing = 'artifactId' in action;
     const removing = !installing && action.remove === true;
+    if (findPendingModSwitch(useModSwitch.getState().pending, row)) return false;
+    const openRemovalChat = removing && !batch;
+    const switchId = openRemovalChat ? null : reserveModSwitch(installing
+      ? { ...row, kind: 'install', name: action.name, artifactId: action.artifactId }
+      : { ...row, kind: removing ? 'remove' : 'uninstall', name: action.name, installId: action.installId });
+    if (!openRemovalChat && !switchId) return false;
+    if (openRemovalChat) { startingRemoval.current = true; setBusy(true); }
+    setModActionError(null);
     const actionKey = removing ? `delete:${action.installId}` : installing ? `install:${action.artifactId}` : `uninstall:${action.installId}`;
     const target = JSON.stringify(installing ? { gameId, artifactId: action.artifactId } : { gameId, installId: action.installId });
     const content = installing
       ? `我已在游戏详情中明确选择为此游戏安装这一项 Mod。目标（精确 ID）：${target}。请按系统安装 Skill，先用 match_mod_install 核对本地归档和适配规则。仅在本地证据不足时，先通过来源 MCP 查阅作者说明；若 MCP 无法提供足够说明，再用 Playwright 查阅对应发布页。只有本地证据和作者说明都不足以确定安装方式，或需要我决定可选偏好时，才向我提问。确定后用 install_library_mod 申请安装，不要替换成其他游戏或归档。`
-      : `我已在游戏详情中明确选择${removing ? '卸载并从管理列表删除' : '卸载并保留在管理中'}这一条安装记录。目标（精确 ID）：${target}。请先读取 system-mod-uninstall Skill，再用 inspect_install 核对该记录，按 reconciliation.recommendedAction 和 Skill 处理：仅在 safe_uninstall 时用 uninstall_mod；在 rollback_install 或 rollback_replacement 时，用报告中的事务 ID（transaction_id）和相同的 game_id、install_id 申请 rollback_transaction；存在冲突时先说明。不要按名称匹配或操作其他安装记录。${removing ? '卸载或回滚成功后，再用 forget_uninstalled_mod 对相同游戏和记录执行从管理列表删除。' : ''}`;
-    await run(async () => {
-      try {
-        const settings = await api<AppSettings>('get_settings');
-        // Keyless local providers are supported; the model and endpoint are required.
-        if (!settings.model.trim() || !settings.base_url.trim()) {
-          throw new Error('请先在「设置 → 模型服务」中配置 Agent 模型。');
+      : `我已在游戏详情中明确选择${removing ? '从管理列表删除' : '卸载并保留在管理中'}这一条安装记录。目标（精确 ID）：${target}。`
+        + '请先读取 system-mod-uninstall Skill，再用 inspect_install 核对该记录，按 reconciliation.recommendedAction 和 Skill 处理。不要按名称匹配或操作其他安装记录。'
+        + '如果报告为 forget_missing_files（清单文件全部缺失，且无覆盖、共享或替换关系），'
+        + (removing
+          ? '直接调用 forget_uninstalled_mod({game_id, install_id})，仅移除这条管理记录，无需卸载或回滚。'
+          : '只说明清单文件已不在，保留管理记录和库条目，不执行写操作，不报告卸载成功。')
+        + '仅在 safe_uninstall 时用 uninstall_mod；在 rollback_install 或 rollback_replacement 时，用报告中的事务 ID（transaction_id）和相同的 game_id、install_id 申请 rollback_transaction。'
+        + (removing ? '在这些卸载或回滚分支中，成功后才对同一记录调用 forget_uninstalled_mod。' : '')
+        + '其他异常先说明原因和冲突并提交审核，未解决前保留管理记录。';
+    try {
+      const [settings, { permissionMode, preferences }] = await Promise.all([
+        api<AppSettings>('get_settings'), resolveComposerPermission(client, selection),
+      ]);
+      // Keyless local providers are supported; the model and endpoint are required.
+      if (!settings.model.trim() || !settings.base_url.trim()) {
+        throw new Error('请先在「设置 → 模型服务」中配置 Agent 模型。');
+      }
+      if (installing) {
+        if (action.gameId === null) {
+          // Only a deliberate click on this exact archive can authorize this binding.
+          await api('bind_mod_library_entry', { gameId, artifactId: action.artifactId });
+          client.setQueryData<LibraryMod[]>(['mod-library', gameId], (entries) =>
+            entries?.map(entry => entry.artifactId === action.artifactId ? { ...entry, gameId } : entry));
+          void client.invalidateQueries({ queryKey: ['mod-library'] });
+        } else if (action.gameId !== gameId) {
+          throw new Error('归档已绑定到其他游戏，请刷新 Mod 管理列表后重试。');
         }
-        if (installing) {
-          if (action.gameId === null) {
-            // Only a deliberate click on this exact archive can authorize this binding.
-            await api('bind_mod_library_entry', { gameId, artifactId: action.artifactId });
-            client.setQueryData<LibraryMod[]>(['mod-library', gameId], (entries) =>
-              entries?.map(entry => entry.artifactId === action.artifactId ? { ...entry, gameId } : entry));
-            void client.invalidateQueries({ queryKey: ['mod-library'] });
-          } else if (action.gameId !== gameId) {
-            throw new Error('归档已绑定到其他游戏，请刷新 Mod 库后重试。');
-          }
-        }
-        let id = unstartedConversation.current?.actionKey === actionKey ? unstartedConversation.current.id : null;
-        if (!id) {
-          const conversation = await api<Conversation>('create_conversation', { title: `${removing ? '删除' : installing ? '安装' : '卸载'} Mod：${action.name.slice(0, 80)}`, gameId });
-          id = conversation.id;
-          unstartedConversation.current = { actionKey, id };
-          void client.invalidateQueries({ queryKey: ['conversations'] });
-        }
-        const turnId = await api<string>('start_turn', {
-          request: { conversationId: id, content, model: null, permissionMode: 'request_approval', reasoningEffort: null },
+      }
+      let id = unstartedConversations.current.get(actionKey);
+      if (!id) {
+        const category = removing ? 'remove' : installing ? 'install' : 'uninstall';
+        const conversation = await api<Conversation>('create_conversation', {
+          title: `${conversationCategoryLabels[category]}：${action.name.slice(0, 80)}`, gameId, category,
         });
-        unstartedConversation.current = null;
+        id = conversation.id;
+        unstartedConversations.current.set(actionKey, id);
+        void client.invalidateQueries({ queryKey: ['conversations'] });
+      }
+      const turnId = await api<string>('start_turn', {
+        request: { conversationId: id, content, model: null, permissionMode, reasoningEffort: null },
+      });
+      if (preferences && permissionMode !== preferences.permission_mode) {
+        rememberComposerPreferences(client, { ...preferences, permission_mode: permissionMode });
+      }
+      unstartedConversations.current.delete(actionKey);
+      if (switchId) {
+        if (!bindModSwitch(switchId, id, turnId)) throw new Error('无法跟踪已启动的任务，请核对当前安装状态。');
+      } else {
         trackAgentTurn(id, turnId);
         useUI.getState().openConversation(id, gameId);
-      } catch (failure) {
-        const message = `无法启动 Agent：${errorText(failure)}`;
-        const state = useUI.getState();
-        if (state.view === 'detail' && state.gameId === gameId) setModActionError({ actionKey, message });
-        else notify(message);
       }
-    });
-    startingModAction.current = false;
+      return true;
+    } catch (failure) {
+      if (switchId) releaseModSwitch(switchId);
+      const message = `无法启动 Agent：${errorText(failure)}`;
+      if (batch) throw new Error(message);
+      const state = useUI.getState();
+      if (state.view === 'detail' && state.gameId === gameId) setModActionError(message);
+      else notify(message);
+      return false;
+    } finally {
+      if (openRemovalChat) { startingRemoval.current = false; setBusy(false); }
+    }
+  }
+  async function runBatchItem(action: BatchAction, reviewed: ModRow) {
+    // Resolve from the latest cache, not a stale row captured before the confirmation or an earlier IPC.
+    const installQuery = client.getQueryState<Installed[]>(['installs', gameId]);
+    const libraryQuery = client.getQueryState<LibraryMod[]>(['mod-library', gameId]);
+    if (!backendAvailable || client.getQueryState<{ recoveryError: string | null }>(['bootstrap'])?.data?.recoveryError !== null ||
+        installQuery?.status !== 'success' || libraryQuery?.status !== 'success') throw new Error('当前不能写入，请刷新 Mod 列表后重试。');
+    const row = buildModRows(gameId, installQuery.data, libraryQuery.data).find(item => item.key === reviewed.key);
+    const intent = row && batchIntent(action, row);
+    if (!row || !intent || intent !== batchIntent(action, reviewed) || findPendingModSwitch(useModSwitch.getState().pending, row.target)) return 'skipped';
+    if (action === 'remove' && row.removal && row.removal.kind !== 'installed') {
+      const { kind, id } = row.removal;
+      await api('remove_managed_mod', { gameId, target: { kind, id } });
+      return 'removed';
+    }
+    const agentAction: ModAction = action === 'install' ? row.install!
+      : { installId: row.target.installId!, name: row.item.name, remove: action === 'remove' };
+    return await startModAction(agentAction, row.target, true) ? 'submitted' : 'skipped';
+  }
+  async function refreshBatchRemovals() {
+    await Promise.all([['installs', gameId], ['mod-library', gameId], ['game', gameId], ['games']].map(queryKey =>
+      client.invalidateQueries({ queryKey }, { throwOnError: true })));
   }
   function askRemoval(target: Removal) {
     setRemovalError(null);
@@ -295,7 +340,7 @@ function GameDetails({ gameId }: { gameId: string }) {
     const { kind, id, name } = removal;
     if (kind === 'installed') {
       setRemoval(null);
-      await startModAction({ installId: id, name, remove: true });
+      await startModAction({ installId: id, name, remove: true }, { gameId, installId: id });
       return;
     }
     await run(async () => {
@@ -313,20 +358,20 @@ function GameDetails({ gameId }: { gameId: string }) {
       await api<LibraryMod>('register_imported_mod', { gameId, transactionId });
       setUnindexedImport(null);
       void client.invalidateQueries({ queryKey: ['mod-library', gameId] });
-      notify('归档已导入 Mod 库，可选择使用 Agent 安装');
+      notify('归档已导入，可在 Mod 管理列表中安装');
     });
   }
   async function importArchive() {
     if (!writable || busy || unindexedImport) return;
     await run(async () => {
-      const selected = await open({ multiple: false, directory: false, title: '选择本地 Mod 归档', filters: [{ name: 'Mod 归档', extensions: ['zip', 'jar', 'mrpack', '7z', 'gz', 'tgz'] }] });
+      const selected = await open({ multiple: false, directory: false, title: '选择本地 Mod 归档', filters: [{ name: 'Mod 归档', extensions: ['zip', 'jar', 'mrpack', '7z', 'rar', 'gz', 'tgz'] }] });
       if (typeof selected !== 'string') return;
       const { plan } = await api<{ plan: FilePlan }>('plan_import_archive', { path: selected });
       reviewPlan(plan, () => { void indexImport(plan.id); });
     });
   }
   const fileRoots = [{ name: '游戏目录', path: game.data?.rootPath ?? '' },
-    ...Object.entries(roots.data ?? {}).map(([name, path]) => ({ name, path }))];
+  ...Object.entries(roots.data ?? {}).map(([name, path]) => ({ name, path }))];
   const fileRoot = fileRoots.find(root => root.path === fileRootPath) ?? fileRoots[0];
 
   return <Page className="min-w-0" data-testid="game-detail-page">
@@ -349,17 +394,23 @@ function GameDetails({ gameId }: { gameId: string }) {
             </CardDescription>
           </div>
         </div>
-        <Button disabled={!writable || busy || !!unindexedImport} onClick={() => { void importArchive(); }}><FolderOpenIcon data-icon="inline-start" />导入本地归档</Button>
+        <Button disabled={!writable || busy || batchBusy || !!unindexedImport} onClick={() => { void importArchive(); }}><FolderOpenIcon data-icon="inline-start" />导入本地归档</Button>
       </CardHeader>
     </Card>
 
-    <Tabs className="min-w-0 gap-4" value={tab} onValueChange={setTab}>
-      <TabsList className="w-full sm:w-fit">
-        <TabsTrigger value="mods">Mod 管理</TabsTrigger>
-        <TabsTrigger value="files">文件</TabsTrigger>
-        <TabsTrigger value="snapshots">快照</TabsTrigger>
-        <TabsTrigger value="diagnostics">诊断</TabsTrigger>
-      </TabsList>
+    <Tabs className="min-w-0 gap-4" value={tab} onValueChange={value => { setTab(value); if (!batchBusy) setBatchMode(false); }}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <TabsList className="w-full sm:w-fit">
+          <TabsTrigger value="mods">Mod 管理</TabsTrigger>
+          <TabsTrigger value="files">文件</TabsTrigger>
+          <TabsTrigger value="snapshots">快照</TabsTrigger>
+          <TabsTrigger value="diagnostics">诊断</TabsTrigger>
+        </TabsList>
+        {tab === 'mods' && <div className="ml-auto flex items-center gap-2">
+          <Switch id="mod-batch-mode" aria-label="批量操作" checked={batchMode} disabled={batchBusy} onCheckedChange={setBatchMode} />
+          <Label htmlFor="mod-batch-mode">批量操作</Label>
+        </div>}
+      </div>
 
       <TabsContent value="files" forceMount className={tab === 'files' ? 'min-w-0' : 'hidden'}>
         <ErrorState error={roots.error} />
@@ -371,51 +422,15 @@ function GameDetails({ gameId }: { gameId: string }) {
 
       <TabsContent value="mods" className="flex min-w-0 flex-col gap-3">
         <ErrorState error={installs.error} />
-        <Card className="min-w-0 py-0">
-          <Table aria-busy={installs.isFetching}>
-            <TableHeader><TableRow><TableHead>名称</TableHead><TableHead>版本</TableHead><TableHead>来源</TableHead><TableHead>状态</TableHead><TableHead>安装时间</TableHead><TableHead /></TableRow></TableHeader>
-            <TableBody>{(installs.data ?? []).map(mod => {
-              const artifactId = archiveFor(mod);
-              const reinstall = artifactId && !ownedArchives.has(artifactId) && ['uninstalled', 'rolled_back'].includes(mod.status) ? archivesById.get(artifactId) : undefined;
-              return <TableRow key={mod.id}>
-              <TableCell className="min-w-28 whitespace-normal"><strong className="wrap-anywhere">{mod.name}</strong><small className="block text-muted-foreground">{mod.files.length} 个文件</small></TableCell>
-              <TableCell className="min-w-24 wrap-anywhere whitespace-normal">{mod.version ?? '—'}{mod.downloadOrigin && <PathText className="block">版本 ID：{mod.downloadOrigin.versionId}</PathText>}</TableCell>
-              <TableCell className="min-w-28 wrap-anywhere whitespace-normal">{mod.downloadOrigin?.sourceId ?? (mod.source === 'local' ? '本地归档' : mod.source)}
-                {mod.downloadOrigin ? <PathText className="block">项目 ID：{mod.downloadOrigin.projectId}</PathText> : mod.source !== 'local' && <small className="block text-muted-foreground">未绑定下载记录</small>}
-              </TableCell>
-              <TableCell><Badge tone={mod.status === 'enabled' ? 'success' : 'warning'}>{statuses[mod.status] ?? mod.status}</Badge></TableCell>
-              <TableCell>{date(mod.installedAt)}</TableCell>
-              <TableCell><div className="flex justify-end gap-2">
-                <IconButton title={mod.status === 'partially_restored' ? '部分恢复：需先处理剩余回收站文件' : '使用 Agent 卸载'} disabled={!writable || busy || !['enabled', 'installed'].includes(mod.status)} onClick={() => { void startModAction({ installId: mod.id, name: mod.name }); }}><PackageMinusIcon data-icon="inline-start" /></IconButton>
-                {['enabled', 'installed', 'planned', 'uninstalled', 'rolled_back', 'purged'].includes(mod.status) && <IconButton title={mod.status === 'planned' ? '取消安装计划' : '从管理列表删除'} disabled={!writable || busy} onClick={() => askRemoval({ kind: mod.status === 'planned' ? 'plan' : ['enabled', 'installed'].includes(mod.status) ? 'installed' : 'record', id: mod.id, name: mod.name })}><Trash2Icon data-icon="inline-start" /></IconButton>}
-                {reinstall && <IconButton title="使用 Agent 重新安装" disabled={!writable || busy} onClick={() => { void startModAction(reinstall); }}><PackagePlusIcon data-icon="inline-start" /></IconButton>}
-                {replacementTransaction(mod) && <IconButton title="预览回滚替换" disabled={!writable || busy || installs.isFetching} onClick={() => { void previewReplacementRollback(mod); }}><Undo2Icon data-icon="inline-start" /></IconButton>}
-              </div></TableCell>
-            </TableRow>; })}</TableBody>
-          </Table>
-        </Card>
-        {modActionError && /^(uninstall|delete):/.test(modActionError.actionKey) && <div ref={modActionErrorRef}><ErrorState error={modActionError.message} /></div>}
-        {!installs.data?.length && !installs.error && <DetailEmptyState loading={installs.isLoading} title={installs.isLoading ? '正在读取 Mod…' : '暂无安装记录'} />}
-        <Card className="min-w-0">
-          <CardHeader><CardTitle>Mod 库</CardTitle><CardDescription>选择已下载或已导入的归档。Agent 会检查安装方式，文件变更需要批准。</CardDescription></CardHeader>
-          <CardContent className="flex min-w-0 flex-col gap-3">
-            <ErrorState error={library.error} />
-            {unindexedImport && <Button className="self-start" variant="outline" disabled={!writable || busy} onClick={() => { void indexImport(unindexedImport); }}>重试添加到 Mod 库</Button>}
-            {library.data?.length ? <ItemGroup aria-label="Mod 库归档" aria-busy={library.isFetching} className="gap-2">
-              {library.data.map(mod => <Item role="listitem" key={mod.artifactId} variant="outline" size="sm">
-                <ItemContent className="min-w-0 basis-40">
-                  <ItemTitle className="max-w-full wrap-anywhere">{mod.name}{mod.version && <Badge>{mod.version}</Badge>}</ItemTitle>
-                  <ItemDescription className="wrap-anywhere">{mod.filename}{mod.gameName && ` · ${mod.gameName}`}</ItemDescription>
-                </ItemContent>
-                <ItemActions>
-                  <Button variant="outline" size="sm" disabled={!writable || busy || ownedArchives.has(mod.artifactId)} onClick={() => { void startModAction(mod); }}><PackagePlusIcon data-icon="inline-start" />{ownedArchives.has(mod.artifactId) ? '已安装' : '使用 Agent 安装'}</Button>
-                  <IconButton title="从管理列表删除" disabled={!writable || busy || ownedArchives.has(mod.artifactId)} onClick={() => askRemoval({ kind: 'archive', id: mod.artifactId, name: mod.name })}><Trash2Icon data-icon="inline-start" /></IconButton>
-                </ItemActions>
-                {modActionError?.actionKey === `install:${mod.artifactId}` && <div ref={modActionErrorRef} className="min-w-0 basis-full"><ErrorState error={modActionError.message} /></div>}
-              </Item>)}
-            </ItemGroup> : !library.error && <DetailEmptyState loading={library.isLoading} title={library.isLoading ? '正在读取 Mod 库…' : '尚无归档'} />}
-          </CardContent>
-        </Card>
+        <ErrorState error={library.error} />
+        {(installs.isError || library.isError) && !gameSwitches.some(entry => entry.status === 'readback_failed') &&
+          <Button variant="outline" size="sm" className="self-start" onClick={() => { void installs.refetch(); void library.refetch(); }}>刷新 Mod 列表</Button>}
+        {unindexedImport && <Button className="self-start" variant="outline" disabled={!writable || busy} onClick={() => { void indexImport(unindexedImport); }}>重试添加到 Mod 库</Button>}
+        <ModManagementTable rows={modRows} batchMode={batchMode} disabled={modWritesDisabled || batchBusy} fetching={installs.isFetching || library.isFetching}
+          onStart={startModAction} onRemove={askRemoval} onRollback={previewReplacementRollback} onBatchItem={runBatchItem}
+          onBatchBusy={setBatchBusy} refreshRemovals={refreshBatchRemovals} />
+        {modActionError && <div ref={modActionErrorRef}><ErrorState error={modActionError} /></div>}
+        {!modRows.length && !installs.error && !library.error && <DetailEmptyState loading={modsLoading} title={modsLoading ? '正在读取 Mod…' : '暂无 Mod'} />}
       </TabsContent>
 
       <TabsContent value="snapshots" className="flex min-w-0 flex-col gap-3">
@@ -549,11 +564,17 @@ function GameDetails({ gameId }: { gameId: string }) {
       </TabsContent>
     </Tabs>
 
+    {gameSwitches.map(entry =>
+      entry.status === 'running' ? <ModActionReview key={entry.id} operationId={entry.id} name={entry.name} conversationId={entry.conversationId} turnId={entry.turnId} />
+        : entry.status === 'readback_failed' ? <div className="flex flex-col items-start gap-2" key={entry.id}>
+          <ErrorState error={entry.error} /><Button size="sm" variant="outline" onClick={() => retryModSwitchReadback(entry.id)}>重新读取状态</Button>
+        </div> : null)}
+
     {removal && <Modal title={removal.kind === 'plan' ? '取消安装计划' : '从管理列表删除'} onClose={() => { if (!busy) setRemoval(null); }} actions={<>
       <Button variant="outline" disabled={busy} onClick={() => setRemoval(null)}>返回</Button>
-      <Button variant="destructive" disabled={!writable || busy} onClick={() => { void confirmRemoval(); }}>{removal.kind === 'installed' ? '使用 Agent 卸载并删除' : removal.kind === 'plan' ? '确认取消计划' : '确认删除'}</Button>
+      <Button variant="destructive" disabled={!writable || busy} onClick={() => { void confirmRemoval(); }}>{removal.kind === 'installed' ? '使用 Agent 删除' : removal.kind === 'plan' ? '确认取消计划' : '确认删除'}</Button>
     </>}>
-      <p className="wrap-anywhere">{removal.kind === 'plan' ? `取消「${removal.name}」的这次安装计划？同名的其他安装记录会保留。` : removal.kind === 'installed' ? `Agent 将先卸载「${removal.name}」，卸载成功后再从管理列表移除。` : `从此游戏的管理列表移除「${removal.name}」？磁盘上的原包和事务历史会保留。`}</p>
+      <p className="wrap-anywhere">{removal.kind === 'plan' ? `取消「${removal.name}」的这次安装计划？同名的其他安装记录会保留。` : removal.kind === 'installed' ? `Agent 会先检查「${removal.name}」。若清单文件全部缺失，且无覆盖、共享或替换关系，只移除管理记录；若可安全卸载或回滚，成功后才移除记录。其他异常需先审核。` : `从此游戏的管理列表移除「${removal.name}」？磁盘上的原包和事务历史会保留。`}</p>
       <ErrorState error={removalError} />
     </Modal>}
     {rollback && <Modal title="回滚版本替换" onClose={() => { if (!busy) setRollback(null); }} actions={<>

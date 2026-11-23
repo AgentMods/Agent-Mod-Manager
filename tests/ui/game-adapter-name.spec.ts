@@ -36,11 +36,13 @@ test("更改游戏库显示名称时保留目标游戏并在适配包绑定完�
 
   await expect.poll(async () => (await calls(page, "start_turn")).length).toBe(1);
   const request = (await calls(page, "start_turn"))[0].args.request;
-  expect((await calls(page, "create_conversation"))[0].args.gameId).toBe("game-fixture");
+  expect((await calls(page, "create_conversation"))[0].args).toMatchObject({gameId: "game-fixture", category: "adapter"});
   expect(request.content).toBe(
     `${originalPrompt}\n\n请在绑定适配包时，将这款游戏在游戏库中的显示名称改为 ${JSON.stringify(newName)}。`,
   );
   expect(await calls(page, "update_game")).toHaveLength(0);
+  await expect(page.getByRole("button", {name: "适配包", exact: true})).toHaveAttribute("aria-expanded", "true");
+  await expect(page.locator('ul[aria-label="适配包"] button[aria-current="true"]')).toHaveCount(1);
 
   await page.evaluate(({oldName, targetName}) => {
     const mock = (window as any).__AMM_TEST__;
@@ -88,7 +90,7 @@ test("名称未更改时原始创建提示不变且不请求 Agent 改名", asyn
   await expect.poll(async () => (await calls(page, "start_turn")).length).toBe(1);
 
   const request = (await calls(page, "start_turn"))[0].args.request;
-  expect((await calls(page, "create_conversation"))[0].args.gameId).toBe("game-fixture");
+  expect((await calls(page, "create_conversation"))[0].args).toMatchObject({gameId: "game-fixture", category: "adapter"});
   expect(request.content).toBe(originalPrompt);
   expect(request.content).not.toMatch(/请在绑定适配包时，将这款游戏在游戏库中的显示名称改为/);
   expect(await calls(page, "update_game")).toHaveLength(0);

@@ -147,7 +147,9 @@ fn preview_is_inert_camel_case_and_native_apply_enables_separate_install() {
 #[test]
 fn accepts_only_supported_extensions_case_insensitively_without_extraction() {
     let (_temp, engine, source) = setup();
-    for name in ["a.jar", "a.ZIP", "a.mrpack", "a.7z", "a.TAR.GZ", "a.tgz"] {
+    for name in [
+        "a.jar", "a.ZIP", "a.mrpack", "a.7z", "a.RaR", "a.TAR.GZ", "a.tgz",
+    ] {
         let path = source.with_file_name(name);
         fs::write(&path, b"not parsed or executed").unwrap();
         let preview = plan_import_archive(&engine, &path).unwrap();
@@ -164,6 +166,7 @@ fn accepts_only_supported_extensions_case_insensitively_without_extraction() {
         "a.tar",
         "a.exe",
         "a.zip.part",
+        "a.rar.part",
         "a.zip.rejected",
         "a.json",
     ] {

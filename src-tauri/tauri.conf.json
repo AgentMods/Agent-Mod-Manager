@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "identifier": "com.glossmod.amm",
   "build": {
-    "beforeDevCommand": "yarn prepare:mcp-runtime && yarn dev",
+    "beforeDevCommand": "yarn prepare:seven-zip && yarn prepare:mcp-runtime && yarn dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "yarn prepare:mcp-runtime && yarn build",
-    "beforeBundleCommand": "yarn prepare:mcp-runtime",
+    "beforeBuildCommand": "yarn prepare:seven-zip && yarn prepare:mcp-runtime && yarn build",
+    "beforeBundleCommand": "yarn prepare:seven-zip && yarn prepare:mcp-runtime",
     "frontendDist": "../dist"
   },
   "app": {
@@ -55,7 +55,8 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "resources/mcp-runtime/": "mcp-runtime/"
+      "resources/mcp-runtime/": "mcp-runtime/",
+      "resources/seven-zip/": "seven-zip/"
     },
     "icon": [
       "icons/32x32.png",

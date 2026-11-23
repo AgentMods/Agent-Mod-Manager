@@ -56,14 +56,16 @@ export function invalidateAgentModQueries(client: QueryClient, events: AgentEven
         break;
       }
       default: {
-        // The managed GlossMod proxy has a namespaced name. Only its native
-        // approval for saving into Mods and its matching catalog receipt count.
+        // Trust host implementation provenance, retaining native approval
+        // previews for events recorded before the host marker existed.
         const name = event.payload.name;
         const approval = approvals.get(event.payload.toolCallId);
-        if (typeof name !== "string" || !name.startsWith("mcp__") || approval?.title !== name) break;
-        const preview = record(approval.preview);
+        if (typeof name !== "string" || !name.startsWith("mcp__")) break;
+        const preview = record(approval?.preview);
         const artifact = record(receipt.artifact);
-        if (preview.tool === "get_work_file_download" && preview.destination === "Mods/" &&
+        const trusted = event.payload.hostToolKind === "glossmod_attachment_download" ||
+          (approval?.title === name && preview.tool === "get_work_file_download" && preview.destination === "Mods/");
+        if (trusted &&
           receipt.cataloged === true && id(receipt.artifactId) && artifact.artifactId === receipt.artifactId) {
           rememberLibraryReceipt(artifact);
         }

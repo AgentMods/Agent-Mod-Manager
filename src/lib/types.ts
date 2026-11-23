@@ -6,7 +6,12 @@ export interface Game {
   coverPath: string | null; steamAppId: string | null; installedModCount: number;
   enabledModCount: number; metadata: Record<string, unknown>; createdAt: string; updatedAt: string;
 }
+export type ConversationCategory = "install" | "uninstall" | "remove" | "adapter";
+/** null follows all registered games; an empty list deliberately selects none. */
+export type GameWorkspace = string[] | null;
 export interface Conversation {
+  workspace_game_ids?: GameWorkspace;
+  category: ConversationCategory | null;
   id: string; title: string; game_id: string | null; task_summary: string | null;
   archived: boolean; pinned: boolean; message_count: number; created_at: string;
   updated_at: string; permission_mode: PermissionMode | null;
@@ -30,9 +35,13 @@ export interface AgentEvent {
   seq: number; turnId: string; conversationId: string; messageId: string | null;
   kind: string; payload: Record<string, unknown>; createdAt: string;
 }
+export type FileOperation =
+  | { op: "copy" | "move" | "compress" | "extract"; src: string; dst: string }
+  | { op: "mkdir"; src?: never; dst: string }
+  | { op: "write_text"; src?: never; dst: string; content: string };
 export interface FilePlan {
   id: string; summary: string; total_bytes: number; created_at: string; requires_review: boolean;
-  entries: Array<{operation: {op: string; src?: string; dst: string}; impact: string;
+  entries: Array<{operation: FileOperation; impact: string;
     before: {kind: string; size: number; sha256: string} | null;
     source: {kind: string; size: number; sha256: string} | null}>;
 }
@@ -68,7 +77,16 @@ export interface ComposerPreferences {
 export interface BootstrapState {
   dataRoot: string; storageMigrationError?: string | null; recoveredTransactions: string[]; recoveryError: string | null; onboardingCompleted: boolean; isFirstRun: boolean; resumeOnboarding: boolean;
 }
+export interface CatalogPluginRelease {
+  id: string; releaseId: string; name: string; slug: string; version: string;
+  authorName: string; platforms: string[]; steamAppId: string; description: string; tags?: string[];
+}
+export interface CatalogGame {
+  id: string; name: string; slug: string; aliases: string[]; steamAppId: string; plugins: CatalogPluginRelease[];
+}
+export interface CatalogSearch { totalGames: number; skippedEntries: number; games: CatalogGame[] }
 export interface GameCandidate {
+  sources?: { kind: string; steamAppId?: string | null; completeInstall?: boolean | null }[];
   status: "high_confidence" | "candidate" | "unidentified";
   rootPath: string; name: string; confidence: number; suggestedAdapterSlug: string | null; registeredGameId: string | null; platform: string; warnings: string[];
 }
@@ -76,8 +94,9 @@ export interface ScanReport {
   candidates: GameCandidate[]; warnings: {path: string; message: string}[]; directoriesChecked: number; entriesChecked: number; truncated: boolean; nextCursor?: string | null;
 }
 export interface Plugin {
+  updatedAt: string | null;
   slug: string; name: string; gameName: string; version: string; description: string;
-  source: string; enabled: boolean; validated: boolean; installPath: string; coverUrl: string | null; mcpServerNames?: string[];
+  source: string; hasCloudEvidence: boolean; enabled: boolean; validated: boolean; installPath: string; coverUrl: string | null; mcpServerNames?: string[];
 }
 export interface TrashItem {
   id: string; original_path: string; trash_path: string; transaction_id: string | null;

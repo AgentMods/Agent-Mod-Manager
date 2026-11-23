@@ -671,3 +671,96 @@ fn management_uninstall_keeps_archive_and_delete_preserves_disk_and_audit_histor
         "uninstalled"
     );
 }
+
+#[test]
+fn management_record_removal_keeps_other_history_for_the_same_archive() {
+    use crate::mod_management::{remove, visible_installs, Target};
+    let (_tmp, engine, game) = legacy::fixture("stardew-valley");
+    let src = legacy::zip(&engine, &[("One/manifest.json", b"contents")]);
+    let item = import(&engine, &game, "One.zip", &src);
+    let req = auto(&game, &item, "smapi-mod", false);
+    let install_then_uninstall = || {
+        let preview = plan_library_install(&engine, &req).unwrap();
+        legacy::apply(&engine, &preview.plan);
+        let uninstall = install::plan_uninstall(&engine, &preview.install_id).unwrap();
+        legacy::apply(&engine, &uninstall);
+        (preview.install_id, uninstall.id)
+    };
+    let (first, _) = install_then_uninstall();
+    let (second, second_uninstall) = install_then_uninstall();
+    let history = visible_installs(&engine, &game.id).unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().all(|record| record.status == "uninstalled"));
+
+    remove(&engine, &game.id, &Target::Record(first)).unwrap();
+    let remaining = visible_installs(&engine, &game.id).unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].id, second);
+    let archives = mod_library::list_for_game(&engine.db, &game.id).unwrap();
+    assert_eq!(archives.len(), 1);
+    assert_eq!(archives[0].id, item.id);
+
+    remove(&engine, &game.id, &Target::Record(second.clone())).unwrap();
+    assert!(visible_installs(&engine, &game.id).unwrap().is_empty());
+    assert!(mod_library::list_for_game(&engine.db, &game.id)
+        .unwrap()
+        .is_empty());
+
+    engine.rollback_transaction(&second_uninstall).unwrap();
+    let restored = visible_installs(&engine, &game.id).unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].id, second);
+    assert_eq!(restored[0].status, "enabled");
+    assert_eq!(
+        mod_library::list_for_game(&engine.db, &game.id).unwrap()[0].id,
+        item.id
+    );
+}
+
+#[test]
+fn unreal_pak_manual_mapping_installs_and_uninstalls_under_nested_content_paks() {
+    let (temp, engine, _) = legacy::fixture("stardew-valley");
+    let game = no_adapter(&engine, temp.path());
+    let pak_bytes = b"UnrealPak fixture payload";
+    let pak = temp.path().join("Example.pak");
+    fs::write(&pak, pak_bytes).unwrap();
+    let entry = import(&engine, &game, "Example.pak", &pak);
+    let request = manual(
+        &game,
+        &entry,
+        LibrarySourceKind::SingleFile,
+        &entry.filename,
+        "Content/Paks/~mods/Example.pak",
+    );
+
+    let preview = plan_library_install(&engine, &request).unwrap();
+    assert_eq!(preview.mod_type, "manual");
+    assert_eq!(preview.plan.entries.len(), 1);
+    let destination = Path::new(&game.root_path).join("Content/Paks/~mods/Example.pak");
+    legacy::apply(&engine, &preview.plan);
+
+    assert_eq!(fs::read(&destination).unwrap(), pak_bytes);
+    let record = install::get_install(&engine, &preview.install_id).unwrap();
+    assert_eq!(record.status, "enabled");
+    assert_eq!(record.install_root, Path::new(&game.root_path));
+    assert_eq!(record.installed_files.len(), 1);
+
+    let uninstall = install::plan_uninstall(&engine, &preview.install_id).unwrap();
+    legacy::apply(&engine, &uninstall);
+    assert!(!destination.exists());
+    assert_eq!(
+        install::get_install(&engine, &preview.install_id)
+            .unwrap()
+            .status,
+        "uninstalled"
+    );
+
+    engine.rollback_transaction(&uninstall.id).unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), pak_bytes);
+    assert_eq!(
+        install::get_install(&engine, &preview.install_id)
+            .unwrap()
+            .status,
+        "enabled"
+    );
+}

@@ -20,7 +20,7 @@ function fields(value: unknown, schema: Record<string, Projection>): unknown {
 
 function fileOperation(value: unknown) {
   switch (record(value)?.op) {
-    case "copy": case "move": return fields(value, { src: path, dst: path });
+    case "copy": case "move": case "compress": case "extract": return fields(value, { src: path, dst: path });
     case "mkdir": case "write_text": return fields(value, { dst: path });
     default: return value;
   }

@@ -1,7 +1,55 @@
 # Agent Mod Manager implementation status
 
-Updated: 2026-11-22. The full project goal remains active. This is an
+Updated: 2026-11-23. The full project goal remains active. This is an
 implementation and verification snapshot, not a release-completion claim.
+
+**Per-conversation Agent game workspaces (2026-11-23, Windows).** The sidebar workspace
+selector (chat header on narrow screens) stages single or multiple registered games,
+dynamic all, or explicitly none. Schema v21 preserves previous game bindings and
+keeps an empty scope empty when the last selected game is removed. The next turn
+uses the saved selection; changing it does not alter the transcript, filesystem access,
+or approval policy. Active turns and archived chats cannot change scope. The frontend
+production build and 15 workspace-specific Playwright checks across three viewport
+sizes passed; the dark desktop and light narrow layouts were also inspected. The
+12 workspace-specific Rust tests passed, including migration, game removal,
+concurrent turn start, download classification and installation targeting.
+
+**Batch Mod actions (2026-11-23, Windows).** Game Details → Mod management has an
+opt-in selection mode for installing, uninstalling and removing Mods. Mixed selections
+skip ineligible rows; repeated archive targets are installed at most once per dispatch.
+Deletion previews the targets before submitting. Installed Mods follow their scoped
+Agent workflow and require both a removal receipt and list readback; inactive records,
+plans and unused archives use the existing desktop list-removal command. Other visible
+records tied to the same archive are retained when deleting a record.
+The frontend production build, 30 batch-action and 42 removal-tracking Playwright
+cases across three viewports, 32 desktop single-action/replacement regressions,
+and 15 Rust install-library tests passed. UI checks used mock IPC, not a live game.
+
+**Collapsible task conversations (2026-11-23, Windows).** Recent Agent chats group
+Mod installation, uninstallation, list removal and adapter authoring separately.
+Ordinary and pinned chats remain directly accessible. A group takes its newest
+chat's position; opening a chat reveals its group, and manual disclosure choices
+are remembered locally. A collapsed group still indicates running or waiting work.
+Schema v20 stores the original category and backfills recognizable historical
+operations once, without changing chat titles, messages or archive state. The
+frontend production build, 22 Rust history tests and 36 related Playwright cases
+across the three viewport projects passed.
+
+**Desktop plugin list actions (2026-11-23, Windows).** Catalog install and row-level
+removal passed 57 Rust catalog/workflow tests, including duplicate clicks, registry
+failure rollback, restart, and reinstall. Thirty Playwright cases across three
+viewport sizes covered the two lists, optional details, explicit game binding,
+retry behavior, and existing installed/draft timestamps. The frontend production
+build passed. The tests used local fixtures, not the live public catalog.
+
+**Mod download location (Windows, 2026-11-22).** The stock Playwright browser saves
+files to `downloads/Playwright` under the active storage directory. Schema v19
+updates unchanged legacy presets; moving storage rebases the stock output folder
+and expires its old launch consent. Custom output paths and files in the former
+system Downloads folder are left untouched. The four bundled uvx source presets
+set their own download-directory environment variable to `downloads/incoming`
+when launched. A real Chromium download from a loopback page landed in the stock
+managed directory; offline tests also cover relocation and filing a ZIP in `Mods`.
 
 **Managed Playwright browser (Windows, 2026-11-22).** The stock MCP no longer
 requires system Edge or Chrome. The packaged CLI downloaded Chromium into an
@@ -10,12 +58,53 @@ native MCP connection reused that build, opened a local fixture page and saved
 the expected file bytes in its configured output folder. No live mod site or
 account was used in this test.
 
+**Background installation switches.** In Game Details → Mod management, the
+status switch sends an Agent install, reinstall or uninstall for that exact
+archive or install record. Each pending switch is disabled independently.
+File-plan approvals and installation questions can be answered on Game Details;
+changing pages does not cancel the task. The switch reads back the native
+install list after the turn ends and checks the scoped tool receipt (including
+uninstall by rollback). A missing receipt or mismatched list state is not
+success; retrying a failed status read does not send a second install command.
+Removing a Mod from the management list remains a separate action.
+Frontend production build, 177 related Playwright cases across the three viewport
+projects, and all five offline Rust Mod-library Agent flow tests passed.
+
+**Single Mod management table (2026-11-22).** Game Details lists install records
+and still-uninstalled archives in one table. Archives are matched by artifact
+ID, not display name: installed packages do not get a duplicate archive row,
+and new downloads/imports remain available to install without leaving the tab.
+Uninstalling does not discard the archived package or its reinstall action.
+
 **Installed, uninstalled and removed Mods (2026-11-22).** Game details distinguishes
 uninstalling from removing list membership. The desktop can hide unused archives,
 uninstalled records, or individually cancelled previews. Deleting a deployed Mod
-runs its scoped Agent uninstall/rollback before the removal step. SQLite retains
+runs its scoped Agent uninstall/rollback before the removal step. Game Details
+uses the same permission selection as chat for install, uninstall and removal,
+including a choice made before leaving the composer. With no explicit choice,
+the new conversation inherits its normal backend policy. SQLite retains
 ownership and transaction history for restoration. Ordinary uninstall keeps both
 the record and its library entry.
+
+**Removal when all deployed files are already gone (2026-11-23).** On an explicit
+delete, a verified manifest of exclusively new, now-missing files can be removed
+from management without an uninstall or rollback. Approval is bound to the game,
+install and inspected state; execution rechecks the filesystem under the writer
+lock. Refreshing the list no longer resurrects the record or counts it as enabled.
+The original archive and file journal are kept. Partial loss, modified files,
+overwrites, shared ownership and replacement chains are not eligible.
+
+**Agent permission audit.** Chat, retry/edit, questionnaire follow-ups and Game
+Details use the same turn selection. The model receives the resolved mode and
+is told not to ask for duplicate execution consent; genuine choices still wait
+for the user. A historical turn without a recorded mode is not labelled Full
+Trust. Direct inbound MCP tools use only the host global mode, record it at
+start, and will not commit using automatic consent revoked during preparation.
+Managed Mod Inn download receipts also refresh the library after a Full Trust
+transfer, without relying on a manual approval event. Windows verification passed all 1,033
+non-ignored Rust library tests (15 ignored) and strict all-target Clippy. UI
+regressions cover per-turn inheritance, retry/replay, background status, real
+questions vs approvals, and the install/uninstall switches in Full Trust.
 
 **Game-classified Mod library and Agent installation (2026-11-22).** New downloads
 are filed under the active storage root's `Mods` folder. Each game category can
@@ -115,6 +204,21 @@ navigation button that was absent from the current UI.
 locations. Directory selection, single-game inspection and scan results share
 that dialog. Adding a game marks its row as managed and refreshes the library.
 Players can continue adding candidates or close the dialog and open a game card.
+
+**Cloud adapters during game discovery (2026-11-23).** The Library scan dialog
+and onboarding compare candidates locally against the anonymous manager-plugin
+catalog. A unique Steam App ID or exact normalized game name/alias can suggest
+an adapter; browsing the scan does not download or activate a package. Adding
+a matched game selects a specific plugin ID and release ID. The desktop checks
+the published files, re-probes the canonical directory against all enabled adapters,
+and commits the game binding alongside the journaled package installation. A
+failure to register rolls back the new package as well. Exact already-installed
+packages can be reused; disabled or differing local packages are never replaced.
+Absent/ambiguous catalog matches and offline use retain local registration. The
+separate opt-in web identification flow still does not authorize installation.
+Verification: production build passed; 40 focused Rust tests passed (one
+large-scan test ignored), and 72 Playwright scan/onboarding cases passed across
+the three configured viewport sizes.
 
 **Windows Rust test directories (2026-11-21).** The local and CI test launcher
 places each run under `src-tauri/target/test-tmp/` and removes its directory
@@ -260,6 +364,12 @@ Windows and Linux smoke scripts use the new identity for future package runs.
 - Trash moves/restores use the transaction engine. Manifest and DB metadata are
   recorded before mutation. Restored visibility is derived from committed
   restore transactions, so rollback restores visibility as well as files.
+- The desktop Trash list uses compact, expandable rows and paginates after
+  search/game filtering (10, 25 or 50 items per page). The header checkbox
+  selects only the current page; selection persists across pages and filters.
+  Empty Trash explicitly confirms a snapshot of all unrestored items across
+  games/pages, not just the filtered view. The preview is paginated and large
+  purges use batches within the existing desktop IPC limit.
 - Only `trash::purge_trash` permanently removes files. Turning on the confirmation switch
   enables the desktop dialog’s delete button. Clicking it sends the selected IDs
   and the required `PURGE_TRASH` confirmation over desktop-only IPC.
@@ -284,8 +394,8 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   requires exact staged source paths and hashes. If directory identity changes,
   cleanup does not delete the replacement. Staging referenced by a committed
   plan is kept for the transaction engine.
-- Game adapters are installed externally through the draft and reviewed deployment
-  workflow. Schema validation covers identity, versions, relative paths,
+- Game adapters can be installed directly from the desktop catalog. Authoring
+  and Agent imports retain the draft and reviewed deployment workflow. Schema validation covers identity, versions, relative paths,
   references and Skill frontmatter.
 - The adapter manifest provides optional `coverUrl` for the library and package
   details. Missing or unavailable covers fall back to the game placeholder.
@@ -365,7 +475,9 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   model in the composer leaves the saved default intact. Legacy single-level
   settings load as one enabled option.
 - The composer remembers the last model, reasoning level and permission policy
-  used to send a turn. They are stored in the SQLite `settings` table under
+  used to send a turn. The running chat shows the permission recorded at the
+  start of that turn, not the selection for the next turn. The composer
+  preferences are stored in the SQLite `settings` table under
   `composer_preferences` (separate from `AppSettings`, so saving Settings never
   overwrites them) and restored on the next launch. A removed model or a level
   the model no longer enables falls back to the saved default. SQLite lives in
@@ -388,6 +500,9 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   Confirmation pattern. The card shows the prepared request or file plan before
   the user approves or rejects it. After a decision the tool trace shows the
   outcome. A header shortcut opens a chat with a pending background approval.
+- The desktop sends a native Tauri notification when a chat task completes
+  successfully, asks for an answer, or pauses for tool approval. Replaying
+  history does not resend notices. Notification text contains no chat or tool data.
 - Agent `ask_user` requests open a questionnaire in the bottom message composer.
   Each step accepts a single choice, multiple choices (`multiSelect: true`), or
   free text. Players can select preset options alongside a custom answer,
@@ -433,6 +548,20 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   Planning fingerprints the inline text without writing the destination. A plan
   with `write_text` requires review under `auto_approve`, even for registered
   game paths. Inbound MCP and other generic planners reject this operation.
+- The desktop Agent also accepts `compress` (`src`: ordinary folder, `dst`: new
+  `.zip` or `.7z`) and `extract` (`src`: supported archive, `dst`: new folder)
+  in `plan_file_ops`. RAR4/5 is read-only: listing and extraction accept
+  only unencrypted, single-volume RAR archives. The local Mod import picker
+  accepts `.rar`; compression does not create RAR archives.
+  Compression preserves the source folder name as the archive
+  root; extraction preserves the archive layout. Both fingerprint the source,
+  leave it unchanged, and require review under `auto_approve`, including within
+  registered game roots. A validation failure never publishes a target. The
+  Agent rejects protected paths and archive members (including `.env`, `.env.*`,
+  `private` and `.amm-retained`), linked source files and ambiguous member names.
+  Rollback retains the generated output only if its identity and content still
+  match the journal. The existing Agent approval UI and transaction history are
+  reused; inbound MCP and other generic planners do not support these operations.
 - Adapter-driven install previews and installed-file manifests. JAR/ZIP payloads
   declared single-file stay intact; SMAPI directories retain their manifests;
   declared Data prefixes are stripped only after inspection. FOMOD archives now
@@ -493,7 +622,9 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   capped at 64 KiB and redact the configured API key before persistence.
 - Explicit permission matrix: request_approval/auto_approve/full_trust, global,
   conversation and turn overrides; interactive approval responses verify their
-  conversation. Reads and file writes have separate effects; a write outside
+  conversation. Full Trust executes permitted tools without creating a manual
+  approval, including Mod receipts, uncataloged downloads and Agent plugin
+  publication. It still waits for actual answers to `ask_user` and rejects forbidden tools. Reads and file writes have separate effects; a write outside
   the app data root and registered game roots is not a game write and still
   needs review under `auto_approve`. Plans remain fingerprinted and writes use
   the same durable journal, backups, rollback, and recovery. The desktop
@@ -590,8 +721,11 @@ Windows and Linux smoke scripts use the new identity for future package runs.
 - Desktop download commands emit progress events, allow cancellation and list
   completed artifacts. Agent download completion uses the same artifact catalog.
 - The Agent's separate `download_web_mod` tool fills the uncataloged direct-link
-  fallback: explicit approval in all permission modes, public HTTPS with
+  fallback: approval except in Full Trust, public HTTPS with
   independently validated redirects, disk-space admission and archive signature check.
+  The direct-link, signed MCP and completed-download receipt gates recognize
+  `.rar` and require a complete RAR4 or RAR5 signature before passing it on.
+  The signature check is not a full archive validation.
   Known-length downloads and extracted bytes are admitted against current free
   space with headroom; unannounced response bodies use at most half their starting
   space budget. Cancelled downloads retain only usable, strong-ETag fragments.
@@ -607,6 +741,11 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   block's LZMA-family decoders); unusual codec stacks and oversized dictionaries
   are not retried without those guards. TAR.xz and sparse TAR remain unsupported.
   The bounded 7z reader requires Rust 1.93 or newer.
+  Folder extraction uses the bundled official 7-Zip CLI after that read-only
+  preflight. It operates on a private snapshot of the already-open file and
+  streams to stdout, never to user-controlled paths. The manager creates safe
+  staging entries, checks their sizes and SHA-256 against the preflight, and
+  discards the stage on cancellation, a decoder error or a content mismatch.
   It retains rejected bytes and records valid bytes as unverified `web` artifacts
   without catalog identifiers. It never installs and is not exported by inbound
   MCP. Completed-download promotion uses checked exclusive renames on native
@@ -655,7 +794,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   CurseForge, GameBanana, 3DM and Nexus Mods. `system-mod-download` uses the
   connected source MCPs for project and file discovery and download, including
   Mod 客栈. The official Mod 客栈 attachment tool requests a signed link and transfers a selected
-  file into managed downloads under a single approval. When a source cannot
+  file into managed downloads as one operation under the same approval policy. When a source cannot
   deliver the file, the Agent uses the connected Playwright MCP to download it
   from the official page. Schema v12 gives the stock Playwright browser a
   user-writable output directory and absolute download receipts.
@@ -727,8 +866,11 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   resolve/download, install/list/uninstall/rollback and diagnosis/logs. The complete
   registry also includes the bounded web search and reviewed plugin-publication
   operations described above.
-- The plugin center, library and Agent can discover anonymous Mod客栈 catalog releases. A selected release's exact two source files pass the local validator and reviewed draft/install workflow. Library binding retains the registered game's marker checks.
-- Publishing from a draft or installed external plugin generates a review with a model-written title, summary, description, tags and PNG cover. The authenticated author's complete plugin list determines first release versus update by exact slug. The final click sends the reviewed release copies; the local adapter and installation rules stay intact. Missing read permission, ambiguous ownership or a changed target blocks the write. The public catalog reads cover artwork lazily from the release Skill. See [the publication contract](plugin-publication.md).
+- The plugin center, library and Agent can discover anonymous Mod客栈 catalog releases. The desktop card’s **安装** action validates the selected immutable release and installs its two files in one journaled transaction, without importing a draft. A matching installed slug is shown instead of offering to overwrite it. **已安装 → 移除** removes an unbound package and its Skill/tool registrations while retaining a recoverable backup. Neither action changes an installed Mod. Agent imports retain the reviewed draft workflow, and library binding remains explicit and checks the game’s markers. The cloud catalog shows releases from different games side by side, with the game cover on the left. The grid switches to one column in narrow windows and the library picker.
+- Publishing from a draft or installed external plugin generates a review with a model-written title, summary, description and supplementary tags. The source manifest supplies the complete game name as the first publication tag and the original game cover. The authenticated author's complete plugin list determines first release versus update by exact slug. The final click sends the reviewed release copies; the local adapter and installation rules stay intact. Missing read permission, ambiguous ownership or a changed target blocks the write. The public catalog reads the validated game cover URL from the release manifest; missing images have a placeholder, and old pixel art is not displayed. A valid receipt or automatic read-back leads directly to **发布成功**; reopening an interrupted manager-plugin record checks it without sending another publication. See [the publication contract](plugin-publication.md).
+- Already-published adapters update the current creator's plugin ID, not a historical slug match. Receipts for that ID prevent version reuse after a cloud rollback. A separately approved, strictly newer release can proceed past an older uncertain write when the verified cloud version has caught up; the old record is not replayed or marked successful.
+- The installed adapter list and details show when the current version was deployed locally; refreshing or toggling a package does not change that time. The draft list keeps creation time separate from the latest saved change to `adapter.json` or `SKILL.md`. Both lists use local time and show a dash when no reliable timestamp is available.
+- The installed adapter list and details show **云端插件** for a confirmed local publication receipt or an exact public catalog slug match. Successful publication and reconciliation refresh the label without changing installation provenance, version or enabled state.
 - The frontend has eight lazy-loaded views (including game detail), light/dark
   themes, Skill management, plugin draft/validate/install/enable controls, and
   publication preview/history. These implemented surfaces are not evidence of

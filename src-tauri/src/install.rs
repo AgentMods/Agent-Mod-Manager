@@ -137,8 +137,7 @@ pub struct InstallFileInspection {
 
 /// Read-only coordination advice for an install that overlaps another
 /// deployment or participates in a replacement chain. The suggested action
-/// never authorizes a write; callers must still create/approve the existing
-/// rollback or uninstall transaction and let its ownership checks run again.
+/// never authorizes a write; each operation must recheck its own preconditions.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallReconciliation {
@@ -833,26 +832,37 @@ pub(crate) const INSTALL_STATE: &str = "CASE
         AND EXISTS(SELECT 1 FROM trash_items t WHERE t.transaction_id=f.id AND EXISTS(SELECT 1 FROM trash_restore_links r JOIN file_transactions rf ON rf.id=r.transaction_id WHERE r.item_id=t.id AND rf.status='committed'))) THEN 'partially_restored'
       WHEN EXISTS(SELECT 1 FROM install_transactions a JOIN file_transactions f ON f.id=a.transaction_id WHERE a.install_id=installs.id AND a.action='uninstall' AND f.status='committed'
         AND EXISTS(SELECT 1 FROM trash_items t WHERE t.transaction_id=f.id AND NOT EXISTS(SELECT 1 FROM trash_restore_links r JOIN file_transactions rf ON rf.id=r.transaction_id WHERE r.item_id=t.id AND rf.status='committed'))) THEN 'uninstalled'
+      WHEN EXISTS(SELECT 1 FROM install_missing_removals m WHERE m.install_id=installs.id) THEN 'removed_missing'
       ELSE 'enabled' END";
+
+pub(crate) const FORGET_MISSING_FILES: &str = "forget_missing_files";
+
+pub(crate) fn effective_install_state() -> String {
+    format!("CASE WHEN EXISTS(SELECT 1 FROM install_transactions a WHERE a.install_id=installs.id) THEN ({INSTALL_STATE}) ELSE status END")
+}
 
 /// Derived from durable transaction states, not a success flag set by the UI.
 /// Safe after both normal execution and startup journal recovery.
 pub fn reconcile(db: &Db) -> AppResult<()> {
     let mut conn = db.conn();
     let tx = conn.transaction()?;
-    tx.execute_batch(&format!("UPDATE installs SET status={INSTALL_STATE}
+    reconcile_from(&tx)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(crate) fn reconcile_from(conn: &rusqlite::Connection) -> AppResult<()> {
+    conn.execute_batch(&format!("UPDATE installs SET status={INSTALL_STATE}
       WHERE EXISTS(SELECT 1 FROM install_transactions a WHERE a.install_id=installs.id);
       UPDATE games SET installed_mod_count=(SELECT count(*) FROM installs WHERE game_id=games.id AND status IN ('enabled','partially_restored')),
         enabled_mod_count=(SELECT count(*) FROM installs WHERE game_id=games.id AND status='enabled');"))?;
-    crate::mod_management::restore_membership(&tx)?;
-    tx.commit()?;
-    Ok(())
+    crate::mod_management::restore_membership(conn)
 }
 
 fn read_installs(engine: &FileEngine, game_id: &str) -> AppResult<Vec<InstalledMod>> {
     let conn = engine.db.conn();
     let mut stmt = conn.prepare(&format!(
-        "SELECT id,game_id,name,version,source,CASE WHEN EXISTS(SELECT 1 FROM install_transactions state_tx WHERE state_tx.install_id=installs.id) THEN ({INSTALL_STATE}) ELSE status END AS status,install_root,files_json,metadata_json,installed_at FROM installs WHERE game_id=?1 ORDER BY installed_at DESC,rowid DESC"
+        "SELECT id,game_id,name,version,source,{} AS status,install_root,files_json,metadata_json,installed_at FROM installs WHERE game_id=?1 ORDER BY installed_at DESC,rowid DESC", effective_install_state()
     ))?;
     let rows = stmt.query_map([game_id], |r| {
         Ok((
@@ -1076,6 +1086,14 @@ fn reconciliation(
     {
         recommended_action = "safe_uninstall".into();
         reasons.push("所有文件仍与安装清单一致，且没有共享路径".into());
+    } else if !files.is_empty() && files.iter().all(|file| file.state == "missing") {
+        match verify_missing_manifest(engine, installed) {
+            Ok(()) => {
+                recommended_action = FORGET_MISSING_FILES.into();
+                reasons.push("安装清单中的文件均已不存在，没有需要恢复的原文件。若用户明确要求删除，可仅移除管理记录，无需卸载或回滚".into());
+            }
+            Err(err) => reasons.push(format!("文件均已缺失，但不能安全移除记录：{err}")),
+        }
     } else if files.iter().any(|file| file.state == "modified") {
         reasons.push("至少一个文件在安装后发生修改".into());
     } else if files.iter().any(|file| file.state == "missing") {
@@ -1225,6 +1243,53 @@ fn uninstall_sources(
     }
     replacement::verify_ownership(engine, &owned, (&installed.id, None), None)?;
     Ok(files)
+}
+
+// The absence of every path is not sufficient: confirm that this game actually
+// deployed this complete, exclusively owned manifest without replacing anything.
+fn verify_missing_manifest(engine: &FileEngine, installed: &InstalledMod) -> AppResult<()> {
+    let mut sources = uninstall_sources(engine, installed)?;
+    let transaction_id: String = engine
+        .db
+        .conn()
+        .query_row(
+            "SELECT a.transaction_id FROM install_transactions a JOIN file_transactions f ON f.id=a.transaction_id
+             WHERE a.install_id=?1 AND a.action='install'
+             GROUP BY a.install_id HAVING count(*)=1 AND f.status='committed' AND f.game_id=?2",
+            params![installed.id, installed.game_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::Conflict("无法核对此游戏唯一的已提交安装事务".into()))?;
+    let unsettled: bool = engine.db.conn().query_row(
+        "SELECT EXISTS(SELECT 1 FROM file_transactions WHERE status IN ('applying','rolling_back','recovery_failed'))
+         OR EXISTS(SELECT 1 FROM install_transactions a JOIN file_transactions f ON a.transaction_id=f.id
+                   WHERE a.install_id=?1 AND a.action='uninstall' AND f.status='committed')",
+        [&installed.id], |r| r.get(0),
+    )?;
+    if unsettled {
+        return Err(AppError::Conflict(
+            "请先核对文件事务及回收站恢复记录".into(),
+        ));
+    }
+    let mismatch = || AppError::Conflict("原安装事务与独占新增文件清单不符".into());
+    let plan = engine.get_plan(&transaction_id)?;
+    if plan.id != transaction_id {
+        return Err(mismatch());
+    }
+    for entry in plan.entries {
+        let FileOp::Copy { dst, .. } = entry.operation else {
+            return Err(mismatch());
+        };
+        let expected = sources.remove(&dst).ok_or_else(mismatch)?;
+        if entry.before.is_some() || entry.source.as_ref() != Some(&expected) {
+            return Err(mismatch());
+        }
+    }
+    if !sources.is_empty() {
+        return Err(mismatch());
+    }
+    Ok(())
 }
 
 fn validate_uninstall_moves(

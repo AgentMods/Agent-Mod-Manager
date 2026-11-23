@@ -1,7 +1,8 @@
-import { memo, useId, useRef, useState } from "react";
+import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { ArchiveIcon, CircleCheckIcon, CircleHelpIcon, EllipsisIcon, LoaderCircleIcon, SquarePenIcon, PencilIcon, PinIcon, PinOffIcon, ShieldIcon, Trash2Icon } from "lucide-react";
+import { ArchiveIcon, ChevronRightIcon, CircleCheckIcon, CircleHelpIcon, EllipsisIcon, LoaderCircleIcon, SquarePenIcon, PencilIcon, PinIcon, PinOffIcon, ShieldIcon, Trash2Icon } from "lucide-react";
 import { api } from "@/lib/api";
+import { conversationCategoryLabels, groupConversations, type ConversationGroup } from "@/lib/conversation-groups";
 import { type AgentConversationStatus, useAgentConversationStatuses } from "@/lib/agent-conversation-status";
 import { useUI } from "@/lib/store";
 import type { Conversation } from "@/lib/types";
@@ -12,6 +13,7 @@ import {
   AlertDialogHeader, AlertDialogTitle,
 } from "./ui/alert-dialog";
 import { Button } from "./ui/button";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "./ui/collapsible";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "./ui/dialog";
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
@@ -50,6 +52,54 @@ function ConversationStatus({ id, status }: { id: string; status: AgentConversat
     {status === "running" && <span aria-hidden="true" className="absolute size-3 rounded-full border-[1.5px] border-current opacity-25 motion-safe:animate-soft-ping" />}
     <Icon aria-hidden="true" className={cn("size-3.5", status === "running" && "motion-safe:animate-spin")} />
   </span>;
+}
+
+function CategoryDisclosure({ group, selectedId, statuses, renderRow }: {
+  group: ConversationGroup;
+  selectedId: string | null;
+  statuses: ReturnType<typeof useAgentConversationStatuses>;
+  renderRow: (conversation: Conversation, index: number) => React.ReactNode;
+}) {
+  const { category, rows } = group;
+  const label = conversationCategoryLabels[category];
+  const descriptionId = useId();
+  const selectedMember = rows.some(row => row.id === selectedId) ? selectedId : null;
+  const storageKey = `amm.chat.group.${category}.expanded`;
+  const [open, setOpen] = useState(() => {
+    if (selectedMember) return true;
+    try { return localStorage.getItem(storageKey) === "true"; }
+    catch { return false; }
+  });
+  // Reveal a chat opened from another page, including when the list arrives later.
+  useEffect(() => { if (selectedMember) setOpen(true); }, [selectedMember]);
+  function toggle(next: boolean) {
+    setOpen(next);
+    try { localStorage.setItem(storageKey, String(next)); }
+    catch { /* Disclosure still works when WebView storage is unavailable. */ }
+  }
+  const activeStatus = !open && (["waiting-approval", "waiting-answer", "running"] as const)
+    .find(status => rows.some(row => statuses[row.id]?.status === status));
+
+  return <Collapsible asChild open={open} onOpenChange={toggle}>
+    <li className="min-w-0">
+      <CollapsibleTrigger asChild>
+        <Button type="button" variant="ghost" size="sm" aria-label={label} aria-describedby={descriptionId}
+          className={cn("w-full justify-start gap-2 bg-sidebar-accent/35", !open && selectedMember && "bg-secondary")}>
+          <ChevronRightIcon aria-hidden="true" className={cn("size-3.5 text-muted-foreground motion-safe:transition-transform", open && "rotate-90")} />
+          <span>{label}</span>
+          <span id={descriptionId} className="ms-auto flex items-center gap-2 text-xs text-muted-foreground tabular-nums">
+            {activeStatus && <ConversationStatus id={`${descriptionId}-status`} status={activeStatus} />}
+            {rows.length}<span className="sr-only">个对话{!open && selectedMember ? "，含当前对话" : ""}</span>
+          </span>
+        </Button>
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <ul aria-label={label} className="my-1 ms-4 flex gap-1 overflow-x-auto border-s ps-1.5 md:flex-col md:overflow-visible">
+          {open && rows.map(renderRow)}
+        </ul>
+      </CollapsibleContent>
+    </li>
+  </Collapsible>;
 }
 
 export const AgentConversationList = memo(function AgentConversationList({ conversations, selectedId, disabled, onSelect }: Props) {
@@ -112,66 +162,75 @@ export const AgentConversationList = memo(function AgentConversationList({ conve
     }
   }
 
-  const pinned = conversations.filter((conversation) => conversation.pinned);
-  const recent = conversations.filter((conversation) => !conversation.pinned);
+  const { pinned, recent } = useMemo(() => groupConversations(conversations), [conversations]);
 
-  function renderGroup(label: string, rows: Conversation[]) {
-    return <div className="flex flex-col gap-2">
+  function renderConversation(conversation: Conversation, index: number) {
+    // The group already names the operation; leave more space for the Mod name.
+    const label = !conversation.pinned && conversation.category ? conversationCategoryLabels[conversation.category] : null;
+    const title = conversation.title;
+    const visibleTitle = label && (title.startsWith(label + "：") || title.startsWith(label + ":"))
+      ? title.slice(label.length + 1).trim() || title : title;
+    const current = conversation.id === selectedId;
+    const state = statuses[conversation.id];
+    const statusId = `${titleId}-status-${conversation.id}`;
+    const PinActionIcon = conversation.pinned ? PinOffIcon : PinIcon;
+    return <li key={conversation.id}
+      className={cn("flex max-w-full min-w-0 shrink-0 items-center rounded-md pr-1 transition-colors duration-200 motion-safe:animate-slide-in-left md:w-full", current && "bg-secondary")} style={stagger(index, 30)}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button type="button" variant="ghost" size="sm" disabled={disabled || pending} aria-current={current || undefined}
+            aria-label={conversation.title} aria-describedby={state ? statusId : undefined} onClick={() => onSelect(conversation.id)}
+            className="min-w-0 flex-1 justify-start text-left">
+            {conversation.pinned && <PinIcon aria-hidden="true" className="text-muted-foreground" />}
+            <span className="min-w-0 truncate" title={title}>{visibleTitle}</span>
+            {state && <ConversationStatus id={statusId} status={state.status} />}
+          </Button>
+        </TooltipTrigger>
+        {state && <TooltipContent side="top" align="end" sideOffset={4}>{statusIndicators[state.status].text}</TooltipContent>}
+      </Tooltip>
+      <DropdownMenu modal={false}>
+        <DropdownMenuTrigger asChild>
+          <Button type="button" size="icon-xs" variant="ghost" className="shrink-0 text-muted-foreground"
+            aria-label={`对话操作：${conversation.title}`} disabled={disabled || pending}
+            onPointerDown={(event) => { opener.current = event.currentTarget; }}
+            onFocus={(event) => { opener.current = event.currentTarget; }}>
+            <EllipsisIcon aria-hidden="true" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="start" side="right" collisionPadding={8} onCloseAutoFocus={(event) => {
+          if (dialog) event.preventDefault();
+        }}>
+          <DropdownMenuGroup>
+            <DropdownMenuItem onSelect={() => launch("rename", conversation)}><PencilIcon />重命名</DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => void apply("pin", conversation)}>
+              <PinActionIcon />{conversation.pinned ? "取消置顶" : "置顶"}
+            </DropdownMenuItem>
+            <DropdownMenuItem disabled={state?.active} onSelect={() => void apply("archive", conversation)}><ArchiveIcon />归档</DropdownMenuItem>
+          </DropdownMenuGroup>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem variant="destructive" disabled={state?.active} onSelect={() => launch("delete", conversation)}><Trash2Icon />删除</DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </li>;
+  }
+
+  function renderSection(label: string, entries: (Conversation | ConversationGroup)[], count: number) {
+    const grouped = entries.some(entry => "rows" in entry);
+    return <div className="flex min-w-0 flex-col gap-2">
       <div className="flex items-center justify-between px-2 text-xs font-medium text-muted-foreground">
-        <span>{label}</span><span className="tabular-nums">{rows.length}</span>
+        <span>{label}</span><span className="tabular-nums">{count}</span>
       </div>
-      <ul aria-label={label} className="flex gap-1 overflow-x-auto md:flex-col md:overflow-visible">
-        {rows.map((conversation, index) => {
-          const current = conversation.id === selectedId;
-          const state = statuses[conversation.id];
-          const statusId = `${titleId}-status-${conversation.id}`;
-          const PinActionIcon = conversation.pinned ? PinOffIcon : PinIcon;
-          return <li key={conversation.id}
-            className={cn("flex max-w-full min-w-0 shrink-0 items-center rounded-md pr-1 transition-colors duration-200 motion-safe:animate-slide-in-left md:w-full", current && "bg-secondary")} style={stagger(index, 30)}>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button type="button" variant="ghost" size="sm" disabled={disabled || pending} aria-current={current || undefined}
-                  aria-label={conversation.title} aria-describedby={state ? statusId : undefined} onClick={() => onSelect(conversation.id)}
-                  className="min-w-0 flex-1 justify-start text-left">
-                  {conversation.pinned && <PinIcon aria-hidden="true" className="text-muted-foreground" />}
-                  <span className="min-w-0 truncate" title={conversation.title}>{conversation.title}</span>
-                  {state && <ConversationStatus id={statusId} status={state.status} />}
-                </Button>
-              </TooltipTrigger>
-              {state && <TooltipContent side="top" align="end" sideOffset={4}>{statusIndicators[state.status].text}</TooltipContent>}
-            </Tooltip>
-            <DropdownMenu modal={false}>
-              <DropdownMenuTrigger asChild>
-                <Button type="button" size="icon-xs" variant="ghost" className="shrink-0 text-muted-foreground"
-                  aria-label={`对话操作：${conversation.title}`} disabled={disabled || pending}
-                  onPointerDown={(event) => { opener.current = event.currentTarget; }}
-                  onFocus={(event) => { opener.current = event.currentTarget; }}>
-                  <EllipsisIcon aria-hidden="true" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="start" side="right" collisionPadding={8} onCloseAutoFocus={(event) => {
-                if (dialog) event.preventDefault();
-              }}>
-                <DropdownMenuGroup>
-                  <DropdownMenuItem onSelect={() => launch("rename", conversation)}><PencilIcon />重命名</DropdownMenuItem>
-                  <DropdownMenuItem onSelect={() => void apply("pin", conversation)}>
-                    <PinActionIcon />{conversation.pinned ? "取消置顶" : "置顶"}
-                  </DropdownMenuItem>
-                  <DropdownMenuItem disabled={state?.active} onSelect={() => void apply("archive", conversation)}><ArchiveIcon />归档</DropdownMenuItem>
-                </DropdownMenuGroup>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem variant="destructive" disabled={state?.active} onSelect={() => launch("delete", conversation)}><Trash2Icon />删除</DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </li>;
-        })}
+      <ul aria-label={label} className={cn("flex gap-1 md:flex-col", grouped ? "flex-col" : "overflow-x-auto md:overflow-visible")}>
+        {entries.map((entry, index) => "rows" in entry
+          ? <CategoryDisclosure key={entry.category} group={entry} selectedId={selectedId} statuses={statuses} renderRow={renderConversation} />
+          : renderConversation(entry, index))}
       </ul>
     </div>;
   }
 
   return <div ref={list} tabIndex={-1} className="flex flex-col gap-3 outline-none">
-    {pinned.length > 0 && renderGroup("置顶对话", pinned)}
-    {(recent.length > 0 || !pinned.length) && renderGroup("最近对话", recent)}
+    {pinned.length > 0 && renderSection("置顶对话", pinned, pinned.length)}
+    {(recent.length > 0 || !pinned.length) && renderSection("最近对话", recent, conversations.length - pinned.length)}
     {!conversations.length && <p className="px-2 text-xs text-muted-foreground">还没有已保存的对话</p>}
     {!dialog && <ErrorState error={error} />}
     <Dialog open={dialog?.action === "rename"} onOpenChange={closeDialog}>

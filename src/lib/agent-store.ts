@@ -194,7 +194,7 @@ export function subscribeAgentToolResults(onResults: (results: AgentEvent[]) => 
       if (before === events) continue;
       const start = latestTurnStart(events);
       // Opening a finished conversation replays history, not new tool results.
-      if (!start || (!watched.has(id) && !activeTurn(events))) continue;
+      if (!start || (!watched.has(id) && !activeTurnStart(events))) continue;
       for (let i = lowerBound(events, start.seq); i < events.length; i++) {
         const event = events[i];
         if (event.kind === "tool-result" && event.turnId === start.turnId &&
@@ -233,6 +233,18 @@ export function ensureAgentListeners() {
 // A later live sequence must not hide an earlier event lost during reconnect.
 const cursors = new Map<string, number>();
 const replaying = new Map<string, Promise<void>>();
+const replaySubscribers = new Set<(conversationId: string) => void>();
+
+export function subscribeAgentReplays(listener: (conversationId: string) => void) {
+  replaySubscribers.add(listener);
+  return () => { replaySubscribers.delete(listener); };
+}
+
+/** Only events covered by native replay, including late events filled in before a live done. */
+export function getReplayedAgentMilestones(conversationId: string) {
+  const events = useAgent.getState().milestones[conversationId] ?? [];
+  return events.slice(0, lowerBound(events, (cursors.get(conversationId) ?? 0) + 1));
+}
 export function replayConversation(id: string, { afterPending = false } = {}): Promise<void> {
   const existing = replaying.get(id);
   if (existing) {
@@ -251,7 +263,9 @@ export function replayConversation(id: string, { afterPending = false } = {}): P
       cursors.set(id, next);
       if (events.length < 2000) return;
     }
-  })().finally(() => replaying.delete(id));
+  })().then(() => {
+    for (const subscriber of replaySubscribers) subscriber(id);
+  }).finally(() => replaying.delete(id));
   replaying.set(id, replay);
   return replay;
 }
@@ -308,10 +322,10 @@ function latestTurnStart(events: AgentEvent[]) {
   }
 }
 
-export function activeTurn(events: AgentEvent[]) {
+export function activeTurnStart(events: AgentEvent[]) {
   const latest = latestTurnStart(events);
   if (!latest || events.some((event) => event.turnId === latest.turnId && event.kind === "done")) return null;
-  return latest.turnId;
+  return latest;
 }
 
 export function isQuestionRequest(event: AgentEvent) {

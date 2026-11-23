@@ -1,20 +1,27 @@
 import type { PublicationRecord } from '../../src/components/PluginPublications';
 import type { TrashItem } from '../../src/lib/types';
 
+export const GAME_COVER_URL = 'https://covers.example.org/minecraft-java.jpg';
+export const GAME_COVER_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jZQAAAABJRU5ErkJggg==';
+export const GAME_COVER_BYTES = Buffer.from(GAME_COVER_BASE64, 'base64');
+
 type LegacyFixtureState = 'prepared' | 'unknown' | 'awaitingScan' | 'uploadReady' | 'completed';
 type FixtureControls = {
-  outcome: 'completed' | 'hidden' | 'unknown';
+  outcome: 'completed' | 'completed_error' | 'hidden' | 'unknown' | 'unknown_error';
   reconciliation: 'unconfirmed' | 'verified';
   listDenied: boolean;
   exposeCatalog: boolean;
+  catalogUnavailable: boolean;
+  catalogEntrySlug: string | null;
   matched: boolean;
   ambiguous: boolean;
-  invalidCover: boolean;
+  missingCover: boolean;
   agentDraftId: string | null;
   readonly recycledDrafts: TrashItem[];
-  holdNext(command: 'prepare_auto_manager_publication' | 'publish_manager_publication'): void;
+  holdNext(command: 'prepare_auto_manager_publication' | 'publish_manager_publication' | 'reconcile_manager_publication'): void;
   resume(): void;
   seedManagerV1(count: number, state: 'intended' | 'unknown'): Promise<void>;
+  seedLegacyCoverIntent(): Promise<void>;
   legacyState: LegacyFixtureState | null;
   handles(command: string): boolean;
   invoke(command: string, args: Record<string, any>): Promise<unknown>;
@@ -25,10 +32,11 @@ declare global {
 }
 
 // Installed via page.addInitScript. Keep the browser callback self-contained.
-export function installPublicationHandlers() {
+export function installPublicationHandlers({coverUrl, legacyCoverPng}: {coverUrl: string; legacyCoverPng: string}) {
   if (window.__publicationFixture) return;
   const now = '2026-11-21T00:00:00Z';
-  const adapter = '{\r\n  "slug": "fixture-game", "name": "测试游戏", "version": "1.1.0"\r\n}\r\n';
+  const adapter = `{\r\n  "slug": "fixture-game", "name": "测试游戏", "version": "1.1.0", "coverUrl": "${coverUrl}"\r\n}\r\n`;
+  const adapterWithoutCover = '{\r\n  "slug": "fixture-game", "name": "测试游戏", "version": "1.1.0"\r\n}\r\n';
   const skill = '---\nname: fixture-game\ndescription: 公开测试\n---\nReview <em>before</em> installing.\n';
   async function digestBytes(text: string) {
     const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -38,9 +46,10 @@ export function installPublicationHandlers() {
     return {name, text, size: new TextEncoder().encode(text).length, sha256: await digestBytes(text)};
   }
   const draftFiles = Promise.all([makeFile('adapter.json', adapter), makeFile('SKILL.md', skill)]);
+  const noCoverDraftFiles = Promise.all([makeFile('adapter.json', adapterWithoutCover), makeFile('SKILL.md', skill)]);
   const installedSlug = 'minecraft-java';
   const installedName = 'Minecraft Java Edition';
-  const installedAdapter = JSON.stringify({slug: installedSlug, name: installedName, version: '1.0.0'}, null, 2) + '\n';
+  const installedAdapter = JSON.stringify({slug: installedSlug, name: installedName, version: '1.0.0', coverUrl}, null, 2) + '\n';
   const installedFiles = Promise.all([makeFile('adapter.json', installedAdapter), makeFile('SKILL.md', '---\nname: minecraft-java\ndescription: Minecraft 模组安装指引\n---\n已审核的安装指引。\n')]);
   const destination = 'https://www.glossmod.com/api/v1/mcp';
   const records: PublicationRecord[] = [];
@@ -50,6 +59,7 @@ export function installPublicationHandlers() {
     record.remote = {...ownPlugin, id: record.preview.target.kind === 'release' ? record.preview.target.pluginId : 41,
       slug: record.preview.slug, name: record.preview.slug === installedSlug ? installedName : ownPlugin.name,
       releaseId: 71, version: record.preview.version, tags: record.preview.tags, hidden, reason: hidden ? '测试下架原因' : ''};
+    (window as any).__AMM_TEST__.cloudPluginSlugs.add(record.preview.slug);
     recycleDraft(record.preview.source);
   }
   const legacySource = {kind: 'draft', draftId: 'draft-fixture', writeTransactionId: 'txn-draft-fixture'} as const;
@@ -72,19 +82,10 @@ export function installPublicationHandlers() {
     waits.delete(command);
     if (wait) await wait;
   }
-  const canvas = document.createElement('canvas');
-  canvas.width = 320; canvas.height = 180;
-  const ctx = canvas.getContext('2d')!;
-  const gradient = ctx.createLinearGradient(0, 0, 320, 180);
-  gradient.addColorStop(0, '#244953'); gradient.addColorStop(0.55, '#122e38'); gradient.addColorStop(1, '#8a915c');
-  ctx.fillStyle = gradient; ctx.fillRect(0, 0, 320, 180);
-  ctx.translate(160, 90); ctx.rotate(Math.PI / 4); ctx.strokeStyle = '#e6c26e'; ctx.lineWidth = 4;
-  ctx.strokeRect(-12, -12, 24, 24); ctx.fillStyle = '#dce8e9'; ctx.fillRect(-6, -6, 12, 12);
-  const png = canvas.toDataURL('image/png').split(',')[1];
   const commands = new Set(['list_manager_publications', 'get_manager_publication', 'prepare_auto_manager_publication', 'publish_manager_publication', 'reconcile_manager_publication', 'list_my_manager_plugins']);
   const fixture: FixtureControls = {
-    outcome: 'completed', reconciliation: 'verified', listDenied: false, exposeCatalog: false, legacyState: null,
-    matched: false, ambiguous: false, invalidCover: false, agentDraftId: null, recycledDrafts: [],
+    outcome: 'completed', reconciliation: 'verified', listDenied: false, exposeCatalog: false, catalogUnavailable: false, catalogEntrySlug: null, legacyState: null,
+    matched: false, ambiguous: false, missingCover: false, agentDraftId: null, recycledDrafts: [],
     holdNext(command) { waits.set(command, new Promise<void>(resolve => { release = resolve; })); },
     resume() { release(); },
     async seedManagerV1(count, state) {
@@ -97,13 +98,24 @@ export function installPublicationHandlers() {
             slug, tags: ['旧标签'], version: '0.9.0', digest, files, destination}});
       }
     },
+    async seedLegacyCoverIntent() {
+      const files = await draftFiles;
+      const listing = {title: '旧封面预览', summary: '历史发布摘要', description: '历史发布描述。', tags: ['旧标签'], coverPng: legacyCoverPng};
+      const base = {source: legacySource, target: {kind: 'first'}, slug: 'fixture-game', version: '1.1.0', tags: listing.tags,
+        destination, originalVersion: '1.1.0', listing, files};
+      const digest = await digestBytes(JSON.stringify(base));
+      records.unshift({id: 'manager_legacy_cover', state: 'intended', createdAt: now, updatedAt: now, remote: null, approvedDigest: null,
+        preview: {...base, digest}});
+    },
     handles(command) {
       return commands.has(command) || (fixture.exposeCatalog && command === 'list_manager_plugin_games') || (fixture.legacyState !== null && ['list_plugin_publications', 'get_plugin_publication', 'reconcile_plugin_publication'].includes(command));
     },
     async invoke(command, args) {
       switch (command) {
         case 'list_manager_plugin_games': {
+          if (fixture.catalogUnavailable) throw new Error('模拟云端目录不可用');
           const plugins = records.flatMap(({remote}) => remote && !remote.hidden ? [{...remote, id: String(remote.id), releaseId: String(remote.releaseId), authorName: '测试作者', platforms: ['windows'], steamAppId: '', description: ''}] : []);
+          if (fixture.catalogEntrySlug) plugins.push({id: '90', releaseId: '91', name: installedName, slug: fixture.catalogEntrySlug, version: '2.0.0', tags: [], hidden: false, reason: '', authorName: '外部作者', platforms: ['windows'], steamAppId: '', description: ''});
           const games = plugins.length ? [{id: '1', name: installedName, slug: installedSlug, aliases: [], steamAppId: '', plugins}] : [];
           return {games, totalGames: games.length, skippedEntries: 0};
         }
@@ -127,9 +139,11 @@ export function installPublicationHandlers() {
             : {kind: 'draft', draftId: args.draftId, writeTransactionId: 'txn-draft-fixture'};
           const target: PublicationRecord['preview']['target'] = fixture.matched ? {kind: 'release', pluginId: 42} : {kind: 'first'};
           const listing = {title: installed ? 'Minecraft Java · 游戏适配包' : '测试游戏 · 游戏适配包', summary: '按已验证的规则识别并安装模组。',
-            description: '自动定位模组目录。\n安装前请核对 <em>文件变更</em>。', tags: ['游戏适配', '中文'], coverPng: fixture.invalidCover ? 'https://covers.invalid/fixture.png' : png};
+            description: '自动定位模组目录。\n安装前请核对 <em>文件变更</em>。', tags: [installed ? installedName : '测试游戏', '游戏适配', '中文'],
+            ...(fixture.missingCover ? {} : {coverUrl})};
           const preview = {source, target, listing, remoteVersion: fixture.matched ? '1.3.0' : null, originalVersion: installed ? '1.0.0' : '1.1.0', slug: installed ? installedSlug : 'fixture-game',
-            version: fixture.matched ? '1.3.1' : installed ? '1.0.0' : '1.1.0', tags: listing.tags, files: await (installed ? installedFiles : draftFiles), destination};
+            version: fixture.matched ? '1.3.1' : installed ? '1.0.0' : '1.1.0', tags: listing.tags,
+            files: await (installed ? installedFiles : fixture.missingCover ? noCoverDraftFiles : draftFiles), destination};
           const digest = await digestBytes(JSON.stringify(preview));
           const previous = records.find(item => item.preview.digest === digest);
           if (previous) return structuredClone(previous);
@@ -142,11 +156,17 @@ export function installPublicationHandlers() {
           const record = records.find(item => item.id === args.id);
           if (!record || record.state !== 'intended' || record.preview.digest !== args.digest || args.confirmation !== 'PUBLISH_PLUGIN') throw new Error('审批不匹配');
           record.approvedDigest = args.digest;
-          if (fixture.outcome === 'unknown') { record.state = 'unknown'; throw new Error('发布请求中断，结果待核对'); }
+          if (fixture.outcome === 'unknown' || fixture.outcome === 'unknown_error') {
+            record.state = 'unknown';
+            if (fixture.outcome === 'unknown_error') throw new Error('模拟发布响应中断');
+            return structuredClone(record);
+          }
           complete(record, fixture.outcome === 'hidden');
+          if (fixture.outcome === 'completed_error') throw new Error('模拟发布响应中断');
           return structuredClone(record);
         }
         case 'reconcile_manager_publication': {
+          await waitIfHeld(command);
           const record = records.find(item => item.id === args.id);
           if (!record || record.state !== 'unknown') throw new Error('无法核对这条记录');
           if (fixture.listDenied) throw new Error('核对远端状态需要 manager_plugins.read 权限');

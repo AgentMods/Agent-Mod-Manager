@@ -1,15 +1,21 @@
 use super::*;
-use crate::agent::policy::PermissionMode;
+use crate::{agent::policy::PermissionMode, mcp};
 use std::{fs, io::Write};
 
 const FILENAME: &str = "Release build.zip";
 
-fn setup() -> (tempfile::TempDir, FileEngine, PathBuf) {
+fn setup_with_stock_playwright() -> (tempfile::TempDir, FileEngine, PathBuf) {
     let (dir, engine, game) = crate::transaction::tests::setup();
-    // Keep all actual fixture file access within the temporary directory. The
-    // stock Playwright launcher/path contract has separate config-level tests.
+    mcp::McpServers::new(engine.db.clone())
+        .seed_presets()
+        .unwrap();
+    (dir, engine, game)
+}
+
+fn setup() -> (tempfile::TempDir, FileEngine, PathBuf) {
+    let (dir, engine, game) = setup_with_stock_playwright();
+    // The receipt tools must not use Playwright when its launcher was customized.
     let servers = mcp::McpServers::new(engine.db.clone());
-    servers.seed_presets().unwrap();
     let mut playwright = servers.get("playwright").unwrap();
     playwright.args.push("--fixture-disabled".into());
     servers.update(&playwright).unwrap();
@@ -31,6 +37,15 @@ fn zip_at(path: &Path, bytes: &[u8]) {
 }
 
 fn context(engine: FileEngine, resolution_scope: ResolutionScope) -> ToolContext {
+    let resolution_scope = match resolution_scope {
+        ResolutionScope::Agent(_) => ResolutionScope::Agent(
+            crate::history::History::new(engine.db.clone())
+                .create_conversation("Fixture", None)
+                .unwrap()
+                .id,
+        ),
+        other => other,
+    };
     ToolContext {
         engine,
         resolution_scope,
@@ -98,6 +113,7 @@ fn requires_a_portable_archive_basename_and_scrubs_rejected_history() {
         "archive.zip ",
         "archive.exe",
         "archive.zip.crdownload",
+        "archive.rar.crdownload",
         "bad\u{202e}.zip",
         " archive.zip",
     ] {
@@ -111,6 +127,7 @@ fn requires_a_portable_archive_basename_and_scrubs_rejected_history() {
         "mod.tgz",
         "mod-tar-1.gz",
         "中文.7z",
+        "mod.RaR",
     ] {
         assert!(archive_kind(filename).is_ok(), "{filename}");
     }
@@ -118,61 +135,69 @@ fn requires_a_portable_archive_basename_and_scrubs_rejected_history() {
 
 #[test]
 fn chooses_only_actual_files_in_the_fixed_folders_and_rejects_ambiguity() {
-    let (dir, engine, _) = setup();
+    let (dir, engine, _) = setup_with_stock_playwright();
     let incoming = incoming(&engine);
-    let external = dir.path().canonicalize().unwrap().join("browser");
-    fs::create_dir(&external).unwrap();
-    let folders = Folders {
-        incoming: incoming.clone(),
-        playwright: Some(external.clone()),
-    };
-    zip_at(&engine.paths.downloads().join(FILENAME), b"not in inbox");
-    zip_at(&dir.path().join(FILENAME), b"not in inbox");
+    let downloads = engine.paths.downloads();
+    let playwright = downloads.join("Playwright");
+    let nested = playwright.join("nested");
+    let sibling = downloads.join("Playwright-other");
+    fs::create_dir(&nested).unwrap();
+    fs::create_dir(&sibling).unwrap();
+    let folders = Folders::configured(&engine).unwrap();
+    for other in [downloads.as_path(), dir.path(), &nested, &sibling] {
+        let path = other.join(FILENAME);
+        zip_at(&path, b"not directly in an inbox");
+        let bytes = fs::read(&path).unwrap();
+        let receipt = ApprovedArtifact {
+            artifact_id: "received-denied",
+            path: &path,
+            filename: FILENAME,
+            size: bytes.len() as u64,
+            sha256: &hex::encode(Sha256::digest(&bytes)),
+        };
+        assert!(matches!(
+            mod_library::ingest_received(&engine, &receipt, "Game", Some("g"), FILENAME, None),
+            Err(AppError::Denied(_))
+        ));
+    }
     assert!(matches!(folders.find(FILENAME), Err(AppError::NotFound(_))));
 
-    zip_at(&external.join(FILENAME), b"browser");
+    zip_at(&playwright.join(FILENAME), b"browser");
     let actual = folders.find(FILENAME).unwrap();
     assert!(matches!(actual.kind, Kind::Playwright));
-    assert_eq!(actual.path, external.join(FILENAME));
+    assert_eq!(actual.path, playwright.join(FILENAME));
     zip_at(&incoming.join(FILENAME), b"generic MCP");
     assert!(matches!(folders.find(FILENAME), Err(AppError::Conflict(_))));
 
     let other = incoming.join("directory.zip");
     fs::create_dir(&other).unwrap();
     assert!(folders.find("directory.zip").is_err());
-    assert!(!Folders::playwright_allowed(
-        &engine,
-        &engine.paths.root.join("private")
-    ));
 }
 
 #[test]
 fn rejects_hard_links_and_symlinked_receipts_or_roots() {
-    let (dir, engine, _) = setup();
-    let incoming = incoming(&engine);
+    let (_dir, engine, _) = setup_with_stock_playwright();
+    let folders = Folders::configured(&engine).unwrap();
+    let playwright = folders.playwright.as_ref().unwrap();
     let private = engine.paths.root.join("private");
     fs::create_dir(&private).unwrap();
     let source = private.join("secret.zip");
     zip_at(&source, b"private");
-    fs::hard_link(&source, incoming.join(FILENAME)).unwrap();
-    let folders = Folders {
-        incoming,
-        playwright: None,
-    };
-    assert!(folders.find(FILENAME).is_err());
+    for inbox in [&folders.incoming, playwright] {
+        let link = inbox.join(FILENAME);
+        fs::hard_link(&source, &link).unwrap();
+        assert!(folders.find(FILENAME).is_err());
+        fs::remove_file(link).unwrap();
+    }
 
-    let link = dir.path().canonicalize().unwrap().join("link");
+    fs::remove_dir(playwright).unwrap();
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&private, &link).unwrap();
+    std::os::unix::fs::symlink(&private, playwright).unwrap();
     #[cfg(windows)]
-    if std::os::windows::fs::symlink_dir(&private, &link).is_err() {
+    if std::os::windows::fs::symlink_dir(&private, playwright).is_err() {
         return; // Windows may not grant Developer Mode / symlink privileges.
     }
-    assert!(!Folders::playwright_allowed(&engine, &link));
-    let folders = Folders {
-        incoming: folders.incoming,
-        playwright: Some(link),
-    };
+    assert!(Folders::configured(&engine).unwrap().playwright.is_none());
     assert!(folders.find("secret.zip").is_err());
 }
 
@@ -194,13 +219,51 @@ async fn receipt_tools_only_accept_desktop_agent_scope() {
             Err(AppError::Denied(_))
         ));
     }
-    for mode in [
-        PermissionMode::RequestApproval,
-        PermissionMode::AutoApprove,
-        PermissionMode::FullTrust,
-    ] {
-        assert!(mode.needs_approval(ReceivedModTool.definition().effect));
-    }
+    assert_eq!(
+        ReceivedModTool.definition().effect,
+        Effect::UncatalogedDownload
+    );
+}
+
+#[tokio::test]
+async fn full_trust_files_a_received_mod_without_requesting_approval() {
+    use crate::agent::mod_library_flow_tests::{
+        final_reply, model_tool_call, next_event, scripted_agent, turn_request,
+    };
+    let (_dir, engine, _) = setup();
+    zip_at(&incoming(&engine).join(FILENAME), b"completed download");
+    let (agent, conv, mut events, model) = scripted_agent(engine, Some("g"), 2, |step, _| {
+        if step == 0 {
+            model_tool_call(NAME, "receipt", json!({"gameId":"g","filename":FILENAME}))
+        } else {
+            final_reply()
+        }
+    })
+    .await;
+    agent
+        .start_turn(turn_request(
+            &conv,
+            "归档刚下载的 Mod",
+            PermissionMode::FullTrust,
+        ))
+        .unwrap();
+    let result = next_event(&mut events, "tool-result").await;
+    assert_eq!(result.payload["name"], NAME);
+    assert_eq!(result.payload["status"], "done", "{}", result.payload);
+    assert_eq!(
+        next_event(&mut events, "done").await.payload["status"],
+        "done"
+    );
+    let entries = mod_library::list_for_game(&agent.engine.db, "g").unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(result.payload["result"]["artifactId"], entries[0].id);
+    assert!(!agent
+        .events
+        .replay(&conv, 0, 100)
+        .unwrap()
+        .iter()
+        .any(|e| e.kind == "approval-request"));
+    model.await.unwrap();
 }
 
 #[tokio::test]
@@ -332,6 +395,57 @@ async fn files_approved_archives_in_mods_without_installing_and_reuses_receipt()
 }
 
 #[tokio::test]
+async fn files_stock_playwright_download_from_managed_inbox_into_mods() {
+    let (_dir, engine, game) = setup_with_stock_playwright();
+    let playwright = engine.paths.downloads().join("Playwright");
+    assert!(
+        playwright.is_dir(),
+        "storage provisions downloads/Playwright"
+    );
+    let configured = mcp::playwright_receipt_dir(&engine.db).unwrap().unwrap();
+    assert!(configured.is_absolute());
+    assert_eq!(
+        paths::display_path(&configured),
+        paths::display_path(&playwright)
+    );
+    let source = playwright.join(FILENAME);
+    zip_at(&source, b"completed browser download");
+    let original = fs::read(&source).unwrap();
+    let context = context(engine, ResolutionScope::Agent("fixture".into()));
+    let lookup = json!({});
+    let prepared = ReceiptFoldersTool.prepare(&context, &lookup).await.unwrap();
+    let folders = ReceiptFoldersTool
+        .execute(&context, lookup, prepared)
+        .await
+        .unwrap();
+    assert_eq!(folders["playwright"], paths::display_path(&playwright));
+
+    let args = json!({"gameId":"g","filename":FILENAME});
+    let prepared = ReceivedModTool.prepare(&context, &args).await.unwrap();
+    assert_eq!(prepared.preview["receiptFolder"], "playwright");
+    assert_eq!(prepared.preview["sourcePath"], paths::display_path(&source));
+    assert_eq!(
+        prepared.preview["sourceFingerprint"]["sha256"],
+        hex::encode(Sha256::digest(&original))
+    );
+    let entry = ReceivedModTool
+        .execute(&context, args, prepared)
+        .await
+        .unwrap();
+    let id = entry["artifactId"].as_str().unwrap();
+    let verified = mod_library::verify_for_install(&context.engine, "g", id).unwrap();
+    assert!(verified
+        .archive_path
+        .starts_with(context.engine.paths.mod_library()));
+    assert_eq!(fs::read(verified.archive_path).unwrap(), original);
+    assert_eq!(fs::read(source).unwrap(), original);
+    assert_eq!(verified.entry.source_id, "local");
+    assert!(!verified.entry.integrity_verified);
+    assert!(verified.origin.is_none());
+    assert!(fs::read_dir(game).unwrap().next().is_none());
+}
+
+#[tokio::test]
 async fn right_magic_with_broken_archive_never_becomes_a_library_entry() {
     let (_dir, engine, _) = setup();
     let directory = incoming(&engine);
@@ -343,6 +457,38 @@ async fn right_magic_with_broken_archive_never_becomes_a_library_entry() {
         ReceivedModTool.execute(&context, args, prepared).await,
         Err(AppError::UnsafeArchive(_))
     ));
+    assert!(mod_library::list_for_game(&context.engine.db, "g")
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn received_download_preview_checks_entire_rar_signature() {
+    let (_dir, engine, _) = setup();
+    let directory = incoming(&engine);
+    let context = context(engine, ResolutionScope::Agent("fixture".into()));
+    for (filename, bytes, valid) in [
+        ("legacy.rar", &b"Rar!\x1a\x07\x00"[..], true),
+        ("current.RAR", &b"Rar!\x1a\x07\x01\x00"[..], true),
+        ("short-legacy.rar", &b"Rar!\x1a\x07"[..], false),
+        ("short-current.rar", &b"Rar!\x1a\x07\x01"[..], false),
+    ] {
+        fs::write(directory.join(filename), bytes).unwrap();
+        let args = json!({"gameId":"g","filename":filename});
+        let result = ReceivedModTool.prepare(&context, &args).await;
+        if valid {
+            // Preparation only verifies the signature and fingerprints the bytes.
+            let preview = result.unwrap().preview;
+            assert_eq!(preview["filename"], filename);
+            assert_eq!(preview["sourceFingerprint"]["size"], bytes.len());
+            assert_eq!(
+                preview["sourceFingerprint"]["sha256"],
+                hex::encode(Sha256::digest(bytes))
+            );
+        } else {
+            assert!(matches!(result, Err(AppError::UnsafeArchive(_))));
+        }
+    }
     assert!(mod_library::list_for_game(&context.engine.db, "g")
         .unwrap()
         .is_empty());
@@ -391,5 +537,40 @@ async fn accepts_playwright_spelled_targz_only_when_contents_are_tar() {
             .unwrap()
             .len(),
         1
+    );
+}
+
+#[test]
+fn receipt_target_respects_explicit_workspace_and_global_names() {
+    let (_dir, engine, _) = setup();
+    let game = games::get_game(&engine.db, "g").unwrap();
+    let by_name = Args::parse(json!({"filename":FILENAME,"gameName":game.name})).unwrap();
+    let selected = vec!["g".to_owned()];
+    assert_eq!(
+        by_name
+            .target(&engine, Some(&selected))
+            .unwrap()
+            .id
+            .as_deref(),
+        Some("g")
+    );
+    assert!(by_name.target(&engine, Some(&[])).is_err());
+    let multiple = vec!["g".into(), "other".into()];
+    assert!(by_name.target(&engine, Some(&multiple)).is_err());
+    let unknown =
+        Args::parse(json!({"filename":FILENAME,"gameName":"Unregistered workspace test game"}))
+            .unwrap();
+    assert!(unknown.target(&engine, None).unwrap().id.is_none());
+    assert!(unknown.target(&engine, Some(&selected)).is_err());
+    let by_id = Args::parse(json!({"filename":FILENAME,"gameId":"g"})).unwrap();
+    assert!(by_id.target(&engine, Some(&[])).is_err());
+    assert!(by_id.target(&engine, Some(&["other".into()])).is_err());
+    assert_eq!(
+        by_id
+            .target(&engine, Some(&multiple))
+            .unwrap()
+            .id
+            .as_deref(),
+        Some("g")
     );
 }

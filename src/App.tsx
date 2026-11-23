@@ -4,6 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { backendAvailable, useBackendQuery } from "./lib/api";
 import { subscribeAgentToolResults, syncAgentEvents } from "./lib/agent-store";
 import { invalidateAgentModQueries } from "./lib/agent-mod-cache";
+import { syncModSwitches, withoutModSwitchWrites } from "./lib/mod-switch-store";
 import { useUI } from "./lib/store";
 import { t } from "./lib/i18n";
 import type { BootstrapState, PageName } from "./lib/types";
@@ -88,14 +89,17 @@ export default function App() {
     return () => { clearTimeout(timer); root.classList.remove("theme-switching"); };
   }, [theme]);
   useEffect(() => subscribeAgentToolResults((results) => {
-    // The draft list and badge share this cache. Read back the backend state
-    // as soon as the tool finishes; the Agent may keep working in this turn.
-    if (results.some(({ payload: { name, status, result } }) => status === "done" &&
-      (name === "install_plugin" || (name === "publish_plugin" && result &&
-        typeof result === "object" && "state" in result && result.state === "completed")))) {
+    // Read back durable changes as soon as the tool finishes; the Agent may
+    // keep working in this turn. An unknown publication is not a receipt.
+    const published = results.some(({ payload: { name, status, result } }) =>
+      name === "publish_plugin" && status === "done" && result &&
+      typeof result === "object" && "state" in result && result.state === "completed");
+    if (published || results.some(({ payload: { name, status } }) => name === "install_plugin" && status === "done")) {
       void client.invalidateQueries({ queryKey: ["plugin-drafts"] });
     }
+    if (published) void client.invalidateQueries({ queryKey: ["plugins"] });
   }), [client]);
+  useEffect(() => syncModSwitches(client, notify), [client, notify]);
   useEffect(() => syncAgentEvents(visibleConversation, (id, events) => {
     void client.invalidateQueries({ queryKey: ["conversation", id] });
     void client.invalidateQueries({ queryKey: ["conversations"] });
@@ -122,7 +126,7 @@ export default function App() {
         void client.invalidateQueries({ queryKey: [key] });
       }
     }
-    invalidateAgentModQueries(client, events);
+    invalidateAgentModQueries(client, withoutModSwitchWrites(events));
     if (successfulTools.has("publish_plugin")) {
       for (const key of ["manager-publications", "manager-plugin-games"]) {
         void client.invalidateQueries({ queryKey: [key] });

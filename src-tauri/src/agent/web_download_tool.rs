@@ -75,7 +75,7 @@ impl AgentTool for WebDownloadTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: NAME.into(),
-            description: "仅用于用户明确点名通过管理器的直链下载工具传输公开 HTTPS ZIP/JAR/7z/tar.gz 归档。常规 Mod 下载请先用来源 MCP，无法取得文件时用 Playwright MCP 的浏览器下载。不要猜测 URL，不要提交网页、私有链接、登录链接或带参数/签名的地址。聊天未关联游戏时提供登记游戏 ID 或明确的游戏名称，作为 Mods 库游戏分类。结果不是目录版本、不会自动安装；安装需要另外核对文件和创建安装计划。".into(),
+            description: "仅用于用户明确点名通过管理器的直链下载工具传输公开 HTTPS ZIP/JAR/7z/RAR/tar.gz 归档。常规 Mod 下载请先用来源 MCP，无法取得文件时用 Playwright MCP 的浏览器下载。不要猜测 URL，不要提交网页、私有链接、登录链接或带参数/签名的地址。聊天未关联游戏时提供登记游戏 ID 或明确的游戏名称，作为 Mods 库游戏分类。结果不是目录版本、不会自动安装；安装需要另外核对文件和创建安装计划。".into(),
             parameters: agent_download_schema(json!({"url":{"type":"string","minLength":1,"maxLength":MAX_WEB_URL_BYTES}}), vec!["url"]),
             effect: Effect::UncatalogedDownload,
         }
@@ -149,11 +149,14 @@ mod tests {
     #[tokio::test]
     async fn prepared_url_cannot_be_substituted_and_tool_stays_agent_only() {
         let (_dir, engine, _) = setup();
+        let conversation = crate::history::History::new(engine.db.clone())
+            .create_conversation("Fixture", None)
+            .unwrap();
         let mut context = ToolContext {
             engine,
             cancel: CancellationToken::new(),
             progress: None,
-            resolution_scope: ResolutionScope::Agent("fixture".into()),
+            resolution_scope: ResolutionScope::Agent(conversation.id),
         };
         let args = json!({"url":"https://example.com/file.zip","gameName":"Example Game"});
         let prepared = WebDownloadTool.prepare(&context, &args).await.unwrap();
@@ -174,14 +177,7 @@ mod tests {
             WebDownloadTool.prepare(&context, &args).await,
             Err(AppError::Denied(_))
         ));
-        let downloads = context.engine.paths.downloads();
-        assert_eq!(std::fs::read_dir(&downloads).unwrap().count(), 1);
-        assert_eq!(
-            std::fs::read_dir(downloads.join("incoming"))
-                .unwrap()
-                .count(),
-            0
-        );
+        crate::storage::assert_downloads_empty(&context.engine.paths);
         assert_eq!(
             std::fs::read_dir(context.engine.paths.mod_library())
                 .unwrap()

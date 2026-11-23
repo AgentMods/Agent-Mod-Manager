@@ -74,7 +74,7 @@ async fn next_expected(
 }
 
 #[tokio::test]
-async fn generic_web_download_is_reviewed_before_network_io_in_every_permission_mode() {
+async fn generic_web_download_follows_permission_mode_before_network_io() {
     let archive = inert_zip();
 
     for mode in [
@@ -107,47 +107,42 @@ async fn generic_web_download_is_reviewed_before_network_io_in_every_permission_
             })
             .unwrap();
 
-        let approval = next_expected(&mut rx, "approval-request").await;
-        assert_eq!(approval.turn_id, turn);
-        assert_eq!(approval.payload["title"], "download_web_mod");
-        let preview = &approval.payload["preview"];
-        assert_eq!(preview["url"], download_url);
-        assert_eq!(preview["filename"], "archive.zip");
-        assert_eq!(preview["classification"]["gameName"], "Example Game");
-        assert!(preview.get("maxBytes").is_none());
-        assert!(preview["sizePolicy"].is_string());
-        assert!(artifacts::list(&agent.engine.db).unwrap().is_empty());
-        let downloads = agent.engine.paths.downloads();
-        assert_eq!(std::fs::read_dir(&downloads).unwrap().count(), 1);
-        assert_eq!(
-            std::fs::read_dir(downloads.join("incoming"))
-                .unwrap()
-                .count(),
-            0
-        );
-        assert_eq!(
-            std::fs::read_dir(agent.engine.paths.mod_library())
-                .unwrap()
-                .count(),
-            0
-        );
+        if mode != PermissionMode::FullTrust {
+            let approval = next_expected(&mut rx, "approval-request").await;
+            assert_eq!(approval.turn_id, turn);
+            assert_eq!(approval.payload["title"], "download_web_mod");
+            let preview = &approval.payload["preview"];
+            assert_eq!(preview["url"], download_url);
+            assert_eq!(preview["filename"], "archive.zip");
+            assert_eq!(preview["classification"]["gameName"], "Example Game");
+            assert!(preview.get("maxBytes").is_none());
+            assert!(preview["sizePolicy"].is_string());
+            assert!(artifacts::list(&agent.engine.db).unwrap().is_empty());
+            crate::storage::assert_downloads_empty(&agent.engine.paths);
+            assert_eq!(
+                std::fs::read_dir(agent.engine.paths.mod_library())
+                    .unwrap()
+                    .count(),
+                0
+            );
 
-        match tokio::time::timeout(Duration::from_millis(250), target.accept()).await {
-            Err(_) => {}
-            Ok(Ok(_)) => panic!("download request arrived before approval in {mode:?} mode"),
-            Ok(Err(error)) => panic!("loopback fixture accept failed: {error}"),
+            match tokio::time::timeout(Duration::from_millis(250), target.accept()).await {
+                Err(_) => {}
+                Ok(Ok(_)) => panic!("download request arrived before approval in {mode:?} mode"),
+                Ok(Err(error)) => panic!("loopback fixture accept failed: {error}"),
+            }
+
+            agent
+                .respond_approval(
+                    &conversation,
+                    approval.payload["approvalId"].as_str().unwrap(),
+                    ApprovalResponse {
+                        approved: true,
+                        answer: Value::Null,
+                    },
+                )
+                .unwrap();
         }
-
-        agent
-            .respond_approval(
-                &conversation,
-                approval.payload["approvalId"].as_str().unwrap(),
-                ApprovalResponse {
-                    approved: true,
-                    answer: Value::Null,
-                },
-            )
-            .unwrap();
 
         let (mut socket, _) = tokio::time::timeout(Duration::from_secs(10), target.accept())
             .await
@@ -168,6 +163,15 @@ async fn generic_web_download_is_reviewed_before_network_io_in_every_permission_
         let result = next_expected(&mut rx, "tool-result").await;
         let done = next_expected(&mut rx, "done").await;
         assert_eq!(done.payload["status"], "done", "mode: {mode:?}");
+        let events = agent.events.replay(&conversation, 0, 100).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "approval-request")
+                .count(),
+            usize::from(mode != PermissionMode::FullTrust),
+            "unexpected approval count in {mode:?} mode"
+        );
         assert_eq!(result.payload["status"], "done", "{}", result.payload);
         let model_requests = tokio::time::timeout(Duration::from_secs(10), model_job)
             .await
@@ -319,7 +323,13 @@ async fn web_download_rejects_unreviewed_destination_without_network_io() {
 
 #[tokio::test]
 async fn web_download_requires_game_or_context_and_cancelled_approval_never_fetches() {
-    for cancel_approval in [false, true] {
+    for (mode, cancel_approval) in [
+        (PermissionMode::FullTrust, false),
+        (PermissionMode::RequestApproval, false),
+        (PermissionMode::AutoApprove, false),
+        (PermissionMode::RequestApproval, true),
+        (PermissionMode::AutoApprove, true),
+    ] {
         let (_dir, engine, _) = setup();
         let target = TcpListener::bind((REVIEWED_URL_HOST, 0)).await.unwrap();
         let mut args =
@@ -343,7 +353,7 @@ async fn web_download_requires_game_or_context_and_cancelled_approval_never_fetc
                 content: "下载这个归档".into(),
                 attachments: None,
                 model: None,
-                permission_mode: Some(PermissionMode::FullTrust),
+                permission_mode: Some(mode),
                 reasoning_effort: None,
             })
             .unwrap();

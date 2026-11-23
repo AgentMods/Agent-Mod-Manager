@@ -57,10 +57,13 @@ impl GlossModDownload {
 
 #[async_trait::async_trait]
 impl AgentTool for GlossModDownload {
+    fn host_tool_kind(&self) -> Option<&'static str> {
+        Some("glossmod_attachment_download")
+    }
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: self.name.clone(),
-            description: format!("[Mod 客栈 MCP: {}] {TOOL} — 下载 list_work_files 中已选定的附件。聊天未关联游戏时提供登记游戏 ID 或明确的游戏名称，作为 Mods 库游戏分类。一次审批完成签发并归档，成功返回 Mods 库 artifact.path、大小和 SHA-256。签发计入下载次数，只在确需下载时调用。", self.client.server_id()),
+            description: format!("[Mod 客栈 MCP: {}] {TOOL} — 下载 list_work_files 中已选定的附件。聊天未关联游戏时提供登记游戏 ID 或明确的游戏名称，作为 Mods 库游戏分类。按当前权限模式一次完成签发并归档，成功返回 Mods 库 artifact.path、大小和 SHA-256。签发计入下载次数，只在确需下载时调用。", self.client.server_id()),
             parameters: agent_download_schema(json!({"work_id":{"type":"integer","minimum":1},"file_id":{"type":"integer","minimum":1}}), vec!["work_id","file_id"]),
             effect: Effect::UncatalogedDownload,
         }

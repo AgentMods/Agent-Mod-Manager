@@ -315,7 +315,7 @@ test("adapter center previews the game Skill and prefills Agent creation and rev
   await expectAdapterResearchPrompt(composer);
 
   await adapterCenter.click();
-  await page.getByRole("row").getByRole("button", {name: /Minecraft Java Edition/}).click();
+  await page.getByRole("row").filter({hasText: "Minecraft Java Edition"}).getByRole("cell").first().getByRole("button").click();
   await page.getByRole("button", {name: "查看游戏 Skill", exact: true}).click();
   const skill = page.getByRole("dialog", {name: "游戏 Skill · minecraft-java", exact: true});
   await expect(skill).toContainText("Minecraft Java Edition 适配指导");
@@ -389,7 +389,7 @@ test("empty package center stays empty until an external draft is installed", as
   const installedRow = page.getByRole("row").filter({hasText: "External Fixture"});
   await expect(installedRow).toContainText("External Fixture");
   await expect(installedRow).toContainText("本地导入");
-  await installedRow.getByRole("button", {name: /External Fixture/}).click();
+  await installedRow.getByRole("cell").first().getByRole("button").click();
   await expect(page.getByText("external-fixture", {exact: true})).toBeVisible();
   const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
   expect(calls.filter((call: any) => call.command === "apply_plan").map((call: any) => call.args.planId)).toEqual([
@@ -418,7 +418,7 @@ test("library prefills adapter creation for an unbound game and displays its bou
   await binding.getByRole("button", {name: "应用适配包", exact: true}).click();
   await expect(binding).toBeHidden();
   await expect(card.getByRole("button", {name: "创建适配包", exact: true})).toHaveCount(0);
-  await expect(cover).toHaveAttribute("src", "/favicon.png");
+  await expect(cover).toHaveAttribute("src", "https://covers.example.org/minecraft-java.jpg");
   await expect.poll(() => cover.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
 
   const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls);
@@ -466,8 +466,8 @@ test("library explains adapter conflicts and lets the player release pending tas
 
 test("library retains the game cover placeholder when the adapter image fails", async ({page}) => {
   await installMockTauri(page, {withExternalAdapter: true});
-  await page.route("**/favicon.png", (route) => route.abort());
-  const failedImage = page.waitForEvent("requestfailed", (request) => request.resourceType() === "image" && request.url().endsWith("/favicon.png"));
+  await page.route("https://covers.example.org/minecraft-java.jpg", (route) => route.abort());
+  const failedImage = page.waitForEvent("requestfailed", (request) => request.resourceType() === "image" && request.url() === "https://covers.example.org/minecraft-java.jpg");
   await page.goto("/");
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
   await failedImage;

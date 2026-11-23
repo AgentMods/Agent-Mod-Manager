@@ -167,6 +167,34 @@ impl Db {
             if version < 17 {
                 crate::mcp::config::migrate_bundled_playwright(&tx)?;
             }
+            if version < 18 {
+                let has_package_updated_at: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('plugins') WHERE name='package_updated_at')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if !has_package_updated_at {
+                    // The old updated_at was also written by enable/disable and
+                    // reconciliation. Verified deployments are backfilled on replay.
+                    tx.execute("ALTER TABLE plugins ADD COLUMN package_updated_at TEXT", [])?;
+                }
+            }
+            if version < 19 {
+                crate::mcp::config::migrate_playwright_storage(&tx)?;
+            }
+            if version < 20 {
+                let has_category: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='category')",
+                    [], |row| row.get(0),
+                )?;
+                if !has_category {
+                    tx.execute("ALTER TABLE conversations ADD COLUMN category TEXT CHECK(category IN ('install','uninstall','remove','adapter'))", [])?;
+                }
+                crate::history::backfill_conversation_categories(&tx)?;
+            }
+            if version < 21 {
+                crate::history::migrate_workspaces(&tx)?;
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
@@ -179,7 +207,7 @@ impl Db {
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 17;
+pub const SCHEMA_VERSION: i64 = 21;
 
 // SQLite appends rowid to the index key: these indexes bound scans to the
 // conversation's insertion-order suffix and the most recent retained user.
@@ -325,6 +353,12 @@ CREATE TABLE IF NOT EXISTS installs (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_installs_game ON installs(game_id);
+-- Explicitly relinquished ownership after verifying every deployed file was absent.
+-- This is not an uninstall/rollback transaction and has no inverse file operations.
+CREATE TABLE IF NOT EXISTS install_missing_removals (
+  install_id TEXT PRIMARY KEY REFERENCES installs(id),
+  removed_at TEXT NOT NULL
+);
 -- List membership is separate from file ownership and rollback history.
 CREATE TABLE IF NOT EXISTS removed_mod_items (
   game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
@@ -453,7 +487,8 @@ CREATE TABLE IF NOT EXISTS plugins (
   install_path TEXT NOT NULL,
   adapter_json TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  package_updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS skills (
@@ -499,6 +534,24 @@ CREATE TABLE IF NOT EXISTS plugin_deployments (
   created_at TEXT NOT NULL
 );
 
+-- Keep the deployment history, but do not replay a generation retired by removal.
+CREATE TABLE IF NOT EXISTS plugin_removals (
+  sequence INTEGER PRIMARY KEY,
+  transaction_id TEXT NOT NULL UNIQUE REFERENCES file_transactions(id),
+  slug TEXT NOT NULL,
+  last_deployment_id TEXT REFERENCES plugin_deployments(transaction_id),
+  package_json TEXT NOT NULL,
+  package_updated_at TEXT,
+  removed INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_plugin_removals_slug ON plugin_removals(slug);
+CREATE VIEW IF NOT EXISTS active_plugin_deployments AS
+  SELECT p.*, p.rowid AS generation FROM plugin_deployments p WHERE NOT EXISTS (
+    SELECT 1 FROM plugin_removals r
+    JOIN plugin_deployments last ON last.transaction_id=r.last_deployment_id
+    WHERE r.slug=p.slug AND r.removed=1 AND p.rowid<=last.rowid
+  );
+
 CREATE TABLE IF NOT EXISTS mcp_servers (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -512,6 +565,7 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
   secret_ref TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
   builtin INTEGER NOT NULL DEFAULT 0,
+  plugin_slug TEXT REFERENCES plugins(slug) ON DELETE CASCADE,
   startup_digest BLOB,
   created_at TEXT NOT NULL
 );
@@ -519,8 +573,10 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL DEFAULT '新对话',
+  category TEXT CHECK(category IN ('install','uninstall','remove','adapter')),
   auto_title_pending INTEGER NOT NULL DEFAULT 0,
   game_id TEXT,
+  workspace_game_ids_json TEXT CHECK(workspace_game_ids_json IS NULL OR json_type(workspace_game_ids_json)='array'),
   task_summary TEXT,
   context_summary_through_message_id TEXT,
   archived INTEGER NOT NULL DEFAULT 0,

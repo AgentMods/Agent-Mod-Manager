@@ -466,14 +466,7 @@ async fn bundled_playwright_navigates_with_managed_chromium() {
     );
     servers.seed_presets().unwrap();
     let mut config = servers.get("playwright").unwrap();
-    let output = config
-        .args
-        .iter()
-        .position(|arg| arg == "--output-dir")
-        .unwrap()
-        + 1;
-    let downloads = dunce::simplified(&base).join("browser output");
-    config.args[output] = downloads.display().to_string();
+    let downloads = ctx.engine.paths.downloads().join("Playwright");
     config.enabled = true;
     servers.update(&config).unwrap();
     let consent = ConnectionConsent::after_user_confirmation(&config, true).unwrap();
@@ -512,4 +505,46 @@ async fn bundled_playwright_navigates_with_managed_chromium() {
             .unwrap_or_else(|err| panic!("{err}: {download}")),
         "Chromium downloaded this fixture"
     );
+}
+
+#[test]
+fn stock_source_download_dirs_use_each_active_storage_root_without_touching_user_commands() {
+    use super::super::client::configure_source_download_dir;
+    use std::ffi::OsStr;
+    use tokio::process::Command;
+
+    let (_a, servers_a, _, ctx_a) = fixture();
+    let (_b, servers_b, _, ctx_b) = fixture();
+    assert_ne!(ctx_a.engine.paths.root, ctx_b.engine.paths.root);
+    for (servers, ctx) in [(&servers_a, &ctx_a), (&servers_b, &ctx_b)] {
+        servers.seed_presets().unwrap();
+        let inbox = ctx.engine.paths.downloads().join("incoming");
+        let inbox = crate::paths::user_path(&inbox);
+        for (id, key) in [
+            ("modio", "MODIO_DOWNLOAD_DIR"),
+            ("curseforge", "CURSEFORGE_DOWNLOAD_DIR"),
+            ("gamebanana", "GAMEBANANA_DOWNLOAD_DIR"),
+            ("nexusmods", "NEXUSMODS_DOWNLOAD_DIR"),
+        ] {
+            let stock = servers.get(id).unwrap();
+            let mut command = Command::new("uvx");
+            configure_source_download_dir(&mut command, &stock, &servers.db).unwrap();
+            assert_eq!(
+                command.as_std().get_envs().collect::<Vec<_>>(),
+                [(OsStr::new(key), Some(inbox.as_os_str()))]
+            );
+
+            let mut wrapper = stock.clone();
+            wrapper.command = Some("custom-wrapper".into());
+            let mut other_package = stock.clone();
+            other_package.args = vec!["different-package".into()];
+            let mut manual = stock;
+            manual.builtin = false;
+            for custom in [wrapper, other_package, manual] {
+                let mut command = Command::new(custom.command.as_deref().unwrap());
+                configure_source_download_dir(&mut command, &custom, &servers.db).unwrap();
+                assert_eq!(command.as_std().get_envs().count(), 0);
+            }
+        }
+    }
 }

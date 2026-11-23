@@ -2,11 +2,13 @@
 
 ## Public catalog
 
-The desktop plugin center, library, and local Agent use the public Mod客栈 manager plugin catalog. The Rust client reads `GET /api/v1/manager-plugins/games` anonymously. Selecting an immutable release loads `adapter.json` and `SKILL.md` from `/api/v1/manager-plugins/releases/{releaseId}/` on the same host. Both original texts, their hashes, declared MCP services, and any installed version are available for review. Import commits a draft. Installation and binding to a registered game use the existing reviewed operations.
+The desktop plugin center, library, and local Agent use the public Mod客栈 manager plugin catalog. The Rust client reads `GET /api/v1/manager-plugins/games` anonymously. Selecting an immutable release loads `adapter.json` and `SKILL.md` from `/api/v1/manager-plugins/releases/{releaseId}/` on the same host. In the desktop catalog, **安装** authorizes that release only. The backend checks its identity, validates both files, and installs without creating a draft or replacing an existing plugin. **查看详情** optionally shows the original texts and declared MCP services. From **已安装**, **移除** removes the unbound local package, not the cloud release or any game Mods. Agent imports and manual drafts keep their review workflow; applying an installed adapter to a game remains a separate explicit action.
 
 ## Publish a manager plugin
 
-Select **发布插件** on a committed draft or a verified installed package. Preparation reads the current creator's plugin list and asks the configured Agent model to generate a title, short introduction, detailed description, tags and cover design. The preview shows the exact publication version and whether the current account will create a plugin or update an existing one. The **发布** button submits the reviewed release.
+In **已安装**, the list and detail panel show **云端插件** when a confirmed manager-plugin publication receipt or an exact plugin slug in the public catalog establishes cloud presence. A published adapter keeps this label even if its installed version differs from the cloud version. The label does not alter the local installation source or grant update permission. When the catalog is offline, local receipts still work and unconfirmed publications alone do not change the label.
+
+Select **发布插件** on a committed draft or a verified installed package. Preparation reads the current creator's plugin list and asks the configured Agent model to generate a title, short introduction, detailed description and tags. The preview uses the same validated `adapter.json.coverUrl` as the installed game card, not model-generated artwork. A missing or unavailable image is shown as a placeholder and does not block publication. The preview shows the exact publication version and whether the current account will create a plugin or update an existing one. The **发布** button submits the reviewed release. In Agent chat, the same prepared release is submitted without a manual approval in Full Trust; other modes show the publication review.
 
 Configure an approved creator's Mod客栈 key with both `manager_plugins.read` (match the account's own list) and `manager_plugins.publish` (submit the release). Matching uses the package slug across the author's paginated list, including hidden plugins. A failed or ambiguous lookup leaves the publication unsent. The public catalog still works anonymously.
 
@@ -14,12 +16,15 @@ Configure an approved creator's Mod客栈 key with both `manager_plugins.read` (
 | --- | --- |
 | Title and version | `name` and `version` in the published copy of `adapter.json` |
 | Short introduction | `description` in the `SKILL.md` frontmatter |
-| Full description and generated cover | A display section in `SKILL.md` containing the description and an embedded PNG |
-| Tags | The manager-plugin MCP `tags` parameter |
+| Full description | A display section in `SKILL.md` |
+| Game cover | The original `coverUrl` in `adapter.json`, unchanged; no image is generated or uploaded |
+| Tags | The first tag is the complete game name from the source `adapter.json`. Other tags come from the generated copy. The reviewed list is sent unchanged as the manager-plugin MCP `tags` parameter. |
 
-Publishing sends the prepared copies with `publish_manager_plugin` or `publish_manager_plugin_release`. Local source and installation rules are preserved. The desktop cloud catalog can retrieve the artwork and detailed description by immutable release ID. The website's own listing controls how much of that content it displays. Newer releases of a hidden plugin keep their moderation status. Uncertain writes are checked with `list_my_manager_plugins` and `get_my_manager_plugin_texts` before any further publication.
+Publishing sends the prepared copies with `publish_manager_plugin` or `publish_manager_plugin_release`. Local source and installation rules are preserved. The desktop cloud catalog can retrieve the artwork and detailed description by immutable release ID. The website's own listing controls how much of that content it displays. Newer releases of a hidden plugin keep their moderation status. A matching receipt shows **发布成功** immediately. If the write reply is inconclusive, the app automatically checks the remote release without repeating the write. Opening an interrupted record also checks it automatically; **刷新发布状态** is available if confirmation is still unavailable.
 
-The automatic path validates that its final copies, including the generated artwork, fit the desktop catalog read limits (256 KiB for the manifest and 128 KiB for the Skill). The current website v1 parser does not accept `mcpServers`; a package with non-empty service declarations is reported as unsupported rather than silently publishing it without its tools.
+For an existing plugin, the preview chooses a version above both the current remote version and any higher version already confirmed locally for that remote plugin ID. The publish step rechecks ownership and the exact remote release shown in the preview. It never changes an approved first publication into an update or silently retries a rejected write. An in-flight send still blocks competing writes. An uncertain record is never resent or marked successful based on version alone: a separately reviewed update can proceed only if its verified cloud head has already reached or passed the uncertain version for that plugin and its new version is strictly higher. Recovery requires matching owner metadata and the approved release texts. Legacy uncertain records without a credential binding still require reconciliation.
+
+Old pixel-art previews must be prepared again before sending. Existing cloud releases and local history are not rewritten. The automatic path validates that its final copies fit the desktop catalog read limits (256 KiB for the manifest and 128 KiB for the Skill). The current website v1 parser does not accept `mcpServers`; a package with non-empty service declarations is reported as unsupported rather than silently publishing it without its tools.
 
 ## Earlier ordinary-work publication records
 

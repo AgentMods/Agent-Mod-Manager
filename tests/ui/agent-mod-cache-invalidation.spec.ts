@@ -11,7 +11,7 @@ const entry = {
   filename: "Cache.jar", version: null, sha256: "a".repeat(64), projectPage: null,
 };
 
-type ToolOutcome = {name: string; args: Record<string, unknown>; result: Record<string, unknown>; preview?: Record<string, unknown>; status?: "done" | "error" | "denied"};
+type ToolOutcome = {hostToolKind?: string; name: string; args: Record<string, unknown>; result: Record<string, unknown>; preview?: Record<string, unknown>; status?: "done" | "error" | "denied"};
 
 async function addAnotherGame(page: Page, name: string) {
   await page.evaluate(({id, name}) => {
@@ -25,6 +25,14 @@ async function openDetail(page: Page, name = gameName, occurrence = 0) {
   await page.getByRole("button").filter({has: page.getByRole("heading", {name, exact: true})}).nth(occurrence).click();
   await expect(page.getByTestId("game-detail-page").getByRole("heading", {name, exact: true})).toBeVisible();
   await expect(page.getByRole("table")).toHaveAttribute("aria-busy", "false");
+}
+
+function modTable(page: Page) {
+  return page.getByTestId("game-detail-page").getByRole("table");
+}
+
+function archiveRow(page: Page, filename: string) {
+  return modTable(page).getByRole("row").filter({hasText: filename});
 }
 
 function reads(page: Page, id = gameId) {
@@ -48,7 +56,7 @@ async function finishTurn(page: Page, tools: ToolOutcome[], libraryReceipt?: typ
       else fixture.modLibrary[index] = libraryReceipt;
     }
     fixture.emit("turn-start", {}, conversationId, null);
-    tools.forEach(({name, args, result, preview, status = "done"}, index) => {
+    tools.forEach(({name, args, result, preview, hostToolKind, status = "done"}, index) => {
       const toolCallId = "refresh-fixture-" + index;
       fixture.emit("tool-start", {toolCallId, name, arguments: args}, conversationId, null);
       if (preview) {
@@ -56,7 +64,7 @@ async function finishTurn(page: Page, tools: ToolOutcome[], libraryReceipt?: typ
         fixture.emit("approval-request", {toolCallId, approvalId, title: name, preview}, conversationId, null);
         fixture.emit("approval-resolved", {approvalId, status: "approved"}, conversationId, null);
       }
-      fixture.emit("tool-result", {toolCallId, name, status, result}, conversationId, null);
+      fixture.emit("tool-result", {toolCallId, name, status, result, hostToolKind}, conversationId, null);
     });
     fixture.emit("done", {status: "done"}, conversationId, null);
   }, {conversationId, tools, libraryReceipt});
@@ -68,12 +76,14 @@ for (const [name, target] of [["download_mod", gameId], ["download_web_mod", nul
     await installMockTauri(page);
     await page.goto("/");
     await openDetail(page);
-    await expect(page.getByRole("heading", {name: "尚无归档", exact: true})).toBeVisible();
+    await expect(archiveRow(page, entry.filename)).toHaveCount(0);
     const before = await reads(page);
     const libraryReceipt = {...entry, gameId: target};
     const result = name === "file_received_mod" ? libraryReceipt : {id: entry.artifactId, artifactId: entry.artifactId, gameId: target, gameName};
     await finishTurn(page, [{name, args: target ? {gameId: target} : {gameName}, result}], libraryReceipt);
-    await expect(page.getByRole("list", {name: "Mod 库归档"})).toContainText(entry.filename);
+    const receivedRow = archiveRow(page, entry.filename);
+    await expect(receivedRow).toHaveCount(1);
+    await expect(receivedRow).toContainText("待安装");
     const after = await reads(page);
     expect(after.library).toBeGreaterThan(before.library);
     expect(after.game).toBe(before.game);
@@ -85,17 +95,41 @@ test("managed Mod Inn attachment downloads refresh the library from the catalog 
   await installMockTauri(page);
   await page.goto("/");
   await openDetail(page);
-  await expect(page.getByRole("heading", {name: "尚无归档", exact: true})).toBeVisible();
+  await expect(archiveRow(page, entry.filename)).toHaveCount(0);
   const before = await reads(page);
   const libraryReceipt = {...entry, gameId};
   const name = "mcp__glossmod_h__get_work_f_b522dbe15ac715b1364c89a1d06eec0a";
   await finishTurn(page, [{name, args: {work_id: 99, file_id: 42}, preview: {tool: "get_work_file_download", destination: "Mods/"},
     result: {artifactId: entry.artifactId, artifact: libraryReceipt, cataloged: true}}], libraryReceipt);
-  await expect(page.getByRole("list", {name: "Mod 库归档"})).toContainText(entry.filename);
+  const receivedRow = archiveRow(page, entry.filename);
+  await expect(receivedRow).toHaveCount(1);
+  await expect(receivedRow).toContainText("待安装");
   const after = await reads(page);
   expect(after.library).toBeGreaterThan(before.library);
   expect(after.game).toBe(before.game);
   expect(after.installs).toBe(before.installs);
+});
+
+test("Full Trust attachment refresh without approval", async ({page}) => {
+  await installMockTauri(page);
+  await page.goto("/");
+  await openDetail(page);
+  const libraryReceipt = {...entry, gameId};
+  await finishTurn(page, [{name: "mcp__custom__attachment", args: {},
+    hostToolKind: "glossmod_attachment_download",
+    result: {artifactId: entry.artifactId, artifact: libraryReceipt, cataloged: true}}], libraryReceipt);
+  await expect(archiveRow(page, entry.filename)).toHaveCount(1);
+});
+
+test("forged receipt provenance does not refresh", async ({page}) => {
+  await installMockTauri(page);
+  await page.goto("/");
+  await openDetail(page);
+  const before = await reads(page);
+  await finishTurn(page, [{name: "mcp__glossmod_http__get_work_file_download", args: {},
+    result: {hostToolKind: "glossmod_attachment_download", artifactId: entry.artifactId,
+      artifact: {...entry, gameId}, cataloged: true}}]);
+  expect(await reads(page)).toEqual(before);
 });
 
 test("Agent binding refreshes the other same-name game's Mod library too", async ({page}) => {
@@ -103,11 +137,11 @@ test("Agent binding refreshes the other same-name game's Mod library too", async
   await page.goto("/");
   await addAnotherGame(page, gameName);
   await openDetail(page, gameName, 1);
-  await expect(page.getByRole("list", {name: "Mod 库归档"})).toContainText(entry.filename);
+  await expect(archiveRow(page, entry.filename)).toHaveCount(1);
   const before = await reads(page, otherGameId);
   const boundEntry = {...entry, gameId};
   await finishTurn(page, [{name: "bind_mod_library_entry", args: {game_id: gameId, artifact_id: entry.artifactId}, result: boundEntry}], boundEntry);
-  await expect(page.getByRole("heading", {name: "尚无归档", exact: true})).toBeVisible();
+  await expect(archiveRow(page, entry.filename)).toHaveCount(0);
   const after = await reads(page, otherGameId);
   expect(after.library).toBeGreaterThan(before.library);
   expect(after.game).toBe(before.game);
@@ -119,10 +153,10 @@ test("scoped rollback invalidates only the affected game's detail caches", async
   await page.goto("/");
   await addAnotherGame(page, otherGameName);
   await openDetail(page);
-  await expect(page.getByRole("heading", {name: "尚无归档", exact: true})).toBeVisible();
+  await expect(archiveRow(page, entry.filename)).toHaveCount(0);
   const beforeTarget = await reads(page);
   await openDetail(page, otherGameName);
-  await expect(page.getByRole("heading", {name: "尚无归档", exact: true})).toBeVisible();
+  await expect(archiveRow(page, entry.filename)).toHaveCount(0);
   const beforeOther = await reads(page, otherGameId);
   expect(beforeTarget).toEqual({game: 1, installs: 1, library: 1});
   expect(beforeOther).toEqual({game: 1, installs: 1, library: 1});
@@ -139,7 +173,7 @@ test("read-only, failed or unscoped tool results leave the Mod projections alone
   await installMockTauri(page);
   await page.goto("/");
   await openDetail(page);
-  await expect(page.getByRole("heading", {name: "尚无归档", exact: true})).toBeVisible();
+  await expect(archiveRow(page, entry.filename)).toHaveCount(0);
   const before = await reads(page);
   await finishTurn(page, [
     {name: "list_mod_library", args: {game_id: gameId}, result: {entries: []}},

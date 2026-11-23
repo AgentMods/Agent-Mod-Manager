@@ -1,6 +1,15 @@
 use crate::error::{AppError, AppResult};
 use std::path::{Path, PathBuf};
 
+pub(crate) fn incoming_downloads(root: &Path) -> PathBuf {
+    root.join("downloads").join("incoming")
+}
+
+/// Browser output is separate from both native transfers and the third-party inbox.
+pub(crate) fn playwright_downloads(root: &Path) -> PathBuf {
+    root.join("downloads").join("Playwright")
+}
+
 /// Manager-owned paths and the protected locations shared by filesystem callers.
 #[derive(Debug, Clone)]
 pub struct AppPaths {
@@ -20,7 +29,8 @@ impl AppPaths {
         for dir in [
             p.downloads(),
             p.mod_library(),
-            p.downloads().join("incoming"),
+            incoming_downloads(&p.root),
+            playwright_downloads(&p.root),
             p.staging(),
             p.backups(),
             p.trash(),
@@ -163,6 +173,29 @@ impl AppPaths {
             "{} 不属于任何已登记的游戏目录，只能先加入游戏库",
             crate::paths::display_path(&canon)
         )))
+    }
+}
+
+/// No rejected or pending transfer may have written anywhere (including either inbox).
+#[cfg(test)]
+pub(crate) fn assert_downloads_empty(paths: &AppPaths) {
+    let mut actual: Vec<_> = std::fs::read_dir(paths.downloads())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    let mut expected = [
+        incoming_downloads(&paths.root),
+        playwright_downloads(&paths.root),
+    ];
+    actual.sort();
+    expected.sort();
+    assert_eq!(actual, expected);
+    for inbox in expected {
+        assert!(
+            std::fs::read_dir(&inbox).unwrap().next().is_none(),
+            "unexpected download in {}",
+            inbox.display()
+        );
     }
 }
 
