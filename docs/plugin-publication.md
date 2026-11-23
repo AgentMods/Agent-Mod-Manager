@@ -2,7 +2,9 @@
 
 ## Public catalog
 
-The desktop plugin center, library, and local Agent use the public Mod客栈 manager plugin catalog. The Rust client reads `GET /api/v1/manager-plugins/games` anonymously. Selecting an immutable release loads `adapter.json` and `SKILL.md` from `/api/v1/manager-plugins/releases/{releaseId}/` on the same host. In the desktop catalog, **安装** authorizes that release only. The backend checks its identity, validates both files, and installs without creating a draft or replacing an existing plugin. **查看详情** optionally shows the original texts and declared MCP services. From **已安装**, **移除** removes the unbound local package, not the cloud release or any game Mods. Agent imports and manual drafts keep their review workflow; applying an installed adapter to a game remains a separate explicit action.
+The desktop plugin center, library, and local Agent use the public Mod客栈 manager plugin catalog. The Rust client reads `GET /api/v1/manager-plugins/games` anonymously. Selecting an immutable release loads `adapter.json` and `SKILL.md` from `/api/v1/manager-plugins/releases/{releaseId}/` on the same host. In the desktop catalog, **安装** installs the selected release and records its cloud plugin ID for future startup updates. The backend checks its identity, validates both files, and installs without creating a draft or replacing an existing plugin. **查看详情** optionally shows the original texts and declared MCP services. From **已安装**, **移除** removes the unbound local package, not the cloud release or any game Mods. Agent imports and manual drafts keep their review workflow; applying an installed adapter to a game remains a separate explicit action.
+
+At desktop startup, the manager fetches the public catalog once when it has eligible installations and applies strictly newer releases in the background. Each update uses the immutable release files and a reversible transaction. Game bindings and the independent adapter and Skill settings survive the update.
 
 ## Publish a manager plugin
 

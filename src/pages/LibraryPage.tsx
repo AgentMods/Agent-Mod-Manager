@@ -363,8 +363,13 @@ export default function LibraryPage() {
         {scanRoot && <PathText>扫描目录：{displayPath(scanRoot)}</PathText>}
         <p>已检查 {report.directoriesChecked} 个目录、{report.entriesChecked} 个条目，本批 {discoveryRows.length} 个候选目录{report.truncated ? " · 已达到扫描上限" : ""}</p>
         {!report.candidates.length && !report.nextCursor && <p>{scanRoot ? "未发现候选游戏。若已选择单个游戏的安装目录，可使用“检查单个游戏”。" : "未在常用位置发现候选游戏，可指定目录扫描。"}</p>}
-        {report.warnings.map((warning, index) => <PathText className="text-warning" key={index}>{displayPath(warning.path)}：{warning.message}</PathText>)}
       </div>}
+      {!!report?.warnings.length && <details className="min-w-0 text-sm">
+        <summary className="w-fit cursor-pointer text-muted-foreground">扫描警告（{report.warnings.length}）</summary>
+        <ul className="mt-2 flex flex-col gap-1">
+          {report.warnings.map((warning, index) => <li key={index}><PathText className="text-warning">{displayPath(warning.path)}：{warning.message}</PathText></li>)}
+        </ul>
+      </details>}
       {discoveryRows.length > 0 && <ItemGroup aria-label="扫描候选游戏" className="gap-2">
         {discoveryRows.map((candidate, index) => {
           const matched = cloud.match(candidate);

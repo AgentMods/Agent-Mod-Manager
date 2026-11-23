@@ -9,7 +9,10 @@ const SCRATCH: &str = "plugin-catalog";
 const RELEASE_PREFIX: &str = "release-";
 
 pub(crate) fn is_desktop_plugin_kind(kind: &str) -> bool {
-    matches!(kind, CATALOG_INSTALL_KIND | CATALOG_UPDATE_KIND | PLUGIN_REMOVE_KIND)
+    matches!(
+        kind,
+        CATALOG_INSTALL_KIND | CATALOG_UPDATE_KIND | PLUGIN_REMOVE_KIND
+    )
 }
 
 pub(super) fn is_catalog_scratch(engine: &FileEngine, source: &Path) -> bool {
@@ -126,6 +129,9 @@ pub(super) fn deploy_catalog_locked(
         hashes: preview.hashes,
     };
     let package = content.package(slug)?;
+    if package.adapter.version != preview.plugin.version {
+        return Err(AppError::Conflict("适配包版本与所选云端发布不一致".into()));
+    }
     ensure_mcp_ids_free(&engine.db.conn(), slug, &package)?;
     let (kind, action) = if previous.is_some() {
         (CATALOG_UPDATE_KIND, "自动更新云插件")
@@ -164,7 +170,14 @@ pub(super) fn deploy_catalog_locked(
         false,
     )?;
     plan.requires_review = true;
-    verify_copy_plan(&plan, &plan.id, &source, target, &content, previous.is_none())?;
+    verify_copy_plan(
+        &plan,
+        &plan.id,
+        &source,
+        target,
+        &content,
+        previous.is_none(),
+    )?;
     verify_previous(&plan, target, previous.as_ref())?;
     let hashes = content.hashes.clone();
     let json = serde_json::to_string(&DeploymentRecord {
@@ -305,7 +318,11 @@ fn ensure_unbound(conn: &Connection, slug: &str) -> AppResult<()> {
     Ok(())
 }
 
-pub(super) fn ensure_mcp_ids_free(conn: &Connection, slug: &str, package: &GamePackage) -> AppResult<()> {
+pub(super) fn ensure_mcp_ids_free(
+    conn: &Connection,
+    slug: &str,
+    package: &GamePackage,
+) -> AppResult<()> {
     for config in package.adapter.mcp_configs()? {
         let collision: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM mcp_servers WHERE id=?1 AND plugin_slug IS NOT ?2)",

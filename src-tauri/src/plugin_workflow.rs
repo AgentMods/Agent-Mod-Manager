@@ -28,7 +28,8 @@ pub(crate) const SKILL_LIMIT: usize = 128 * 1024;
 const SOURCE: &str = "external";
 mod catalog_updates;
 pub(crate) use catalog_updates::{
-    catalog_update_candidates, record_catalog_draft_origin, update_catalog_release, CatalogUpdateCandidate,
+    catalog_update_candidates, record_catalog_draft_origin, update_catalog_release,
+    CatalogUpdateCandidate,
 };
 #[cfg(test)]
 mod catalog_update_tests;
@@ -811,7 +812,10 @@ fn deployment_record(engine: &FileEngine, row: &DeploymentRow) -> AppResult<Depl
             _ => None,
         })
         .ok_or_else(|| invalid("部署不是复制事务"))?;
-    if matches!(row.kind.as_str(), desktop::CATALOG_INSTALL_KIND | desktop::CATALOG_UPDATE_KIND) {
+    if matches!(
+        row.kind.as_str(),
+        desktop::CATALOG_INSTALL_KIND | desktop::CATALOG_UPDATE_KIND
+    ) {
         let is_update = row.kind == desktop::CATALOG_UPDATE_KIND;
         if record.previous.is_some() != is_update || !desktop::is_catalog_scratch(engine, source) {
             return Err(invalid("云插件部署源或历史基线无效"));
@@ -1044,10 +1048,17 @@ pub fn plan_install_plugin(engine: &FileEngine, draft_id: &str) -> AppResult<Dep
     let tx = conn.transaction()?;
     tx.execute("INSERT INTO plugin_deployments(transaction_id,slug,package_json,install_path,created_at) VALUES (?1,?2,?3,?4,?5)",params![plan.id,draft.slug,json,target.to_string_lossy(),util::now()])?;
     // Editing either file turns an imported release into an independent local package.
-    tx.execute("INSERT INTO catalog_plugin_origins(transaction_id,plugin_id,adapter_sha256,skill_sha256)
+    tx.execute(
+        "INSERT INTO catalog_plugin_origins(transaction_id,plugin_id,adapter_sha256,skill_sha256)
         SELECT ?1,plugin_id,adapter_sha256,skill_sha256 FROM catalog_plugin_origins
         WHERE transaction_id=?2 AND adapter_sha256=?3 AND skill_sha256=?4",
-        params![plan.id, draft.write_transaction_id, content.hashes.adapter_sha256, content.hashes.skill_sha256])?;
+        params![
+            plan.id,
+            draft.write_transaction_id,
+            content.hashes.adapter_sha256,
+            content.hashes.skill_sha256
+        ],
+    )?;
     tx.commit()?;
     Ok(DeploymentPreview {
         draft_id: draft.id,

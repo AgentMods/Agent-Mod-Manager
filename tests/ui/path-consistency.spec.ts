@@ -63,7 +63,7 @@ test("扫描候选合并旧路径别名，UNC 与 Unix 大小写不合并，发�
   const row = (name: string) => discovery.locator('[data-slot="item"]').filter({ has: page.getByText(name, { exact: true }) });
   await expect(discovery).toBeVisible();
   await expect(discovery.getByRole("status").filter({ hasText: "已检查" })).toContainText("已检查 9 个目录、9 个条目");
-  await expect(row("已登记")).toBeVisible();
+  await expect(row("Minecraft Java Edition")).toBeVisible();
   expect(await argsFor(page, "scan_games")).toEqual([{ options: { userRoots: [], includeCommonRoots: true, page: { requestId: expect.any(String) } } }]);
   await page.keyboard.press("Escape");
   await expect(discovery).toBeHidden();
@@ -75,8 +75,8 @@ test("扫描候选合并旧路径别名，UNC 与 Unix 大小写不合并，发�
     { options: { userRoots: [], includeCommonRoots: true, page: { requestId: expect.any(String) } } },
     { options: { userRoots: [], includeCommonRoots: true, page: { requestId: expect.any(String) } } },
   ]);
-  await expect(row("已登记").getByRole("button", { name: "管理中" })).toBeDisabled();
-  await expect(row("已登记").getByText(ordinaryUnc, { exact: true })).toBeVisible();
+  await expect(row("Minecraft Java Edition").getByRole("button", { name: "管理中" })).toBeDisabled();
+  await expect(row("Minecraft Java Edition").getByText(ordinaryUnc, { exact: true })).toBeVisible();
   await expect(row("已登记的另一拼法")).toHaveCount(0);
   await expect(row("普通拼法")).toHaveCount(0);
   for (const name of ["大小写不同的共享游戏", "Unix 大写", "Unix 小写", "保留尾空格"]) {
@@ -86,7 +86,14 @@ test("扫描候选合并旧路径别名，UNC 与 Unix 大小写不合并，发�
   await discovery.getByRole("button", { name: "选择游戏目录", exact: true }).click();
   await expect(discovery.getByLabel("游戏目录", { exact: true })).toHaveValue(verbatimUnc);
   await expect(discovery.getByRole("status").filter({ hasText: "扫描目录：" })).toContainText(`扫描目录：${ordinaryUnc}`);
-  await expect(discovery.getByRole("status").filter({ hasText: "检查路径" })).toContainText(`${ordinaryUnc}：检查路径`);
+  const warnings = discovery.getByText("扫描警告（1）", { exact: true });
+  const warning = discovery.getByText(`${ordinaryUnc}：检查路径`, { exact: true });
+  await expect(warnings).toBeVisible();
+  await expect(warning).toBeHidden();
+  await warnings.click();
+  await expect(warning).toBeVisible();
+  await warnings.press("Enter");
+  await expect(warning).toBeHidden();
   expect((await argsFor(page, "scan_games")).at(-1)).toEqual({ options: { userRoots: [verbatimUnc], includeCommonRoots: false, page: { requestId: expect.any(String) } } });
 
   await discovery.getByLabel("游戏目录", { exact: true }).fill(unix);

@@ -16,6 +16,20 @@ const installButton = (scope: Page | ReturnType<typeof pluginCard>) => scope.get
 const detailButton = (scope: Page | ReturnType<typeof pluginCard>) => scope.getByRole("button", {name: /(?=.*查看详情)(?=.*Minecraft Java Edition)/});
 const plan = (page: Page) => page.getByRole("dialog", { name: "确认文件变更", exact: true });
 
+test("启动自动更新后，正在查看的已安装列表显示新版", async ({ page }) => {
+  await openCatalogFixture(page, { installed: true });
+  await page.getByRole("button", { name: "插件中心", exact: true }).click();
+  const row = page.getByRole("row").filter({ hasText: "Minecraft Java Edition" });
+  await expect(row.getByRole("cell", { name: "1.0.0", exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    const app = (window as any).__AMM_TEST__;
+    app.installedPlugins.find((p: { slug: string }) => p.slug === "minecraft-java").version = "1.1.0";
+    app.emitEvent("plugin://catalog-updated", "minecraft-java");
+  });
+  await expect(row.getByRole("cell", { name: "1.1.0", exact: true })).toBeVisible();
+  expect(await calls(page, "install_manager_plugin")).toHaveLength(0);
+});
+
 test("已安装同 slug 的目录卡片展示本地版本，详情只读且不覆盖", async ({page}) => {
   await page.emulateMedia({colorScheme: "dark"});
   await openCatalogFixture(page, {installed: true});

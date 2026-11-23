@@ -967,6 +967,11 @@ async fn direct_install_refuses_a_different_version_but_keeps_manual_overwrite_w
     apply(engine, &older.plan);
     let deployed = plugin_workflow::plan_install_plugin(engine, &older.draft.id).unwrap();
     apply(engine, &deployed.plan);
+    plugin_workflow::reconcile_deployments(engine).unwrap();
+    assert_eq!(
+        plugins::list_plugins(&engine.db).unwrap()[0].version,
+        "0.9.0"
+    );
     server
         .client
         .update_installed_at_startup(engine, |_| panic!("manual draft is not a cloud install"))
@@ -1036,6 +1041,54 @@ fn serve_startup_release_files(
         Reply::ok(skill.clone()),
     );
     (adapter, skill)
+}
+
+#[tokio::test]
+async fn startup_with_no_installs_skips_network_and_checks_again_after_an_outage() {
+    let (_temp, ctx) = context();
+    let engine = &ctx.engine;
+    let server = Server::new().await;
+    server
+        .client
+        .update_installed_at_startup(engine, |_| panic!("unexpected update"))
+        .await
+        .unwrap();
+    assert!(server.requests().is_empty());
+    server
+        .client
+        .install(engine, PLUGIN_ID, RELEASE_ID)
+        .await
+        .unwrap();
+    server.set(
+        GAMES_PATH,
+        Reply {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            bytes: vec![],
+            chunked: false,
+        },
+    );
+    assert!(server
+        .client
+        .update_installed_at_startup(engine, |_| panic!("unexpected update"))
+        .await
+        .is_err());
+    assert_eq!(
+        plugins::list_plugins(&engine.db).unwrap()[0].version,
+        "1.0.0"
+    );
+
+    let next = startup_release("fallout4", PLUGIN_ID, "32", "1.1.0");
+    serve_startup_release_files(&server, &next, "1.1.0");
+    serve_startup_releases(&server, vec![next]);
+    server
+        .client
+        .update_installed_at_startup(engine, |slug| assert_eq!(slug, "fallout4"))
+        .await
+        .unwrap();
+    assert_eq!(
+        plugins::list_plugins(&engine.db).unwrap()[0].version,
+        "1.1.0"
+    );
 }
 
 #[tokio::test]
@@ -1127,7 +1180,10 @@ async fn startup_checks_the_catalog_once_and_isolates_a_bad_release_from_another
         })
         .await
         .unwrap();
-    assert_eq!(notified.into_inner().unwrap(), [good.slug.clone()]);
+    assert_eq!(
+        notified.into_inner().unwrap(),
+        std::slice::from_ref(&good.slug)
+    );
     let requests = server.requests();
     let requests = &requests[initial_requests..];
     assert_eq!(requests[0], GAMES_PATH);

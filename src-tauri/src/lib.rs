@@ -253,9 +253,12 @@ pub fn run() {
                 let events = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     use tauri::Emitter;
-                    if let Err(error) = manager_catalog::update_installed_at_startup(&engine, |slug| {
-                        let _ = events.emit("plugin://catalog-updated", slug);
-                    }).await {
+                    if let Err(error) =
+                        manager_catalog::update_installed_at_startup(&engine, |slug| {
+                            let _ = events.emit("plugin://catalog-updated", slug);
+                        })
+                        .await
+                    {
                         tracing::warn!(%error, "could not check for catalog adapter updates");
                     }
                 });

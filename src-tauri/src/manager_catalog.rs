@@ -647,6 +647,7 @@ pub async fn install(engine: &FileEngine, plugin_id: &str, release_id: &str) -> 
 
 /// Refresh installed cloud packages from one anonymous catalog snapshot.
 /// Global discovery failures are returned; individual package failures are logged.
+#[cfg(not(test))]
 pub(crate) async fn update_installed_at_startup(
     engine: &FileEngine,
     on_updated: impl Fn(&str),
