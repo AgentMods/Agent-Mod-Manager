@@ -78,7 +78,7 @@ export interface BootstrapState {
   dataRoot: string; storageMigrationError?: string | null; recoveredTransactions: string[]; recoveryError: string | null; onboardingCompleted: boolean; isFirstRun: boolean; resumeOnboarding: boolean;
 }
 export interface CatalogPluginRelease {
-  id: string; releaseId: string; name: string; slug: string; version: string;
+  id: string; releaseId: string; name: string; gameName?: string | null; slug: string; version: string;
   authorName: string; platforms: string[]; steamAppId: string; description: string; tags?: string[];
 }
 export interface CatalogGame {

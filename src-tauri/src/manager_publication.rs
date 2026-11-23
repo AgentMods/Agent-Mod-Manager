@@ -25,6 +25,7 @@ mod tests;
 
 pub use crate::plugin_publish_remote::ReconciliationOutcome;
 pub use automatic::prepare_automatic;
+pub(crate) use automatic::version_cmp;
 #[cfg(test)]
 pub(crate) use automatic::{prepare_automatic_with, publish_automatic_with};
 
@@ -337,7 +338,7 @@ fn with_current_source<T>(
         // write requires the source game's name in the already-reviewed tags.
         if let Some(listing) = &preview.listing {
             let adapter: plugins::GameAdapter = serde_json::from_str(&files[0].text)?;
-            listing.require_game_tag(&adapter.name)?;
+            listing.require_game_tag(adapter.display_game_name())?;
         }
         f()
     })

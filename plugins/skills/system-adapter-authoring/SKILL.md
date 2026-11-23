@@ -22,13 +22,13 @@ description: "创建或更新游戏适配包。通过已连接的平台 MCP 取�
 
 ## 编写、验证和部署
 
-1. 准备声明式 `adapter.json` 和 `SKILL.md`。JSON 的 `slug`、Skill frontmatter 的 `name` 和草稿的 `slug` 必须一致。`version` 表示适配包版本。`coverUrl` 可选，填写时使用公开 HTTPS 图片地址。核实目录识别标记、加载顺序、日志、存档和卸载注意事项。没有专门加载顺序的游戏可使用 `loadOrder.kind: "none"`。
+1. 准备声明式 `adapter.json` 和 `SKILL.md`。JSON 的 `slug`、Skill frontmatter 的 `name` 和草稿的 `slug` 必须一致。生成清单时用 `name` 填适配包标题，用 `gameName` 填游戏库显示的游戏名称。例如 `"name": "幻兽帕鲁 Windows 模组适配包"`、`"gameName": "幻兽帕鲁"`。旧清单省略 `gameName` 时沿用 `name`。`version` 表示适配包版本。`coverUrl` 可选，填写时使用公开 HTTPS 图片地址。核实目录识别标记、加载顺序、日志、存档和卸载注意事项。没有专门加载顺序的游戏可使用 `loadOrder.kind: "none"`。
 2. 将样本映射落实到 `installRoots`、`modTypes` 和对应的 `archiveRules`。`single_file` 复制发布文件本身，适用于完整载荷（如直接分发的 JAR）；ZIP 里的载荷应分析 ZIP 内部布局。`mod_directory` 保留独立模组目录，`strip_prefix` 仅移除已核实的 `sourcePrefix`。`requiredFiles` 使用样本已证实且同类包共有的相对路径。需要用户选件、混合安装根或无法确定自动映射时采用 `manual` 逐文件审核；目标根也未核实时只在 Skill 中记录待补证类型。要求向现有配置追加内容等无法用文件复制表达的步骤，在游戏 Skill 中写明具体人工操作，避免生成整文件覆盖映射。安装路径遵守平台和登记根限制。
    若适配需求包含 MCP，可在同一份 JSON 的 `mcpServers` 数组中声明服务，每项包含包内唯一的 `id`、`name` 和 `transport`。`streamable_http` 使用 `url`，需要 Bearer 凭据时加 `bearerToken: true`。`stdio` 使用 `command` 和可选的 `args` 数组，需要凭据时以 `envSecrets` 列出环境变量名（以 `_API_KEY` 或 `_TOKEN` 结尾）。两种传输均可用 `credentialUrl` 指定领用密钥的页面。只声明已核实的服务地址或启动命令，凭据由用户在「设置 → 工具」填写，插件部署后也在这里启动连接。
 3. 新建包时选用未占用的 `slug`。首次登记游戏目录仍由用户在游戏库确认。
 4. 调用 `write_plugin_draft`，传入 `slug`、`adapter_json` 和 `skill_markdown`，让用户审核草稿原文与文件计划。取得 `draft_id` 后调用 `validate_plugin`，有错误时根据反馈修正并提交新草稿。可用 `list_plugin_drafts` 找回已提交的草稿。
 5. 校验通过且用户要求部署时，用同一个 `draft_id` 调用 `install_plugin`。检查安装计划的覆盖影响以及提交后的登记状态。草稿写入和安装都遵循当前审批策略。Agent 草稿在安装或发布成功、且没有其他待办安装或发布时自动移入回收站。若用户还要求发布，安装后请用已安装包的 `slug` 发布，不再使用旧 `draft_id`。只要求起草时，保留草稿，不安装或发布。
-6. 为指定的已登记游戏部署后，调用 `set_game_adapter`，传入已安装包的 `slug`。在游戏对话中使用当前登记，在通用对话中同时传入已确认目标的 `game_id`。用户指定游戏库显示名称时，在同一次绑定中通过 `game_name` 传入该名称。若登记时沿用了目录名，且已核实游戏正式名称，可让用户确认是否采用正式名称。用户未要求或确认改名时省略 `game_name`。包已安装时可从此步继续。工具会核对磁盘识别标记，并遵循当前审批策略。按返回的游戏名称、适配包 slug 和版本报告结果。若绑定失败，说明具体原因。仅创建草稿或独立安装包时，到用户指定的步骤为止。
+6. 为指定的已登记游戏部署后，调用 `set_game_adapter`，传入已安装包的 `slug`。在游戏对话中使用当前登记，在通用对话中同时传入已确认目标的 `game_id`。用户指定游戏库显示名称时，在同一次绑定中通过 `game_name` 传入该名称。用户未指定名称时省略 `game_name`，管理器会对自动命名的游戏采用清单中的游戏名，并保留玩家自定义的名称。包已安装时可从此步继续。工具会核对磁盘识别标记，并遵循当前审批策略。按返回的游戏名称、适配包 slug 和版本报告结果。若绑定失败，说明具体原因。仅创建草稿或独立安装包时，到用户指定的步骤为止。
 
 两份文件仅包含声明和文档。遇到需要执行的安装器、脚本或 Mod 二进制时，说明当前工具支持的范围。
 

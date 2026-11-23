@@ -207,7 +207,7 @@ impl Db {
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 21;
+pub const SCHEMA_VERSION: i64 = 23;
 
 // SQLite appends rowid to the index key: these indexes bound scans to the
 // conversation's insertion-order suffix and the most recent retained user.
@@ -353,6 +353,33 @@ CREATE TABLE IF NOT EXISTS installs (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_installs_game ON installs(game_id);
+CREATE TABLE IF NOT EXISTS mod_tags (
+  id TEXT PRIMARY KEY,
+  game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  name_key TEXT NOT NULL,
+  color TEXT NOT NULL,
+  UNIQUE(game_id,name_key)
+);
+CREATE TABLE IF NOT EXISTS install_organizations (
+  install_id TEXT PRIMARY KEY REFERENCES installs(id) ON DELETE CASCADE,
+  display_name TEXT,
+  tags_edited INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS mod_organization_jobs (
+  install_id TEXT PRIMARY KEY REFERENCES installs(id) ON DELETE CASCADE,
+  locale TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','done','unavailable')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  ready_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_mod_organization_jobs_ready ON mod_organization_jobs(status,ready_at);
+CREATE TABLE IF NOT EXISTS install_mod_tags (
+  install_id TEXT NOT NULL REFERENCES install_organizations(install_id) ON DELETE CASCADE,
+  tag_id TEXT NOT NULL REFERENCES mod_tags(id) ON DELETE CASCADE,
+  PRIMARY KEY(install_id,tag_id)
+);
+CREATE INDEX IF NOT EXISTS idx_install_mod_tags_tag ON install_mod_tags(tag_id);
 -- Explicitly relinquished ownership after verifying every deployed file was absent.
 -- This is not an uninstall/rollback transaction and has no inverse file operations.
 CREATE TABLE IF NOT EXISTS install_missing_removals (
@@ -526,6 +553,13 @@ CREATE VIEW IF NOT EXISTS unavailable_plugin_drafts AS
       JOIN file_transactions r ON r.id=l.transaction_id
       WHERE l.item_id=d.trash_item_id AND r.status='committed'
     );
+-- Bind an installed deployment or imported draft to the exact downloaded package.
+CREATE TABLE IF NOT EXISTS catalog_plugin_origins (
+  transaction_id TEXT PRIMARY KEY REFERENCES file_transactions(id),
+  plugin_id TEXT NOT NULL,
+  adapter_sha256 TEXT NOT NULL,
+  skill_sha256 TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS plugin_deployments (
   transaction_id TEXT PRIMARY KEY,
   slug TEXT NOT NULL,

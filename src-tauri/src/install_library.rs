@@ -82,6 +82,7 @@ pub struct LibraryInstallMatch {
     pub library_entry_id: String,
     pub filename: String,
     pub artifact_sha256: String,
+    pub active_install_id: Option<String>,
     pub adapter_slug: Option<String>,
     pub candidates: Vec<LibraryAdapterMatch>,
     pub archive_format: Option<String>,
@@ -624,6 +625,7 @@ pub fn match_library_install_cancellable(
         .collect();
     let archive_entries_truncated = archive_entries.len() < archive_file_count;
     Ok(LibraryInstallMatch {
+        active_install_id: active_install_id(engine, &game.id, &entry.id)?,
         game_id: game.id,
         library_entry_id: entry.id,
         filename: entry.filename,
@@ -639,6 +641,26 @@ pub fn match_library_install_cancellable(
         fomod,
         warnings,
     })
+}
+
+// A complete archive can be a native game payload (for example a Minecraft JAR),
+// but copying its container bytes cannot produce a native plugin or executable.
+fn validate_single_file_target(entry: &Entry, destination: &Path) -> AppResult<()> {
+    let native_binary = destination
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ["asi", "dll", "exe", "so", "dylib"]
+                .iter()
+                .any(|kind| ext.eq_ignore_ascii_case(kind))
+        });
+    if native_binary && archive_intent(entry)? {
+        return Err(invalid(format!(
+            "不能把整个归档 {} 当作原生程序文件 {} 安装。请用 match_mod_install 查看成员，再用 sourceKind=archive 指定包内源文件。",
+            entry.filename, paths::display_path(destination)
+        )));
+    }
+    Ok(())
 }
 
 fn approved_mappings(
@@ -663,6 +685,7 @@ fn approved_mappings(
         plugins::validate_relative_path(&mapping.destination, false)?;
         let source = match mode {
             LibrarySourceKind::SingleFile if mapping.source == entry.filename => {
+                validate_single_file_target(entry, Path::new(&mapping.destination))?;
                 entry.archive.clone()
             }
             LibrarySourceKind::SingleFile => {
@@ -889,14 +912,12 @@ struct InstallBinding {
     root_id: Option<String>,
 }
 
-/// Caller holds WRITE_LOCK. Only journal-backed active deployments count;
-/// multiple pending reviews are allowed, but the first commit excludes the rest.
-fn require_artifact_not_active(
+fn active_install_id(
     engine: &FileEngine,
     game_id: &str,
     artifact_id: &str,
-) -> AppResult<()> {
-    let active: Option<String> = engine
+) -> AppResult<Option<String>> {
+    Ok(engine
         .db
         .conn()
         .query_row(
@@ -910,10 +931,18 @@ fn require_artifact_not_active(
             params![game_id, artifact_id],
             |row| row.get(0),
         )
-        .optional()?;
-    if let Some(id) = active {
+        .optional()?)
+}
+
+/// Multiple pending reviews are allowed. Recheck under WRITE_LOCK at plan and apply.
+fn require_artifact_not_active(
+    engine: &FileEngine,
+    game_id: &str,
+    artifact_id: &str,
+) -> AppResult<()> {
+    if let Some(id) = active_install_id(engine, game_id, artifact_id)? {
         return Err(AppError::Conflict(format!(
-            "该模组库归档已安装到此游戏（{id}）；请先完成卸载或回滚原安装"
+            "该模组库归档已有活动安装记录（{id}）。请用 inspect_install 检查现有文件和归属，再按检查结果处理。"
         )));
     }
     Ok(())
@@ -929,6 +958,15 @@ pub fn plan_library_install(
 pub fn plan_library_install_cancellable(
     engine: &FileEngine,
     request: &LibraryInstallRequest,
+    cancel: &CancellationToken,
+) -> AppResult<InstallPreview> {
+    plan_library_install_with_organization(engine, request, None, cancel)
+}
+
+pub fn plan_library_install_with_organization(
+    engine: &FileEngine,
+    request: &LibraryInstallRequest,
+    organization: Option<crate::mod_organization::OrganizationSuggestion>,
     cancel: &CancellationToken,
 ) -> AppResult<InstallPreview> {
     check_cancel(cancel)?;
@@ -1032,7 +1070,7 @@ pub fn plan_library_install_cancellable(
                     adapter_mappings(&entry, scan.as_ref(), ty, &rules, folder_name.as_deref())?;
                 if matched.len() != 1 {
                     return Err(AppError::Unsupported(
-                        "没有唯一安全的适配包映射；请使用审核过的映射或明确选择 FOMOD".into(),
+                        "此 Mod 未匹配到唯一的适配包自动安装规则。请按作者说明使用 mode=approvedMappings 提交逐文件映射，或明确选择 FOMOD 安装选项".into(),
                     ));
                 }
                 let matched = matched.pop().unwrap();
@@ -1066,6 +1104,7 @@ pub fn plan_library_install_cancellable(
         ));
     }
     let destinations = destinations(engine, &root, &payload)?;
+    super::verify_unowned_paths(engine, destinations.iter().map(PathBuf::as_path))?;
     let is_archive = source_kind == LibrarySourceKind::Archive;
     let hashes = if is_archive {
         materialize(
@@ -1143,6 +1182,7 @@ pub fn plan_library_install_cancellable(
     metadata["downloadOrigin"] = serde_json::json!(entry.origin);
     metadata["warnings"] = serde_json::json!(warnings);
     metadata["ignoredFiles"] = serde_json::json!(ignored_files);
+    crate::mod_organization::stage(&engine.db, &mut metadata, organization);
     check_cancel(cancel)?;
     let id = util::new_id("install");
     let timestamp = util::now();
@@ -1180,6 +1220,10 @@ pub(crate) fn validate_library_apply(engine: &FileEngine, plan: &FilePlan) -> Ap
     ).optional()?.ok_or_else(|| AppError::Denied("模组库安装事务缺少对应安装清单".into()))?;
     let binding: InstallBinding = serde_json::from_str(&metadata)?;
     require_artifact_not_active(engine, &game_id, &binding.library_entry_id)?;
+    super::verify_unowned_paths(
+        engine,
+        plan.entries.iter().map(|entry| entry.operation.dst()),
+    )?;
     let entry = load_entry(engine, &game_id, &binding.library_entry_id)?;
     let game = games::get_game(&engine.db, &game_id)?;
     if entry.sha256 != binding.artifact_sha256 || game.adapter_slug != binding.adapter_slug {
@@ -1211,6 +1255,7 @@ pub(crate) fn validate_library_apply(engine: &FileEngine, plan: &FilePlan) -> Ap
         };
         let is_library_source = match binding.source_kind {
             LibrarySourceKind::SingleFile => {
+                validate_single_file_target(&entry, dst)?;
                 src == &entry.archive
                     && planned
                         .source

@@ -15,7 +15,7 @@ export function reconcileCandidates(candidates: GameCandidate[], games: Game[] =
   return Array.from(distinct, ([key, candidate]) => {
     const game = registered.get(key);
     if (game) return {
-      ...candidate, registeredGameId: game.id, suggestedAdapterSlug: game.adapterSlug,
+      ...candidate, name: game.name, registeredGameId: game.id, suggestedAdapterSlug: game.adapterSlug,
       confidence: game.confidence, status: game.adapterSlug ? "high_confidence" : "unidentified",
     };
     return candidate;

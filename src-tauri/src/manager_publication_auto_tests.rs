@@ -38,10 +38,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        Self::with_game_name(GAME_NAME)
+        Self::with_names(GAME_NAME, None)
     }
 
-    fn with_game_name(game_name: &str) -> Self {
+    fn with_names(plugin_name: &str, game_name: Option<&str>) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::new(temp.path().join("manager")).unwrap();
         let engine = FileEngine::new(Db::open(&paths.db_file()).unwrap(), paths);
@@ -51,7 +51,10 @@ impl Fixture {
         let mut adapter: Value =
             serde_json::from_str(plugins::test_fixtures::PACKAGES[0].1).unwrap();
         adapter["slug"] = json!(SLUG);
-        adapter["name"] = json!(game_name);
+        adapter["name"] = json!(plugin_name);
+        if let Some(game_name) = game_name {
+            adapter["gameName"] = json!(game_name);
+        }
         adapter["version"] = json!("1.2.3");
         adapter["coverUrl"] = Value::Null;
         let adapter = serde_json::to_string_pretty(&adapter).unwrap();
@@ -93,7 +96,8 @@ impl Fixture {
             plugins::parse_package(SLUG, &self.adapter, &self.skill)
                 .unwrap()
                 .adapter
-                .name,
+                .display_game_name()
+                .to_owned(),
             "reviewed".into(),
             "fixture".into(),
         ]
@@ -321,7 +325,7 @@ async fn searches_all_pages_and_snapshots_approved_derived_release() {
 
 #[tokio::test]
 async fn installed_source_update_previews_and_sends_the_same_game_name_tag() {
-    let f = Fixture::new();
+    let f = Fixture::with_names("Original Mod Toolkit", Some(GAME_NAME));
     f.install();
     let owner = row(22, 47, SLUG, "1.2.3");
     let preparation = Script::new([page(vec![owner.clone()])]);
@@ -360,7 +364,7 @@ async fn installed_source_update_previews_and_sends_the_same_game_name_tag() {
 async fn long_safe_game_name_is_preserved_as_one_tag_in_preview_and_first_send() {
     let game_name = format!("{} Edition", "Long Game ".repeat(8));
     assert!(game_name.chars().count() > 32);
-    let f = Fixture::with_game_name(&game_name);
+    let f = Fixture::with_names("Original Mod Toolkit", Some(&game_name));
     let record = f.prepare(&Script::new([page(vec![])])).await.unwrap();
     assert_eq!(record.preview.tags[0], game_name);
     assert_eq!(
@@ -383,7 +387,67 @@ async fn long_safe_game_name_is_preserved_as_one_tag_in_preview_and_first_send()
 }
 
 #[tokio::test]
-async fn legacy_preview_without_game_name_is_rejected_before_send_but_history_remains_readable() {
+async fn previously_approved_release_without_game_name_keeps_its_digest_and_bytes() {
+    let f = Fixture::new();
+    let current = f.prepare(&Script::new([page(vec![])])).await.unwrap();
+    let mut preview = current.preview.clone();
+    // Before gameName the overlay changed only the source name for a first release.
+    let old_text = f
+        .adapter
+        .replacen(&json!(GAME_NAME).to_string(), &json!(TITLE).to_string(), 1);
+    let manifest: Value = serde_json::from_str(&old_text).unwrap();
+    assert!(manifest.get("gameName").is_none());
+    assert_eq!(manifest["name"], TITLE);
+    let file = &mut preview.files[0];
+    file.size = old_text.len() as u64;
+    file.sha256 = hex::encode(Sha256::digest(&old_text));
+    file.text = old_text.clone();
+
+    // Build the stored approval with the historical v2 wire layout.
+    let mut hash = Sha256::new();
+    hash.update(b"amm.manager-plugin-publication.v2\0");
+    serde_json::to_writer(
+        &mut hash,
+        &(
+            (
+                &preview.source,
+                preview.target,
+                &preview.slug,
+                &preview.version,
+                &preview.tags,
+                &preview.files,
+                &preview.destination,
+            ),
+            &preview.listing,
+            &preview.original_version,
+            &preview.remote_version,
+            &preview.snapshot,
+        ),
+    )
+    .unwrap();
+    preview.digest = hex::encode(hash.finalize());
+    assert_ne!(preview.digest, current.preview.digest);
+    f.engine.db.conn().execute(
+        "UPDATE manager_publications SET preview_json=?2,digest=?3,approved_digest=?3 WHERE id=?1",
+        rusqlite::params![current.id, serde_json::to_string(&preview).unwrap(), preview.digest],
+    ).unwrap();
+    let legacy = f.load(&current);
+    assert_eq!(legacy.approved_digest.as_ref(), Some(&preview.digest));
+    let sending = Script::new([
+        page(vec![]),
+        Ok(json!({"plugin":row(31, 59, SLUG, "1.2.3")})),
+    ]);
+    let completed = f.publish(&sending, &legacy).await.unwrap();
+    assert_eq!(completed.state, PublicationState::Completed);
+    assert_eq!(completed.preview, preview);
+    assert_eq!(f.load(&completed), completed);
+    let calls = sending.take_calls();
+    assert_eq!(calls[1].1["adapter"], old_text);
+    assert_eq!(calls[1].1["tags"][0], GAME_NAME);
+}
+
+#[tokio::test]
+async fn legacy_preview_without_game_tag_is_rejected_before_send_but_history_remains_readable() {
     let f = Fixture::new();
     let current = f.prepare(&Script::new([page(vec![])])).await.unwrap();
     let game_name = f.expected_tags().into_iter().next().unwrap();

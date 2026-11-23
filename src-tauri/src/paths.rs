@@ -219,13 +219,19 @@ fn windows_device_name(name: &str) -> bool {
     })
 }
 
+/// Unreal Pak mods use this literal directory name under Content/Paks.
+pub(crate) fn is_unreal_mods_dir(component: &str) -> bool {
+    component.eq_ignore_ascii_case("~mods")
+}
+
 /// Reject any archive entry whose relative path tries to escape the destination.
 pub fn safe_join(base: &Path, entry: &str) -> AppResult<PathBuf> {
     if entry.is_empty() {
         return Err(AppError::UnsafeArchive("空的归档条目名".into()));
     }
     let cleaned = entry.replace('\\', "/");
-    if cleaned.starts_with('/') || cleaned.starts_with('~') {
+    let first = cleaned.split('/').next().unwrap_or_default();
+    if cleaned.starts_with('/') || (first.starts_with('~') && !is_unreal_mods_dir(first)) {
         return Err(AppError::UnsafeArchive(format!("绝对路径条目: {entry}")));
     }
     if cleaned.len() > 1 && cleaned.as_bytes()[1] == b':' {
@@ -336,6 +342,22 @@ mod tests {
             safe_join(&base, "mod/data/file.txt").unwrap(),
             PathBuf::from("/tmp/x/mod/data/file.txt")
         );
+    }
+
+    #[test]
+    fn safe_join_accepts_literal_tilde_mods_directory() {
+        let base = Path::new("out");
+        for name in ["~mods/Map.pak", r"~mods\Map.pak"] {
+            assert_eq!(safe_join(base, name).unwrap(), base.join("~mods/Map.pak"));
+        }
+        for name in [
+            "~/Map.pak",
+            "~user/Map.pak",
+            "~mods-backup/Map.pak",
+            "~mods/../Map.pak",
+        ] {
+            assert!(safe_join(base, name).is_err(), "{name}");
+        }
     }
 
     #[test]

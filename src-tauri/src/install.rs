@@ -19,14 +19,18 @@ use std::{
 
 #[path = "install_replacement.rs"]
 mod replacement;
-pub(crate) use replacement::{validate_apply, validate_rollback};
+pub(crate) use replacement::{
+    path_key, validate_apply, validate_rollback, validate_trash_restore_ownership,
+    verify_unowned_paths,
+};
 
 #[path = "install_library.rs"]
 mod library;
+use crate::mod_organization::{self, OrganizationSuggestion};
 pub use library::{
     match_library_install, match_library_install_cancellable, plan_library_install,
-    plan_library_install_cancellable, LibraryInstallMatch, LibraryInstallMode,
-    LibraryInstallRequest, LibraryMatchRequest, LibrarySourceKind,
+    plan_library_install_cancellable, plan_library_install_with_organization, LibraryInstallMatch,
+    LibraryInstallMode, LibraryInstallRequest, LibraryMatchRequest, LibrarySourceKind,
 };
 pub(crate) use library::{validate_library_apply, LIBRARY_INSTALL_KIND};
 
@@ -81,9 +85,21 @@ pub struct InstalledFile {
     pub before: Option<Fingerprint>,
 }
 
+impl InstalledFile {
+    fn fingerprint(&self) -> Fingerprint {
+        Fingerprint {
+            kind: "file".into(),
+            size: self.size,
+            sha256: self.sha256.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstalledMod {
+    #[serde(default)]
+    pub tag_ids: Vec<String>,
     pub id: String,
     pub game_id: String,
     pub name: String,
@@ -363,6 +379,15 @@ pub fn plan_install(engine: &FileEngine, request: &InstallRequest) -> AppResult<
 pub(crate) fn plan_install_cancellable(
     engine: &FileEngine,
     request: &InstallRequest,
+    cancel: &CancellationToken,
+) -> AppResult<InstallPreview> {
+    plan_install_with_organization(engine, request, None, cancel)
+}
+
+pub fn plan_install_with_organization(
+    engine: &FileEngine,
+    request: &InstallRequest,
+    organization: Option<OrganizationSuggestion>,
     cancel: &CancellationToken,
 ) -> AppResult<InstallPreview> {
     let check_cancel = || {
@@ -709,6 +734,11 @@ pub(crate) fn plan_install_cancellable(
     if let Some(replacement) = &replacement {
         replacement.inspect_plan(engine, &plan, None)?;
         warnings.push("这是明确选择的版本替换，不判断版本先后、加载器兼容性或依赖是否满足".into());
+    } else {
+        verify_unowned_paths(
+            engine,
+            plan.entries.iter().map(|entry| entry.operation.dst()),
+        )?;
     }
     if archive::hash_file_cancellable(&artifact, cancel)? != artifact_sha256 {
         return Err(AppError::Conflict(
@@ -732,9 +762,10 @@ pub(crate) fn plan_install_cancellable(
         })
         .collect();
     let id = util::new_id("install");
-    let metadata = serde_json::json!({"transactionId":plan.id,"artifactPath":artifact,"artifactSha256":artifact_sha256,
+    let mut metadata = serde_json::json!({"transactionId":plan.id,"artifactPath":artifact,"artifactSha256":artifact_sha256,
         "adapterSlug":adapter.slug,"adapterVersion":adapter.version,"modType":request.mod_type,"rootId":ty.root,
         "sourceModId":project_id,"downloadOrigin":download_origin,"replacesInstallId":request.replace_install_id,"warnings":warnings,"ignoredFiles":ignored_files});
+    mod_organization::stage(&engine.db, &mut metadata, organization);
     let mut conn = engine.db.conn();
     let tx = conn.transaction()?;
     FileEngine::persist_plan(&tx, &plan, internal)?;
@@ -859,10 +890,22 @@ pub(crate) fn reconcile_from(conn: &rusqlite::Connection) -> AppResult<()> {
     crate::mod_management::restore_membership(conn)
 }
 
-fn read_installs(engine: &FileEngine, game_id: &str) -> AppResult<Vec<InstalledMod>> {
+fn read_installs(
+    engine: &FileEngine,
+    game_id: &str,
+    include_other_owners: bool,
+) -> AppResult<Vec<InstalledMod>> {
+    let state = effective_install_state();
+    let other_owners = if include_other_owners {
+        format!(" OR ({state}) IN ('enabled','installed','partially_restored')")
+    } else {
+        String::new()
+    };
     let conn = engine.db.conn();
     let mut stmt = conn.prepare(&format!(
-        "SELECT id,game_id,name,version,source,{} AS status,install_root,files_json,metadata_json,installed_at FROM installs WHERE game_id=?1 ORDER BY installed_at DESC,rowid DESC", effective_install_state()
+        "SELECT id,game_id,coalesce((SELECT display_name FROM install_organizations WHERE install_id=installs.id),name),version,source,{state} AS status,install_root,files_json,metadata_json,installed_at,
+        (SELECT json_group_array(tag_id ORDER BY tag_id) FROM install_mod_tags WHERE install_id=installs.id)
+        FROM installs WHERE game_id=?1{other_owners} ORDER BY installed_at DESC,rowid DESC"
     ))?;
     let rows = stmt.query_map([game_id], |r| {
         Ok((
@@ -876,15 +919,18 @@ fn read_installs(engine: &FileEngine, game_id: &str) -> AppResult<Vec<InstalledM
             r.get::<_, String>(7)?,
             r.get::<_, String>(8)?,
             r.get::<_, String>(9)?,
+            r.get::<_, String>(10)?,
         ))
     })?;
     rows.map(|row| {
-        let (id, game_id, name, version, source, status, root, files, meta, installed_at) = row?;
+        let (id, game_id, name, version, source, status, root, files, meta, installed_at, tags) =
+            row?;
         let metadata: serde_json::Value = serde_json::from_str(&meta)?;
         let download_origin = metadata
             .get("downloadOrigin")
             .and_then(|origin| DownloadOrigin::deserialize(origin).ok());
         Ok(InstalledMod {
+            tag_ids: serde_json::from_str(&tags)?,
             id,
             game_id,
             name,
@@ -904,7 +950,7 @@ fn read_installs(engine: &FileEngine, game_id: &str) -> AppResult<Vec<InstalledM
 pub fn list_installs(engine: &FileEngine, game_id: &str) -> AppResult<Vec<InstalledMod>> {
     games::get_game(&engine.db, game_id)?;
     reconcile(&engine.db)?;
-    read_installs(engine, game_id)
+    read_installs(engine, game_id, false)
 }
 
 pub fn get_install(engine: &FileEngine, id: &str) -> AppResult<InstalledMod> {
@@ -1030,7 +1076,7 @@ fn reconciliation(
     files: &[InstallFileInspection],
     candidates: &[&InstalledMod],
 ) -> AppResult<InstallReconciliation> {
-    let blocking_install_ids: Vec<_> = files
+    let mut blocking_install_ids: Vec<_> = files
         .iter()
         .flat_map(|file| file.other_install_ids.iter().cloned())
         .collect::<BTreeSet<_>>()
@@ -1069,8 +1115,28 @@ fn reconciliation(
             successor_id
         ));
     } else if !blocking_install_ids.is_empty() {
-        recommended_action = "review_shared_paths".into();
-        reasons.push("路径由多个安装记录共同引用，不能单独移入回收站".into());
+        let owners: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| blocking_install_ids.binary_search(&candidate.id).is_ok())
+            .collect();
+        match engine.shared_install_rollback(installed, files, &owners) {
+            Ok(transaction) => {
+                blocking_install_ids.clear();
+                recommended_action = "rollback_install".into();
+                rollback_transaction_id = Some(transaction);
+                reasons.push(
+                    "事务日志已确认本次安装是共享文件的最后写入者，回滚会还原先前安装的文件".into(),
+                );
+            }
+            Err(error) => {
+                recommended_action = "review_shared_paths".into();
+                reasons.push(format!(
+                    "共享路径无法直接卸载：{error}。请核对关联安装 {}，从可回滚的安装开始处理",
+                    blocking_install_ids.join(", ")
+                ));
+            }
+        }
     } else if files.iter().any(|file| file.replaced) {
         let transaction = committed_install_transaction(engine, &installed.id)?;
         if transaction.is_some() && files.iter().all(|file| file.state == "owned") {
@@ -1122,7 +1188,7 @@ pub fn inspect_install(engine: &FileEngine, id: &str) -> AppResult<InstallInspec
         })
         .optional()?;
     let game_id = game_id.ok_or_else(|| AppError::NotFound(id.into()))?;
-    let installs = read_installs(engine, &game_id)?;
+    let installs = read_installs(engine, &game_id, true)?;
     let installed = installs
         .iter()
         .find(|install| install.id == id)
@@ -1132,30 +1198,36 @@ pub fn inspect_install(engine: &FileEngine, id: &str) -> AppResult<InstallInspec
         .iter()
         .filter(|other| {
             other.id != installed.id
-                && matches!(other.status.as_str(), "enabled" | "partially_restored")
+                && matches!(
+                    other.status.as_str(),
+                    "enabled" | "installed" | "partially_restored"
+                )
         })
         .collect();
 
+    let owner_paths: Vec<_> = candidates
+        .iter()
+        .map(|other| {
+            let keys: BTreeSet<_> = other
+                .files
+                .iter()
+                .map(|file| replacement::path_key(&file.path))
+                .collect();
+            (&other.id, keys)
+        })
+        .collect();
     let files: Vec<InstallFileInspection> = installed
         .files
         .iter()
         .map(|file| {
-            let expected = Fingerprint {
-                kind: "file".into(),
-                size: file.size,
-                sha256: file.sha256.clone(),
-            };
+            let expected = file.fingerprint();
             let (current_fingerprint, state, mut reasons) =
                 inspect_file_state(engine, &file.path, &expected, &roots);
-            let other_install_ids: Vec<_> = candidates
+            let key = replacement::path_key(&file.path);
+            let other_install_ids: Vec<_> = owner_paths
                 .iter()
-                .filter(|other| {
-                    other
-                        .files
-                        .iter()
-                        .any(|other_file| other_file.path == file.path)
-                })
-                .map(|other| other.id.clone())
+                .filter(|(_, paths)| replacement::overlaps(paths, &key))
+                .map(|(id, _)| (*id).clone())
                 .collect();
             let replaced = file.before.is_some();
             if replaced {
@@ -1210,6 +1282,23 @@ fn uninstall_sources(
             "此安装覆盖了既有文件，请使用安装事务回滚以恢复原文件",
         ));
     }
+    let manifest = checked_manifest(engine, installed)?;
+    let keys = manifest
+        .keys()
+        .map(|path| replacement::path_key(path))
+        .collect();
+    replacement::verify_ownership(engine, &keys, (Some(&installed.id), None), None)?;
+    Ok(manifest
+        .into_iter()
+        .map(|(path, file)| (path.to_owned(), file.fingerprint()))
+        .collect())
+}
+
+pub(crate) fn checked_manifest<'a>(
+    engine: &FileEngine,
+    installed: &'a InstalledMod,
+) -> AppResult<BTreeMap<&'a Path, &'a InstalledFile>> {
+    let conflict = |message: &str| AppError::Conflict(message.into());
     let game = games::get_game(&engine.db, &installed.game_id)?;
     let mut scopes: Vec<_> = game_roots::registered_user_roots(&engine.db, &game.id)?
         .into_values()
@@ -1232,16 +1321,8 @@ fn uninstall_sources(
         {
             return Err(conflict("安装清单含链接、重复路径或超出安装根的文件"));
         }
-        files.insert(
-            file.path.clone(),
-            Fingerprint {
-                kind: "file".into(),
-                size: file.size,
-                sha256: file.sha256.clone(),
-            },
-        );
+        files.insert(file.path.as_path(), file);
     }
-    replacement::verify_ownership(engine, &owned, (&installed.id, None), None)?;
     Ok(files)
 }
 

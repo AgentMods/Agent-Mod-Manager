@@ -160,6 +160,12 @@ export async function installMockTauri(page: Page, {
     }] : [])];
     let settings: Args = { base_url: "https://example.com/v1", model: onboarding ? "" : "mock-model", models: configuredModels, permission_mode: "request_approval", api_key_ref: "model.api_key", onboarding_completed: !onboarding };
     let composerPreferences: Args = {model: null, reasoning_effort: null, permission_mode: null};
+    const modOrganizationLanguages: Array<[string, string]> = [
+      ["zh-CN", "简体中文"], ["zh-TW", "繁體中文"], ["en", "English"], ["ja", "日本語"], ["ko", "한국어"],
+      ["fr", "Français"], ["de", "Deutsch"], ["es", "Español"], ["pt-BR", "Português (Brasil)"], ["it", "Italiano"],
+      ["ru", "Русский"], ["pl", "Polski"], ["uk", "Українська"], ["tr", "Türkçe"],
+    ];
+    let modOrganizationLocale: string | null = null;
     let onboardingCompleted = !onboarding;
     let onboardingInProgress = onboardingStarted;
     const plan = {
@@ -189,6 +195,8 @@ export async function installMockTauri(page: Page, {
       {name: "system-adapter-authoring", description: "创建或更新游戏适配包。", instruction: "先确认目标游戏和适配需求。"},
       {name: "system-web-search", description: "查找游戏、模组和加载器资料。", instruction: "仅发送公开的搜索关键词。"},
       {name: "system-mod-download", description: "从来源定位版本并下载 Mod。", instruction: "先核对目标版本和加载器。"},
+      {name: "system-mod-commission", description: "引导玩家到 Mod 客栈创建委托。", instruction: "先区分查找现有作品和定制需求。"},
+      {name: "system-mod-organize", description: "安装成功后由管理器自动整理 Mod 展示名与分类标签。", instruction: "根据已知资料生成展示名和分类标签。"},
     ].map(({name, description, instruction}) => ({
       skill: {name, description, location: `plugins/skills/${name}/SKILL.md`, source: "system", kind: "system", valid: true, enabled: true, issues: []},
       markdown: `---\nname: ${name}\ndescription: ${description}\n---\n\n${instruction}`,
@@ -375,6 +383,18 @@ export async function installMockTauri(page: Page, {
         case "get_game": return games.find((game) => game.id === args.id) ?? games[0];
         case "get_game_adapter": return {modTypes: [{id: "java-mod", name: "Java 加载器模组", root: "mods", notes: "请核对加载器和依赖"}], installRoots: [{id: "mods", kind: "game", notes: ""}]};
         case "get_settings": return settings;
+        case "get_mod_organization_locale": return {
+          locale: modOrganizationLocale,
+          effective_locale: modOrganizationLocale ?? "zh-CN",
+          languages: modOrganizationLanguages,
+        };
+        case "set_mod_organization_locale": {
+          if (args.locale !== null && !modOrganizationLanguages.some(([code]) => code === args.locale)) {
+            throw new Error("不支持的 Mod 整理目标语言");
+          }
+          modOrganizationLocale = args.locale;
+          return null;
+        }
         case "list_agent_models": return providerModels;
         case "get_agent_model_metadata": {
           if (args.baseUrl === "https://offline.example/v1") throw new Error("metadata unavailable");
@@ -525,10 +545,11 @@ export async function installMockTauri(page: Page, {
             throw new Error("测试模拟安装状态回读失败");
           }
           return [
-            ...(removedRecords.has("install-fixture") ? [] : [{ id: "install-fixture", gameId: "game-fixture", name: "Example", version: "1.0.0", source: "modrinth", status: fixtureRolledBack ? "rolled_back" : fixtureUninstalled ? "uninstalled" : "enabled", installRoot: "/sandbox/minecraft/mods", files: [], metadata: fixtureRolledBack ? {transactionId: fixtureRollbackTransactionId} : {}, installedAt: now }]),
-            ...archiveInstallRecords.filter(record => !removedRecords.has(record.id)),
+            ...(removedRecords.has("install-fixture") ? [] : [{ id: "install-fixture", gameId: "game-fixture", name: "Example", version: "1.0.0", source: "modrinth", status: fixtureRolledBack ? "rolled_back" : fixtureUninstalled ? "uninstalled" : "enabled", installRoot: "/sandbox/minecraft/mods", files: [], metadata: fixtureRolledBack ? {transactionId: fixtureRollbackTransactionId} : {}, installedAt: now, tagIds: [] }]),
+            ...archiveInstallRecords.filter(record => !removedRecords.has(record.id)).map(record => ({...record, tagIds: record.tagIds ?? []})),
           ];
         }
+        case "list_mod_tags": return [];
         case "list_user_roots": return {};
         case "list_downloads": return (window as any).__AMM_TEST__.seedDownload ? [{artifact: {id: 'artifact-fixture', path: '/sandbox/data/downloads/fixture/Fixture.jar', filename: 'Fixture.jar', size: 1024, sha256: 'b'.repeat(64), integrity_verified: true, requires_review: true, warnings: []}, sourceId: 'modrinth', projectId: 'fixture', versionId: 'V'.repeat(128), name: 'Downloaded Fixture', version: '1.0.0', createdAt: now}] : [];
         case "plan_import_archive": if (args.path !== "/sandbox/incoming/Fixture.jar") throw new Error("unknown archive"); return {filename: "Fixture.jar", artifactPath: "/sandbox/data/staging/imports/fixture/Fixture.jar", sha256: "b".repeat(64), size: 1024, plan: importPlan, warnings: []};

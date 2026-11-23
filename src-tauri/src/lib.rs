@@ -29,8 +29,13 @@ pub mod manager_publication;
 pub mod mcp;
 pub mod mcp_connections;
 pub mod mcp_server;
+pub mod mod_language;
 pub mod mod_library;
 mod mod_management;
+pub mod mod_organization;
+mod mod_organization_fallback;
+mod mod_organization_jobs;
+mod mod_organizer;
 pub mod paths;
 pub mod plugin_publish;
 pub mod plugin_publish_remote;
@@ -143,6 +148,10 @@ pub fn run() {
             commands::list_user_roots,
             commands::plan_install,
             commands::list_installs,
+            commands::list_mod_tags,
+            commands::save_mod_tag,
+            commands::delete_mod_tag,
+            commands::set_mod_tags,
             commands::inspect_install,
             commands::check_modrinth_dependencies,
             commands::review_modrinth_dependency_graph,
@@ -164,6 +173,8 @@ pub fn run() {
             commands::rename_conversation,
             commands::set_conversation_pinned,
             commands::delete_conversation,
+            mod_language::get_mod_organization_locale,
+            mod_language::set_mod_organization_locale,
             commands::get_settings,
             commands::list_agent_models,
             commands::get_agent_model_metadata,
@@ -237,6 +248,31 @@ pub fn run() {
             }
             app.manage(local.clone());
             app.manage(agent.clone());
+            if services.recovery_error.is_none() {
+                let engine = services.engine.clone();
+                let events = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    use tauri::Emitter;
+                    if let Err(error) = manager_catalog::update_installed_at_startup(&engine, |slug| {
+                        let _ = events.emit("plugin://catalog-updated", slug);
+                    }).await {
+                        tracing::warn!(%error, "could not check for catalog adapter updates");
+                    }
+                });
+                let ui = app.handle().clone();
+                let organizer = mod_organizer::start(
+                    agent.settings.clone(),
+                    services.engine.organization_wake.clone(),
+                    move |game, install| {
+                        use tauri::Emitter;
+                        let _ = ui.emit(
+                            "mod://organized",
+                            serde_json::json!({"gameId": game, "installId": install}),
+                        );
+                    },
+                );
+                app.manage(organizer);
+            }
             app.manage(services);
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

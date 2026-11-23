@@ -26,6 +26,12 @@ use std::{
 pub(crate) const ADAPTER_LIMIT: usize = 256 * 1024;
 pub(crate) const SKILL_LIMIT: usize = 128 * 1024;
 const SOURCE: &str = "external";
+mod catalog_updates;
+pub(crate) use catalog_updates::{
+    catalog_update_candidates, record_catalog_draft_origin, update_catalog_release, CatalogUpdateCandidate,
+};
+#[cfg(test)]
+mod catalog_update_tests;
 mod desktop;
 pub(crate) use desktop::{
     finalize_desktop_transaction, install_catalog_release, is_desktop_plugin_kind,
@@ -805,8 +811,9 @@ fn deployment_record(engine: &FileEngine, row: &DeploymentRow) -> AppResult<Depl
             _ => None,
         })
         .ok_or_else(|| invalid("部署不是复制事务"))?;
-    if row.kind == desktop::CATALOG_INSTALL_KIND {
-        if record.previous.is_some() || !desktop::is_catalog_scratch(engine, source) {
+    if matches!(row.kind.as_str(), desktop::CATALOG_INSTALL_KIND | desktop::CATALOG_UPDATE_KIND) {
+        let is_update = row.kind == desktop::CATALOG_UPDATE_KIND;
+        if record.previous.is_some() != is_update || !desktop::is_catalog_scratch(engine, source) {
             return Err(invalid("云插件部署源或历史基线无效"));
         }
         verify_copy_plan(
@@ -815,8 +822,9 @@ fn deployment_record(engine: &FileEngine, row: &DeploymentRow) -> AppResult<Depl
             source,
             &expected,
             &record.content,
-            true,
+            !is_update,
         )?;
+        verify_previous(&plan, &expected, record.previous.as_ref())?;
         return Ok(record);
     }
     let slug = source
@@ -1032,7 +1040,15 @@ pub fn plan_install_plugin(engine: &FileEngine, draft_id: &str) -> AppResult<Dep
     let plan = engine.require_review(&plan.id)?;
     verify_copy_plan(&plan, &plan.id, &draft.path, &target, &content, false)?;
     verify_previous(&plan, &target, record.previous.as_ref())?;
-    engine.db.conn().execute("INSERT INTO plugin_deployments(transaction_id,slug,package_json,install_path,created_at) VALUES (?1,?2,?3,?4,?5)",params![plan.id,draft.slug,json,target.to_string_lossy(),util::now()])?;
+    let mut conn = engine.db.conn();
+    let tx = conn.transaction()?;
+    tx.execute("INSERT INTO plugin_deployments(transaction_id,slug,package_json,install_path,created_at) VALUES (?1,?2,?3,?4,?5)",params![plan.id,draft.slug,json,target.to_string_lossy(),util::now()])?;
+    // Editing either file turns an imported release into an independent local package.
+    tx.execute("INSERT INTO catalog_plugin_origins(transaction_id,plugin_id,adapter_sha256,skill_sha256)
+        SELECT ?1,plugin_id,adapter_sha256,skill_sha256 FROM catalog_plugin_origins
+        WHERE transaction_id=?2 AND adapter_sha256=?3 AND skill_sha256=?4",
+        params![plan.id, draft.write_transaction_id, content.hashes.adapter_sha256, content.hashes.skill_sha256])?;
+    tx.commit()?;
     Ok(DeploymentPreview {
         draft_id: draft.id,
         slug: draft.slug,
@@ -1096,13 +1112,14 @@ fn register_in(
     let now = util::now();
     tx.execute(
         "INSERT INTO plugins(slug,name,game_name,version,description,source,enabled,validated,install_path,adapter_json,created_at,updated_at,package_updated_at)
-         VALUES (?1,?2,?2,?3,?4,'external',?5,1,?6,?7,?8,?8,?9)
+         VALUES (?1,?2,?3,?4,?5,'external',?6,1,?7,?8,?9,?9,?10)
          ON CONFLICT(slug) DO UPDATE SET name=excluded.name,game_name=excluded.game_name,version=excluded.version,
          description=excluded.description,enabled=excluded.enabled,validated=1,install_path=excluded.install_path,
          adapter_json=excluded.adapter_json,updated_at=excluded.updated_at,package_updated_at=excluded.package_updated_at",
-        params![slug, package.adapter.name, package.adapter.version, package.skill.description, plugin_enabled, target.to_string_lossy(), content.adapter_json, now, package_updated_at],
+        params![slug, package.adapter.name, package.adapter.display_game_name(), package.adapter.version, package.skill.description, plugin_enabled, target.to_string_lossy(), content.adapter_json, now, package_updated_at],
     )?;
     tx.execute("INSERT INTO skills(name,description,location,source,enabled,created_at) VALUES (?1,?2,?3,'external',?4,?5) ON CONFLICT(name) DO UPDATE SET description=excluded.description,location=excluded.location,enabled=excluded.enabled",params![slug,package.skill.description,target.join("SKILL.md").to_string_lossy(),skill_enabled,now])?;
+    crate::games::refresh_bound_game_names(tx, &package.adapter)?;
     sync_plugin_servers(tx, slug, &package.adapter.mcp_configs()?)
 }
 fn disable(engine: &FileEngine, slug: &str, target: &Path) -> AppResult<bool> {

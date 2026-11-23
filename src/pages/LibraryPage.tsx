@@ -289,7 +289,7 @@ export default function LibraryPage() {
   function finishRegistration(directory: string, game: Game) {
     const key = gameDirectoryKey(directory);
     setCandidates((items) => items.map((item) => gameDirectoryKey(item.rootPath) === key
-      ? { ...item, registeredGameId: game.id, suggestedAdapterSlug: game.adapterSlug } : item));
+      ? { ...item, name: game.name, registeredGameId: game.id, suggestedAdapterSlug: game.adapterSlug } : item));
     notify(`已将「${game.name}」添加到游戏库`);
   }
   async function register(candidate: GameCandidate, localOnly = false) {
@@ -372,13 +372,13 @@ export default function LibraryPage() {
           return <Item role="listitem" variant="outline" key={gameDirectoryKey(candidate.rootPath)} className="motion-safe:animate-rise-in" style={stagger(index)}>
             <ItemMedia variant="icon"><Gamepad2Icon /></ItemMedia>
             <ItemContent className="min-w-0">
-              <ItemTitle className="max-w-full break-all">{candidate.name}</ItemTitle>
+              <ItemTitle className="max-w-full break-all">{matched?.gameName ?? candidate.name}</ItemTitle>
               <ItemDescription className="line-clamp-none"><PathText>{displayPath(candidate.rootPath)}</PathText></ItemDescription>
-              {matched && <p className="wrap-anywhere text-xs text-muted-foreground">{matched.name} · {matched.reusable ? "将校验并复用已安装适配包" : "适配包将随添加安装"}</p>}
+              {matched && <p className="wrap-anywhere text-xs text-muted-foreground">{matched.pluginName} · {matched.reusable ? "将校验并复用已安装适配包" : "适配包将随添加安装"}</p>}
               {candidate.warnings.map((warning) => <p key={warning} className="text-xs text-warning">{warning}</p>)}
             </ItemContent>
             <ItemActions className="w-full flex-wrap sm:w-auto">
-              <GameMatchBadge loading={waiting} candidate={candidate} cloudName={matched?.name} />
+              <GameMatchBadge loading={waiting} candidate={candidate} cloudMatched={!!matched} />
               {!matched && !waiting && !candidate.suggestedAdapterSlug && !candidate.registeredGameId && <Button variant="outline" size="sm" disabled={!backendAvailable || busy || games.isLoading} onClick={(event) => setIdentity({ directory: candidate.rootPath, trigger: event.currentTarget })}><GlobeIcon data-icon="inline-start" />联网识别</Button>}
               <Button size="sm" variant={candidate.registeredGameId ? "outline" : "default"} disabled={!writable || busy || cloud.pending || waiting || games.isLoading || !!candidate.registeredGameId} onClick={() => { void register(candidate); }}>{candidate.registeredGameId ? "管理中" : waiting ? "正在匹配…" : "添加"}</Button>
               {!candidate.registeredGameId && (waiting || failedRegistrations[candidate.rootPath]) && <Button variant="outline" size="sm" disabled={!writable || busy || cloud.pending || games.isLoading} onClick={() => void register(candidate, true)}>仅添加本地</Button>}

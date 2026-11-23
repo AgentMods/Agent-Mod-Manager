@@ -13,7 +13,15 @@ function eligible(candidate: GameCandidate) {
     && !(candidate.status === 'candidate' && candidate.confidence >= 0.8);
 }
 
-function matchRelease(candidate: GameCandidate, catalog: CatalogSearch, installed: Plugin[]) {
+export interface CloudGameMatch {
+  pluginId: string;
+  releaseId: string;
+  pluginName: string;
+  gameName: string;
+  reusable: boolean;
+}
+
+function matchRelease(candidate: GameCandidate, catalog: CatalogSearch, installed: Plugin[]): CloudGameMatch | undefined {
   if (!eligible(candidate)) return;
   const ids = new Set(candidate.sources?.filter(s => s.kind === 'steam').map(s => s.steamAppId).filter((id): id is string => !!id));
   if (ids.size > 1) return;
@@ -35,7 +43,9 @@ function matchRelease(candidate: GameCandidate, catalog: CatalogSearch, installe
   if (local && (!local.enabled || !local.validated || local.version !== release.version)) return;
   if (installed.some(p => p.slug !== release.slug && normalizeName(p.gameName) === normalizeName(game.name))) return;
   // This is only a suggestion: the backend verifies both hashes before reuse.
-  return { ...release, reusable: !!local };
+  // Older catalogs sometimes use a plugin title as the group name.
+  const gameName = release.gameName || (game.plugins.some(p => p.name === game.name) ? candidate.name : game.name);
+  return { pluginId: release.id, releaseId: release.releaseId, pluginName: release.name, gameName, reusable: !!local };
 }
 
 export function useCloudGameMatch(enabled: boolean) {
@@ -58,7 +68,7 @@ export function useCloudGameMatch(enabled: boolean) {
       const release = localOnly ? undefined : match(candidate);
       const game = await api<Game>('register_game', {
         directory: candidate.rootPath, adapterSlug: candidate.suggestedAdapterSlug, fromDiscovery: true,
-        ...(release && { cloudAdapter: { pluginId: release.id, releaseId: release.releaseId }, discoveryName: candidate.name }),
+        ...(release && { cloudAdapter: { pluginId: release.pluginId, releaseId: release.releaseId }, discoveryName: release.gameName }),
       });
       return { game, release };
     },

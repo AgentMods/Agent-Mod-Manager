@@ -190,3 +190,18 @@
   from { transform: translate(-4%, 1px); opacity: 0.65; }
   to { transform: translate(4%, -1px); opacity: 1; }
 }
+
+/* Blend a user-selected tag color with the current theme to keep its text legible. */
+.mod-tag-color {
+  color: color-mix(in srgb, var(--mod-tag-color) 42%, var(--foreground));
+  background-color: color-mix(in srgb, var(--mod-tag-color) 12%, var(--card));
+  border-color: color-mix(in srgb, var(--mod-tag-color) 54%, var(--border));
+}
+
+button.mod-tag-color:is(:hover, [data-state="on"]) {
+  background-color: color-mix(in srgb, var(--mod-tag-color) 20%, var(--card));
+}
+
+button.mod-tag-color[data-state="on"] {
+  box-shadow: inset 0 0 0 1px currentColor;
+}

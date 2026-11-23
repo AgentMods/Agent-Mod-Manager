@@ -228,7 +228,7 @@ fn rejects_ambiguous_ids_and_unsafe_release_paths_without_hiding_unrelated_candi
         ("skillUrl",json!("/api/v1/manager-plugins/releases/30/../31/SKILL.md")),
         ("skillUrl",json!("/api/v1/manager-plugins/releases/31/SKILL.md?x")),
         ("authorId",json!(0)), ("releaseId",json!("031")), ("id",json!(2.5)), ("platforms",json!(["unsupported"])),
-        ("version",json!("invalid")), ("name",json!("label\u{202e}hidden")), ("slug",json!("../escape"))
+        ("gameName",json!("label\u{202e}hidden")), ("version",json!("invalid")), ("name",json!("label\u{202e}hidden")), ("slug",json!("../escape"))
     ] {
         let mut body = catalog();
         candidate(&mut body)[field] = value;
@@ -255,7 +255,7 @@ fn rejects_ambiguous_ids_and_unsafe_release_paths_without_hiding_unrelated_candi
             .as_array_mut()
             .unwrap()
             .push(distinct);
-        let result = parse_catalog(&body.to_string()).unwrap();
+        let result = parse_catalog(&body.to_string()).unwrap().search;
         assert_eq!(result.skipped_entries, 2);
         assert_eq!(result.games[0].plugins[0].id, "61");
     }
@@ -459,8 +459,16 @@ async fn reviewed_agent_import_preserves_exact_bytes_after_server_disappears_the
         fs::read(install.install_path.join("SKILL.md")).unwrap(),
         skill.as_bytes()
     );
+    let cloud = plugin_workflow::catalog_update_candidates(&ctx.engine).unwrap();
+    assert_eq!(cloud.len(), 1);
+    assert_eq!(cloud[0].slug, slug);
+    assert_eq!(cloud[0].plugin_id.as_deref(), Some(PLUGIN_ID));
+    assert_eq!(cloud[0].deployment_id, install.plan.id);
     ctx.engine.rollback_transaction(&install.plan.id).unwrap();
     plugin_workflow::reconcile_deployments(&ctx.engine).unwrap();
+    assert!(plugin_workflow::catalog_update_candidates(&ctx.engine)
+        .unwrap()
+        .is_empty());
     assert_eq!(
         fs::read(install.install_path.join("adapter.json")).unwrap(),
         old_adapter.as_bytes()
@@ -597,6 +605,42 @@ fn fallout_root(root: &std::path::Path) {
     fs::create_dir_all(root.join("Data")).unwrap();
     fs::write(root.join("Fallout4.exe"), "fixture").unwrap();
     fs::write(root.join("Data/Fallout4.esm"), "fixture").unwrap();
+}
+
+#[tokio::test]
+async fn release_game_name_reaches_the_library_on_catalog_install_and_reuse() {
+    let (temp, ctx) = context();
+    let server = Server::new().await;
+    let (source, _) = files();
+    let mut manifest: Value = serde_json::from_str(&source).unwrap();
+    manifest["name"] = json!("辐射 4 Windows 适配包");
+    manifest["gameName"] = json!("辐射 4");
+    let mut directory = catalog();
+    candidate(&mut directory)["name"] = manifest["name"].clone();
+    candidate(&mut directory)["gameName"] = manifest["gameName"].clone();
+    server.set_catalog(directory);
+    server.set_file("adapter.json", Reply::ok(manifest.to_string()));
+
+    let preview = server
+        .client
+        .preview(&ctx.engine, PLUGIN_ID, RELEASE_ID)
+        .await
+        .unwrap();
+    let directory = server.client.games().await.unwrap();
+    let row = serde_json::to_value(&directory.games[0].plugins[0]).unwrap();
+    assert_eq!(row["gameName"], "辐射 4");
+    assert_eq!(row["name"], "辐射 4 Windows 适配包");
+    assert_eq!(preview.game_name, "辐射 4");
+    assert_eq!(preview.plugin.name, "辐射 4 Windows 适配包");
+    for folder in ["first", "second"] {
+        let path = temp.path().join(folder);
+        fallout_root(&path);
+        let game = add_with_catalog(&server, &ctx.engine, &path).await.unwrap();
+        assert_eq!(game.name, "辐射 4");
+    }
+    let library = crate::games::list_games(&ctx.engine.db).unwrap();
+    assert_eq!(library.len(), 2);
+    assert!(library.iter().all(|game| game.name == "辐射 4"));
 }
 
 #[tokio::test]
@@ -923,6 +967,12 @@ async fn direct_install_refuses_a_different_version_but_keeps_manual_overwrite_w
     apply(engine, &older.plan);
     let deployed = plugin_workflow::plan_install_plugin(engine, &older.draft.id).unwrap();
     apply(engine, &deployed.plan);
+    server
+        .client
+        .update_installed_at_startup(engine, |_| panic!("manual draft is not a cloud install"))
+        .await
+        .unwrap();
+    assert!(server.requests().is_empty());
     assert!(
         matches!(server.client.install(engine, PLUGIN_ID, RELEASE_ID).await,
         Err(AppError::Conflict(message)) if message.contains("0.9.0") && message.contains("先移除"))
@@ -943,4 +993,239 @@ async fn direct_install_refuses_a_different_version_but_keeps_manual_overwrite_w
         plugins::list_plugins(&engine.db).unwrap()[0].version,
         "1.0.0"
     );
+}
+
+fn startup_release(slug: &str, plugin_id: &str, release_id: &str, version: &str) -> Value {
+    let mut body = catalog();
+    let row = candidate(&mut body);
+    row["id"] = json!(plugin_id);
+    row["releaseId"] = json!(release_id);
+    row["slug"] = json!(slug);
+    row["version"] = json!(version);
+    row["adapterUrl"] = json!(release_path(release_id, "adapter.json"));
+    row["skillUrl"] = json!(release_path(release_id, "SKILL.md"));
+    row.clone()
+}
+
+fn serve_startup_releases(server: &Server, rows: Vec<Value>) {
+    let mut body = catalog();
+    body["data"][0]["plugins"] = json!(rows);
+    server.set_catalog(body);
+}
+
+fn serve_startup_release_files(
+    server: &Server,
+    row: &Value,
+    manifest_version: &str,
+) -> (String, String) {
+    let (adapter, skill) = files();
+    let slug = row["slug"].as_str().unwrap();
+    let release_id = row["releaseId"].as_str().unwrap();
+    let mut adapter: Value = serde_json::from_str(&adapter).unwrap();
+    adapter["slug"] = json!(slug);
+    adapter["version"] = json!(manifest_version);
+    adapter.as_object_mut().unwrap().remove("mcpServers");
+    let adapter = serde_json::to_string_pretty(&adapter).unwrap();
+    let skill = skill.replace("name: fallout4", &format!("name: {slug}"));
+    server.set(
+        &release_path(release_id, "adapter.json"),
+        Reply::ok(adapter.clone()),
+    );
+    server.set(
+        &release_path(release_id, "SKILL.md"),
+        Reply::ok(skill.clone()),
+    );
+    (adapter, skill)
+}
+
+#[tokio::test]
+async fn startup_requires_both_pinned_identity_fields_and_strictly_higher_precedence() {
+    let (_temp, ctx) = context();
+    let engine = &ctx.engine;
+    let server = Server::new().await;
+    server
+        .client
+        .install(engine, PLUGIN_ID, RELEASE_ID)
+        .await
+        .unwrap();
+    let initial_requests = server.requests().len();
+    let changes = [
+        ("fallout4", "23", "2.0.0"),
+        ("different-slug", PLUGIN_ID, "2.0.0"),
+        ("fallout4", PLUGIN_ID, "1.0.0+rebuild"),
+        ("fallout4", PLUGIN_ID, "1.0.0-rc.10"),
+    ];
+    for (slug, id, version) in changes {
+        serve_startup_releases(&server, vec![startup_release(slug, id, "32", version)]);
+        server
+            .client
+            .update_installed_at_startup(engine, |_| panic!("unexpected update"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(&server.requests()[initial_requests..], &[GAMES_PATH; 4]);
+    assert_eq!(
+        plugins::list_plugins(&engine.db).unwrap()[0].version,
+        "1.0.0"
+    );
+}
+
+#[tokio::test]
+async fn startup_checks_the_catalog_once_and_isolates_a_bad_release_from_another_update() {
+    let (_temp, ctx) = context();
+    let engine = &ctx.engine;
+    let server = Server::new().await;
+    let second_id = "23";
+    let second_release = startup_release("second-fallout", second_id, "33", "1.0.0-rc.9");
+    serve_startup_release_files(&server, &second_release, "1.0.0-rc.9");
+    let first_release = candidate(&mut catalog()).clone();
+    serve_startup_releases(&server, vec![first_release, second_release]);
+    server
+        .client
+        .install(engine, PLUGIN_ID, RELEASE_ID)
+        .await
+        .unwrap();
+    server
+        .client
+        .install(engine, second_id, "33")
+        .await
+        .unwrap();
+
+    // Give the first candidate a version-mismatched manifest, then verify
+    // that the remaining candidate can still commit and notify the caller.
+    let installed = plugin_workflow::catalog_update_candidates(engine).unwrap();
+    assert_eq!(installed.len(), 2);
+    let bad = &installed[0];
+    let good = &installed[1];
+    let bad_id = bad.plugin_id.as_deref().unwrap();
+    let good_id = good.plugin_id.as_deref().unwrap();
+    let higher = |slug: &str| {
+        if slug == "fallout4" {
+            "1.0.1"
+        } else {
+            "1.0.0-rc.10"
+        }
+    };
+    let bad_row = startup_release(&bad.slug, bad_id, "41", higher(&bad.slug));
+    serve_startup_release_files(&server, &bad_row, &bad.version);
+    let good_row = startup_release(&good.slug, good_id, "42", higher(&good.slug));
+    let (adapter, skill) = serve_startup_release_files(&server, &good_row, higher(&good.slug));
+    let different_author = startup_release(&good.slug, "53", "43", "99.0.0");
+    let unrelated = startup_release("not-installed", "54", "44", "99.0.0");
+    // Even an otherwise valid author/release with the same slug cannot replace
+    // the recorded ID, and unrelated catalog entries never trigger downloads.
+    serve_startup_releases(
+        &server,
+        vec![different_author, unrelated, bad_row, good_row],
+    );
+    let initial_requests = server.requests().len();
+    let notified = Mutex::new(Vec::new());
+    server
+        .client
+        .update_installed_at_startup(engine, |slug| {
+            notified.lock().unwrap().push(slug.to_owned());
+        })
+        .await
+        .unwrap();
+    assert_eq!(notified.into_inner().unwrap(), [good.slug.clone()]);
+    let requests = server.requests();
+    let requests = &requests[initial_requests..];
+    assert_eq!(requests[0], GAMES_PATH);
+    let mut files = requests[1..].to_vec();
+    files.sort();
+    assert_eq!(
+        files,
+        [
+            release_path("41", "SKILL.md"),
+            release_path("41", "adapter.json"),
+            release_path("42", "SKILL.md"),
+            release_path("42", "adapter.json"),
+        ]
+    );
+    let installed = plugins::list_plugins(&engine.db).unwrap();
+    assert_eq!(
+        installed
+            .iter()
+            .find(|p| p.slug == bad.slug)
+            .unwrap()
+            .version,
+        bad.version
+    );
+    assert_eq!(
+        installed
+            .iter()
+            .find(|p| p.slug == good.slug)
+            .unwrap()
+            .version,
+        higher(&good.slug)
+    );
+    let target = engine.paths.plugins().join("games").join(&good.slug);
+    assert_eq!(
+        fs::read(target.join("adapter.json")).unwrap(),
+        adapter.as_bytes()
+    );
+    assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), skill.as_bytes());
+    assert_no_catalog_drafts(engine);
+}
+
+#[tokio::test]
+async fn startup_requires_a_unique_catalog_slug_for_legacy_install_without_an_id() {
+    let (_temp, ctx) = context();
+    let engine = &ctx.engine;
+    let server = Server::new().await;
+    server
+        .client
+        .install(engine, PLUGIN_ID, RELEASE_ID)
+        .await
+        .unwrap();
+    let deployment = lifecycle_transaction(engine, "catalog_plugin_install");
+    assert_eq!(
+        engine
+            .db
+            .conn()
+            .execute(
+                "DELETE FROM catalog_plugin_origins WHERE transaction_id=?1",
+                [&deployment],
+            )
+            .unwrap(),
+        1
+    );
+    let next = startup_release("fallout4", "23", "32", "2.0.0");
+    let older = startup_release("fallout4", "24", "33", "0.9.0");
+    let mut hidden = older.clone();
+    hidden["hidden"] = json!(true);
+    let mut invalid = older.clone();
+    invalid["version"] = json!("invalid");
+    let initial_requests = server.requests().len();
+    for competing in [older, hidden, invalid] {
+        serve_startup_releases(&server, vec![next.clone(), competing]);
+        server
+            .client
+            .update_installed_at_startup(engine, |_| panic!("ambiguous legacy slug"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(&server.requests()[initial_requests..], &[GAMES_PATH; 3]);
+    assert_eq!(
+        plugins::list_plugins(&engine.db).unwrap()[0].version,
+        "1.0.0"
+    );
+
+    serve_startup_release_files(&server, &next, "2.0.0");
+    serve_startup_releases(&server, vec![next]);
+    let notified = Mutex::new(Vec::new());
+    server
+        .client
+        .update_installed_at_startup(engine, |slug| {
+            notified.lock().unwrap().push(slug.to_owned());
+        })
+        .await
+        .unwrap();
+    assert_eq!(notified.into_inner().unwrap(), ["fallout4"]);
+    assert_eq!(
+        plugins::list_plugins(&engine.db).unwrap()[0].version,
+        "2.0.0"
+    );
+    let cloud = plugin_workflow::catalog_update_candidates(engine).unwrap();
+    assert_eq!(cloud[0].plugin_id.as_deref(), Some("23"));
 }

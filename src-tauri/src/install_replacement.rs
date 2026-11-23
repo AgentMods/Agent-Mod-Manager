@@ -63,11 +63,14 @@ fn expected(file: &InstalledFile) -> Fingerprint {
 
 // Compare path components conservatively on every platform so previews remain
 // safe on case-insensitive Steam libraries and external volumes.
-pub(super) fn path_key(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/").to_lowercase()
+pub(crate) fn path_key(path: &Path) -> String {
+    crate::paths::user_path(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase()
 }
 
-fn overlaps(paths: &BTreeSet<String>, path: &str) -> bool {
+pub(super) fn overlaps(paths: &BTreeSet<String>, path: &str) -> bool {
     if paths.contains(path)
         || path
             .match_indices('/')
@@ -82,28 +85,39 @@ fn overlaps(paths: &BTreeSet<String>, path: &str) -> bool {
         .is_some_and(|p| p.starts_with(&prefix))
 }
 
+pub(crate) fn verify_unowned_paths<'a>(
+    engine: &FileEngine,
+    paths: impl IntoIterator<Item = &'a Path>,
+) -> AppResult<()> {
+    let keys = paths.into_iter().map(path_key).collect();
+    verify_ownership(engine, &keys, (None, None), None)
+}
+
 pub(super) fn verify_ownership(
     engine: &FileEngine,
     paths: &BTreeSet<String>,
-    ignored: (&str, Option<&str>),
+    ignored: (Option<&str>, Option<&str>),
     project: Option<(&str, &DownloadOrigin)>,
 ) -> AppResult<()> {
     let conn = engine.db.conn();
     let mut stmt = conn.prepare(&format!(
-        "SELECT game_id,files_json,metadata_json FROM installs
-        WHERE id<>?1 AND id<>COALESCE(?2,'') AND ({}) IN ('enabled','installed','partially_restored')",
+        "SELECT game_id,files_json,metadata_json,id,name FROM installs
+        WHERE id IS NOT ?1 AND id IS NOT ?2 AND ({}) IN ('enabled','installed','partially_restored')",
         super::effective_install_state(),
     ))?;
     let mut rows = stmt.query(rusqlite::params![ignored.0, ignored.1])?;
     while let Some(row) = rows.next()? {
         let files: Vec<InstalledFile> = serde_json::from_str(&row.get::<_, String>(1)?)?;
-        if files
+        if let Some(file) = files
             .iter()
-            .any(|file| overlaps(paths, &path_key(&file.path)))
+            .find(|file| overlaps(paths, &path_key(&file.path)))
         {
-            return Err(conflict(
-                "涉及其他已安装或部分恢复 Mod 的文件，不能替换或移除",
-            ));
+            let owner: String = row.get(3)?;
+            let name: String = row.get(4)?;
+            return Err(conflict(format!(
+                "涉及其他已安装或部分恢复 Mod「{name}」的文件：{}。请用 inspect_install 核对安装记录 {owner} 的文件归属。",
+                crate::paths::display_path(&file.path)
+            )));
         }
         if let Some((game, origin)) = project {
             if row.get::<_, String>(0)? == game {
@@ -253,18 +267,25 @@ impl Replacement {
         verify_ownership(
             engine,
             &touched,
-            (&self.previous.id, next_install_id),
+            (Some(&self.previous.id), next_install_id),
             Some((&self.previous.game_id, &self.next)),
         )
     }
 }
 
 pub(crate) fn validate_apply(engine: &FileEngine, plan: &FilePlan) -> AppResult<()> {
-    let link: Option<(String, String, Option<String>)> = engine.db.conn().query_row(
-        "SELECT i.install_id,i.action,r.replaced_install_id FROM install_transactions i
-         LEFT JOIN install_replacements r ON r.transaction_id=i.transaction_id WHERE i.transaction_id=?1",
-        [&plan.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    ).optional()?;
+    let link: Option<(String, String, Option<String>)> = engine
+        .db
+        .conn()
+        .query_row(
+            "SELECT i.install_id,i.action,r.replaced_install_id FROM install_transactions i
+         JOIN file_transactions f ON f.id=i.transaction_id
+         LEFT JOIN install_replacements r ON r.transaction_id=i.transaction_id
+         WHERE i.transaction_id=?1 AND f.kind<>?2",
+            rusqlite::params![plan.id, super::LIBRARY_INSTALL_KIND],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
     if let Some((next_id, _, Some(previous_id))) = link {
         let next = get_install(engine, &next_id)?;
         if next.status != "planned" {
@@ -280,11 +301,102 @@ pub(crate) fn validate_apply(engine: &FileEngine, plan: &FilePlan) -> AppResult<
         )?
         .inspect_plan(engine, plan, Some(&next_id))?;
     } else if let Some((id, action, None)) = link {
-        if action == "uninstall" {
-            super::validate_uninstall_apply(engine, plan, &id)?;
+        match action.as_str() {
+            "uninstall" => super::validate_uninstall_apply(engine, plan, &id)?,
+            "install" => {
+                verify_unowned_paths(
+                    engine,
+                    plan.entries.iter().map(|entry| entry.operation.dst()),
+                )?;
+            }
+            _ => {}
         }
     }
     Ok(())
+}
+
+/// Restoring any item from a managed uninstall reactivates its full manifest.
+/// Validate the physical destinations as well, including ordinary trash restores.
+pub(crate) fn validate_trash_restore_ownership<'a>(
+    engine: &FileEngine,
+    destinations: impl IntoIterator<Item = &'a Path>,
+    managed: impl IntoIterator<Item = (&'a str, &'a Path)>,
+) -> AppResult<()> {
+    let mut ordinary: BTreeSet<_> = destinations.into_iter().map(path_key).collect();
+    let mut reactivated: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    for (id, path) in managed {
+        let key = path_key(path);
+        ordinary.remove(&key);
+        reactivated.entry(id).or_default().insert(key);
+    }
+    verify_restore_claims(engine, ordinary, reactivated)
+}
+
+fn verify_restore_claims(
+    engine: &FileEngine,
+    ordinary: BTreeSet<String>,
+    reactivated: BTreeMap<&str, BTreeSet<String>>,
+) -> AppResult<()> {
+    if !ordinary.is_empty() {
+        verify_ownership(engine, &ordinary, (None, None), None)?;
+    }
+    let mut earlier = ordinary;
+    for (id, mut paths) in reactivated {
+        let manifest: String = engine
+            .db
+            .conn()
+            .query_row("SELECT files_json FROM installs WHERE id=?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .ok_or_else(|| conflict(format!("缺少待恢复安装记录 {id} 的文件清单")))?;
+        let files: Vec<InstalledFile> = serde_json::from_str(&manifest)?;
+        paths.extend(files.iter().map(|file| path_key(&file.path)));
+        verify_ownership(engine, &paths, (Some(id), None), None)?;
+        if let Some(path) = paths.iter().find(|path| overlaps(&earlier, path)) {
+            return Err(conflict(format!(
+                "同一恢复计划中，安装记录 {id} 与其他恢复项的路径冲突：{path}"
+            )));
+        }
+        earlier.extend(paths);
+    }
+    Ok(())
+}
+
+/// Check the paths that a committed trash move would return on rollback.
+/// FileEngine validates the journal contents and performs the rollback itself.
+fn validate_trash_rollback(engine: &FileEngine, transaction_id: &str) -> AppResult<()> {
+    let (owner, originals) = {
+        let conn = engine.db.conn();
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT install_id FROM install_transactions WHERE transaction_id=?1 AND action='uninstall'",
+                [transaction_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let mut stmt = conn.prepare(
+            "SELECT src,dst FROM file_transaction_entries WHERE transaction_id=?1 AND op='move' AND src IS NOT NULL
+             UNION ALL SELECT original_path,trash_path FROM trash_items WHERE transaction_id=?1",
+        )?;
+        let mut rows = stmt.query([transaction_id])?;
+        let trash = engine.paths.trash();
+        let mut originals = BTreeSet::new();
+        while let Some(row) = rows.next()? {
+            let dst: String = row.get(1)?;
+            if crate::paths::contains_path(&trash, Path::new(&dst)) {
+                let src: String = row.get(0)?;
+                originals.insert(path_key(Path::new(&src)));
+            }
+        }
+        (owner, originals)
+    };
+    match owner.as_deref() {
+        Some(id) => {
+            verify_restore_claims(engine, BTreeSet::new(), BTreeMap::from([(id, originals)]))
+        }
+        None => verify_restore_claims(engine, originals, BTreeMap::new()),
+    }
 }
 
 pub(crate) fn validate_rollback(engine: &FileEngine, transaction_id: &str) -> AppResult<bool> {
@@ -317,7 +429,24 @@ pub(crate) fn validate_rollback(engine: &FileEngine, transaction_id: &str) -> Ap
         return Err(conflict("先回滚较新的版本替换，再回滚此事务"));
     }
     let Some((previous_id, next_id)) = replacement else {
-        return Ok(false);
+        let install_id: Option<String> = engine.db.conn().query_row(
+            "SELECT install_id FROM install_transactions WHERE transaction_id=?1 AND action='install'",
+            [transaction_id], |r| r.get(0),
+        ).optional()?;
+        let Some(id) = install_id else {
+            validate_trash_rollback(engine, transaction_id)?;
+            return Ok(false);
+        };
+        // The transaction history and unscoped rollback also reach this entry point.
+        let report = super::inspect_install(engine, &id)?;
+        let action = &report.reconciliation;
+        if action.recommended_action != "safe_uninstall"
+            && !(action.recommended_action == "rollback_install"
+                && action.rollback_transaction_id.as_deref() == Some(transaction_id))
+        {
+            return Err(conflict(action.reasons.join("；")));
+        }
+        return Ok(true);
     };
     let next = get_install(engine, &next_id)?;
     if next.status != "enabled" {
@@ -358,7 +487,7 @@ pub(crate) fn validate_rollback(engine: &FileEngine, transaction_id: &str) -> Ap
     verify_ownership(
         engine,
         &touched,
-        (&next_id, Some(&previous_id)),
+        (Some(&next_id), Some(&previous_id)),
         next.download_origin
             .as_ref()
             .map(|origin| (next.game_id.as_str(), origin)),
@@ -369,6 +498,15 @@ pub(crate) fn validate_rollback(engine: &FileEngine, transaction_id: &str) -> Ap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn legacy_and_canonical_drive_paths_share_an_ownership_key() {
+        assert_eq!(
+            path_key(Path::new(r"E:\Games\Scripts\Trainer.asi")),
+            path_key(Path::new(r"\\?\E:\games\scripts\trainer.asi"))
+        );
+    }
 
     fn nexus(project_id: &str) -> DownloadOrigin {
         DownloadOrigin {

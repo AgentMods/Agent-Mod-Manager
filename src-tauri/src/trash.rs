@@ -2,10 +2,10 @@ use crate::{
     db::Db,
     error::{AppError, AppResult},
     storage::AppPaths,
-    transaction::{FileEngine, FileOp, FilePlan},
+    transaction::{write_lock, FileEngine, FileOp, FilePlan},
     util,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -61,9 +61,13 @@ impl TrashDraft {
 /// Build trash moves and metadata without recording a plan or acquiring the write lock.
 /// Call before taking the DB connection; path validation reads through the engine.
 pub(crate) fn prepare_trash(engine: &FileEngine, req: &TrashRequest) -> AppResult<Vec<TrashDraft>> {
-    let mut drafts = Vec::with_capacity(req.paths.len());
+    draft_trash(engine, req, resolve_sources(engine, req)?)
+}
+
+fn resolve_sources(engine: &FileEngine, req: &TrashRequest) -> AppResult<Vec<PathBuf>> {
+    let mut sources = Vec::with_capacity(req.paths.len());
     if req.paths.is_empty() {
-        return Ok(drafts);
+        return Ok(sources);
     }
     let roots = engine.roots()?;
     let retained = engine.retained_paths()?;
@@ -88,6 +92,18 @@ pub(crate) fn prepare_trash(engine: &FileEngine, req: &TrashRequest) -> AppResul
                 "不能移动管理器内部数据或已登记的根目录".into(),
             ));
         }
+        sources.push(src);
+    }
+    Ok(sources)
+}
+
+fn draft_trash(
+    engine: &FileEngine,
+    req: &TrashRequest,
+    sources: Vec<PathBuf>,
+) -> AppResult<Vec<TrashDraft>> {
+    let mut drafts = Vec::with_capacity(sources.len());
+    for (raw, src) in req.paths.iter().zip(sources) {
         let fp = crate::transaction::fingerprint(&src)?
             .ok_or_else(|| AppError::NotFound(raw.clone()))?;
         let id = util::new_id("trash");
@@ -138,14 +154,107 @@ pub(crate) fn record_prepared(
 
 /// Return a preview. The approval coordinator must approve before execution.
 pub fn plan_trash(engine: &FileEngine, req: &TrashRequest) -> AppResult<FilePlan> {
-    let drafts = prepare_trash(engine, req)?;
+    let guard = write_lock();
+    let sources = resolve_sources(engine, req)?;
+    if !sources.is_empty() {
+        validate_sources(engine, sources.iter().map(PathBuf::as_path))?;
+    }
+    let drafts = draft_trash(engine, req, sources)?;
     let ops = drafts.iter().map(|draft| draft.operation.clone()).collect();
-    let plan = engine.plan_internal(ops, "移入回收站".into())?;
+    let plan = engine.build_locked_plan(&guard, ops, "移入回收站".into(), true)?;
     let mut conn = engine.db.conn();
     let tx = conn.transaction()?;
+    FileEngine::persist_plan(&tx, &plan, true)?;
     record_prepared(engine, &tx, &plan.id, drafts)?;
     tx.commit()?;
     Ok(plan)
+}
+
+fn validate_sources<'a>(
+    engine: &FileEngine,
+    paths: impl Iterator<Item = &'a Path> + Clone,
+) -> AppResult<()> {
+    let library = engine.paths.mod_library();
+    if let Some(path) = paths
+        .clone()
+        .find(|path| crate::paths::overlaps(&library, path))
+    {
+        return Err(AppError::Denied(format!(
+            "不能通过通用回收站移走 Mods 库目录或库文件：{}。请通过 Mods 库管理入口操作。",
+            crate::paths::display_path(path)
+        )));
+    }
+    crate::install::verify_unowned_paths(engine, paths)
+}
+
+/// Recheck trash moves under the file write lock, including legacy plans.
+/// Incoming uninstall and replacement moves pass the dedicated install validation.
+pub(crate) fn validate_apply(engine: &FileEngine, plan: &FilePlan) -> AppResult<()> {
+    let trash = engine.paths.trash();
+    let mut sources = plan
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.operation {
+            FileOp::Move { src, dst } if crate::paths::contains_path(&trash, dst) => {
+                Some(src.as_path())
+            }
+            _ => None,
+        })
+        .peekable();
+    if sources.peek().is_some() {
+        let install_action: bool = engine.db.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM install_transactions t WHERE t.transaction_id=?1 AND (
+                t.action='uninstall' OR (t.action='install' AND EXISTS(
+                    SELECT 1 FROM install_replacements r WHERE r.transaction_id=t.transaction_id
+                    AND r.replacement_install_id=t.install_id))))",
+            [&plan.id],
+            |row| row.get(0),
+        )?;
+        if !install_action {
+            validate_sources(engine, sources)?;
+        }
+    }
+    validate_restore_apply(engine, plan, &trash)
+}
+
+fn validate_restore_apply(engine: &FileEngine, plan: &FilePlan, trash: &Path) -> AppResult<()> {
+    let mut destinations = plan
+        .entries
+        .iter()
+        .filter_map(|entry| match &entry.operation {
+            FileOp::Move { src, dst } if crate::paths::contains_path(trash, src) => {
+                Some(dst.as_path())
+            }
+            _ => None,
+        })
+        .peekable();
+    if destinations.peek().is_none() {
+        return Ok(());
+    }
+    let managed = {
+        let conn = engine.db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT a.install_id,t.original_path FROM trash_restore_links r
+             JOIN trash_items t ON t.id=r.item_id
+             JOIN install_transactions a ON a.transaction_id=t.transaction_id AND a.action='uninstall'
+             JOIN file_transactions u ON u.id=a.transaction_id AND u.status='committed'
+             WHERE r.transaction_id=?1",
+        )?;
+        let rows = stmt.query_map([&plan.id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                PathBuf::from(row.get::<_, String>(1)?),
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    crate::install::validate_trash_restore_ownership(
+        engine,
+        destinations,
+        managed
+            .iter()
+            .map(|(id, path)| (id.as_str(), path.as_path())),
+    )
 }
 
 pub fn list_trash(db: &Db, include_restored: bool) -> AppResult<Vec<TrashItem>> {
@@ -181,6 +290,7 @@ pub fn list_trash(db: &Db, include_restored: bool) -> AppResult<Vec<TrashItem>> 
 }
 
 pub fn plan_restore(engine: &FileEngine, ids: &[String], overwrite: bool) -> AppResult<FilePlan> {
+    let guard = write_lock();
     let items = list_trash(&engine.db, false)?;
     let selected = ids
         .iter()
@@ -197,7 +307,7 @@ pub fn plan_restore(engine: &FileEngine, ids: &[String], overwrite: bool) -> App
         ));
     }
     let mut ops = Vec::with_capacity(selected.len());
-    for item in selected {
+    for item in &selected {
         let src = PathBuf::from(&item.trash_path);
         crate::paths::ensure_within(&src, &[engine.paths.trash()])?;
         let dst = engine
@@ -211,13 +321,38 @@ pub fn plan_restore(engine: &FileEngine, ids: &[String], overwrite: bool) -> App
         }
         ops.push(FileOp::Move { src, dst });
     }
-    let plan = engine.plan_internal(ops, "还原回收站文件".into())?;
+    let managed = {
+        let conn = engine.db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT install_id FROM install_transactions WHERE transaction_id=?1 AND action='uninstall'",
+        )?;
+        let mut managed = Vec::new();
+        for (item, op) in selected.iter().zip(&ops) {
+            let owner: Option<String> = stmt
+                .query_row([&item.transaction_id], |row| row.get(0))
+                .optional()?;
+            if let Some(owner) = owner {
+                managed.push((owner, op.dst()));
+            }
+        }
+        managed
+    };
+    crate::install::validate_trash_restore_ownership(
+        engine,
+        ops.iter().map(FileOp::dst),
+        managed.iter().map(|(id, path)| (id.as_str(), *path)),
+    )?;
+    let plan = engine.build_locked_plan(&guard, ops, "还原回收站文件".into(), true)?;
+    let mut conn = engine.db.conn();
+    let tx = conn.transaction()?;
+    FileEngine::persist_plan(&tx, &plan, true)?;
     for id in ids {
-        engine.db.conn().execute(
+        tx.execute(
             "INSERT INTO trash_restore_links (item_id,transaction_id) VALUES (?1,?2)",
             params![id, plan.id],
         )?;
     }
+    tx.commit()?;
     Ok(plan)
 }
 
@@ -276,6 +411,10 @@ pub fn purge_trash(
     }
     Ok(freed)
 }
+
+#[cfg(test)]
+#[path = "trash_install_tests.rs"]
+mod install_tests;
 
 #[cfg(test)]
 mod tests {

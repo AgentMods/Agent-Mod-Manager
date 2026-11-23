@@ -209,12 +209,17 @@ fn embedded_catalog_lists_readable_system_skills_with_persisted_preferences() {
         ("system-adapter-authoring", "read_plugin_package"),
         ("system-web-search", "web_search"),
         ("system-mod-download", "GameBanana"),
+        (
+            "system-mod-commission",
+            "https://www.glossmod.com/commissions/new",
+        ),
         ("system-mod-install", "match_mod_install"),
+        (MOD_ORGANIZER_SKILL_NAME, "insufficientEvidence"),
         ("system-mod-uninstall", "inspect_install"),
     ];
     let listed = list_skills(&f.engine).unwrap();
     assert_eq!(listed.len(), guides.len());
-    for (name, tool) in guides {
+    for (name, expected_text) in guides {
         let info = listed.iter().find(|skill| skill.name == name).unwrap();
         assert!(is_system_skill(name));
         assert_eq!(info.kind, SkillKind::System);
@@ -222,7 +227,7 @@ fn embedded_catalog_lists_readable_system_skills_with_persisted_preferences() {
         assert!(info.enabled && info.valid && info.issues.is_empty());
         let detail = get_skill(&f.engine, name).unwrap();
         assert_eq!(detail.skill.description, info.description);
-        assert!(detail.markdown.contains(tool));
+        assert!(detail.markdown.contains(expected_text));
     }
     assert!(!is_system_skill(NAME));
 
@@ -249,6 +254,23 @@ fn embedded_catalog_lists_readable_system_skills_with_persisted_preferences() {
     );
     assert_eq!(f.count("file_transactions"), 0);
     assert_eq!(f.count("skills"), 0);
+}
+
+#[test]
+fn organizer_worker_reads_the_catalog_body_and_respects_persisted_toggle() {
+    let f = Fixture::new();
+    let name = MOD_ORGANIZER_SKILL_NAME;
+    let detail = get_skill(&f.engine, name).unwrap();
+    let body = enabled_mod_organizer(&f.engine.db).unwrap().unwrap();
+    assert!(body.starts_with("# 整理已安装的 Mod"));
+    assert!(detail.markdown.trim_end().ends_with(body));
+
+    set_enabled(&f.engine, name, false).unwrap();
+    let reopened = f.reopen();
+    assert_eq!(enabled_mod_organizer(&reopened.db).unwrap(), None);
+    assert!(!get_skill(&reopened, name).unwrap().skill.enabled);
+    set_enabled(&reopened, name, true).unwrap();
+    assert_eq!(enabled_mod_organizer(&f.reopen().db).unwrap(), Some(body));
 }
 
 #[tokio::test]

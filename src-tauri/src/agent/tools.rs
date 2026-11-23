@@ -302,7 +302,7 @@ impl Builtin {
                 Effect::Read,
             ),
             "plan_file_ops" => (
-                "生成文件变更预览，不立即写入。桌面 Agent 可使用未登记的源或目标。write_text 在指定路径新建/完整覆盖 UTF-8 文本；compress 将普通文件夹打包为新的 .zip 或 .7z；extract 将支持的归档（RAR 仅支持非加密单卷）解压到不存在的目录，不去掉归档顶层目录。压缩与解压不会删除、移动或覆盖源，也不能覆盖目标；用 apply_file_ops 提交审批并执行。",
+                "生成通用文件变更预览，不立即写入。桌面 Agent 可使用未登记的源或目标。write_text 在指定路径新建/完整覆盖 UTF-8 文本；compress 将普通文件夹打包为新的 .zip 或 .7z；extract 将支持的归档（RAR 仅支持非加密单卷）解压到不存在的目录，保留归档顶层目录。压缩与解压保留源且要求新目标，用 apply_file_ops 提交审批并执行。安装或重装 Mods 库条目请先用 match_mod_install，再用 install_library_mod。需要归档成员时逐文件映射，不能用 copy 把外层 ZIP 改名或复制成游戏组件。恢复时先核对原事务，或用 inspect_install 检查安装记录。按报告走 rollback_transaction、uninstall_mod 或冲突审核。不要用通用移动、覆盖或 trash_paths 清空冲突路径。",
                 schema(
                     json!({"operations":{"type":"array","minItems":1,"items":{"type":"object","properties":{
                         "op":{"type":"string","enum":["copy","move","mkdir","write_text","compress","extract"]},

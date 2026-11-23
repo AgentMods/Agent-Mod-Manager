@@ -139,6 +139,41 @@ fn installed_plugin(engine: &FileEngine) -> plugins::PluginInfo {
 }
 
 #[test]
+fn installs_and_restores_distinct_package_and_game_names() {
+    let f = Fixture::new();
+    f.deployed("1.0.0");
+    let original = installed_plugin(&f.engine);
+    assert_eq!(original.game_name, original.name);
+    let root = f._temp.path().join("game");
+    fs::create_dir_all(root.join("versions")).unwrap();
+    fs::create_dir_all(root.join("saves")).unwrap();
+    write(&root.join("options.txt"), "");
+    let game = crate::games::register_game(&f.engine.db, &root, Some(SLUG)).unwrap();
+    assert_eq!(game.name, original.name);
+
+    let (adapter, skill) = content(SLUG, "2.0.0");
+    let mut adapter: Value = serde_json::from_str(&adapter).unwrap();
+    adapter["name"] = json!("幻兽帕鲁 Windows 模组适配包");
+    adapter["gameName"] = json!("幻兽帕鲁");
+    let update = f.install_content(SLUG, &adapter.to_string(), &skill);
+    let reopened = f.reopened();
+    reconcile_deployments(&reopened).unwrap();
+    let installed = installed_plugin(&reopened);
+    assert_eq!(installed.name, "幻兽帕鲁 Windows 模组适配包");
+    assert_eq!(installed.game_name, "幻兽帕鲁");
+    assert_eq!(
+        crate::games::get_game(&reopened.db, &game.id).unwrap().name,
+        installed.game_name
+    );
+
+    reopened.rollback_transaction(&update.plan.id).unwrap();
+    reconcile_deployments(&reopened).unwrap();
+    let restored = installed_plugin(&reopened);
+    assert_eq!(restored.game_name, original.game_name);
+    assert_eq!(restored.name, original.name);
+}
+
+#[test]
 fn draft_update_time_tracks_each_package_file_but_not_unrelated_changes() {
     const COMMITTED: &str = "2024-01-02T00:00:00.000Z";
     const ADAPTER_EDITED: &str = "2024-01-03T00:00:00.000Z";

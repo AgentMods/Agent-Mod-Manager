@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Gamepad2Icon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
+import { listen } from "@tauri-apps/api/event";
 import { backendAvailable, useBackendQuery } from "./lib/api";
 import { subscribeAgentToolResults, syncAgentEvents } from "./lib/agent-store";
 import { invalidateAgentModQueries } from "./lib/agent-mod-cache";
@@ -67,6 +68,11 @@ function Loading({ children }: { children: string }) {
   return <div role="status" className="flex min-h-40 items-center justify-center gap-2 p-8 text-sm text-muted-foreground motion-safe:animate-soft-fade"><Spinner />{children}</div>;
 }
 
+function invalidateOrganizedModQueries(client: ReturnType<typeof useQueryClient>, gameId: string) {
+  void client.invalidateQueries({ queryKey: ["installs", gameId] });
+  void client.invalidateQueries({ queryKey: ["mod-tags", gameId] });
+}
+
 export default function App() {
   const view = useUI((state) => state.view);
   const navigate = useUI((state) => state.navigate);
@@ -94,12 +100,61 @@ export default function App() {
     const published = results.some(({ payload: { name, status, result } }) =>
       name === "publish_plugin" && status === "done" && result &&
       typeof result === "object" && "state" in result && result.state === "completed");
-    if (published || results.some(({ payload: { name, status } }) => name === "install_plugin" && status === "done")) {
+    const installed = results.some(({ payload: { name, status } }) => name === "install_plugin" && status === "done");
+    if (installed) {
+      // An updated adapter may also change the default name of its bound games.
+      for (const key of ["games", "game", "mod-library"]) void client.invalidateQueries({ queryKey: [key] });
+    }
+    if (published || installed) {
       void client.invalidateQueries({ queryKey: ["plugin-drafts"] });
     }
     if (published) void client.invalidateQueries({ queryKey: ["plugins"] });
   }), [client]);
+  useEffect(() => {
+    if (!backendAvailable) return;
+    const refresh = () => {
+      for (const key of ["plugins", "skills", "mcp", "games", "game", "mod-library", "manager-plugin-preview"]) {
+        void client.invalidateQueries({ queryKey: [key] });
+      }
+    };
+    let disposed = false;
+    const subscription = listen<string>("plugin://catalog-updated", refresh).then(stop => {
+      if (!disposed) refresh(); // A native update can finish while the webview is starting.
+      return stop;
+    }).catch(error => {
+      if (!disposed) notify(`无法订阅适配包更新：${String(error)}`);
+    });
+    return () => { disposed = true; void subscription.then(stop => stop?.()); };
+  }, [client, notify]);
   useEffect(() => syncModSwitches(client, notify), [client, notify]);
+  useEffect(() => {
+    if (!backendAvailable) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ gameId: string; installId: string }>("mod://organized", ({ payload }) => {
+      if (typeof payload?.gameId !== "string" || !payload.gameId ||
+          typeof payload.installId !== "string" || !payload.installId) return;
+      invalidateOrganizedModQueries(client, payload.gameId);
+    }).then((stop) => {
+      if (disposed) {
+        stop();
+        return;
+      }
+      unlisten = stop;
+      // A query may have completed before Tauri finished registering this listener.
+      // Refresh the currently open game once registration is ready to cover that gap.
+      const current = useUI.getState();
+      if (current.view === "detail" && current.gameId) {
+        invalidateOrganizedModQueries(client, current.gameId);
+      }
+    }).catch((error) => {
+      if (!disposed) notify(`无法订阅 Mod 整理更新：${String(error)}`);
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [client, notify]);
   useEffect(() => syncAgentEvents(visibleConversation, (id, events) => {
     void client.invalidateQueries({ queryKey: ["conversation", id] });
     void client.invalidateQueries({ queryKey: ["conversations"] });

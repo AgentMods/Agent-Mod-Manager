@@ -2,7 +2,7 @@
 use crate::{
     error::{AppError, AppResult},
     game_roots,
-    games::{self, Game},
+    games::{self, Game, AUTOMATIC_GAME_NAME},
     install::INSTALL_STATE,
     paths,
     plugins::{GameAdapter, Platform, RootKind},
@@ -57,6 +57,9 @@ pub(crate) fn update_game(
     } else {
         metadata.remove("launchPath");
     }
+    if game.name != name {
+        metadata.remove(AUTOMATIC_GAME_NAME);
+    }
     game.name = name.to_owned();
     game.updated_at = util::now();
     tx.execute(
@@ -76,6 +79,8 @@ pub(crate) struct GameAdapterBinding {
     pub game_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_game_name: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    uses_adapter_game_name: bool,
     pub root_path: String,
     pub current_adapter_slug: Option<String>,
     pub current_adapter_version: Option<String>,
@@ -85,6 +90,14 @@ pub(crate) struct GameAdapterBinding {
     pub matched_markers: Vec<String>,
     pub missing_required_markers: Vec<String>,
     state_sha256: String,
+}
+
+impl GameAdapterBinding {
+    fn requested_name(&self) -> Option<&str> {
+        self.target_game_name
+            .as_deref()
+            .filter(|_| !self.uses_adapter_game_name)
+    }
 }
 
 pub(crate) fn set_game_adapter(engine: &FileEngine, id: &str, slug: &str) -> AppResult<Game> {
@@ -129,7 +142,7 @@ fn commit_game_adapter_binding(
     let mut conn = engine.db.conn();
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let game = games::get_game_from(&tx, game_id)?;
-    let requested_name = approved.and_then(|binding| binding.target_game_name.as_deref());
+    let requested_name = approved.and_then(GameAdapterBinding::requested_name);
     let current = binding_preview(&tx, &game, &root, &selected, requested_name)?;
     if approved.is_some_and(|reviewed| *reviewed != current) {
         return Err(AppError::Conflict(
@@ -139,7 +152,7 @@ fn commit_game_adapter_binding(
     // The same selection supplies both the reviewed effects and the mutation.
     // Its exact adapter and selected match, not just their display fields,
     // have been checked against the approval. No binding input is taken from args.
-    let updated = games::rebind_game(&tx, game, &selected, current.target_game_name.as_deref())?;
+    let updated = games::rebind_game(&tx, game, &selected, current.requested_name())?;
     tx.commit()?;
     Ok(updated)
 }
@@ -167,7 +180,12 @@ fn binding_preview(
     selected: &games::GameAdapterSelection,
     target_game_name: Option<&str>,
 ) -> AppResult<GameAdapterBinding> {
-    let target_game_name = target_game_name.map(validate_name).transpose()?;
+    let requested_name = target_game_name.map(validate_name).transpose()?;
+    let automatic_name = game
+        .automatic_adapter_name(&selected.adapter)
+        .filter(|&name| name != game.name);
+    let uses_adapter_game_name = requested_name.is_none() && automatic_name.is_some();
+    let target_game_name = requested_name.or(automatic_name);
     if Path::new(&game.root_path) != root {
         return Err(AppError::Conflict("已登记的游戏目录已改变".into()));
     }
@@ -195,15 +213,18 @@ fn binding_preview(
         &selected.matched,
     ))?;
     if let Some(target) = target_game_name {
-        // Bind the rename to the exact current and proposed names without
-        // changing the digest for legacy binding-only previews.
+        // The approval also binds whether the name stays eligible for automatic updates.
         serde_json::to_writer(&mut state, &(&game.name, target))?;
+        if uses_adapter_game_name {
+            serde_json::to_writer(&mut state, &uses_adapter_game_name)?;
+        }
     }
     let state_sha256 = util::sha256_reader(&mut state.as_slice())?;
     Ok(GameAdapterBinding {
         game_id: game.id.clone(),
         game_name: game.name.clone(),
         target_game_name: target_game_name.map(str::to_owned),
+        uses_adapter_game_name,
         root_path: paths::display_path(root),
         current_adapter_slug: game.adapter_slug.clone(),
         current_adapter_version: game.adapter_version.clone(),

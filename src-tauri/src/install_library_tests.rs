@@ -138,6 +138,7 @@ fn matching_is_read_only_bounded_and_cross_game_denied() {
     let entry = import(&engine, &game, "example.zip", &source);
     let (_, payload) = paths_for(&engine, &entry);
     let result = match_library_install(&engine, &match_request(&game, &entry)).unwrap();
+    assert!(result.active_install_id.is_none());
     assert_eq!(result.archive_format.as_deref(), Some("zip"));
     assert_eq!(result.archive_file_count, 222);
     assert_eq!(result.archive_entries.len(), 200);
@@ -423,6 +424,103 @@ fn generic_and_legacy_paths_cannot_get_library_source_scope() {
 }
 
 #[test]
+fn library_trainer_install_uses_the_archive_member_bytes() {
+    let (temp, engine, _) = legacy::fixture("stardew-valley");
+    let game = no_adapter(&engine, temp.path());
+    let member = "scripts/GlossTrainer.asi";
+    let bytes = b"inert native plugin fixture";
+    let zip = legacy::zip(&engine, &[(member, bytes), ("README.txt", b"other file")]);
+    let entry = import(&engine, &game, "GlossTrainer.zip", &zip);
+    let (archive, _) = paths_for(&engine, &entry);
+    let relative = "platform/steam/scripts/GlossTrainer.asi";
+    let target = Path::new(&game.root_path).join(relative);
+    let error = engine
+        .for_local_agent()
+        .plan_file_ops(
+            vec![FileOp::Copy {
+                src: archive.clone(),
+                dst: target.clone(),
+            }],
+            "restore plugin".into(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::Denied(message) if message.contains("install_library_mod") && message.contains("sourceKind=archive"))
+    );
+    let wrong = manual(
+        &game,
+        &entry,
+        LibrarySourceKind::SingleFile,
+        &entry.filename,
+        relative,
+    );
+    assert!(
+        matches!(plan_library_install(&engine, &wrong), Err(AppError::Invalid(message)) if message.contains("sourceKind=archive"))
+    );
+    assert!(!target.exists());
+    assert!(install::list_installs(&engine, &game.id)
+        .unwrap()
+        .is_empty());
+
+    let matched = match_library_install(&engine, &match_request(&game, &entry)).unwrap();
+    assert!(matched.archive_entries.iter().any(|path| path == member));
+    let correct = manual(&game, &entry, LibrarySourceKind::Archive, member, relative);
+    let preview = plan_library_install(&engine, &correct).unwrap();
+    assert_eq!(preview.plan.entries.len(), 1);
+    legacy::apply(&engine, &preview.plan);
+    assert_eq!(fs::read(&target).unwrap(), bytes);
+    assert_eq!(util::sha256_file(&archive).unwrap(), entry.sha256);
+    engine.rollback_transaction(&preview.plan.id).unwrap();
+    assert!(!target.exists());
+}
+
+#[test]
+fn pending_whole_archive_plan_cannot_deploy_as_native_plugin_after_upgrade() {
+    let (_temp, engine, game) = legacy::fixture("stardew-valley");
+    let source = legacy::zip(&engine, &[("module.dll", b"inert plugin")]);
+    let entry = import(&engine, &game, "module.zip", &source);
+    let request = manual(
+        &game,
+        &entry,
+        LibrarySourceKind::SingleFile,
+        &entry.filename,
+        "Mods/intact.zip",
+    );
+    let mut preview = plan_library_install(&engine, &request).unwrap();
+    // Recreate the persisted singleFile mapping accepted by older versions.
+    let target = Path::new(&game.root_path).join("Mods/module.DLL");
+    let FileOp::Copy { dst, .. } = &mut preview.plan.entries[0].operation else {
+        unreachable!()
+    };
+    *dst = target.clone();
+    let mut files = install::get_install(&engine, &preview.install_id)
+        .unwrap()
+        .files;
+    files[0].path = target.clone();
+    {
+        let conn = engine.db.conn();
+        conn.execute(
+            "UPDATE file_transactions SET plan_json=?1 WHERE id=?2",
+            params![
+                serde_json::to_string(&preview.plan).unwrap(),
+                preview.plan.id
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE installs SET files_json=?1 WHERE id=?2",
+            params![serde_json::to_string(&files).unwrap(), preview.install_id],
+        )
+        .unwrap();
+    }
+    engine.approve_plan(&preview.plan.id).unwrap();
+    assert!(
+        matches!(engine.apply_file_ops(&preview.plan.id), Err(AppError::Invalid(message)) if message.contains("sourceKind=archive"))
+    );
+    assert!(!target.exists());
+}
+
+#[test]
 fn archive_apply_rollback_reinstall_reuses_verified_generation() {
     let (_temp, engine, game) = legacy::fixture("stardew-valley");
     let source = legacy::zip(
@@ -564,8 +662,20 @@ fn only_one_of_two_previews_can_commit_the_same_library_artifact() {
         1
     );
 
+    let lookup = match_request(&game, &entry);
+    assert_eq!(
+        match_library_install(&engine, &lookup)
+            .unwrap()
+            .active_install_id
+            .as_deref(),
+        Some(first.install_id.as_str())
+    );
     let uninstall = install::plan_uninstall(&engine, &first.install_id).unwrap();
     legacy::apply(&engine, &uninstall);
+    assert!(match_library_install(&engine, &lookup)
+        .unwrap()
+        .active_install_id
+        .is_none());
     let reinstall = plan_library_install(&engine, &request).unwrap();
     legacy::apply(&engine, &reinstall.plan);
     assert_eq!(
@@ -574,6 +684,53 @@ fn only_one_of_two_previews_can_commit_the_same_library_artifact() {
             .status,
         "enabled"
     );
+}
+
+#[test]
+fn competing_library_plugins_cannot_claim_the_same_path_even_if_it_goes_missing() {
+    let (temp, engine, _) = legacy::fixture("stardew-valley");
+    let game = no_adapter(&engine, temp.path());
+    let relative = "platform/steam/scripts/GlossTrainer.asi";
+    let plugin = |name, bytes: &[u8]| {
+        let zip = legacy::zip(&engine, &[("GlossTrainer.asi", bytes)]);
+        let entry = import(&engine, &game, name, &zip);
+        manual(
+            &game,
+            &entry,
+            LibrarySourceKind::Archive,
+            "GlossTrainer.asi",
+            relative,
+        )
+    };
+    let standalone = plugin("standalone.zip", b"standalone");
+    let bundled = plugin("bundled.zip", b"bundled");
+    let first = plan_library_install(&engine, &standalone).unwrap();
+    let second = plan_library_install(&engine, &bundled).unwrap();
+    engine.approve_plan(&second.plan.id).unwrap();
+    legacy::apply(&engine, &first.plan);
+    let target = Path::new(&game.root_path).join(relative);
+    let conflict = |error| matches!(error, AppError::Conflict(reason) if reason.contains(&first.install_id) && reason.contains("GlossTrainer.asi"));
+    assert!(conflict(
+        plan_library_install(&engine, &bundled).unwrap_err()
+    ));
+    assert_eq!(fs::read(&target).unwrap(), b"standalone");
+
+    // Match the second preview's original absent fingerprint. Ownership alone must block it.
+    let moved = temp.path().join("moved.asi");
+    fs::rename(&target, &moved).unwrap();
+    assert!(conflict(
+        engine.apply_file_ops(&second.plan.id).unwrap_err()
+    ));
+    assert!(conflict(
+        plan_library_install(&engine, &bundled).unwrap_err()
+    ));
+    assert!(!target.exists());
+    fs::rename(moved, &target).unwrap();
+    let uninstall = install::plan_uninstall(&engine, &first.install_id).unwrap();
+    legacy::apply(&engine, &uninstall);
+    let selected = plan_library_install(&engine, &bundled).unwrap();
+    legacy::apply(&engine, &selected.plan);
+    assert_eq!(fs::read(target).unwrap(), b"bundled");
 }
 
 #[test]
@@ -743,7 +900,8 @@ fn unreal_pak_manual_mapping_installs_and_uninstalls_under_nested_content_paks()
     let record = install::get_install(&engine, &preview.install_id).unwrap();
     assert_eq!(record.status, "enabled");
     assert_eq!(record.install_root, Path::new(&game.root_path));
-    assert_eq!(record.installed_files.len(), 1);
+    assert_eq!(record.files.len(), 1);
+    assert_eq!(record.files[0].path, destination);
 
     let uninstall = install::plan_uninstall(&engine, &preview.install_id).unwrap();
     legacy::apply(&engine, &uninstall);
@@ -763,4 +921,109 @@ fn unreal_pak_manual_mapping_installs_and_uninstalls_under_nested_content_paks()
             .status,
         "enabled"
     );
+}
+
+#[test]
+fn unreal_pak_adapter_strip_prefix_installs_to_declared_content_paks_root() {
+    let (_temp, engine, game) = legacy::fixture("skyrim-se");
+    let mut adapter = game_roots::adapter(&engine.db, &game).unwrap();
+    let data_root = adapter
+        .install_roots
+        .iter_mut()
+        .find(|root| root.id == "data")
+        .unwrap();
+    data_root.relative_path = "Content/Paks/~mods".into();
+    adapter
+        .mod_types
+        .iter_mut()
+        .find(|mod_type| mod_type.id == "data-mod")
+        .unwrap()
+        .extensions
+        .push("pak".into());
+    let strip_rule = adapter
+        .archive_rules
+        .iter_mut()
+        .find(|rule| {
+            rule.mod_type == "data-mod" && rule.layout == plugins::ArchiveLayout::StripPrefix
+        })
+        .unwrap();
+    strip_rule.source_prefix = Some("~mods".into());
+    adapter.validate().unwrap();
+    let adapter_json = serde_json::to_string(&adapter).unwrap();
+    engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE plugins SET adapter_json=?1 WHERE slug=?2",
+            rusqlite::params![adapter_json, adapter.slug],
+        )
+        .unwrap();
+
+    let archive = legacy::zip(&engine, &[("~mods/Example.pak", b"Unreal package bytes")]);
+    let entry = import(&engine, &game, "Example.zip", &archive);
+
+    let matched = match_library_install(&engine, &match_request(&game, &entry)).unwrap();
+    assert!(matched
+        .candidates
+        .iter()
+        .any(|candidate| candidate.mod_type == "data-mod" && candidate.status == "matched"));
+    let request = auto(&game, &entry, "data-mod", false);
+    let preview = plan_library_install(&engine, &request).unwrap();
+    let destination = Path::new(&game.root_path).join("Content/Paks/~mods/Example.pak");
+    assert_eq!(
+        preview.install_root,
+        Path::new(&game.root_path).join("Content/Paks/~mods")
+    );
+    assert_eq!(preview.plan.entries.len(), 1);
+    assert_eq!(
+        preview.plan.entries[0].operation.dst(),
+        destination.as_path()
+    );
+
+    legacy::apply(&engine, &preview.plan);
+    assert_eq!(fs::read(destination).unwrap(), b"Unreal package bytes");
+}
+
+#[test]
+fn library_organization_survives_reopen_and_reuses_user_tags() {
+    use crate::mod_organization::{
+        list_mod_tags, save_mod_tag, set_mod_tags, OrganizationSuggestion,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    let (_temp, engine, game) = legacy::fixture("stardew-valley");
+    let source = legacy::zip(&engine, &[("Example/manifest.json", b"verified")]);
+    let entry = import(&engine, &game, "example.zip", &source);
+    let request = auto(&game, &entry, "smapi-mod", false);
+    let first = crate::install::plan_library_install_with_organization(
+        &engine,
+        &request,
+        Some(OrganizationSuggestion {
+            display_name: "Organized name".into(),
+            tags: vec!["Alpha".into(), "Beta".into()],
+        }),
+        &CancellationToken::new(),
+    )
+    .unwrap();
+    assert!(list_mod_tags(&engine.db, &game.id).unwrap().is_empty());
+    legacy::apply(&engine, &first.plan);
+    let db = crate::db::Db::open(&engine.paths.db_file()).unwrap();
+    assert_eq!(list_mod_tags(&db, &game.id).unwrap().len(), 2);
+    let installed = install::get_install(&engine, &first.install_id).unwrap();
+    assert_eq!(installed.name, "Organized name");
+    assert_eq!(installed.tag_ids.len(), 2);
+    let custom = save_mod_tag(&db, &game.id, None, "Mine", "#123456").unwrap();
+    set_mod_tags(
+        &db,
+        &game.id,
+        &first.install_id,
+        std::slice::from_ref(&custom.id),
+    )
+    .unwrap();
+    engine.rollback_transaction(&first.plan.id).unwrap();
+    let second = plan_library_install(&engine, &request).unwrap();
+    legacy::apply(&engine, &second.plan);
+    let installed = install::get_install(&engine, &second.install_id).unwrap();
+    assert_eq!(installed.tag_ids, [custom.id]);
+    assert_ne!(installed.name, "Organized name");
 }

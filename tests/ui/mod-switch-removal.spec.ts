@@ -21,7 +21,7 @@ type Readback = { rows: ReturnType<typeof row>[]; hold?: boolean } | { error: st
 type Turn = { installId: string; name: string; body: Pick<AgentEvent, "kind" | "payload">[]; done?: string };
 const target = (body: Turn["body"], done?: string): Turn => ({ installId, name: "目标 Mod", body, done });
 
-async function track(page: Page, turns: Turn[], readbacks: Readback[]) {
+async function track(page: Page, turns: (Turn | Turn[])[], readbacks: Readback[]) {
   const bindings = await page.evaluate(async ({ readbacks, turns, gameId, storePath, agentPath }) => {
     const modSwitch = await import(storePath) as typeof import("../../src/lib/mod-switch-store");
     const agent = await import(agentPath) as typeof import("../../src/lib/agent-store");
@@ -40,23 +40,35 @@ async function track(page: Page, turns: Turn[], readbacks: Readback[]) {
     };
     const ids: string[] = [];
     let duplicateTurnAllowed = false;
-    const outputs = turns.map(({ installId, name, body, done }, index) => {
+    const outputs = turns.map((turn, index) => {
       const conversationId = `removal-conversation-${index}`;
       const turnId = `removal-turn-${index}`;
-      const id = modSwitch.reserveModSwitch({ kind: "remove", gameId, installId, name });
-      if (!id) throw new Error("Could not reserve removal");
-      if (index > 0) duplicateTurnAllowed ||= modSwitch.bindModSwitch(id, "removal-conversation-0", "removal-turn-0");
-      const bound = modSwitch.bindModSwitch(id, conversationId, turnId);
-      ids.push(id);
-      const events = [{ kind: "turn-start", payload: {} }, ...body, { kind: "done", payload: { status: done ?? "done" } }]
+      const targets = Array.isArray(turn) ? turn : [turn];
+      const reserved = targets.map(({ installId, name }) => {
+        const id = modSwitch.reserveModSwitch({ kind: "remove", gameId, installId, name });
+        if (!id) throw new Error("Could not reserve removal");
+        return id;
+      });
+      if (index > 0) duplicateTurnAllowed ||= modSwitch.bindModSwitch(reserved[0], "removal-conversation-0", "removal-turn-0");
+      const bound = Array.isArray(turn) ? modSwitch.bindModSwitches(reserved, conversationId, turnId)
+        : modSwitch.bindModSwitch(reserved[0], conversationId, turnId);
+      ids.push(...reserved);
+      const events = [
+        { kind: "turn-start", payload: {} }, ...targets.flatMap(target => target.body),
+        { kind: "done", payload: { status: targets[0].done ?? "done" } },
+      ]
         .map((event, seq): AgentEvent => ({ ...event, seq: seq + 100, conversationId, turnId, messageId: null, createdAt: "" }));
       // The regular cache listener should not own the target write. Results for
       // other rows must still reach it, even when they use the same native tool.
       return { events, bound, otherResults: modSwitch.withoutModSwitchWrites(events)
         .filter(event => event.kind === "tool-result").map(event => event.payload.toolCallId) };
     });
+    const states = () => ids.map(id => modSwitch.useModSwitch.getState().pending[id]?.status ?? null);
+    const transitions: ReturnType<typeof states>[] = [];
+    modSwitch.useModSwitch.subscribe(() => transitions.push(states()));
     window_.__modRemovalTest = {
       reads: () => reads,
+      transitions: () => transitions,
       release: () => release(),
       status: (index: number) => modSwitch.useModSwitch.getState().pending[ids[index]]?.status ?? null,
       retry: (index: number) => modSwitch.retryModSwitchReadback(ids[index]),
@@ -73,6 +85,7 @@ async function track(page: Page, turns: Turn[], readbacks: Readback[]) {
   return {
     otherResults: bindings.otherResults,
     reads: () => page.evaluate(() => (window as any).__modRemovalTest.reads()),
+    transitions: () => page.evaluate(() => (window as any).__modRemovalTest.transitions()),
     release: () => page.evaluate(() => (window as any).__modRemovalTest.release()),
     status: (index = 0) => page.evaluate(i => (window as any).__modRemovalTest.status(i), index),
     retry: (index = 0) => page.evaluate(i => (window as any).__modRemovalTest.retry(i), index),
@@ -84,6 +97,99 @@ test.beforeEach(async ({ page }) => {
   await installMockTauri(page);
   await page.goto("/");
   await expect(page.getByRole("button", { name: "游戏库", exact: true })).toBeVisible();
+});
+
+test("shared binding validates the whole reservation and publishes it once", async ({ page }) => {
+  const observed = await page.evaluate(async ({ gameId, storePath }) => {
+    const { bindModSwitch, bindModSwitches, reserveModSwitch, useModSwitch } = await import(storePath) as typeof import("../../src/lib/mod-switch-store");
+    const reserve = (installId: string, kind: "remove" | "uninstall" = "remove", game = gameId) => {
+      const id = reserveModSwitch({ kind, name: installId, gameId: game, installId });
+      if (!id) throw new Error("Could not reserve switch");
+      return id;
+    };
+    const ids = [reserve("first"), reserve("second")];
+    const otherGame = reserve("third", "remove", "other-game");
+    const otherKind = reserve("fourth", "uninstall");
+    const running = reserve("fifth");
+    const spare = reserve("spare");
+    const started = bindModSwitch(running, "other-conversation", "other-turn");
+    const states: (string | undefined)[][] = [];
+    const stop = useModSwitch.subscribe(({ pending }) => states.push(ids.map(id => pending[id]?.status)));
+    const invalid = [[], [ids[0], ids[0]], [ids[0], "unknown"], [ids[0], otherGame], [ids[0], otherKind], [ids[0], running]]
+      .map(batch => bindModSwitches(batch, "conversation", "turn"));
+    invalid.push(bindModSwitches(ids, "", "turn"), bindModSwitches(ids, "conversation", ""));
+    const bound = bindModSwitches(ids, "conversation", "turn");
+    const duplicate = bindModSwitch(spare, "conversation", "turn");
+    const duplicateBatch = bindModSwitches([spare], "conversation", "turn");
+    stop();
+    const { pending } = useModSwitch.getState();
+    return {
+      started, invalid, bound, duplicate, duplicateBatch, states, spare: pending[spare].status,
+      turns: ids.map(id => [pending[id].conversationId, pending[id].turnId]),
+    };
+  }, { gameId, storePath });
+  expect(observed).toEqual({
+    started: true, invalid: Array(8).fill(false), bound: true, duplicate: false, duplicateBatch: false,
+    states: [["running", "running"]], spare: "starting", turns: [["conversation", "turn"], ["conversation", "turn"]],
+  });
+});
+
+test("a shared turn verifies committed, rejected and skipped removals with one list read", async ({ page }) => {
+  const rejectedId = "rejected-install";
+  const skippedId = "skipped-install";
+  const tracked = await track(page, [[
+    target([
+      started(forgetTool, scoped, "removed"), result(forgetTool, removed, "removed"),
+      started(forgetTool, { ...scoped, install_id: "untracked-install" }, "untracked"),
+      result(forgetTool, { ...removed, installId: "untracked-install" }, "untracked"),
+      started("download_mod", { game_id: gameId }, "download"), result("download_mod", { gameId }, "download"),
+    ]),
+    { installId: rejectedId, name: "拒绝的 Mod", body: [
+      started(forgetTool, { ...scoped, install_id: rejectedId }, "rejected"),
+      { kind: "approval-request", payload: { approvalId: "review", toolCallId: "rejected" } },
+      { kind: "approval-resolved", payload: { approvalId: "review", status: "rejected" } },
+      result(forgetTool, { error: "用户拒绝了此操作" }, "rejected", "error"),
+    ] },
+    { installId: skippedId, name: "跳过的 Mod", body: [
+      started("inspect_install", { ...scoped, install_id: skippedId }, "inspection"),
+      result("inspect_install", { gameId, installId: skippedId }, "inspection"),
+    ] },
+  ]], [{ rows: [row("uninstalled", rejectedId), row("enabled", skippedId)], hold: true }]);
+  expect(tracked.otherResults).toEqual([["untracked", "download", "inspection"]]);
+  await tracked.replay();
+  await expect.poll(tracked.reads).toBe(1);
+  expect(await tracked.transitions()).toEqual([["verifying", "verifying", "verifying"]]);
+  await tracked.replay();
+  expect(await tracked.reads()).toBe(1);
+  await expect(notice(page, success)).toHaveCount(0);
+  await tracked.release();
+  await expect(notice(page, success)).toBeVisible();
+  await expect(notice(page, /已拒绝删除「拒绝的 Mod」。该记录当前为已卸载/)).toBeVisible();
+  await expect(notice(page, /未执行「跳过的 Mod」的删除。该记录仍在管理列表中/)).toBeVisible();
+  expect(await tracked.transitions()).toEqual([["verifying", "verifying", "verifying"], [null, null, null]]);
+  expect(await tracked.reads()).toBe(1);
+});
+
+test("retrying one row reads the list once for its failed shared turn", async ({ page }) => {
+  const skippedId = "skipped-install";
+  const tracked = await track(page, [[
+    target([started(forgetTool, scoped), result(forgetTool, removed)]),
+    { installId: skippedId, name: "跳过的 Mod", body: [] },
+  ]], [{ error: "fixture list unavailable" }, { rows: [row("enabled", skippedId)], hold: true }]);
+  await tracked.replay();
+  await expect(notice(page, /最新管理列表：fixture list unavailable。可重试读取/)).toBeVisible();
+  expect(await tracked.transitions()).toEqual([["verifying", "verifying"], ["readback_failed", "readback_failed"]]);
+  expect(await tracked.reads()).toBe(1);
+  await tracked.retry();
+  await tracked.retry(1);
+  await expect.poll(tracked.reads).toBe(2);
+  await tracked.release();
+  await expect(notice(page, success)).toBeVisible();
+  await expect(notice(page, /未执行「跳过的 Mod」的删除/)).toBeVisible();
+  expect(await tracked.transitions()).toEqual([
+    ["verifying", "verifying"], ["readback_failed", "readback_failed"], ["verifying", "verifying"], [null, null],
+  ]);
+  expect(await tracked.reads()).toBe(2);
 });
 
 test("removal waits for list readback even when a scoped receipt committed before the turn was cancelled", async ({ page }) => {

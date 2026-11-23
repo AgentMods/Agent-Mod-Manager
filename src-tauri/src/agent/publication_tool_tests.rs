@@ -61,7 +61,7 @@ fn generated_listing() -> PublicationListing {
         r#"{"title":"适配包发布测试","summary":"自动生成的测试摘要","description":"用于验证自动发布预览。","tags":["适配测试"]}"#,
     )
     .unwrap();
-    assert_eq!(listing.tags.first(), Some(&package.adapter.name));
+    assert_eq!(listing.tags[0], package.adapter.display_game_name());
     assert_eq!(&listing.tags[1..], &[String::from("适配测试")]);
     assert_eq!(listing.cover_url, package.adapter.cover_url);
     assert!(listing.cover_png.is_empty());
@@ -152,7 +152,10 @@ async fn preparation_returns_generated_files_and_listing_without_publication_con
             hex::encode(Sha256::digest(file.text.as_bytes()))
         );
     }
-    assert!(record.preview.files[0].text.contains(&listing.title));
+    let manifest: Value = serde_json::from_str(&record.preview.files[0].text).unwrap();
+    assert_eq!(manifest["name"], listing.title);
+    assert_eq!(manifest["gameName"], "Minecraft Java Edition");
+    assert_eq!(manifest["gameName"], record.preview.tags[0]);
     assert!(record.preview.files[1]
         .text
         .contains("amm-publication-display:v2"));

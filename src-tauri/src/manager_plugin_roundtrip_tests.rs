@@ -33,6 +33,7 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 const SLUG: &str = "minecraft-java";
+const GAME_NAME: &str = "Minecraft Java Edition";
 const COVER_URL: &str = "https://www.glossmod.com/manager-plugins/covers/minecraft-java.png";
 const ADAPTER_BYTES: &[u8] =
     include_bytes!("../tests/fixtures/game-adapters/minecraft-java/adapter.json");
@@ -148,7 +149,7 @@ impl LoopbackCatalog {
         let games = json!({
             "data": [{
                 "id": 31001,
-                "name": "Minecraft Java Edition",
+                "name": package.adapter.display_game_name(),
                 "slug": package.adapter.slug,
                 "aliases": [],
                 "steamAppId": steam_app_id,
@@ -257,11 +258,24 @@ async fn published_manager_plugin_is_listed_imported_installed_byte_exact() {
         hex::encode(Sha256::digest(SKILL_BYTES)),
         OFFICIAL_SKILL_SHA256
     );
+    let mut manifest: Value = serde_json::from_slice(ADAPTER_BYTES).unwrap();
+    manifest["gameName"] = json!(GAME_NAME);
+    manifest["name"] = json!("Local instance manager");
+    assert_publication_roundtrip(manifest).await;
+}
+
+#[tokio::test]
+async fn legacy_source_game_name_survives_first_release_update_and_reimport() {
+    let manifest: Value = serde_json::from_slice(ADAPTER_BYTES).unwrap();
+    assert!(manifest.get("gameName").is_none());
+    assert_publication_roundtrip(manifest).await;
+}
+
+async fn assert_publication_roundtrip(mut authoring_adapter: Value) {
     let publisher_temp = tempfile::tempdir().unwrap();
     let importer_temp = tempfile::tempdir().unwrap();
     let publisher = engine(publisher_temp.path(), "publisher");
     let importer = engine(importer_temp.path(), "importer");
-    let mut authoring_adapter: Value = serde_json::from_slice(ADAPTER_BYTES).unwrap();
     authoring_adapter["coverUrl"] = json!(COVER_URL);
     let authoring_adapter = serde_json::to_vec_pretty(&authoring_adapter).unwrap();
     let source_draft = plugin_workflow::plan_write_draft(
@@ -312,7 +326,7 @@ async fn published_manager_plugin_is_listed_imported_installed_byte_exact() {
         assert_eq!(listing.title, reply["title"]);
         assert_eq!(listing.summary, reply["summary"]);
         assert_eq!(listing.description, reply["description"]);
-        assert_eq!(listing.tags.first(), Some(&package.adapter.name));
+        assert_eq!(listing.tags[0], GAME_NAME);
         assert_eq!(json!(listing.tags[1..].to_vec()), reply["tags"]);
         assert_eq!(listing.cover_url.as_deref(), Some(COVER_URL));
         assert!(
@@ -380,6 +394,8 @@ async fn published_manager_plugin_is_listed_imported_installed_byte_exact() {
         assert_eq!(release.adapter, approved.preview.files[0].text);
         assert_eq!(release.skill, approved.preview.files[1].text);
         let published_adapter: Value = serde_json::from_str(&release.adapter).unwrap();
+        assert_eq!(published_adapter["gameName"], GAME_NAME);
+        assert_eq!(published_adapter["name"], listing.title);
         assert_eq!(published_adapter["coverUrl"], COVER_URL);
         assert_eq!(
             crate::publication_copy::read_display(&release.skill).as_deref(),
@@ -413,6 +429,7 @@ async fn assert_catalog_install(
     let [plugin] = game.plugins.as_slice() else {
         panic!("expected one public plugin")
     };
+    assert_eq!(game.name, GAME_NAME);
     assert_eq!(plugin.id, release.plugin.id.to_string());
     assert_eq!(plugin.release_id, release.plugin.release_id.to_string());
     assert_eq!(plugin.name, listing.title);
@@ -435,8 +452,10 @@ async fn assert_catalog_install(
         imported.preview.installed_version.as_deref(),
         previous_version
     );
+    assert_eq!(imported.preview.game_name, GAME_NAME);
     assert_eq!(imported.preview.adapter_json, release.adapter);
     let imported_adapter: Value = serde_json::from_str(&imported.preview.adapter_json).unwrap();
+    assert_eq!(imported_adapter["gameName"], GAME_NAME);
     assert_eq!(imported_adapter["coverUrl"], COVER_URL);
     assert_eq!(imported.preview.skill_markdown, release.skill);
     assert_eq!(
@@ -459,14 +478,11 @@ async fn assert_catalog_install(
         std::fs::read(install.install_path.join("SKILL.md")).unwrap(),
         release.skill.as_bytes()
     );
-    let installed_version: String = importer
-        .db
-        .conn()
-        .query_row("SELECT version FROM plugins WHERE slug=?1", [SLUG], |row| {
-            row.get(0)
-        })
-        .unwrap();
-    assert_eq!(installed_version, plugin.version);
+    let installed = plugins::list_plugins(&importer.db).unwrap();
+    let plugin_info = installed.iter().find(|p| p.slug == SLUG).unwrap();
+    assert_eq!(plugin_info.game_name, GAME_NAME);
+    assert_eq!(plugin_info.name, listing.title);
+    assert_eq!(plugin_info.version, plugin.version);
 
     let requests = catalog.requests.lock().unwrap();
     assert_eq!(

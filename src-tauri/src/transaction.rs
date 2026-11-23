@@ -19,6 +19,9 @@ use std::{
 #[path = "transaction_archive.rs"]
 mod archive_ops;
 
+#[path = "transaction_install_history.rs"]
+mod install_history;
+
 // Stored only by the native desktop Agent planner, never taken from tool input.
 const LOCAL_AGENT_FILES: &str = "local_agent_files";
 
@@ -70,7 +73,7 @@ fn lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum FileOp {
     Copy { src: PathBuf, dst: PathBuf },
@@ -213,7 +216,7 @@ fn fingerprint_leaf(path: &Path) -> AppResult<Fingerprint> {
     })
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannedEntry {
     pub operation: FileOp,
     pub before: Option<Fingerprint>,
@@ -344,6 +347,7 @@ pub struct FileEngine {
     pub paths: Arc<AppPaths>,
     local_agent_files: bool,
     plugin_mcp_change_handler: Arc<OnceLock<PluginMcpChangeHandler>>,
+    pub(crate) organization_wake: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     fail_before: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
@@ -359,6 +363,7 @@ impl FileEngine {
             paths: Arc::new(paths),
             local_agent_files: false,
             plugin_mcp_change_handler: Arc::new(OnceLock::new()),
+            organization_wake: Arc::default(),
             #[cfg(test)]
             fail_before: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             #[cfg(test)]
@@ -519,6 +524,12 @@ impl FileEngine {
         {
             return Err(AppError::Denied("不能修改事务保留目录".into()));
         }
+        if !internal && paths::contains_path(&self.paths.mod_library(), &target) {
+            return Err(AppError::Denied(format!(
+                "通用文件计划不能使用 Mods 库内路径：{}。安装库中原包请在桌面 Agent 中用 list_mod_library 获取 artifactId，再用 match_mod_install 和 install_library_mod；提取包内文件时用 sourceKind=archive 映射实际成员名。",
+                paths::display_path(&target)
+            )));
+        }
         if !internal && target.starts_with(&self.paths.root) {
             let allowed = [
                 self.paths.staging(),
@@ -562,6 +573,7 @@ impl FileEngine {
         self.plan_locked(ops, summary, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn plan_internal(&self, ops: Vec<FileOp>, summary: String) -> AppResult<FilePlan> {
         self.plan_locked(ops, summary, true)
     }
@@ -898,6 +910,7 @@ impl FileEngine {
             crate::install::validate_library_apply(self, &plan)?;
         }
         crate::install::validate_apply(self, &plan)?;
+        crate::trash::validate_apply(self, &plan)?;
         crate::plugin_workflow::validate_deployment_source(self, &plan)?;
         let mut evidence = Vec::with_capacity(plan.entries.len());
         for e in &plan.entries {
@@ -1372,6 +1385,8 @@ impl FileEngine {
                 }
             }
         }
+        let organization_queued =
+            status == "committed" && crate::mod_organization::finalize(&tx, id)?;
         let plugin_changed = if let Some(finished_at) = finished_at.as_deref() {
             crate::plugin_workflow::finalize_desktop_transaction(
                 self,
@@ -1386,6 +1401,9 @@ impl FileEngine {
         };
         tx.commit()?;
         drop(conn);
+        if organization_queued {
+            self.organization_wake.notify_one();
+        }
         if let Some(slug) = plugin_changed {
             self.notify_plugin_mcp_changed(&slug);
         }
@@ -1440,7 +1458,21 @@ impl FileEngine {
         if status == "committed" {
             crate::plugin_workflow::validate_plugin_rollback(&engine, id, &kind)?;
             if crate::install::validate_rollback(&engine, id)? {
-                engine.validate_replacement_rollback_payloads(&journal)?;
+                // Old Copy journals recorded output identity only. Carry the recorded
+                // digest into each inverse rename, including crash recovery after this point.
+                for entry in &mut journal {
+                    if let FileOp::Copy { dst, .. } = &entry.entry.operation {
+                        if let Some(output) = entry
+                            .renames
+                            .iter_mut()
+                            .flatten()
+                            .find(|step| &step.to == dst)
+                        {
+                            output.expected_content.clone_from(&entry.entry.source);
+                        }
+                    }
+                }
+                engine.validate_install_rollback_payloads(&journal)?;
             }
             engine.validate_committed_rollback(&journal)?;
         }
@@ -1491,16 +1523,16 @@ impl FileEngine {
         Ok(())
     }
 
-    fn validate_replacement_rollback_payloads(&self, journal: &[JournalEntry]) -> AppResult<()> {
+    fn validate_install_rollback_payloads(&self, journal: &[JournalEntry]) -> AppResult<()> {
         for entry in journal {
             self.stable_path(&entry.undo, true)?;
             if fingerprint(&entry.undo)?.is_some() {
-                return Err(AppError::Conflict("替换事务的回滚保留路径已占用".into()));
+                return Err(AppError::Conflict("安装事务的回滚保留路径已占用".into()));
             }
             if let Some(before) = &entry.entry.before {
                 self.stable_path(&entry.backup, true)?;
                 if fingerprint(&entry.backup)?.as_ref() != Some(before) {
-                    return Err(AppError::Conflict("替换备份丢失或已修改，不能回滚".into()));
+                    return Err(AppError::Conflict("安装备份丢失或已修改，不能回滚".into()));
                 }
             }
             for (park, expected) in [
@@ -1879,6 +1911,20 @@ pub(crate) mod tests {
                 "".into(),
             )
             .unwrap();
+        // Model a pending install review attached to this journal. Recovery must
+        // roll back the files without applying its organization suggestion.
+        e.db.conn().execute(
+            "INSERT INTO installs(id,game_id,name,status,metadata_json,installed_at,updated_at)
+             VALUES ('pending','g','Original','planned',?1,'now','now')",
+            [serde_json::json!({"organization":{"locale":"en","displayName":"Proposed","tags":["Uncommitted"]}}).to_string()],
+        ).unwrap();
+        e.db.conn()
+            .execute(
+                "INSERT INTO install_transactions(install_id,transaction_id,action,created_at)
+             VALUES ('pending',?1,'install','now')",
+                [&p.id],
+            )
+            .unwrap();
         let mut journal = e.prepare_journal(&p).unwrap();
         journal[0].state = "intent".into();
         e.save_journal(&p.id, "applying", &journal).unwrap();
@@ -1902,6 +1948,9 @@ pub(crate) mod tests {
         assert_eq!(restarted.recover_interrupted().unwrap(), vec![p.id]);
         assert_eq!(fs::read(dst).unwrap(), b"old");
         assert!(restarted.recover_interrupted().unwrap().is_empty());
+        assert!(crate::mod_organization::list_mod_tags(&restarted.db, "g")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

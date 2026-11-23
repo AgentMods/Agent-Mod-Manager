@@ -157,6 +157,7 @@ fn overlay_preserves_source_bytes_rules_and_idempotence_across_the_provider_fixt
         assert_eq!(decoded.adapter.version, "23.0.1-beta.1+local");
         assert_eq!(orig, untouched);
         let mut expected: Value = serde_json::from_str(adapter).unwrap();
+        expected["gameName"] = json!(p.adapter.display_game_name());
         expected["name"] = json!(l.title);
         expected["version"] = json!(decoded.adapter.version);
         assert_eq!(
@@ -195,9 +196,46 @@ fn overlay_preserves_source_bytes_rules_and_idempotence_across_the_provider_fixt
 }
 
 #[test]
+fn overlay_preserves_explicit_game_name_bytes_and_fills_a_null_game_name() {
+    let (package, original) = fixture();
+    for (field, expected_field, game_name) in [
+        (
+            r#""game\u004eame" : "A\u0020Game""#,
+            r#""game\u004eame" : "A\u0020Game""#.to_owned(),
+            "A Game",
+        ),
+        (
+            r#""gameName" : null"#,
+            format!(r#""gameName" : "{}""#, package.adapter.name),
+            package.adapter.name.as_str(),
+        ),
+    ] {
+        let text = original[0]
+            .text
+            .replacen('{', &format!("{{\n  {field},"), 1);
+        let package =
+            plugins::parse_package(&package.adapter.slug, &text, &original[1].text).unwrap();
+        let generated = listing(&package);
+        assert_eq!(generated.tags[0], game_name);
+        let rendered = render_files(
+            &package,
+            &[file("adapter.json", text), original[1].clone()],
+            &generated,
+            "1.0.1",
+        )
+        .unwrap();
+        assert!(rendered[0].text.contains(&expected_field));
+        let manifest: Value = serde_json::from_str(&rendered[0].text).unwrap();
+        assert_eq!(manifest["gameName"], game_name);
+        assert_eq!(manifest["name"], generated.title);
+    }
+}
+
+#[test]
 fn listing_reserves_the_first_tag_for_the_source_game_not_the_generated_title() {
     let (mut p, _) = fixture();
-    p.adapter.name = "Call of Duty: Black Ops III".into();
+    p.adapter.name = "Black Ops Mod Toolkit".into();
+    p.adapter.game_name = Some("Call of Duty: Black Ops III".into());
     let mut r = reply();
     let mut generate_tags = |tags: Value| {
         r["tags"] = tags;
@@ -424,10 +462,10 @@ fn validates_provenance_and_handles_provider_schema_without_losing_operations() 
         "1.0.2",
     )
     .unwrap();
-    assert!(serde_json::from_str::<Value>(&copy[0].text)
-        .unwrap()
-        .get("mcpServers")
-        .is_none());
+    let normalized: Value = serde_json::from_str(&copy[0].text).unwrap();
+    assert!(normalized.get("mcpServers").is_none());
+    assert_eq!(normalized["gameName"], p.adapter.name);
+    assert_eq!(normalized["name"], l.title);
     json["mcpServers"] = json!([{"id":"docs","name":"Docs","transport":"streamable_http","url":"https://example.org/mcp"}]);
     let declared: plugins::GameAdapter = serde_json::from_value(json).unwrap();
     let declared = GamePackage {
@@ -502,13 +540,14 @@ async fn configured_model_receives_only_bounded_structured_facts_and_no_tools() 
     let root = tempfile::tempdir().unwrap();
     let settings = settings(root.path(), format!("http://{addr}/v1"));
     let (mut p, _) = fixture();
-    p.adapter.name = r"C:\Users\private\identity".into();
+    p.adapter.game_name = Some(r"C:\Users\private\identity".into());
     let err = generate(&settings, &p, &CancellationToken::new())
         .await
         .unwrap_err();
     assert!(err.to_string().contains("游戏名称标签"));
     assert!(received.lock().unwrap().is_none());
-    p.adapter.name = "Stardew Valley".into();
+    p.adapter.name = "PRIVATE_LOCAL_TITLE".into();
+    p.adapter.game_name = Some("Stardew Valley".into());
     p.skill.description = "PRIVATE_FRONTMATTER".into();
     p.skill_markdown = "PRIVATE_INSTRUCTIONS".into();
     p.adapter.cover_url = Some("https://private.example.test".into());
@@ -530,7 +569,7 @@ async fn configured_model_receives_only_bounded_structured_facts_and_no_tools() 
     assert_eq!(body["messages"].as_array().unwrap().len(), 2);
     let facts = body["messages"][1]["content"].as_str().unwrap();
     let facts: Value = serde_json::from_str(facts).unwrap();
-    assert_eq!(facts["name"], "Stardew Valley");
+    assert_eq!(facts["gameName"], "Stardew Valley");
     assert_eq!(facts["modTypes"].as_array().unwrap().len(), 16);
     assert_eq!(facts["slug"], p.adapter.slug);
     for needle in [

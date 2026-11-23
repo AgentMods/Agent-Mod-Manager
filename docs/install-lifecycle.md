@@ -21,8 +21,23 @@ Single-file mods copy from the library's `archive` directory. Other layouts copy
 from a verified extraction in the entry's `payload` directory. Reinstall uses the
 same library entry. The game detail uninstall action uses `system-mod-uninstall`,
 `inspect_install` and the recorded install ID to select trash or restoration of
-the original files. Conflicts with shared or edited files are reported. The
+the original files. For overlapping legacy deployments the manager can restore
+the preceding installation when its journal proves the overwrite order. The
 library archive is available after uninstall.
+
+`match_mod_install` returns `activeInstallId` when this artifact already has an
+active deployment in the selected game. Inspect that record before a reinstall.
+For a plugin distributed in a ZIP, use `approvedMappings` with `sourceKind` set
+to `archive`, the full member name as `source`, and the relative game path as
+`destination`. The library planner rejects whole-archive copies to native plugin
+or executable targets. The same check runs when applying a saved plan. The ordinary
+and library installers check active ownership when planning and again when
+applying. They also check tracked paths whose files have gone missing. When two
+packages ship the same plugin, the conflict identifies its path and owner.
+Generic trash plans also check ownership before planning and before moving any
+file or parent directory. A tracked uninstall uses the installation manifest
+and its own ownership checks. Restoring any part of a managed uninstall checks
+every path the reactivated installation would claim.
 
 In the game’s Mod 管理 tab, 已安装 means the files have been deployed.
 已卸载 keeps the install record and any associated library archive available for
@@ -38,7 +53,12 @@ previously uninstalled mod through the journal makes its active record visible a
 
 Turn on **批量操作** in Mod 管理 to select individual rows or all actionable rows.
 Batch install and uninstall skip inapplicable items and do not submit an archive twice.
-Each submitted Agent task retains the existing permission, approval and readback flow.
+Each batch with Agent work starts one conversation and one turn for all eligible
+archives or installs. Its title names the action and target count. The selected
+permission mode applies to that turn. The game page shows each pending approval or
+question once and verifies each target against its own tool receipt and list state.
+Deleting only unused archives, inactive records or unexecuted plans uses desktop
+list removal directly and creates no Agent conversation.
 Batch deletion first lists the selected targets for confirmation. Removing one install
 record does not hide other visible histories that use the same archive. Turning batch
 mode off clears the selection without cancelling already submitted tasks.
@@ -163,9 +183,15 @@ be identified without guessing.
 `blockingInstallIds`, `successorInstallId` and `rollbackTransactionId` are
 evidence for the next user-visible action, not an approval. The Agent must still
 call the recommended operation; ownership, path, backup and
-current-fingerprint checks run again immediately before mutation. Ordinary
-shared installs remain manual-review cases, and this preview never merges bytes,
-rewrites manifests, or changes database/file state.
+current-fingerprint checks run again immediately before mutation.
+
+For overlapping ordinary installs made by older versions, the manager matches
+each published file object and fingerprint to the next installation’s overwrite
+backup. Only the installation currently on top at every shared path can be
+rolled back. The full installation must match its manifest and current files,
+and its backups must pass preflight. Equal bytes alone cannot establish order.
+Batch removal rechecks the other selected records after each successful rollback.
+Missing evidence, edited files and ownership across games still require review.
 
 `forget_missing_files` is not a rollback recommendation. On an explicit removal,
 `forget_uninstalled_mod` rechecks the exact game, install, and missing-file evidence

@@ -274,7 +274,6 @@ async fn prepare_with(
     )?;
     let listing = generate(&source.package).await?;
     check_cancel(cancel)?;
-    listing.require_game_tag(&source.package.adapter.name)?;
     let files = publication_copy::render_files(&source.package, &source.files, &listing, &version)?;
     let mut preview = PublicationPreview {
         source: source.source,
@@ -531,7 +530,7 @@ fn decimal_cmp(a: &str, b: &str) -> Ordering {
     a.len().cmp(&b.len()).then_with(|| a.cmp(b))
 }
 
-pub(super) fn version_cmp(a: &str, b: &str) -> Ordering {
+pub(crate) fn version_cmp(a: &str, b: &str) -> Ordering {
     let (a, a_pre) = precedence_parts(a);
     let (b, b_pre) = precedence_parts(b);
     for (a, b) in a.split('.').zip(b.split('.')) {

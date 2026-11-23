@@ -1,4 +1,4 @@
-import { useCloudGameMatch } from '@/lib/cloud-game-match';
+import { type CloudGameMatch, useCloudGameMatch } from '@/lib/cloud-game-match';
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArrowLeftIcon, ArrowRightIcon, BotIcon, CheckIcon, CircleAlertIcon, CircleCheckIcon, FolderOpenIcon, MoonIcon, PlugIcon, RadarIcon, ScanSearchIcon, SunIcon, TriangleAlertIcon } from "lucide-react";
@@ -113,7 +113,7 @@ export default function OnboardingPage({ automatic = false, bootstrap }: { autom
       const game = await cloud.register(candidate, localOnly);
       setReport((previous) => previous && ({
         ...previous, candidates: previous.candidates.map((item) =>
-          gameDirectoryKey(item.rootPath) === key ? { ...item, registeredGameId: game.id, suggestedAdapterSlug: game.adapterSlug } : item,
+          gameDirectoryKey(item.rootPath) === key ? { ...item, name: game.name, registeredGameId: game.id, suggestedAdapterSlug: game.adapterSlug } : item,
         )
       }));
       setSelected((previous) => previous.filter((item) => item !== key));
@@ -208,7 +208,7 @@ export default function OnboardingPage({ automatic = false, bootstrap }: { autom
                   const matched = cloud.match(candidate);
                   const waiting = cloud.waiting(candidate);
                   return <CandidateRow key={key} candidate={candidate} selected={selected.includes(key)} disabled={!!busy || cloud.pending || !!recoveryError || games.isLoading}
-                    cloudLoading={waiting} onLocalRegister={() => void register(candidate, true)} cloudReuse={matched?.reusable} cloudName={matched?.name} error={candidateErrors[key]} onSelect={(checked) => setSelected((previous) =>
+                    cloudLoading={waiting} onLocalRegister={() => void register(candidate, true)} cloudMatch={matched} error={candidateErrors[key]} onSelect={(checked) => setSelected((previous) =>
                       checked ? [...previous, key] : previous.filter((path) => path !== key),
                     )} onRegister={() => void register(candidate)} />;
                 })}
@@ -254,29 +254,30 @@ function SetupSummary({ dataRoot }: { dataRoot: string }) {
   </dl>;
 }
 
-function CandidateRow({ cloudLoading, onLocalRegister, cloudReuse, cloudName, candidate, selected, disabled, error, onSelect, onRegister }: {
-  cloudReuse?: boolean; cloudLoading: boolean; onLocalRegister: () => void; cloudName?: string; candidate: GameCandidate; selected: boolean; disabled: boolean; error?: string;
+function CandidateRow({ cloudLoading, onLocalRegister, cloudMatch, candidate, selected, disabled, error, onSelect, onRegister }: {
+  cloudMatch?: CloudGameMatch; cloudLoading: boolean; onLocalRegister: () => void; candidate: GameCandidate; selected: boolean; disabled: boolean; error?: string;
   onSelect: (checked: boolean) => void; onRegister: () => void;
 }) {
   const registered = !!candidate.registeredGameId;
+  const gameName = cloudMatch?.gameName ?? candidate.name;
   const platformLabels: Record<string, string> = { windows: "Windows", macos: "macOS", linux: "Linux", unknown: "未知平台" };
   return <Item asChild variant="outline" className="items-start">
     <li>
       <ItemContent className="min-w-0 gap-1.5">
         <Label className="font-medium">
-          <Checkbox aria-label={`选择 ${candidate.name}`} checked={registered || selected} disabled={disabled || registered} onCheckedChange={(checked) => onSelect(checked === true)} />
-          <ItemTitle>{candidate.name}</ItemTitle>
+          <Checkbox aria-label={`选择 ${gameName}`} checked={registered || selected} disabled={disabled || registered} onCheckedChange={(checked) => onSelect(checked === true)} />
+          <ItemTitle>{gameName}</ItemTitle>
         </Label>
         <PathText>{displayPath(candidate.rootPath)}</PathText>
-        <ItemDescription className="line-clamp-none">{platformLabels[candidate.platform] ?? candidate.platform} · 建议适配包：{candidate.suggestedAdapterSlug ?? (cloudName ? "云端已匹配" : "无")}</ItemDescription>
-        {cloudName && <ItemDescription className="line-clamp-none wrap-anywhere">{cloudName} · {cloudReuse ? "将校验并复用已安装适配包" : "适配包将随添加安装"}</ItemDescription>}
+        <ItemDescription className="line-clamp-none">{platformLabels[candidate.platform] ?? candidate.platform} · 建议适配包：{candidate.suggestedAdapterSlug ?? (cloudMatch ? "云端已匹配" : "无")}</ItemDescription>
+        {cloudMatch && <ItemDescription className="line-clamp-none wrap-anywhere">{cloudMatch.pluginName} · {cloudMatch.reusable ? "将校验并复用已安装适配包" : "适配包将随添加安装"}</ItemDescription>}
         {!!candidate.warnings.length && <ul className="flex list-disc flex-col gap-1 pl-5 text-xs text-warning">
           {candidate.warnings.map((warning, index) => <li key={index}>{warning}</li>)}
         </ul>}
         {error && <p className="text-xs text-destructive" role="alert">添加失败：{error}</p>}
       </ItemContent>
       <ItemActions className="flex-wrap">
-        <GameMatchBadge loading={cloudLoading} candidate={candidate} cloudName={cloudName} variant="outline" />
+        <GameMatchBadge loading={cloudLoading} candidate={candidate} cloudMatched={!!cloudMatch} variant="outline" />
         {registered ? <Badge variant="success">管理中</Badge> : <Button variant="outline" size="sm" disabled={disabled || cloudLoading || !selected} onClick={onRegister}>{cloudLoading ? "正在匹配…" : "添加"}</Button>}
         {!registered && (cloudLoading || !!error) && <Button variant="outline" size="sm" disabled={disabled || !selected} onClick={onLocalRegister}>仅添加本地</Button>}
       </ItemActions>

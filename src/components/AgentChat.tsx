@@ -45,6 +45,8 @@ import {
   TraceTitle,
 } from "@/components/ui/trace";
 import { cn } from "@/lib/utils";
+import { ModRequestCard } from "./ModRequestCard";
+import { parseModRequest, type ModRequest } from "@/lib/mod-request";
 import { AgentConfirmation } from "./AgentConfirmation";
 import { AgentWorkspaceDialog } from "./AgentWorkspaceDialog";
 import { conversationWorkspace, workspaceLabel } from "@/lib/game-workspace";
@@ -174,6 +176,16 @@ export function AgentChat() {
   useEffect(() => {
     end.current?.scrollIntoView({ block: "end", behavior: "auto" });
   }, [stream.length]);
+
+  const modRequests = useMemo(() => {
+    const requests = new Map<string, ModRequest>();
+    for (const message of detail.data?.messages ?? []) {
+      if (message.role !== "user") continue;
+      const request = parseModRequest(message.content);
+      if (request) requests.set(message.id, request);
+    }
+    return requests;
+  }, [detail.data?.messages]);
 
   const { messages, visibleIds, errors, unlinkedErrors, streamingReplyId } = useMemo(() => {
     const all = (detail.data?.messages || []).map((message) => ({ ...message }));
@@ -418,22 +430,27 @@ export function AgentChat() {
             const hasContent = Boolean(message.content.trim());
             const attachments = message.attachments ?? [];
             const hasAttachments = attachments.length > 0;
+            const modRequest = modRequests.get(message.id);
+            const attachmentGroup = hasAttachments && <AttachmentGroup aria-label="消息附件" className="flex-wrap gap-1.5">
+              {attachments.map((value, index) => <MessageAttachment key={index} value={value} />)}
+            </AttachmentGroup>;
             const canAct = writableChat && !detail.isPlaceholderData && !busy && !activeQuestion;
             return <Fragment key={message.id}>
               <article className={cn("chat-message motion-safe:animate-rise-in", message.role)}>
                 <Message align={isAssistant ? "start" : "end"}>
-                  <MessageContent className={cn(isAssistant ? "max-w-3xl" : "max-w-[min(80%,36rem)]")}>
+                  <MessageContent className={cn(isAssistant ? "max-w-3xl" : modRequest ? "max-w-sm" : "max-w-[min(80%,36rem)]")}>
                     {message.reasoning && <ReasoningTrace reasoning={message.reasoning} streaming={message.id === streamingReplyId} />}
-                    <Bubble variant={isAssistant ? "ghost" : "default"} align={isAssistant ? "start" : "end"} className={isAssistant ? "max-w-full" : undefined}>
+                    {modRequest ? <>
+                      {attachmentGroup}
+                      <ModRequestCard request={modRequest} messageId={message.id} gameName={games.data?.find(game => game.id === modRequest.gameId)?.name} tools={tools} />
+                    </> : <Bubble variant={isAssistant ? "ghost" : "default"} align={isAssistant ? "start" : "end"} className={isAssistant ? "max-w-full" : undefined}>
                       <BubbleContent className={cn("markdown min-w-0 break-words", !isAssistant && "rounded-2xl px-4 py-2.5")}>
                         <div data-message-id={message.id} className="flex flex-col gap-3 [&_a]:text-primary [&_a]:underline [&_a]:underline-offset-4 [&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:font-mono [&_code]:text-xs [&_ol]:list-decimal [&_ol]:pl-5 [&_p]:leading-relaxed [&_pre]:max-w-full [&_pre]:overflow-auto [&_pre]:rounded-md [&_pre]:border [&_pre]:bg-muted [&_pre]:p-3 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_table]:w-full [&_table]:border-collapse [&_td]:border [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:px-2 [&_th]:py-1 [&_th]:text-left [&_ul]:list-disc [&_ul]:pl-5">
-                          {hasAttachments && <AttachmentGroup aria-label="消息附件" className="flex-wrap gap-1.5">
-                            {attachments.map((value, index) => <MessageAttachment key={index} value={value} />)}
-                          </AttachmentGroup>}
+                          {attachmentGroup}
                           {hasContent && <MessageMarkdown content={message.content} onError={setError} />}
                         </div>
                       </BubbleContent>
-                    </Bubble>
+                    </Bubble>}
                     {toolsByMessage.get(message.id)?.map(renderTool)}
                     {questionsByMessage.get(message.id)?.map(renderQuestion)}
                     {isAssistant && <TurnError message={failure} />}

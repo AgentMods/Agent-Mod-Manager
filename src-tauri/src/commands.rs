@@ -539,7 +539,9 @@ pub async fn get_agent_model_metadata(
 
 #[tauri::command]
 pub async fn set_settings(agent: State<'_, AgentRuntime>, settings: AppSettings) -> AppResult<()> {
-    agent.settings.save(&settings)
+    agent.settings.save(&settings)?;
+    agent.engine.organization_wake.notify_one();
+    Ok(())
 }
 #[tauri::command]
 pub async fn set_secret(
@@ -1287,7 +1289,11 @@ pub async fn set_skill_enabled(
     enabled: bool,
 ) -> AppResult<crate::skills::SkillInfo> {
     blocking(state.engine.clone(), move |engine| {
-        crate::skills::set_enabled(&engine, &name, enabled)
+        let skill = crate::skills::set_enabled(&engine, &name, enabled)?;
+        if name == crate::skills::MOD_ORGANIZER_SKILL_NAME {
+            engine.organization_wake.notify_one();
+        }
+        Ok(skill)
     })
     .await
 }
@@ -1541,4 +1547,54 @@ pub async fn restore_snapshot(
     })
     .await
     .map(FilePlan::into_user_paths)
+}
+
+#[tauri::command]
+pub async fn list_mod_tags(
+    state: State<'_, AppServices>,
+    game_id: String,
+) -> AppResult<Vec<crate::mod_organization::ModTag>> {
+    blocking(state.engine.clone(), move |e| {
+        crate::mod_organization::list_mod_tags(&e.db, &game_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn save_mod_tag(
+    state: State<'_, AppServices>,
+    game_id: String,
+    id: Option<String>,
+    name: String,
+    color: String,
+) -> AppResult<crate::mod_organization::ModTag> {
+    blocking(state.engine.clone(), move |e| {
+        crate::mod_organization::save_mod_tag(&e.db, &game_id, id.as_deref(), &name, &color)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_mod_tag(
+    state: State<'_, AppServices>,
+    game_id: String,
+    id: String,
+) -> AppResult<()> {
+    blocking(state.engine.clone(), move |e| {
+        crate::mod_organization::delete_mod_tag(&e.db, &game_id, &id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn set_mod_tags(
+    state: State<'_, AppServices>,
+    game_id: String,
+    install_id: String,
+    tag_ids: Vec<String>,
+) -> AppResult<()> {
+    blocking(state.engine.clone(), move |e| {
+        crate::mod_organization::set_mod_tags(&e.db, &game_id, &install_id, &tag_ids)
+    })
+    .await
 }

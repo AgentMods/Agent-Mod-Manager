@@ -26,6 +26,98 @@ const PUBLIC_KEYS: &[&str] = &[
 
 const COMPOSER_PREFERENCES_KEY: &str = "composer_preferences";
 
+const MOD_ORGANIZATION_LOCALE_KEY: &str = "mod_organization_locale";
+pub(crate) const MOD_ORGANIZATION_LANGUAGES: &[(&str, &str)] = &[
+    ("zh-CN", "简体中文"),
+    ("zh-TW", "繁體中文"),
+    ("en", "English"),
+    ("ja", "日本語"),
+    ("ko", "한국어"),
+    ("fr", "Français"),
+    ("de", "Deutsch"),
+    ("es", "Español"),
+    ("pt-BR", "Português (Brasil)"),
+    ("it", "Italiano"),
+    ("ru", "Русский"),
+    ("pl", "Polski"),
+    ("uk", "Українська"),
+    ("tr", "Türkçe"),
+];
+
+fn is_mod_organization_override(locale: &str) -> bool {
+    MOD_ORGANIZATION_LANGUAGES
+        .iter()
+        .any(|(code, _)| *code == locale)
+}
+
+pub(crate) fn mod_organization_locale_override(
+    conn: &rusqlite::Connection,
+) -> AppResult<Option<String>> {
+    let encoded: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key=?1",
+            [MOD_ORGANIZATION_LOCALE_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(encoded
+        .and_then(|value| serde_json::from_str::<String>(&value).ok())
+        .filter(|value| is_mod_organization_override(value)))
+}
+
+pub(crate) fn set_mod_organization_locale_override(db: &Db, locale: Option<&str>) -> AppResult<()> {
+    if let Some(locale) = locale {
+        if !is_mod_organization_override(locale) {
+            return Err(AppError::Invalid("不支持的 Mod 整理目标语言".into()));
+        }
+        db.conn().execute(
+            "INSERT INTO settings(key,value) VALUES(?1,?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![MOD_ORGANIZATION_LOCALE_KEY, serde_json::to_string(locale)?],
+        )?;
+    } else {
+        db.conn().execute(
+            "DELETE FROM settings WHERE key=?1",
+            [MOD_ORGANIZATION_LOCALE_KEY],
+        )?;
+    }
+    Ok(())
+}
+
+fn system_mod_organization_locale(locale: Option<String>) -> String {
+    locale
+        .filter(|locale| {
+            let mut subtags = locale.split('-');
+            locale.len() <= 64
+                && subtags.next().is_some_and(|language| {
+                    (2..=8).contains(&language.len())
+                        && language.bytes().all(|byte| byte.is_ascii_alphabetic())
+                        && !matches!(language.to_ascii_lowercase().as_str(), "posix" | "und")
+                })
+                && subtags.all(|tag| {
+                    (1..=8).contains(&tag.len())
+                        && tag.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                })
+        })
+        .unwrap_or_else(|| "zh-CN".into())
+}
+
+pub(crate) fn system_mod_locale() -> String {
+    system_mod_organization_locale(sys_locale::get_locale())
+}
+
+/// Effective target for new Mod organization runs, independent of model and UI settings.
+pub fn mod_organization_locale(db: &Db) -> String {
+    effective_mod_locale(&db.conn())
+}
+
+pub(crate) fn effective_mod_locale(conn: &rusqlite::Connection) -> String {
+    mod_organization_locale_override(conn)
+        .ok()
+        .flatten()
+        .unwrap_or_else(system_mod_locale)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
@@ -428,6 +520,53 @@ fn validate_setting_key(key: &str) -> AppResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mod_organization_locale_is_independent_of_model_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("db")).unwrap();
+        let settings = Settings::with_secret_store(db.clone(), Arc::new(MockSecrets::default()));
+        assert_eq!(mod_organization_locale_override(&db.conn()).unwrap(), None);
+        let model_settings = AppSettings {
+            model: "test-model".into(),
+            ..Default::default()
+        };
+        settings.save(&model_settings).unwrap();
+        set_mod_organization_locale_override(&db, Some("ja")).unwrap();
+        assert_eq!(settings.load().unwrap(), model_settings);
+        settings.save(&AppSettings::default()).unwrap();
+        assert_eq!(mod_organization_locale(&db), "ja");
+        for invalid in ["", "auto", "JA", " en", "xy", "en\nignore instructions"] {
+            assert!(set_mod_organization_locale_override(&db, Some(invalid)).is_err());
+        }
+        assert_eq!(mod_organization_locale(&db), "ja");
+        set_mod_organization_locale_override(&db, None).unwrap();
+        assert_eq!(mod_organization_locale_override(&db.conn()).unwrap(), None);
+        assert_eq!(
+            mod_organization_locale(&db),
+            system_mod_organization_locale(sys_locale::get_locale())
+        );
+    }
+
+    #[test]
+    fn mod_organization_locale_uses_system_tag_or_chinese_fallback() {
+        for tag in ["en-US", "zh-Hant-TW", "ja", "es-419"] {
+            assert_eq!(system_mod_organization_locale(Some(tag.into())), tag);
+        }
+        for tag in [
+            None,
+            Some("C"),
+            Some("POSIX"),
+            Some("und"),
+            Some("en\nUS"),
+            Some("en--US"),
+        ] {
+            assert_eq!(
+                system_mod_organization_locale(tag.map(str::to_owned)),
+                "zh-CN"
+            );
+        }
+    }
+
     use super::*;
     use serde_json::json;
     use std::{collections::HashMap, sync::Mutex};

@@ -22,6 +22,7 @@ use std::{
 const MANIFEST_LIMIT: u64 = 64 * 1024;
 const SOURCE: &str = "external";
 const SYSTEM_SOURCE: &str = "system";
+pub(crate) const MOD_ORGANIZER_SKILL_NAME: &str = "system-mod-organize";
 
 struct SystemSkill {
     name: &'static str,
@@ -43,7 +44,9 @@ const SYSTEM_SKILLS: &[SystemSkill] = &[
     system_skill!("system-adapter-authoring"),
     system_skill!("system-web-search"),
     system_skill!("system-mod-download"),
+    system_skill!("system-mod-commission"),
     system_skill!("system-mod-install"),
+    system_skill!("system-mod-organize"),
     system_skill!("system-mod-uninstall"),
 ];
 
@@ -53,6 +56,21 @@ fn system_skill(name: &str) -> Option<&'static SystemSkill> {
 
 pub(crate) fn is_system_skill(name: &str) -> bool {
     system_skill(name).is_some()
+}
+
+/// Returns the enabled embedded organizer instructions for the post-install worker.
+pub(crate) fn enabled_mod_organizer(db: &Db) -> AppResult<Option<&'static str>> {
+    let skill = system_skill(MOD_ORGANIZER_SKILL_NAME)
+        .ok_or_else(|| AppError::NotFound(MOD_ORGANIZER_SKILL_NAME.into()))?;
+    if !skill.enabled(db)? {
+        return Ok(None);
+    }
+    let (_, body) = skill
+        .markdown
+        .split_once("\n---\n")
+        .or_else(|| skill.markdown.split_once("\r\n---\r\n"))
+        .ok_or_else(|| invalid("内置 Mod 整理 Skill 缺少正文"))?;
+    Ok(Some(body.trim()))
 }
 
 static SKILLS_LOCK: Mutex<()> = Mutex::new(());

@@ -490,13 +490,20 @@ test("Settings separates system and standalone Skills from game Skills", async (
   ]);
   const panel = page.getByRole("tabpanel", {name: "Skills", exact: true});
   const system = panel.getByRole("region", {name: "系统 Skills", exact: true});
-  await expect(system.getByRole("row")).toHaveCount(4);
-  for (const name of ["创建与修改适配包", "联网搜索", "从网站下载 Mod"]) {
+  await expect(system.getByRole("row")).toHaveCount(6);
+  for (const name of ["创建与修改适配包", "联网搜索", "从网站下载 Mod", "定制 Mod 委托", "安装后整理 Mod"]) {
+    const button = system.getByRole("button", {name, exact: true});
+    await expect(button).toBeVisible();
     const row = system.getByRole("row").filter({has: page.getByRole("button", {name, exact: true})});
     await expect(row.getByRole("cell", {name: "系统内置", exact: true})).toBeVisible();
     await expect(row.getByText("已校验", {exact: true})).toBeVisible();
     await expect(row.getByRole("checkbox", {name: `启用 ${name}`, exact: true})).toBeChecked();
   }
+  const organizerToggle = system.getByRole("checkbox", {name: "启用 安装后整理 Mod", exact: true});
+  await organizerToggle.uncheck();
+  await expect(organizerToggle).not.toBeChecked();
+  await organizerToggle.check();
+  await expect(organizerToggle).toBeChecked();
   await expect(panel).not.toContainText("minecraft-java");
   await expect(panel).not.toContainText("Minecraft 模组安装指引");
 
@@ -531,6 +538,8 @@ test("Settings separates system and standalone Skills from game Skills", async (
     (call: any) => call.command === "get_skill" || call.command === "set_skill_enabled",
   ));
   expect(skillCalls).toEqual([
+    {command: "set_skill_enabled", args: {name: "system-mod-organize", enabled: false}},
+    {command: "set_skill_enabled", args: {name: "system-mod-organize", enabled: true}},
     {command: "get_skill", args: {name: "system-web-search"}},
     {command: "set_skill_enabled", args: {name: "system-web-search", enabled: false}},
     {command: "set_skill_enabled", args: {name: "system-web-search", enabled: true}},

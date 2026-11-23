@@ -137,7 +137,7 @@ export function ManagerPluginCatalog({ writable, initialQuery = "", onReturnToGa
     return <>
       {change.failed?.action === "install" && change.failed.releaseId === plugin.releaseId && <ErrorState className="basis-full" error={change.error} />}
       {local ? <>
-        {local.version !== plugin.version && <p className="basis-full text-xs text-muted-foreground">本地版本 {local.version}。如需安装此版本，请先移除已安装的同标识插件。</p>}
+        {local.version !== plugin.version && <p className="basis-full text-xs text-muted-foreground">本地版本 {local.version}，云端版本 {plugin.version}。</p>}
         <Badge tone="success"><CheckIcon className="size-3" />已安装</Badge>
         {onReturnToGame && <Button size="sm" variant="outline" onClick={() => onReturnToGame(local.slug)}>返回并选择此适配包</Button>}
       </> : <Button size="sm" aria-label={`安装 ${plugin.name} · ${plugin.authorName} · ${plugin.version}`} disabled={!writable || !installed.isSuccess || !!change.pending}

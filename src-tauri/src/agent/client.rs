@@ -4,7 +4,7 @@ use super::sse::{
 };
 use crate::{
     error::{AppError, AppResult},
-    settings::{parse_model_base_url, ReasoningEffort},
+    settings::{parse_model_base_url, ReasoningEffort, Settings, MODEL_API_KEY},
 };
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -24,6 +24,29 @@ pub struct ModelConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
     pub api_key: Option<String>,
 }
+impl ModelConfig {
+    pub(crate) fn configured(settings: &Settings) -> AppResult<Option<Self>> {
+        let saved = settings.load()?;
+        let last = settings.load_composer_preferences()?;
+        let selected = saved
+            .models
+            .iter()
+            .find(|m| Some(&m.id) == last.model.as_ref());
+        let model = selected.map_or(saved.model, |m| m.id.clone());
+        if model.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            model,
+            reasoning_effort: last
+                .reasoning_effort
+                .filter(|level| selected.is_some_and(|m| m.reasoning_levels.contains(level))),
+            base_url: saved.base_url,
+            api_key: settings.read_secret(saved.api_key_ref.as_deref().unwrap_or(MODEL_API_KEY))?,
+        }))
+    }
+}
+
 #[derive(Serialize)]
 struct CompletionRequest<'a> {
     model: &'a str,

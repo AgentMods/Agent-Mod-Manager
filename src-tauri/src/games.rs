@@ -23,6 +23,7 @@ const MAX_KV_DEPTH: usize = 32;
 const MAX_KV_TOKENS: usize = 65_536;
 const MAX_KV_STRING: usize = 65_536;
 pub const HIGH_CONFIDENCE: f64 = 0.80;
+pub(crate) const AUTOMATIC_GAME_NAME: &str = "automaticName";
 
 fn invalid(message: impl Into<String>) -> AppError {
     AppError::Invalid(message.into())
@@ -51,6 +52,20 @@ pub struct Game {
     pub metadata: Value,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl Game {
+    pub(crate) fn automatic_adapter_name<'a>(&self, adapter: &'a GameAdapter) -> Option<&'a str> {
+        // A missing or mismatched record cannot establish the origin of the current name.
+        let automatic = self
+            .metadata
+            .get(AUTOMATIC_GAME_NAME)
+            .and_then(Value::as_str);
+        if automatic != Some(self.name.as_str()) {
+            return None;
+        }
+        adapter.game_name.as_deref()
+    }
 }
 
 const GAME_COLUMNS: &str = "id,name,slug,root_path,platform,adapter_slug,adapter_version,confidence,cover_path,steam_app_id,last_scanned_at,installed_mod_count,enabled_mod_count,metadata_json,created_at,updated_at";
@@ -414,7 +429,8 @@ fn identify_at(
         }
     }
     let name = suggested
-        .map(|m| m.name.clone())
+        .and_then(|matched| adapters.iter().find(|adapter| adapter.slug == matched.slug))
+        .map(|adapter| adapter.display_game_name().to_owned())
         .or_else(|| sources.iter().find_map(|s| s.display_name.clone()))
         .unwrap_or_else(|| {
             root.file_name()
@@ -447,15 +463,27 @@ pub fn identify_game(db: &Db, directory: &Path) -> AppResult<GameCandidate> {
         &active_adapters(db)?,
         vec![DiscoverySource::simple(DiscoveryKind::User)],
     )?;
-    candidate.registered_game_id = db
-        .conn()
-        .query_row(
-            "SELECT id FROM games WHERE root_path=?1",
-            [path_text(&root)?],
-            |row| row.get(0),
-        )
-        .optional()?;
+    apply_registered_game_name(&db.conn(), &path_text(&root)?, &mut candidate)?;
     Ok(candidate)
+}
+
+fn apply_registered_game_name(
+    conn: &rusqlite::Connection,
+    root: &str,
+    candidate: &mut GameCandidate,
+) -> AppResult<()> {
+    if let Some((id, name)) = conn
+        .query_row(
+            "SELECT id,name FROM games WHERE root_path=?1",
+            [root],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+    {
+        candidate.registered_game_id = Some(id);
+        candidate.name = name;
+    }
+    Ok(())
 }
 
 /// Explicit user-selected root registration. Passing an adapter slug also
@@ -486,7 +514,10 @@ enum AdapterSelection<'a> {
     Automatic,
     Explicit(&'a str),
     Discovered(Option<&'a str>),
-    Catalog { slug: &'a str, game_name: &'a str },
+    Catalog {
+        slug: &'a str,
+        discovery_name: &'a str,
+    },
 }
 
 /// Evidence and the exact identity to persist for a manual selection. The
@@ -541,23 +572,33 @@ pub(crate) fn rebind_game(
     tx: &rusqlite::Transaction<'_>,
     game: Game,
     selected: &GameAdapterSelection,
-    target_name: Option<&str>,
+    requested_name: Option<&str>,
 ) -> AppResult<Game> {
-    let changed_name = target_name.filter(|&name| name != game.name);
-    if selected.already_applied(&game) {
-        let Some(name) = changed_name else {
-            return Ok(game);
-        };
-        // An explicit rename of an already bound package does not refresh
-        // identification metadata or any other game configuration.
+    let changed_name = requested_name
+        .or_else(|| game.automatic_adapter_name(&selected.adapter))
+        .filter(|&name| name != game.name);
+    let clear_automatic_name =
+        requested_name.is_some() && game.metadata.get(AUTOMATIC_GAME_NAME).is_some();
+    let already_applied = selected.already_applied(&game);
+    if already_applied && changed_name.is_none() && !clear_automatic_name {
+        return Ok(game);
+    }
+    let mut metadata = game.metadata;
+    if requested_name.is_some() {
+        if let Some(fields) = metadata.as_object_mut() {
+            fields.remove(AUTOMATIC_GAME_NAME);
+        }
+    } else if let Some(name) = changed_name {
+        metadata[AUTOMATIC_GAME_NAME] = json!(name);
+    }
+    if already_applied {
         tx.execute(
-            "UPDATE games SET name=?1,updated_at=?2 WHERE id=?3",
-            params![name, util::now(), game.id],
+            "UPDATE games SET name=COALESCE(?1,name),metadata_json=?2,updated_at=?3 WHERE id=?4",
+            params![changed_name, metadata.to_string(), util::now(), game.id],
         )?;
         return get_game_from(tx, &game.id);
     }
     let now = chrono::Utc::now().to_rfc3339();
-    let mut metadata = game.metadata;
     update_registration_metadata(&mut metadata, selected.identification.clone(), &now)?;
     tx.execute(
         "UPDATE games SET slug=?1,platform=?2,adapter_slug=?1,adapter_version=?3,confidence=?4,
@@ -576,6 +617,27 @@ pub(crate) fn rebind_game(
         ],
     )?;
     get_game_from(tx, &game.id)
+}
+
+/// Refresh proven automatic names in the transaction that activates the package.
+/// Older registrations lack name provenance; older packages lack a declared title.
+pub(crate) fn refresh_bound_game_names(
+    tx: &rusqlite::Transaction<'_>,
+    adapter: &GameAdapter,
+) -> AppResult<()> {
+    if adapter.game_name.is_none() {
+        return Ok(());
+    }
+    let name = adapter.display_game_name();
+    let key = format!("$.{AUTOMATIC_GAME_NAME}");
+    tx.execute(
+        "UPDATE games SET name=?1,metadata_json=json_set(metadata_json,?2,?1),updated_at=?3
+         WHERE adapter_slug=?4 AND name<>?1 AND CASE WHEN json_valid(metadata_json)
+             THEN json_type(metadata_json,?2)='text' AND json_extract(metadata_json,?2)=name
+             ELSE 0 END",
+        params![name, key, util::now(), adapter.slug],
+    )?;
+    Ok(())
 }
 
 fn explicit_adapter_match<'a>(
@@ -687,7 +749,7 @@ impl CatalogGameRegistration {
             &candidate,
             AdapterSelection::Catalog {
                 slug,
-                game_name: &self.name,
+                discovery_name: &self.name,
             },
         )
     }
@@ -752,15 +814,25 @@ fn persist_registration(
     } else {
         adapter.map_or_else(|| "unknown".into(), |a| a.slug.clone())
     };
-    let name = old.map(|g| g.name.clone()).unwrap_or_else(|| {
-        if let AdapterSelection::Catalog { game_name, .. } = selection {
-            return game_name.to_owned();
-        }
-        adapter.map_or_else(
-            || root.file_name().unwrap().to_string_lossy().to_string(),
-            |a| a.name.clone(),
-        )
-    });
+    let automatic_name = match old {
+        Some(game) if !retain_identity => adapter.and_then(|a| game.automatic_adapter_name(a)),
+        Some(_) => None,
+        None => Some(match (selection, adapter) {
+            (AdapterSelection::Catalog { discovery_name, .. }, Some(a))
+                if a.game_name.is_none() =>
+            {
+                discovery_name
+            }
+            (_, Some(a)) => a.display_game_name(),
+            (_, None) => root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&root_text),
+        }),
+    };
+    let name = automatic_name
+        .or_else(|| old.map(|g| g.name.as_str()))
+        .unwrap();
     let id = old
         .map(|g| g.id.clone())
         .unwrap_or_else(|| format!("game_{}", uuid::Uuid::new_v4().simple()));
@@ -793,6 +865,9 @@ fn persist_registration(
     };
     let mut metadata = old.map_or_else(|| json!({}), |g| g.metadata.clone());
     update_registration_metadata(&mut metadata, serde_json::to_value(candidate)?, &now)?;
+    if let Some(name) = automatic_name {
+        metadata[AUTOMATIC_GAME_NAME] = json!(name);
+    }
     tx.execute(
         "INSERT INTO games (id,name,slug,root_path,platform,adapter_slug,adapter_version,confidence,steam_app_id,last_scanned_at,metadata_json,created_at,updated_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?10,?10)
@@ -832,11 +907,12 @@ pub(crate) fn register_online_identity(
     let mut metadata = old
         .as_ref()
         .map_or_else(|| json!({}), |g| g.metadata.clone());
-    if !metadata.is_object() {
-        return Err(invalid("Existing game metadata must be an object"));
-    }
+    let fields = metadata
+        .as_object_mut()
+        .ok_or_else(|| invalid("Existing game metadata must be an object"))?;
     let now = chrono::Utc::now().to_rfc3339();
-    metadata["onlineIdentity"] = evidence;
+    fields.remove(AUTOMATIC_GAME_NAME);
+    fields.insert("onlineIdentity".into(), evidence);
     let id = old
         .as_ref()
         .map(|g| g.id.clone())
@@ -1937,12 +2013,7 @@ fn scan_with(
         let metadata = provenance.iter().any(|s| s.metadata_path.is_some());
         let user = provenance.iter().any(|s| s.kind == DiscoveryKind::User);
         let mut candidate = identify_at(path, scanner.adapters, provenance)?;
-        candidate.registered_game_id = db
-            .conn()
-            .query_row("SELECT id FROM games WHERE root_path=?1", [&root], |r| {
-                r.get(0)
-            })
-            .optional()?;
+        apply_registered_game_name(&db.conn(), &root, &mut candidate)?;
         if candidate.matches.is_empty() && !metadata {
             if hint {
                 candidate
@@ -2377,8 +2448,123 @@ mod tests {
         assert_eq!(registered.adapter_slug, None);
         let selected = register_game(&db, &game, Some("minecraft-java")).unwrap();
         assert_eq!(registered.id, selected.id);
+        assert_eq!(selected.name, registered.name);
         assert_eq!(selected.adapter_slug.as_deref(), Some("minecraft-java"));
         assert!(selected.confidence < HIGH_CONFIDENCE);
+    }
+
+    #[test]
+    fn declared_game_name_is_used_for_scan_and_registrations() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db_with_adapters(&temp);
+        let mut adapter = plugins::adapter_for(&db, "skyrim-se").unwrap();
+        let package_name = adapter.name.clone();
+        adapter.game_name = Some("上古卷轴 V：天际".into());
+        db.conn()
+            .execute(
+                "UPDATE plugins SET adapter_json=?1 WHERE slug=?2",
+                params![serde_json::to_string(&adapter).unwrap(), adapter.slug],
+            )
+            .unwrap();
+        let name = adapter.display_game_name();
+        let direct = temp.path().join("different-directory-name");
+        let discovered = temp.path().join("another-directory-name");
+        skyrim(&direct);
+        skyrim(&discovered);
+
+        let identified = identify_game(&db, &direct).unwrap();
+        assert_eq!(identified.name, name);
+        assert_eq!(identified.matches[0].name, package_name);
+        let report = scan_games(
+            &db,
+            &ScanOptions {
+                user_roots: vec![discovered.clone()],
+                ..scan_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.candidates[0].name, name);
+
+        let manual = register_game(&db, &direct, None).unwrap();
+        let scanned = register_discovered_game(
+            &db,
+            &discovered,
+            report.candidates[0].suggested_adapter_slug.as_deref(),
+        )
+        .unwrap();
+        for game in [manual, scanned] {
+            assert_eq!(game.name, name);
+            assert_eq!(game.metadata[AUTOMATIC_GAME_NAME], name);
+        }
+    }
+
+    #[test]
+    fn refreshing_bound_names_requires_matching_automatic_name_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db_with_adapters(&temp);
+        let mut adapter = plugins::adapter_for(&db, "skyrim-se").unwrap();
+        assert!(adapter.game_name.is_none());
+        let [automatic, legacy, edited, unbound] =
+            ["auto", "legacy", "edited", "unbound"].map(|folder| {
+                let root = temp.path().join(folder);
+                skyrim(&root);
+                register_game(&db, &root, None).unwrap()
+            });
+        assert_eq!(automatic.name, adapter.name);
+        assert_eq!(legacy.name, automatic.name);
+        assert_eq!(legacy.adapter_slug.as_deref(), Some(adapter.slug.as_str()));
+        assert_eq!(
+            legacy.metadata["lastIdentification"]["suggestedAdapterSlug"],
+            adapter.slug
+        );
+        assert_eq!(
+            legacy.metadata["lastIdentification"]["matches"][0]["name"],
+            legacy.name
+        );
+        db.conn().execute(
+            "UPDATE games SET metadata_json=json_remove(metadata_json,'$.automaticName') WHERE id=?1",
+            [&legacy.id],
+        ).unwrap();
+        db.conn()
+            .execute("UPDATE games SET name='我的天际' WHERE id=?1", [&edited.id])
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE games SET adapter_slug=NULL WHERE id=?1",
+                [&unbound.id],
+            )
+            .unwrap();
+
+        let mut conn = db.conn();
+        let tx = conn.transaction().unwrap();
+        adapter.name = "新版包名称".into();
+        refresh_bound_game_names(&tx, &adapter).unwrap();
+        assert_eq!(
+            get_game_from(&tx, &automatic.id).unwrap().name,
+            automatic.name
+        );
+        adapter.game_name = Some("天际特别版".into());
+        refresh_bound_game_names(&tx, &adapter).unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        let after = get_game(&db, &automatic.id).unwrap();
+        assert_eq!(after.name, "天际特别版");
+        assert_eq!(after.metadata[AUTOMATIC_GAME_NAME], after.name);
+        assert_eq!(
+            after.metadata["lastIdentification"],
+            automatic.metadata["lastIdentification"]
+        );
+        assert_eq!(after.adapter_version, automatic.adapter_version);
+        assert_eq!(get_game(&db, &legacy.id).unwrap().name, legacy.name);
+        assert_eq!(get_game(&db, &edited.id).unwrap().name, "我的天际");
+        assert_eq!(get_game(&db, &unbound.id).unwrap().name, unbound.name);
+        let identified = identify_game(&db, Path::new(&edited.root_path)).unwrap();
+        assert_eq!(identified.name, "我的天际");
+        assert_eq!(
+            identified.registered_game_id.as_deref(),
+            Some(edited.id.as_str())
+        );
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //! Anonymous, read-only Mod客栈 catalog. Only locally constructed release URLs enter the HTTP client.
 use crate::{
     error::{AppError, AppResult},
-    plugin_workflow::{self, PackageHashes},
+    manager_publication::version_cmp,
+    plugin_workflow::{self, CatalogUpdateCandidate, PackageHashes},
     plugins::{self, Platform, PluginMcpServer},
     transaction::{FileEngine, FilePlan},
 };
@@ -49,6 +50,8 @@ pub struct CatalogPlugin {
     pub release_id: String,
     pub slug: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_name: Option<String>,
     pub version: String,
     pub platforms: Vec<Platform>,
     pub description: String,
@@ -144,6 +147,10 @@ fn valid_plugin(p: &CatalogPlugin, game_steam_id: &str) -> bool {
     if plugins::validate_slug(&p.slug).is_err()
         || plugins::validate_version(&p.version).is_err()
         || !display_text(&p.name, false)
+        || p.game_name.as_deref().is_some_and(|name| {
+            !name.is_empty()
+                && (name.len() > 256 || name.trim() != name || !display_text(name, false))
+        })
         || !display_text(&p.author_name, false)
         || !display_text(&p.description, true)
         || !valid_steam_id(&p.steam_app_id)
@@ -185,7 +192,34 @@ fn ambiguous_ids<'a>(rows: impl Iterator<Item = &'a Value>, field: &str) -> Hash
     duplicates
 }
 
-fn parse_catalog(text: &str) -> AppResult<CatalogSearch> {
+struct CatalogSnapshot {
+    search: CatalogSearch,
+    ambiguous_slugs: HashSet<String>,
+}
+
+impl CatalogSnapshot {
+    fn update_release(&self, candidate: &CatalogUpdateCandidate) -> Option<(&str, &CatalogPlugin)> {
+        // Old installs have no stable ID. Never infer it from a slug present in
+        // more than one row, even if only one of those rows survived validation.
+        if candidate.plugin_id.is_none() && self.ambiguous_slugs.contains(&candidate.slug) {
+            return None;
+        }
+        self.search.games.iter().find_map(|game| {
+            game.plugins
+                .iter()
+                .find(|plugin| {
+                    plugin.slug == candidate.slug
+                        && candidate
+                            .plugin_id
+                            .as_ref()
+                            .is_none_or(|id| id == &plugin.id)
+                })
+                .map(|plugin| (game.name.as_str(), plugin))
+        })
+    }
+}
+
+fn parse_catalog(text: &str) -> AppResult<CatalogSnapshot> {
     #[derive(Deserialize)]
     struct Envelope {
         data: Vec<Value>,
@@ -199,7 +233,13 @@ fn parse_catalog(text: &str) -> AppResult<CatalogSearch> {
         .filter_map(|g| g["plugins"].as_array())
         .flatten();
     let ambiguous_plugins = ambiguous_ids(raw_plugins.clone(), "id");
-    let ambiguous_releases = ambiguous_ids(raw_plugins, "releaseId");
+    let ambiguous_releases = ambiguous_ids(raw_plugins.clone(), "releaseId");
+    let mut seen_slugs = HashSet::new();
+    let ambiguous_slugs = raw_plugins
+        .filter_map(|row| row["slug"].as_str())
+        .filter(|slug| !seen_slugs.insert(*slug))
+        .map(str::to_owned)
+        .collect();
     let mut games = Vec::new();
     let mut skipped_entries = 0;
     for mut row in envelope.data {
@@ -248,10 +288,13 @@ fn parse_catalog(text: &str) -> AppResult<CatalogSearch> {
             "云端目录含有 {skipped_entries} 项无效或不兼容的记录，当前没有可用版本"
         )));
     }
-    Ok(CatalogSearch {
-        total_games: games.len(),
-        games,
-        skipped_entries,
+    Ok(CatalogSnapshot {
+        search: CatalogSearch {
+            total_games: games.len(),
+            games,
+            skipped_entries,
+        },
+        ambiguous_slugs,
     })
 }
 
@@ -340,6 +383,10 @@ impl CatalogClient {
             .map_err(|_| AppError::Invalid("云端目录或插件文件必须是有效的 UTF-8".into()))
     }
     async fn games(&self) -> AppResult<CatalogSearch> {
+        Ok(self.snapshot().await?.search)
+    }
+
+    async fn snapshot(&self) -> AppResult<CatalogSnapshot> {
         parse_catalog(
             &self
                 .get(GAMES_PATH, CATALOG_LIMIT, "application/json")
@@ -414,7 +461,27 @@ impl CatalogClient {
                     AppError::NotFound("所选云插件版本已更新、已下架或不存在，请刷新目录".into())
                 }
             })?;
-        let (adapter_json, skill_markdown) = self.release_files(release_id).await?;
+        let mut preview = self.preview_release(&game_name, plugin).await?;
+        preview.installed_version = engine
+            .db
+            .conn()
+            .query_row(
+                "SELECT version FROM plugins WHERE slug=?1",
+                [&preview.plugin.slug],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(preview)
+    }
+
+    // A pinned release from an already validated catalog snapshot. Do not look
+    // up the directory again between selection and downloading its files.
+    async fn preview_release(
+        &self,
+        game_name: &str,
+        plugin: CatalogPlugin,
+    ) -> AppResult<CatalogPreview> {
+        let (adapter_json, skill_markdown) = self.release_files(&plugin.release_id).await?;
         let package = plugins::parse_package(&plugin.slug, &adapter_json, &skill_markdown)?;
         let display =
             ReleaseDisplay::from_release(package.adapter.cover_url.clone(), &skill_markdown);
@@ -428,17 +495,8 @@ impl CatalogClient {
                 "云端目录与指定版本的适配包或 Skill 声明不一致".into(),
             ));
         }
-        let installed_version = engine
-            .db
-            .conn()
-            .query_row(
-                "SELECT version FROM plugins WHERE slug=?1",
-                [&plugin.slug],
-                |row| row.get(0),
-            )
-            .optional()?;
         Ok(CatalogPreview {
-            game_name,
+            game_name: adapter.game_name.unwrap_or_else(|| game_name.to_owned()),
             plugin,
             source: SOURCE,
             hashes: PackageHashes::of(&adapter_json, &skill_markdown),
@@ -446,9 +504,67 @@ impl CatalogClient {
             adapter_json,
             skill_markdown,
             mcp_servers: adapter.mcp_servers,
-            installed_version,
+            installed_version: None,
         })
     }
+
+    async fn update_installed_at_startup(
+        &self,
+        engine: &FileEngine,
+        on_updated: impl Fn(&str),
+    ) -> AppResult<()> {
+        let candidate_engine = engine.clone();
+        let candidates = tokio::task::spawn_blocking(move || {
+            plugin_workflow::catalog_update_candidates(&candidate_engine)
+        })
+        .await
+        .map_err(|_| AppError::Other("启动时读取已安装云插件失败".into()))??;
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let snapshot = self.snapshot().await?;
+        for candidate in candidates {
+            let Some((game_name, plugin)) = snapshot.update_release(&candidate) else {
+                continue;
+            };
+            if let Err(error) = plugins::validate_version(&candidate.version) {
+                tracing::warn!(slug = %candidate.slug, %error, "跳过无法比较版本的已安装云插件");
+                continue;
+            }
+            if !version_cmp(&plugin.version, &candidate.version).is_gt() {
+                continue;
+            }
+            let slug = candidate.slug.clone();
+            match self
+                .update_candidate(engine, candidate, game_name, plugin)
+                .await
+            {
+                Ok(()) => on_updated(&slug),
+                Err(error) => tracing::warn!(
+                    %slug, release_id = %plugin.release_id, %error, "启动时更新云插件失败"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    async fn update_candidate(
+        &self,
+        engine: &FileEngine,
+        candidate: CatalogUpdateCandidate,
+        game_name: &str,
+        plugin: &CatalogPlugin,
+    ) -> AppResult<()> {
+        let mut preview = self.preview_release(game_name, plugin.clone()).await?;
+        preview.installed_version = Some(candidate.version.clone());
+        let engine = engine.clone();
+        tokio::task::spawn_blocking(move || {
+            plugin_workflow::update_catalog_release(&engine, &candidate, preview)
+        })
+        .await
+        .map_err(|_| AppError::Other("启动时提交云插件更新失败".into()))?
+    }
+
     pub(crate) async fn prepare_import(
         &self,
         engine: &FileEngine,
@@ -463,6 +579,12 @@ impl CatalogClient {
                 &preview.plugin.slug,
                 &preview.adapter_json,
                 &preview.skill_markdown,
+            )?;
+            plugin_workflow::record_catalog_draft_origin(
+                &engine,
+                &draft.draft.id,
+                &preview.plugin.id,
+                &preview.hashes,
             )?;
             Ok(CatalogImport {
                 preview,
@@ -520,6 +642,17 @@ pub async fn prepare_import(
 pub async fn install(engine: &FileEngine, plugin_id: &str, release_id: &str) -> AppResult<()> {
     CatalogClient::new()?
         .install(engine, plugin_id, release_id)
+        .await
+}
+
+/// Refresh installed cloud packages from one anonymous catalog snapshot.
+/// Global discovery failures are returned; individual package failures are logged.
+pub(crate) async fn update_installed_at_startup(
+    engine: &FileEngine,
+    on_updated: impl Fn(&str),
+) -> AppResult<()> {
+    CatalogClient::new()?
+        .update_installed_at_startup(engine, on_updated)
         .await
 }
 

@@ -1,7 +1,8 @@
 {
   "schemaVersion": 1,
   "slug": "cyberpunk-2077",
-  "name": "Cyberpunk 2077",
+  "name": "Cyberpunk 2077 Windows Mod Adapter",
+  "gameName": "Cyberpunk 2077",
   "version": "1.0.0",
   "platforms": [
     "windows"

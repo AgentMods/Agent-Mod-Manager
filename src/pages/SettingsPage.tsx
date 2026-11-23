@@ -18,6 +18,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { McpTools } from "@/components/McpTools";
 import { StorageDirectory } from "@/components/StorageDirectory";
+import { ModOrganizationLanguage } from "@/components/ModOrganizationLanguage";
 
 const sections = [["model", "AI 与模型"], ["mcp", "工具"], ["skills", "Skills"], ["appearance", "外观与存储"]] as const;
 
@@ -56,6 +57,7 @@ function AppearanceSettings() {
           <ToggleGroupItem value="light" aria-label="亮色"><SunIcon />亮色</ToggleGroupItem>
           <ToggleGroupItem value="dark" aria-label="暗色"><MoonIcon />暗色</ToggleGroupItem>
         </ToggleGroup>
+        <ModOrganizationLanguage />
       </CardContent>
     </Card>
     <Card>
@@ -80,6 +82,8 @@ const systemSkillPresentation = new Map([
   ["system-adapter-authoring", { title: "创建与修改适配包", icon: BoxIcon }],
   ["system-web-search", { title: "联网搜索", icon: SearchIcon }],
   ["system-mod-download", { title: "从网站下载 Mod", icon: DownloadIcon }],
+  ["system-mod-commission", { title: "定制 Mod 委托", icon: FileTextIcon }],
+  ["system-mod-organize", { title: "安装后整理 Mod", icon: FileTextIcon }],
 ]);
 
 function skillPresentation(skill: SkillInfo) {

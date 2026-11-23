@@ -3,12 +3,13 @@
 use super::*;
 
 pub(super) const CATALOG_INSTALL_KIND: &str = "catalog_plugin_install";
+pub(super) const CATALOG_UPDATE_KIND: &str = "catalog_plugin_update";
 pub(crate) const PLUGIN_REMOVE_KIND: &str = "plugin_remove";
 const SCRATCH: &str = "plugin-catalog";
 const RELEASE_PREFIX: &str = "release-";
 
 pub(crate) fn is_desktop_plugin_kind(kind: &str) -> bool {
-    matches!(kind, CATALOG_INSTALL_KIND | PLUGIN_REMOVE_KIND)
+    matches!(kind, CATALOG_INSTALL_KIND | CATALOG_UPDATE_KIND | PLUGIN_REMOVE_KIND)
 }
 
 pub(super) fn is_catalog_scratch(engine: &FileEngine, source: &Path) -> bool {
@@ -107,6 +108,18 @@ fn install_new_release_locked(
         }
         Err(e) => return Err(e.into()),
     }
+    deploy_catalog_locked(engine, files, preview, &target, registration, None)
+}
+
+pub(super) fn deploy_catalog_locked(
+    engine: &FileEngine,
+    files: &MutexGuard<'static, ()>,
+    preview: crate::manager_catalog::CatalogPreview,
+    target: &Path,
+    registration: Option<crate::games::CatalogGameRegistration>,
+    previous: Option<PreviousPackage>,
+) -> AppResult<()> {
+    let slug = &preview.plugin.slug;
     let content = Content {
         adapter_json: preview.adapter_json,
         skill_markdown: preview.skill_markdown,
@@ -114,6 +127,11 @@ fn install_new_release_locked(
     };
     let package = content.package(slug)?;
     ensure_mcp_ids_free(&engine.db.conn(), slug, &package)?;
+    let (kind, action) = if previous.is_some() {
+        (CATALOG_UPDATE_KIND, "自动更新云插件")
+    } else {
+        (CATALOG_INSTALL_KIND, "安装云插件")
+    };
     let parent = checked_path(engine, &engine.paths.staging().join(SCRATCH))?;
     crate::safe_fs::create_dir_all(&parent)?;
     let scratch = tempfile::Builder::new()
@@ -142,20 +160,23 @@ fn install_new_release_locked(
                 dst: target.join(name),
             })
             .collect(),
-        format!("安装云插件 {slug} {}", package.adapter.version),
+        format!("{action} {slug} {}", package.adapter.version),
         false,
     )?;
     plan.requires_review = true;
-    verify_copy_plan(&plan, &plan.id, &source, &target, &content, true)?;
+    verify_copy_plan(&plan, &plan.id, &source, target, &content, previous.is_none())?;
+    verify_previous(&plan, target, previous.as_ref())?;
+    let hashes = content.hashes.clone();
     let json = serde_json::to_string(&DeploymentRecord {
         schema_version: 1,
         registration,
         content,
-        previous: None,
-        plugin_enabled: true,
-        skill_enabled: true,
+        plugin_enabled: previous.as_ref().is_none_or(|p| p.plugin_enabled),
+        skill_enabled: previous.as_ref().is_none_or(|p| p.skill_enabled),
+        previous,
     })?;
-    persist_authorized(engine, &plan, CATALOG_INSTALL_KIND, |tx| {
+    persist_authorized(engine, &plan, kind, |tx| {
+        catalog_updates::record_origin(tx, &plan.id, &preview.plugin.id, &hashes)?;
         tx.execute("INSERT INTO plugin_deployments(transaction_id,slug,package_json,install_path,created_at) VALUES (?1,?2,?3,?4,?5)",
             params![plan.id, slug, json, target.to_string_lossy(), util::now()])?;
         Ok(())
@@ -284,7 +305,7 @@ fn ensure_unbound(conn: &Connection, slug: &str) -> AppResult<()> {
     Ok(())
 }
 
-fn ensure_mcp_ids_free(conn: &Connection, slug: &str, package: &GamePackage) -> AppResult<()> {
+pub(super) fn ensure_mcp_ids_free(conn: &Connection, slug: &str, package: &GamePackage) -> AppResult<()> {
     for config in package.adapter.mcp_configs()? {
         let collision: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM mcp_servers WHERE id=?1 AND plugin_slug IS NOT ?2)",
@@ -318,6 +339,9 @@ pub(super) fn ensure_deployment_not_retired(engine: &FileEngine, id: &str) -> Ap
 
 pub(crate) fn validate_plugin_rollback(engine: &FileEngine, id: &str, kind: &str) -> AppResult<()> {
     ensure_deployment_not_retired(engine, id)?;
+    if kind == CATALOG_UPDATE_KIND {
+        return catalog_updates::validate_rollback(engine, id);
+    }
     let conn = engine.db.conn();
     if kind == CATALOG_INSTALL_KIND {
         let slug: String = conn.query_row(
@@ -359,6 +383,9 @@ pub(crate) fn finalize_desktop_transaction(
     status: &str,
     finished_at: &str,
 ) -> AppResult<Option<String>> {
+    if kind == CATALOG_UPDATE_KIND {
+        return catalog_updates::finalize(engine, tx, id, status, finished_at);
+    }
     if !is_desktop_plugin_kind(kind) {
         return Ok(None);
     }

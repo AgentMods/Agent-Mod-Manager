@@ -78,11 +78,13 @@ export function invalidateAgentModQueries(client: QueryClient, events: AgentEven
     invalidate("trash");
     if (allInstallGames) {
       invalidate("installs");
+      invalidate("mod-tags");
       invalidate("game");
       allLibraryGames = true;
     } else {
       for (const gameId of installGames) {
         invalidate("installs", gameId);
+        invalidate("mod-tags", gameId);
         invalidate("game", gameId);
         libraryGames.add(gameId);
       }

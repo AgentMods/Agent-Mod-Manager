@@ -3,6 +3,52 @@
 Updated: 2026-11-23. The full project goal remains active. This is an
 implementation and verification snapshot, not a release-completion claim.
 
+**Removing Mods with overlapping legacy installations (2026-11-23, Windows).**
+Installation inspection can identify the last writer of a shared path by matching
+file identities and fingerprints in the committed copy and backup journals.
+The Agent and transaction history recheck the installation before rollback.
+Batch removal rechecks selected installations after recovering the preceding
+files. Ordinary installation previews and commits now enforce the ownership
+checks already used for library installations. Restoring a managed uninstall
+checks all files its record would reclaim, including unselected trash items.
+Windows tests covered two and three overlapping installations, identical bytes
+with distinct file identities, changes after approval, and removal of both list
+records with the original game file restored. The 14 desktop batch-action tests,
+frontend production build, all-target Clippy and Rust formatting checks passed.
+
+**Library archive member installation (2026-11-23, Windows).** The generic file
+planner directs library operations to the artifact-based installation tools.
+The library matcher identifies existing active deployments. Both planning and
+apply reject whole-archive mappings to native binaries and collisions with
+paths owned by another active install, including missing files. Generic trash
+operations check active ownership for files and parent directories at both
+stages, including trash plans approved before upgrade.
+A ZIP fixture exercises member selection, deployed plugin bytes, preservation
+of the original archive and transaction rollback. The Windows Rust library suite
+passed 1,104 tests with 15 ignored. All-target Clippy and the Rust formatting
+check passed.
+
+**Automatic post-install Mod organization (2026-11-23, Windows).** The desktop
+runs the built-in `system-mod-organize` skill after a managed installation
+commits. It uses the configured model in a separate, tool-free request. Schema
+v23 queues the exact install ID in the installation transaction. On startup the
+worker also picks up previously installed records with archive filenames,
+missing tags or fallback classifications. The active install chat may finish or
+close while organization runs. An open Game Details view refreshes after the
+localized display name and tags have been saved.
+
+The worker uses recorded source titles and meaningful relative component names
+when download filenames are opaque. It preserves manual tag assignments and
+leaves names alone when the available evidence is insufficient. Transient
+failures retry with backoff. Disabling the skill pauses pending work, and a
+completed record stays complete across restarts. The target language defaults
+to the system language and can be set in Settings → Appearance and storage.
+Game Details shows customizable color tags before the Mod name and supports
+filtering by tag. Organization updates manager metadata only.
+A local model fixture exercised both a new approved installation and startup
+repair of an existing hash-named record. Nine UI event tests across three
+viewport sizes covered automatic refresh, late listeners and game isolation.
+
 **Per-conversation Agent game workspaces (2026-11-23, Windows).** The sidebar workspace
 selector (chat header on narrow screens) stages single or multiple registered games,
 dynamic all, or explicitly none. Schema v21 preserves previous game bindings and
@@ -17,13 +63,23 @@ concurrent turn start, download classification and installation targeting.
 **Batch Mod actions (2026-11-23, Windows).** Game Details → Mod management has an
 opt-in selection mode for installing, uninstalling and removing Mods. Mixed selections
 skip ineligible rows; repeated archive targets are installed at most once per dispatch.
+All eligible Agent targets from one click share one conversation and one turn,
+with one review panel and separate tool receipts and list checks for each target.
+Chat displays the generated install, uninstall and removal requests as cards in
+both themes. Each card lists the game and target Mods, with exact IDs in an
+expandable section. Missing names fall back to record identifiers. Copy and
+edit use the original Agent message.
+Local-only list removals create no conversation. A retry after a failed turn start
+reuses the draft conversation for the same action and target set on the game page.
 Deletion previews the targets before submitting. Installed Mods follow their scoped
 Agent workflow and require both a removal receipt and list readback; inactive records,
 plans and unused archives use the existing desktop list-removal command. Other visible
 records tied to the same archive are retained when deleting a record.
-The frontend production build, 30 batch-action and 42 removal-tracking Playwright
-cases across three viewports, 32 desktop single-action/replacement regressions,
-and 15 Rust install-library tests passed. UI checks used mock IPC, not a live game.
+The production build passed. Across three viewports, 36 batch-action and 51 removal-
+tracking Playwright checks passed. A nine-Mod deletion in the built frontend issued
+one conversation and one turn and produced one entry in the removal group, using
+mock IPC. A Rust integration test ran the real Agent runtime with a loopback model,
+removed two fixture Mods in the same turn and verified both sets of receipts and files.
 
 **Collapsible task conversations (2026-11-23, Windows).** Recent Agent chats group
 Mod installation, uninstallation, list removal and adapter authoring separately.
@@ -208,7 +264,10 @@ Players can continue adding candidates or close the dialog and open a game card.
 **Cloud adapters during game discovery (2026-11-23).** The Library scan dialog
 and onboarding compare candidates locally against the anonymous manager-plugin
 catalog. A unique Steam App ID or exact normalized game name/alias can suggest
-an adapter; browsing the scan does not download or activate a package. Adding
+an adapter. Both scan views show the matched release's `gameName` as the row title
+before registration and keep the plugin title in the install details. For a legacy
+catalog, the scan uses a distinct catalog game name when available and otherwise
+keeps the discovery name. Browsing the scan does not download or activate a package. Adding
 a matched game selects a specific plugin ID and release ID. The desktop checks
 the published files, re-probes the canonical directory against all enabled adapters,
 and commits the game binding alongside the journaled package installation. A
@@ -397,6 +456,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
 - Game adapters can be installed directly from the desktop catalog. Authoring
   and Agent imports retain the draft and reviewed deployment workflow. Schema validation covers identity, versions, relative paths,
   references and Skill frontmatter.
+- `adapter.json` accepts an optional `gameName` for the default game library name. `name` is the adapter title. Older manifests use `name` as their local default. Plugin registration stores both names, and new publication previews retain the game name when assigning a release title. Package upgrades refresh recorded automatic names. Player-chosen names and older registrations with no name provenance keep their existing labels. The game-name flows passed the Windows Rust library suite (1,104 passed, 15 ignored), 39 focused Playwright cases, and a local Mod客栈 MCP publication and download round trip with PostgreSQL 17.
 - The adapter manifest provides optional `coverUrl` for the library and package
   details. Missing or unavailable covers fall back to the game placeholder.
   Existing manifests can omit the field. `loadOrder.kind` accepts `none` for games without a dedicated
@@ -423,8 +483,12 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   it. Startup retries missed cleanup; older drafts are eligible only when a
   successful Agent receipt identifies their draft and write transaction. Manual,
   modified and restored drafts are left alone.
-- Settings shows five embedded system Skills for adapter authoring, web search,
-  Mod downloads, installation and uninstallation, plus manually installed Skills in their own section.
+- Settings shows six embedded system Skills for adapter authoring, web search,
+  Mod downloads, custom commissions, installation and uninstallation, plus
+  manually installed Skills in their own section. When a player wants a custom
+  Mod or a search finds no suitable release, the commission guide links to the
+  Mod 客栈 creation form and helps draft the request. The player reviews the
+  bounty and submits the request on the site.
   Game Skills are available from their package details. The Agent can read the
   active system Skills and the selected game's package Skill.
 - Desktop Settings uses the 工具 and Skills tabs as the entry points for Mod provider
@@ -564,7 +628,9 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   reused; inbound MCP and other generic planners do not support these operations.
 - Adapter-driven install previews and installed-file manifests. JAR/ZIP payloads
   declared single-file stay intact; SMAPI directories retain their manifests;
-  declared Data prefixes are stripped only after inspection. FOMOD archives now
+  declared Data prefixes are stripped only after inspection. Unreal Pak adapters
+  and explicit file mappings accept literal `~mods` components in source paths
+  and destinations, including archives rooted at `~mods/`. FOMOD archives now
   have a bounded `ModuleConfig.xml` preview in the desktop local-archive
   install flow and the Agent. `preview_fomod` still accepts only archives in
   managed downloads or staging. Folder directives expand descendants from the
@@ -867,6 +933,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   registry also includes the bounded web search and reviewed plugin-publication
   operations described above.
 - The plugin center, library and Agent can discover anonymous Mod客栈 catalog releases. The desktop card’s **安装** action validates the selected immutable release and installs its two files in one journaled transaction, without importing a draft. A matching installed slug is shown instead of offering to overwrite it. **已安装 → 移除** removes an unbound package and its Skill/tool registrations while retaining a recoverable backup. Neither action changes an installed Mod. Agent imports retain the reviewed draft workflow, and library binding remains explicit and checks the game’s markers. The cloud catalog shows releases from different games side by side, with the game cover on the left. The grid switches to one column in narrow windows and the library picker.
+- Each desktop launch checks installed catalog adapters in the background after successful transaction recovery. New catalog installations and unedited catalog imports track the originating plugin ID. Earlier direct catalog installs match a unique catalog slug. Only strictly newer versions are applied. Each adapter update is a journaled transaction that preserves game bindings and the user's adapter and Skill settings. Local drafts, modified installations and unrelated packages are skipped. A failed download leaves the installed version available and the next launch checks again.
 - Publishing from a draft or installed external plugin generates a review with a model-written title, summary, description and supplementary tags. The source manifest supplies the complete game name as the first publication tag and the original game cover. The authenticated author's complete plugin list determines first release versus update by exact slug. The final click sends the reviewed release copies; the local adapter and installation rules stay intact. Missing read permission, ambiguous ownership or a changed target blocks the write. The public catalog reads the validated game cover URL from the release manifest; missing images have a placeholder, and old pixel art is not displayed. A valid receipt or automatic read-back leads directly to **发布成功**; reopening an interrupted manager-plugin record checks it without sending another publication. See [the publication contract](plugin-publication.md).
 - Already-published adapters update the current creator's plugin ID, not a historical slug match. Receipts for that ID prevent version reuse after a cloud rollback. A separately approved, strictly newer release can proceed past an older uncertain write when the verified cloud version has caught up; the old record is not replayed or marked successful.
 - The installed adapter list and details show when the current version was deployed locally; refreshing or toggling a package does not change that time. The draft list keeps creation time separate from the latest saved change to `adapter.json` or `SKILL.md`. Both lists use local time and show a dash when no reliable timestamp is available.

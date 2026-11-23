@@ -47,7 +47,7 @@ pub(crate) fn install(db: &Db, paths: &AppPaths) -> AppResult<()> {
         fs::write(dir.join("SKILL.md"), markdown)?;
         let now = crate::util::now();
         tx.execute("INSERT INTO plugins(slug,name,game_name,version,description,source,enabled,validated,install_path,adapter_json,created_at,updated_at)
-            VALUES (?1,?2,?2,?3,?4,'external',1,1,?5,?6,?7,?7)", params![slug, package.adapter.name, package.adapter.version, package.skill.description, dir.to_string_lossy(), json, now])?;
+            VALUES (?1,?2,?3,?4,?5,'external',1,1,?6,?7,?8,?8)", params![slug, package.adapter.name, package.adapter.display_game_name(), package.adapter.version, package.skill.description, dir.to_string_lossy(), json, now])?;
         tx.execute("INSERT INTO skills(name,description,location,source,enabled,created_at) VALUES (?1,?2,?3,'external',1,?4)", params![slug, package.skill.description, dir.join("SKILL.md").to_string_lossy(), now])?;
     }
     tx.commit()?;

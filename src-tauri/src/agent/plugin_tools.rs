@@ -133,7 +133,7 @@ impl AgentTool for PluginTool {
                 Effect::Read,
             ),
             "write_plugin_draft" => (
-                "提交完整 adapter.json 和含 frontmatter 的 SKILL.md 供审查。slug 须与 adapter.slug、Skill name 一致。可声明 HTTPS coverUrl 和 mcpServers。此临时草稿在安装或发布完成后自动移入回收站。",
+                "提交完整 adapter.json 和含 frontmatter 的 SKILL.md 供审查。slug 须与 adapter.slug、Skill name 一致。name 填适配包标题，gameName 填游戏库显示的游戏名称。可声明 HTTPS coverUrl 和 mcpServers。此临时草稿在安装或发布完成后自动移入回收站。",
                 json!({
                     "slug":{"type":"string"},
                     "adapter_json":{"type":"string"},
@@ -222,6 +222,7 @@ impl AgentTool for PluginTool {
                         .map(|plugin| json!({
                             "slug": plugin.slug,
                             "name": plugin.name,
+                            "gameName": plugin.game_name,
                             "version": plugin.version,
                             "source": plugin.source,
                             "enabled": plugin.enabled,

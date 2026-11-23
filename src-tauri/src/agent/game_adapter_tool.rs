@@ -31,7 +31,7 @@ impl AgentTool for SetGameAdapter {
                 "properties": {
                     "slug": {"type": "string", "description": "已安装适配包的 slug"},
                     "game_id": {"type": "string", "description": "已登记游戏的 ID，游戏会话可省略"},
-                    "game_name": {"type": "string", "description": "可选的游戏库显示名称；仅在用户要求时提供，省略则保留原名"}
+                    "game_name": {"type": "string", "description": "可选的游戏库显示名称；仅在用户要求改名时提供。省略时，自动名称可随绑定采用适配包声明的游戏名，自定义和来源不明的名称会保留"}
                 },
                 "required": ["slug"],
                 "additionalProperties": false

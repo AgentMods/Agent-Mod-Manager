@@ -528,8 +528,11 @@ async fn local_library_install_uninstall_and_reinstall_use_one_reviewed_game_pat
         ],
     );
     let destination = game_root.join("mods/OfflineMod/mod.dat");
-    let install_request = approved_archive_request(&game_id, &artifact.artifact_id);
-    let scripted_request = install_request.clone();
+    crate::settings::set_mod_organization_locale_override(&engine.db, Some("zh-CN")).unwrap();
+    let tag = crate::mod_organization::save_mod_tag(&engine.db, &game_id, None, "玩法", "#319163")
+        .unwrap();
+    let mut scripted_request = approved_archive_request(&game_id, &artifact.artifact_id);
+    scripted_request["organization"] = json!({"displayName":"离线示例", "tags":["玩法"]});
     let artifact_id = artifact.artifact_id.clone();
     let scripted_game_id = game_id.clone();
     let (agent, conversation, mut events, model_task) =
@@ -600,6 +603,8 @@ async fn local_library_install_uninstall_and_reinstall_use_one_reviewed_game_pat
         .is_empty());
     assert!(!destination.exists());
 
+    assert_eq!(matched.payload["result"]["organizationLocale"], "zh-CN");
+    assert_eq!(matched.payload["result"]["existingTags"], json!(["玩法"]));
     let install_approval = next_event(&mut events, "approval-request").await;
     assert_eq!(install_approval.turn_id, turn);
     assert_eq!(install_approval.payload["title"], "install_library_mod");
@@ -720,7 +725,9 @@ async fn local_library_install_uninstall_and_reinstall_use_one_reviewed_game_pat
     assert!(crate::install::list_installs(&agent.engine, &game_id)
         .unwrap()
         .iter()
-        .any(|install| install.id == first_install_id));
+        .any(|install| install.id == first_install_id
+            && install.name == "离线示例"
+            && install.tag_ids == [tag.id.clone()]));
     assert_eq!(entry.filename, artifact.filename);
     assert_eq!(
         crate::util::sha256_file(&artifact.path).unwrap(),
@@ -732,68 +739,171 @@ async fn local_library_install_uninstall_and_reinstall_use_one_reviewed_game_pat
 async fn full_trust_game_detail_removal_uninstalls_and_forgets_without_approval() {
     use crate::install;
     let (_temp, engine, game_root) = transaction::tests::setup();
-    let (artifact, _) = ingest_library_fixture(
+    let (first_artifact, _) = ingest_library_fixture(
         &engine,
         "g",
         "Game",
-        "offline.zip",
+        "offline-first.zip",
         &[("OfflineMod/mod.dat", b"fixture")],
     );
-    let request = approved_archive_request("g", &artifact.artifact_id);
-    let preview = install::plan_library_install(
+    let (second_artifact, _) = ingest_library_fixture(
         &engine,
-        &serde_json::from_value(request["request"].clone()).unwrap(),
+        "g",
+        "Game",
+        "offline-second.zip",
+        &[("AnotherMod/plugin.dat", b"second fixture")],
+    );
+    let first_file = game_root.join("mods/OfflineMod/mod.dat");
+    let second_file = game_root.join("mods/AnotherMod/plugin.dat");
+
+    let first_request = approved_archive_request("g", &first_artifact.artifact_id);
+    let first_preview = install::plan_library_install(
+        &engine,
+        &serde_json::from_value(first_request["request"].clone()).unwrap(),
     )
     .unwrap();
-    engine.approve_plan(&preview.plan.id).unwrap();
-    engine.apply_file_ops(&preview.plan.id).unwrap();
+    engine.approve_plan(&first_preview.plan.id).unwrap();
+    engine.apply_file_ops(&first_preview.plan.id).unwrap();
     install::reconcile(&engine.db).unwrap();
-    let installed_file = game_root.join("mods/OfflineMod/mod.dat");
-    assert!(installed_file.is_file());
+    let mut second_request = approved_archive_request("g", &second_artifact.artifact_id);
+    second_request["request"]["mappings"][0]["source"] = json!("AnotherMod/plugin.dat");
+    second_request["request"]["mappings"][0]["destination"] = json!("mods/AnotherMod/plugin.dat");
+    let second_preview = install::plan_library_install(
+        &engine,
+        &serde_json::from_value(second_request["request"].clone()).unwrap(),
+    )
+    .unwrap();
+    engine.approve_plan(&second_preview.plan.id).unwrap();
+    engine.apply_file_ops(&second_preview.plan.id).unwrap();
+    install::reconcile(&engine.db).unwrap();
 
-    let args = json!({"game_id":"g","install_id":preview.install_id});
-    let tools = ["inspect_install", "uninstall_mod", "forget_uninstalled_mod"];
+    assert_ne!(first_preview.install_id, second_preview.install_id);
+    assert_ne!(first_file, second_file);
+    assert_eq!(std::fs::read(&first_file).unwrap(), b"fixture");
+    assert_eq!(std::fs::read(&second_file).unwrap(), b"second fixture");
+
+    let targets = [
+        (first_preview.install_id.clone(), first_file),
+        (second_preview.install_id.clone(), second_file),
+    ];
+    let steps: Vec<_> = targets
+        .iter()
+        .flat_map(|(install_id, _)| {
+            [
+                (
+                    "inspect_install",
+                    json!({"game_id":"g","install_id":install_id}),
+                ),
+                (
+                    "uninstall_mod",
+                    json!({"game_id":"g","install_id":install_id}),
+                ),
+                (
+                    "forget_uninstalled_mod",
+                    json!({"game_id":"g","install_id":install_id}),
+                ),
+            ]
+        })
+        .collect();
     let (agent, conv, mut events, model) =
-        scripted_agent(engine, Some("g"), tools.len() + 1, move |step, _| {
-            tools.get(step).map_or_else(final_reply, |name| {
-                model_tool_call(name, name, args.clone())
-            })
+        scripted_agent(engine, Some("g"), steps.len() + 1, move |step, _| {
+            let Some((name, args)) = steps.get(step) else {
+                return final_reply();
+            };
+            model_tool_call(name, &format!("removal-{step}"), args.clone())
         })
         .await;
-    agent
+    let turn = agent
         .start_turn(turn_request(
             &conv,
-            "卸载并从管理列表删除",
+            "逐个检查、卸载并从管理列表删除这两个安装",
             PermissionMode::FullTrust,
         ))
         .unwrap();
-    for name in tools {
-        let result = next_event(&mut events, "tool-result").await;
-        assert_eq!(result.payload["name"], name);
-        assert_eq!(result.payload["status"], "done", "{}", result.payload);
-    }
-    assert_eq!(
-        next_event(&mut events, "done").await.payload["status"],
-        "done"
-    );
-    assert!(!agent
-        .events
-        .replay(&conv, 0, 200)
-        .unwrap()
-        .iter()
-        .any(|e| e.kind == "approval-request"));
-    assert!(!installed_file.exists());
-    assert_eq!(
-        install::get_install(&agent.engine, &preview.install_id)
+
+    for (install_id, file) in &targets {
+        let inspected = next_event(&mut events, "tool-result").await;
+        assert_eq!(inspected.turn_id, turn);
+        assert_eq!(inspected.payload["name"], "inspect_install");
+        assert_eq!(inspected.payload["status"], "done");
+        assert_eq!(
+            inspected.payload["result"]["installId"].as_str(),
+            Some(install_id.as_str())
+        );
+        assert_eq!(inspected.payload["result"]["canUninstall"], true);
+        assert_eq!(
+            inspected.payload["result"]["reconciliation"]["recommendedAction"],
+            "safe_uninstall"
+        );
+        assert_eq!(
+            inspected.payload["result"]["files"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(inspected.payload["result"]["files"][0]["state"], "owned");
+        assert!(file.is_file());
+
+        let uninstalled = next_event(&mut events, "tool-result").await;
+        assert_eq!(uninstalled.turn_id, turn);
+        assert_eq!(uninstalled.payload["name"], "uninstall_mod");
+        assert_eq!(uninstalled.payload["status"], "done");
+        assert_eq!(uninstalled.payload["result"]["status"], "committed");
+        assert!(!file.exists());
+        assert_eq!(
+            install::get_install(&agent.engine, install_id)
+                .unwrap()
+                .status,
+            "uninstalled"
+        );
+
+        let forgotten = next_event(&mut events, "tool-result").await;
+        assert_eq!(forgotten.turn_id, turn);
+        assert_eq!(forgotten.payload["name"], "forget_uninstalled_mod");
+        assert_eq!(forgotten.payload["status"], "done");
+        assert_eq!(forgotten.payload["result"]["status"], "removed");
+        assert_eq!(
+            forgotten.payload["result"]["installId"].as_str(),
+            Some(install_id.as_str())
+        );
+        assert!(!crate::mod_management::visible_installs(&agent.engine, "g")
             .unwrap()
-            .status,
-        "uninstalled"
+            .iter()
+            .any(|install| install.id == *install_id));
+        assert_eq!(
+            install::get_install(&agent.engine, install_id)
+                .unwrap()
+                .status,
+            "uninstalled"
+        );
+        assert!(!file.exists());
+    }
+
+    let done = next_event(&mut events, "done").await;
+    assert_eq!(done.turn_id, turn);
+    assert_eq!(done.payload["status"], "done");
+    let recorded_events = agent.events.replay(&conv, 0, 200).unwrap();
+    assert!(recorded_events.iter().all(|event| event.turn_id == turn));
+    assert_eq!(
+        recorded_events
+            .iter()
+            .filter(|event| event.kind == "done")
+            .count(),
+        1
     );
-    assert!(!crate::mod_management::visible_installs(&agent.engine, "g")
-        .unwrap()
+    assert!(!recorded_events
         .iter()
-        .any(|i| i.id == preview.install_id));
-    model.await.unwrap();
+        .any(|event| event.kind == "approval-request"));
+    assert_eq!(
+        crate::mod_management::visible_installs(&agent.engine, "g")
+            .unwrap()
+            .iter()
+            .filter(|install| targets.iter().any(|(id, _)| install.id == *id))
+            .count(),
+        0
+    );
+    assert_eq!(model.await.unwrap().len(), 7);
 }
 
 #[tokio::test]

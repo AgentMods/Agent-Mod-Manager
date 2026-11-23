@@ -64,6 +64,116 @@ pub(super) fn apply(engine: &FileEngine, plan: &FilePlan) {
     engine.apply_file_ops(&plan.id).unwrap();
 }
 
+fn record_legacy_owner(engine: &FileEngine, game: &games::Game, id: &str, file: &InstalledFile) {
+    engine
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO installs (id,game_id,name,status,install_root,files_json,installed_at,updated_at)
+             VALUES (?1,?2,?1,'installed',?3,?4,'now','now')",
+            params![id, game.id, game.root_path, serde_json::to_string(&[file]).unwrap()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn ordinary_install_rechecks_ownership_even_when_the_live_file_is_missing() {
+    let (_temp, engine, game) = fixture("minecraft-java");
+    let req = request(
+        &game,
+        zip(&engine, &[("fabric.mod.json", b"{}")]),
+        "java-mod",
+        "Example.jar",
+    );
+    let first = plan_install(&engine, &req).unwrap();
+    let stale = plan_install(&engine, &req).unwrap();
+    engine.approve_plan(&stale.plan.id).unwrap();
+    apply(&engine, &first.plan);
+    let target = first.plan.entries[0].operation.dst();
+    let conflict = |error| {
+        matches!(error, AppError::Conflict(message)
+            if message.contains(&first.install_id) && message.contains("Example.jar"))
+    };
+    assert!(conflict(plan_install(&engine, &req).unwrap_err()));
+
+    // Restore the stale preview's absent baseline without releasing ownership.
+    std::fs::remove_file(target).unwrap();
+    assert_eq!(fingerprint(target).unwrap(), stale.plan.entries[0].before);
+    assert!(conflict(plan_install(&engine, &req).unwrap_err()));
+    assert!(conflict(engine.apply_file_ops(&stale.plan.id).unwrap_err()));
+    assert!(!target.exists());
+    assert!(!engine.paths.backup_dir(&stale.plan.id).exists());
+    assert_eq!(
+        get_install(&engine, &first.install_id).unwrap().status,
+        "enabled"
+    );
+    assert_eq!(
+        get_install(&engine, &stale.install_id).unwrap().status,
+        "planned"
+    );
+}
+
+#[test]
+fn ordinary_and_library_install_previews_cannot_claim_each_others_paths() {
+    for library_first in [false, true] {
+        let (_temp, engine, game) = fixture("stardew-valley");
+        let archive = zip(&engine, RELEASE_ONE);
+        let local = request(&game, archive.clone(), "smapi-mod", "Example.zip");
+        let artifact_id = uuid::Uuid::new_v4().to_string();
+        let import_dir = engine.paths.staging().join("imports").join(&artifact_id);
+        std::fs::create_dir_all(&import_dir).unwrap();
+        let import = import_dir.join("Example.zip");
+        std::fs::copy(archive, &import).unwrap();
+        let entry = crate::mod_library::ingest_import(
+            &engine,
+            &crate::mod_library::ApprovedArtifact {
+                artifact_id: &artifact_id,
+                path: &import,
+                filename: "Example.zip",
+                size: std::fs::metadata(&import).unwrap().len(),
+                sha256: &util::sha256_file(&import).unwrap(),
+            },
+            &game.name,
+            Some(&game.id),
+        )
+        .unwrap();
+        let library = LibraryInstallRequest {
+            game_id: game.id.clone(),
+            library_entry_id: entry.id,
+            mode: LibraryInstallMode::Adapter {
+                mod_type: "smapi-mod".into(),
+                folder_name: None,
+                fomod_selection: None,
+            },
+        };
+        let local_preview = plan_install(&engine, &local).unwrap();
+        let library_preview = plan_library_install(&engine, &library).unwrap();
+        let (first, stale) = if library_first {
+            (library_preview, local_preview)
+        } else {
+            (local_preview, library_preview)
+        };
+        engine.approve_plan(&stale.plan.id).unwrap();
+        apply(&engine, &first.plan);
+        let conflict = |error| matches!(error, AppError::Conflict(message) if message.contains(&first.install_id));
+        let new_preview = if library_first {
+            plan_install(&engine, &local)
+        } else {
+            plan_library_install(&engine, &library)
+        };
+        assert!(conflict(new_preview.unwrap_err()));
+        for entry in &first.plan.entries {
+            std::fs::remove_file(entry.operation.dst()).unwrap();
+        }
+        assert!(conflict(engine.apply_file_ops(&stale.plan.id).unwrap_err()));
+        assert!(first
+            .plan
+            .entries
+            .iter()
+            .all(|entry| !entry.operation.dst().exists()));
+    }
+}
+
 #[test]
 fn install_preview_cannot_use_changed_or_relocated_extracted_payloads() {
     let (_temp, engine, game) = fixture("stardew-valley");
@@ -428,9 +538,13 @@ fn replacement_rechecks_file_ownership_after_preview_even_when_bytes_match() {
     let mut req = release(&engine, &game, "project", "v2", RELEASE_TWO);
     req.replace_install_id = Some(v1.install_id.clone());
     let preview = plan_install(&engine, &req).unwrap();
-    let shared = zip(&engine, &[("Example/manifest.json", b"one")]);
-    let other = plan_install(&engine, &request(&game, shared, "smapi-mod", "other.zip")).unwrap();
-    apply(&engine, &other.plan);
+    let installed = get_install(&engine, &v1.install_id).unwrap();
+    let shared = installed
+        .files
+        .iter()
+        .find(|file| file.path.ends_with("Example/manifest.json"))
+        .unwrap();
+    record_legacy_owner(&engine, &game, "legacy-shared", shared);
     assert!(matches!(
         plan_install(&engine, &req),
         Err(AppError::Conflict(_))
@@ -1099,16 +1213,13 @@ fn inspect_install_reports_shared_paths_between_active_installs() {
     let artifact = zip(&engine, &[("fabric.mod.json", b"{}")]);
     let first = plan_install(
         &engine,
-        &request(&game, artifact.clone(), "java-mod", "Example.jar"),
-    )
-    .unwrap();
-    apply(&engine, &first.plan);
-    let second = plan_install(
-        &engine,
         &request(&game, artifact, "java-mod", "Example.jar"),
     )
     .unwrap();
-    apply(&engine, &second.plan);
+    apply(&engine, &first.plan);
+    let second_id = "legacy-shared";
+    let installed = get_install(&engine, &first.install_id).unwrap();
+    record_legacy_owner(&engine, &game, second_id, &installed.files[0]);
 
     let report = inspect_install(&engine, &first.install_id).unwrap();
     assert!(!report.can_uninstall);
@@ -1120,10 +1231,7 @@ fn inspect_install_reports_shared_paths_between_active_installs() {
     assert!(report.reconciliation.successor_install_id.is_none());
     assert_eq!(report.files[0].state, "owned");
     assert!(!report.files[0].replaced);
-    assert_eq!(
-        report.files[0].other_install_ids,
-        vec![second.install_id.clone()]
-    );
+    assert_eq!(report.files[0].other_install_ids, vec![second_id]);
     assert!(report.files[0]
         .reasons
         .iter()
@@ -1138,10 +1246,7 @@ fn inspect_install_reports_shared_paths_between_active_installs() {
         "review_shared_paths"
     );
     assert_eq!(missing_shared.files[0].state, "missing");
-    assert_eq!(
-        missing_shared.files[0].other_install_ids,
-        vec![second.install_id]
-    );
+    assert_eq!(missing_shared.files[0].other_install_ids, vec![second_id]);
 }
 
 #[test]
@@ -1325,6 +1430,95 @@ fn partial_restore_does_not_claim_a_complete_enabled_install() {
             .enabled_mod_count,
         1
     );
+}
+
+#[test]
+fn managed_restore_and_uninstall_rollback_check_unselected_manifest_paths() {
+    let (_temp, engine, game) = fixture("stardew-valley");
+    let first = plan_install(
+        &engine,
+        &release(&engine, &game, "project", "v1", RELEASE_ONE),
+    )
+    .unwrap();
+    apply(&engine, &first.plan);
+    let uninstall = plan_uninstall(&engine, &first.install_id).unwrap();
+    apply(&engine, &uninstall);
+    let items = trash::list_trash(&engine.db, false).unwrap();
+    let selected = items
+        .iter()
+        .find(|item| item.label == "retired.txt")
+        .unwrap();
+    let selected_ids = std::slice::from_ref(&selected.id);
+    let stale_restore = trash::plan_restore(&engine, selected_ids, false).unwrap();
+    engine.approve_plan(&stale_restore.id).unwrap();
+
+    let next = plan_install(
+        &engine,
+        &release(
+            &engine,
+            &game,
+            "other-project",
+            "v1",
+            &[("Example/manifest.json", b"two")],
+        ),
+    )
+    .unwrap();
+    apply(&engine, &next.plan);
+    // With both original locations absent, the journal's destination checks
+    // alone would allow the old uninstall to roll back.
+    let reassigned = next.plan.entries[0].operation.dst();
+    std::fs::remove_file(reassigned).unwrap();
+    let conflict = |error| {
+        matches!(error, AppError::Conflict(message)
+            if message.contains(&next.install_id) && message.contains("manifest.json"))
+    };
+    assert!(conflict(
+        trash::plan_restore(&engine, selected_ids, true).unwrap_err()
+    ));
+    assert!(conflict(
+        engine.apply_file_ops(&stale_restore.id).unwrap_err()
+    ));
+    assert!(conflict(
+        engine.rollback_transaction(&uninstall.id).unwrap_err()
+    ));
+    assert!(items
+        .iter()
+        .all(|item| Path::new(&item.trash_path).is_file()));
+    assert!(!Path::new(&selected.original_path).exists());
+    assert!(!reassigned.exists());
+    assert_eq!(
+        get_install(&engine, &first.install_id).unwrap().status,
+        "uninstalled"
+    );
+}
+
+#[test]
+fn bulk_restore_rejects_conflicting_install_manifests_with_distinct_destinations() {
+    let (_temp, engine, game) = fixture("stardew-valley");
+    let mut selected = Vec::new();
+    for (version, files, filename) in [
+        ("v1", RELEASE_ONE, "retired.txt"),
+        ("v2", RELEASE_TWO, "new.txt"),
+    ] {
+        let preview =
+            plan_install(&engine, &release(&engine, &game, "project", version, files)).unwrap();
+        apply(&engine, &preview.plan);
+        let uninstall = plan_uninstall(&engine, &preview.install_id).unwrap();
+        apply(&engine, &uninstall);
+        let items = trash::list_trash(&engine.db, false).unwrap();
+        let item = items
+            .into_iter()
+            .find(|item| item.transaction_id == uninstall.id && item.label == filename)
+            .unwrap();
+        selected.push(item.id);
+    }
+    assert!(matches!(
+        trash::plan_restore(&engine, &selected, false),
+        Err(AppError::Conflict(message)) if message.contains("manifest.json")
+    ));
+    let items = trash::list_trash(&engine.db, false).unwrap();
+    assert_eq!(items.len(), 4);
+    assert!(items.iter().all(|item| item.exists));
 }
 
 #[test]
@@ -1771,8 +1965,8 @@ fn tracked_uninstall_rejects_late_identical_owner_at_apply() {
     let uninstall = plan_uninstall(&engine, &first.install_id).unwrap();
     let installed_file = Path::new(&game.root_path).join("Mods/Example/manifest.json");
 
-    let overlap = plan_install(&engine, &request).unwrap();
-    apply(&engine, &overlap.plan);
+    let installed = get_install(&engine, &first.install_id).unwrap();
+    record_legacy_owner(&engine, &game, "legacy-shared", &installed.files[0]);
     assert_eq!(
         fingerprint(&installed_file).unwrap(),
         uninstall.entries[0].source
@@ -1816,4 +2010,70 @@ fn tracked_uninstall_cannot_apply_a_plan_fingerprint_that_disagrees_with_manifes
     );
     assert_eq!(std::fs::read(&installed).unwrap(), b"modified");
     assert!(!uninstall.entries[0].operation.dst().exists());
+}
+
+#[test]
+fn organization_commits_with_install_and_preserves_user_edits_on_reinstall() {
+    use crate::mod_organization::{
+        list_mod_tags, save_mod_tag, set_mod_tags, OrganizationSuggestion,
+    };
+
+    let (_temp, engine, game) = fixture("minecraft-java");
+    let archive = zip(&engine, &[("fabric.mod.json", b"{}")]);
+    let request = request(&game, archive, "java-mod", "Example.jar");
+    let existing = save_mod_tag(&engine.db, &game.id, None, "Graphics", "#aff012").unwrap();
+    let plan = |display_name: &str, tags: Vec<String>| {
+        plan_install_with_organization(
+            &engine,
+            &request,
+            Some(OrganizationSuggestion {
+                display_name: display_name.into(),
+                tags,
+            }),
+            &CancellationToken::new(),
+        )
+        .unwrap()
+    };
+    let first = plan(
+        "First display name",
+        vec!["graphics".into(), "GRAPHICS".into()],
+    );
+    assert_eq!(list_mod_tags(&engine.db, &game.id).unwrap().len(), 1);
+    assert!(get_install(&engine, &first.install_id)
+        .unwrap()
+        .tag_ids
+        .is_empty());
+    assert!(set_mod_tags(&engine.db, &game.id, &first.install_id, &[]).is_err());
+    apply(&engine, &first.plan);
+    let committed = get_install(&engine, &first.install_id).unwrap();
+    assert_eq!(committed.name, "First display name");
+    assert_eq!(committed.tag_ids, [existing.id]);
+
+    let tag_id = &committed.tag_ids[0];
+    save_mod_tag(&engine.db, &game.id, Some(tag_id), "Renamed", "#AABBCC").unwrap();
+    apply(
+        &engine,
+        &plan_uninstall(&engine, &first.install_id).unwrap(),
+    );
+    let second = plan("New suggestion", vec!["Graphics".into()]);
+    apply(&engine, &second.plan);
+    let second_record = get_install(&engine, &second.install_id).unwrap();
+    assert_eq!(second_record.name, "New suggestion");
+    assert_eq!(second_record.tag_ids, std::slice::from_ref(tag_id));
+    let tags = list_mod_tags(&engine.db, &game.id).unwrap();
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].name, "Renamed");
+
+    set_mod_tags(&engine.db, &game.id, &second.install_id, &[]).unwrap();
+    apply(
+        &engine,
+        &plan_uninstall(&engine, &second.install_id).unwrap(),
+    );
+    let third = plan("Third suggestion", vec!["Unused tag".into()]);
+    apply(&engine, &third.plan);
+    assert!(get_install(&engine, &third.install_id)
+        .unwrap()
+        .tag_ids
+        .is_empty());
+    assert_eq!(list_mod_tags(&engine.db, &game.id).unwrap().len(), 1);
 }

@@ -3,7 +3,7 @@ import type { ModSwitchTarget } from './mod-switch-store';
 type DownloadOrigin = { artifactId: string; sourceId: string; projectId: string; versionId: string };
 export type Installed = {
   id: string; name: string; version: string | null; status: string; source: string; downloadOrigin?: DownloadOrigin | null;
-  installRoot: string; files: { path: string; size: number }[]; installedAt: string;
+  installRoot: string; files: { path: string; size: number }[]; installedAt: string; tagIds?: string[];
   metadata?: { libraryEntryId?: string; transactionId?: string | null; replacesInstallId?: string | null } | null;
 };
 export type LibraryMod = {

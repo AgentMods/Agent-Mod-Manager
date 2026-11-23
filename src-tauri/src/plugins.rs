@@ -150,6 +150,9 @@ pub struct GameAdapter {
     pub log_paths: Vec<AdapterPath>,
     pub uninstall_notes: Vec<String>,
     pub sources: Vec<SourceReference>,
+    /// Default library name. Older manifests use the package name for both purposes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -254,7 +257,7 @@ pub fn validate_relative_path(path: &str, allow_root: bool) -> AppResult<()> {
     }
     if path.is_empty()
         || path.len() > 1024
-        || path.contains(['\\', ':', '~', '%', '$', '*', '?', '"', '<', '>', '|'])
+        || path.contains(['\\', ':', '%', '$', '*', '?', '"', '<', '>', '|'])
         || path.chars().any(char::is_control)
     {
         return Err(AppError::PathEscape(format!("不是固定相对路径: {path}")));
@@ -268,6 +271,7 @@ pub fn validate_relative_path(path: &str, allow_root: bool) -> AppResult<()> {
         if part.is_empty()
             || part == "."
             || part == ".."
+            || (part.contains('~') && !crate::paths::is_unreal_mods_dir(part))
             || part.ends_with(['.', ' '])
             || ["con", "prn", "aux", "nul"].contains(&stem.as_str())
             || (stem.len() == 4
@@ -292,12 +296,26 @@ fn validate_platforms(platforms: &[Platform], supported: &[Platform]) -> AppResu
 }
 
 impl GameAdapter {
+    pub fn display_game_name(&self) -> &str {
+        self.game_name.as_deref().unwrap_or(&self.name)
+    }
+
     pub fn validate(&self) -> AppResult<()> {
         validate_slug(&self.slug)?;
         validate_version(&self.version)?;
         self.mcp_configs()?;
         if self.schema_version != 1 || self.name.trim().is_empty() || self.name.len() > 256 {
             return Err(invalid("适配包名称为空或 schemaVersion 不受支持"));
+        }
+        if self.game_name.as_ref().is_some_and(|name| {
+            name.is_empty()
+                || name.trim() != name
+                || name.len() > 256
+                || name.chars().any(char::is_control)
+        }) {
+            return Err(invalid(
+                "gameName 须为 1 至 256 字节的游戏名称，且不能含首尾空白或控制字符",
+            ));
         }
         validate_platforms(
             &self.platforms,
@@ -864,6 +882,34 @@ mod tests {
     }
 
     #[test]
+    fn game_name_is_optional_and_independent_of_package_title() {
+        let (slug, json, skill) = test_fixtures::PACKAGES[0];
+        let mut manifest: serde_json::Value = serde_json::from_str(json).unwrap();
+        manifest["name"] = "幻兽帕鲁 Windows 模组适配包".into();
+        let parse =
+            |manifest: &serde_json::Value| parse_package(slug, &manifest.to_string(), skill);
+        let legacy = parse(&manifest).unwrap().adapter;
+        assert_eq!(legacy.display_game_name(), legacy.name);
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("gameName")
+            .is_none());
+
+        manifest["gameName"] = "幻兽帕鲁".into();
+        let adapter = parse(&manifest).unwrap().adapter;
+        assert_eq!(adapter.display_game_name(), "幻兽帕鲁");
+        assert_eq!(adapter.name, "幻兽帕鲁 Windows 模组适配包");
+        assert_eq!(
+            serde_json::to_value(adapter).unwrap()["gameName"],
+            "幻兽帕鲁"
+        );
+        for name in ["", " ", " 游戏", "游戏\n名", &"x".repeat(257)] {
+            manifest["gameName"] = name.into();
+            assert!(parse(&manifest).is_err());
+        }
+    }
+
+    #[test]
     fn covers_are_optional_and_only_public_https_addresses_are_accepted() {
         for mut package in test_fixtures::packages().unwrap() {
             assert!(package
@@ -909,6 +955,9 @@ mod tests {
             "%APPDATA%/Mods",
             "$HOME/Mods",
             "~/Mods",
+            "~user/Mods",
+            "Data/PROGRA~1/file.pak",
+            "~mods/../outside.pak",
             "Data/*",
             "Data/NUL.txt",
             "Data/COM1",
@@ -924,6 +973,7 @@ mod tests {
         assert!(validate_relative_path(".", false).is_err());
         validate_relative_path(".", true).unwrap();
         validate_relative_path("PlayerProfiles/Public/modsettings.lsx", false).unwrap();
+        validate_relative_path("Content/Paks/~Mods", true).unwrap();
     }
 
     #[test]

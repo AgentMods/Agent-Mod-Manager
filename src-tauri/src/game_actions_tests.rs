@@ -657,6 +657,84 @@ fn selecting_a_package_checks_markers_and_keeps_the_game_registration() {
 }
 
 #[test]
+fn binding_applies_the_declared_game_name_only_to_automatic_defaults() {
+    let f = Fixture::new();
+    make_minecraft_selectable(&f);
+    let mut adapter = minecraft_adapter();
+    let register = |folder: &str| {
+        let root = make_dir(&f.outside.join(folder));
+        make_dir(&root.join("versions"));
+        games::register_game(&f.engine.db, &root, None).unwrap()
+    };
+    let legacy = register("legacy-adapter-default");
+    assert_eq!(legacy.metadata[AUTOMATIC_GAME_NAME], legacy.name);
+    let legacy_bound = set_game_adapter(&f.engine, &legacy.id, &adapter.slug).unwrap();
+    assert_eq!(legacy_bound.name, legacy.name);
+
+    adapter.game_name = Some("我的世界 Java 版".into());
+    f.engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE plugins SET adapter_json=?1 WHERE slug=?2",
+            params![serde_json::to_string(&adapter).unwrap(), adapter.slug],
+        )
+        .unwrap();
+    let automatic = register("自动目录名");
+    assert_eq!(automatic.name, "自动目录名");
+    let preview =
+        prepare_game_adapter_binding(&f.engine, &automatic.id, &adapter.slug, None).unwrap();
+    assert_eq!(
+        preview.target_game_name.as_deref(),
+        adapter.game_name.as_deref()
+    );
+    assert_eq!(preview.target_adapter_name, adapter.name);
+    assert!(preview.uses_adapter_game_name);
+    let mut tampered = preview.clone();
+    tampered.uses_adapter_game_name = false;
+    assert!(matches!(
+        apply_game_adapter_binding(&f.engine, &tampered),
+        Err(AppError::Conflict(_))
+    ));
+    let program = executable(&Path::new(&automatic.root_path).join("game.exe"));
+    update_game(&f.engine, &automatic.id, &automatic.name, program.to_str()).unwrap();
+    let wire = serde_json::to_value(preview).unwrap();
+    let bound =
+        apply_game_adapter_binding(&f.engine, &serde_json::from_value(wire).unwrap()).unwrap();
+    assert_eq!(bound.name, adapter.display_game_name());
+    assert_eq!(bound.metadata[AUTOMATIC_GAME_NAME], bound.name);
+    assert_eq!(bound.metadata["launchPath"], program.to_str().unwrap());
+
+    let renamed = register("another-default");
+    let stale = prepare_game_adapter_binding(&f.engine, &renamed.id, &adapter.slug, None).unwrap();
+    update_game(&f.engine, &renamed.id, "我的存档目录", None).unwrap();
+    assert!(matches!(
+        apply_game_adapter_binding(&f.engine, &stale),
+        Err(AppError::Conflict(_))
+    ));
+    let bound = set_game_adapter(&f.engine, &renamed.id, &adapter.slug).unwrap();
+    assert_eq!(bound.name, "我的存档目录");
+    assert!(bound.metadata.get(AUTOMATIC_GAME_NAME).is_none());
+
+    let kept = register("有意保留的目录名");
+    let desired =
+        prepare_game_adapter_binding(&f.engine, &kept.id, &adapter.slug, Some(&kept.name)).unwrap();
+    let bound = apply_game_adapter_binding(&f.engine, &desired).unwrap();
+    assert_eq!(bound.name, kept.name);
+    assert!(bound.metadata.get(AUTOMATIC_GAME_NAME).is_none());
+
+    let manual = register("manual-adapter-default");
+    let manual = games::register_game(
+        &f.engine.db,
+        Path::new(&manual.root_path),
+        Some(&adapter.slug),
+    )
+    .unwrap();
+    assert_eq!(manual.name, adapter.display_game_name());
+    assert_eq!(manual.metadata[AUTOMATIC_GAME_NAME], manual.name);
+}
+
+#[test]
 fn adapter_binding_preview_round_trips_and_preserves_unrelated_edits() {
     let f = Fixture::new();
     make_minecraft_selectable(&f);

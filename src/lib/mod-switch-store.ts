@@ -22,6 +22,7 @@ export type PendingModSwitch = ModSwitchAction & { id: string } & (
 );
 
 type Pending = Record<string, PendingModSwitch>;
+type Running = Extract<PendingModSwitch, { status: "running" }>;
 type Readback = Extract<PendingModSwitch, { settlement: Settlement }>;
 export const useModSwitch = create<{ pending: Pending }>(() => ({ pending: {} }));
 let nextId = 0;
@@ -69,12 +70,24 @@ export function reserveModSwitch(action: ModSwitchAction): string | null {
 }
 
 export function bindModSwitch(id: string, conversationId: string, turnId: string): boolean {
+  return bindModSwitches([id], conversationId, turnId);
+}
+
+/** Publish all reservations for the turn in a single store update. */
+export function bindModSwitches(ids: string[], conversationId: string, turnId: string): boolean {
+  if (!ids.length || !conversationId || !turnId || new Set(ids).size !== ids.length) return false;
   const { pending } = useModSwitch.getState();
-  const entry = pending[id];
-  if (entry?.status !== "starting" || !conversationId || !turnId ||
-      Object.values(pending).some(other => other.conversationId === conversationId && other.turnId === turnId)) return false;
+  if (Object.values(pending).some(entry => entry.conversationId === conversationId && entry.turnId === turnId)) return false;
+  const first = pending[ids[0]];
+  if (first?.status !== "starting") return false;
+  const next = { ...pending };
+  for (const id of ids) {
+    const entry = pending[id];
+    if (entry?.status !== "starting" || entry.gameId !== first.gameId || entry.kind !== first.kind) return false;
+    next[id] = { ...entry, status: "running", conversationId, turnId };
+  }
   trackAgentTurn(conversationId, turnId);
-  put({ ...entry, status: "running", conversationId, turnId });
+  useModSwitch.setState({ pending: next });
   return true;
 }
 
@@ -85,8 +98,17 @@ export function releaseModSwitch(id: string): void {
 
 /** Re-read native state after an IPC error. Never sends or re-runs an Agent turn. */
 export function retryModSwitchReadback(id: string): void {
-  const entry = useModSwitch.getState().pending[id];
-  if (entry?.status === "readback_failed") put({ ...entry, status: "verifying", error: undefined });
+  const { pending } = useModSwitch.getState();
+  const entry = pending[id];
+  if (entry?.status !== "readback_failed") return;
+  const next = { ...pending };
+  // One retry can verify all failed rows of this turn against the same list.
+  for (const other of Object.values(pending)) {
+    if (other.status === "readback_failed" && other.conversationId === entry.conversationId && other.turnId === entry.turnId) {
+      next[other.id] = { ...other, status: "verifying", error: undefined };
+    }
+  }
+  useModSwitch.setState({ pending: next });
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -95,6 +117,10 @@ function record(value: unknown): Record<string, unknown> {
 
 function text(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function turnKey({ conversationId, turnId }: { conversationId: string; turnId: string }) {
+  return JSON.stringify([conversationId, turnId]);
 }
 
 type MatchingCall = { name: string; mutation: boolean; transactionId?: string };
@@ -137,6 +163,7 @@ function turnSettlement(entry: ModSwitchAction, events: AgentEvent[], done: Agen
     if (kind === "tool-start" && callId) {
       const call = matchingCall(entry, event);
       if (call) calls.set(callId, call);
+      else calls.delete(callId);
     }
     const call = callId ? calls.get(callId) : undefined;
     if (kind === "approval-request" && call?.mutation && approvalId) approvals.add(approvalId);
@@ -185,12 +212,12 @@ function turnSettlement(entry: ModSwitchAction, events: AgentEvent[], done: Agen
   // A turn can be cancelled or fail after the tool committed. Report the real
   // state in that case, not the outcome of the model's final reply.
   if (committed) return committed;
+  if (rejected) return { outcome: "rejected" };
   if (done.payload.status === "interrupted") return { outcome: "failed", detail: text(done.payload.reason) ?? "任务已中断。" };
   if (done.payload.status === "cancelled") return { outcome: "cancelled" };
-  if (rejected) return { outcome: "rejected" };
   if (cancelled && !failure?.detail) return { outcome: "cancelled" };
-  if (done.payload.status === "error" || turnError) return { outcome: "failed", detail: turnError ?? failure?.detail };
   if (failure) return failure;
+  if (done.payload.status === "error" || turnError) return { outcome: "failed", detail: turnError };
   if (entry.kind === "remove" && [...calls.values()].some(call => call.name === "forget_uninstalled_mod")) {
     return { outcome: "failed", detail: "Agent 未返回有效的删除回执。" };
   }
@@ -200,16 +227,32 @@ function turnSettlement(entry: ModSwitchAction, events: AgentEvent[], done: Agen
 
 /** The switch processor owns the authoritative list read for these exact writes. */
 export function withoutModSwitchWrites(events: AgentEvent[]) {
-  const first = events[0];
-  if (!first) return events;
-  const entry = Object.values(useModSwitch.getState().pending).find(action =>
-    action.conversationId === first.conversationId && action.turnId === first.turnId);
-  if (!entry) return events;
-  const callIds = new Set(events.flatMap(event => {
+  if (!events.length) return events;
+  const byTurn = new Map<string, ModSwitchAction[]>();
+  for (const entry of Object.values(useModSwitch.getState().pending)) {
+    if (entry.status === "starting") continue;
+    const key = turnKey(entry);
+    const entries = byTurn.get(key);
+    if (entries) entries.push(entry);
+    else byTurn.set(key, [entry]);
+  }
+  if (!byTurn.size) return events;
+  const trackedCalls = new Map<string, string>();
+  return events.filter(event => {
+    if (event.kind !== "tool-start" && event.kind !== "tool-result") return true;
     const callId = text(event.payload.toolCallId);
-    return event.kind === "tool-start" && callId && matchingCall(entry, event)?.mutation ? [callId] : [];
-  }));
-  return events.filter(event => event.kind !== "tool-result" || !callIds.has(text(event.payload.toolCallId) ?? ""));
+    const entries = byTurn.get(turnKey(event));
+    if (!callId || !entries) return true;
+    const key = JSON.stringify([event.conversationId, event.turnId, callId]);
+    if (event.kind === "tool-start") {
+      const name = text(event.payload.name);
+      if (name && entries.some(entry => matchingCall(entry, event)?.mutation)) trackedCalls.set(key, name);
+      else trackedCalls.delete(key);
+      return true;
+    }
+    const name = trackedCalls.get(key);
+    return !name || (event.payload.name !== undefined && event.payload.name !== name);
+  });
 }
 
 type InstallRecord = {
@@ -305,26 +348,47 @@ export function syncModSwitches(client: QueryClient, notify: (message: string) =
     if (messages.length) notify(messages.join(" "));
   }
 
-  function observe(entry: Extract<PendingModSwitch, { status: "running" }>) {
-    const { id, conversationId, turnId } = entry;
-    if (useModSwitch.getState().pending[id] !== entry) return;
+  function observe(entries: Running[]): Readback[] {
+    const [first] = entries;
+    const { conversationId, turnId } = first;
+    const key = turnKey(first);
     const current = useAgent.getState().milestones[conversationId] ?? [];
     const start = current.find(event => event.kind === "turn-start" && event.turnId === turnId);
-    if (start) startSeqs.set(id, start.seq);
+    if (start) startSeqs.set(key, start.seq);
     const durable = getReplayedAgentMilestones(conversationId);
     const events = durable.filter(event => event.turnId === turnId);
     const done = events.find(event => event.kind === "done");
     if (done) {
-      startSeqs.delete(id);
-      put({ ...entry, status: "verifying", settlement: turnSettlement(entry, events, done) });
-      return;
+      startSeqs.delete(key);
+      return entries.map(entry => ({ ...entry, status: "verifying", settlement: turnSettlement(entry, events, done) }));
     }
-    const startSeq = startSeqs.get(id);
-    if (startSeq !== undefined && durable.some(event => event.kind === "turn-start" &&
-      event.seq > startSeq && typeof event.payload.historyThroughSeq === "number" && event.payload.historyThroughSeq < startSeq)) {
-      startSeqs.delete(id);
-      put({ ...entry, status: "verifying", settlement: { outcome: "failed", detail: "原任务已被重试或编辑；请核对当前状态。" } });
+    const startSeq = startSeqs.get(key);
+    if (startSeq === undefined || !durable.some(event => event.kind === "turn-start" &&
+      event.seq > startSeq && typeof event.payload.historyThroughSeq === "number" && event.payload.historyThroughSeq < startSeq)) return [];
+    startSeqs.delete(key);
+    return entries.map(entry => ({ ...entry, status: "verifying",
+      settlement: { outcome: "failed", detail: "原任务已被重试或编辑；请核对当前状态。" } }));
+  }
+
+  function completeReadback(gameId: string, entries: Readback[], result: { rows: InstallRecord[] } | { error: unknown }) {
+    const { pending } = useModSwitch.getState();
+    const next = { ...pending };
+    const notices: { entry: Readback; message: string }[] = [];
+    for (const entry of entries) {
+      if (pending[entry.id] !== entry) continue;
+      if ("rows" in result) {
+        delete next[entry.id];
+        notices.push({ entry, message: feedback(entry, entry.settlement, result.rows) });
+      } else {
+        const state = entry.kind === "remove" ? "管理列表" : "安装状态";
+        const message = `无法读取「${entry.name}」的最新${state}：${errorText(result.error)}。可重试读取。`;
+        next[entry.id] = { ...entry, status: "readback_failed", error: message };
+        notices.push({ entry, message });
+      }
     }
+    if (!notices.length) return;
+    useModSwitch.setState({ pending: next });
+    notifyReadbacks(gameId, notices);
   }
 
   async function readback(gameId: string, entries: Readback[]) {
@@ -353,40 +417,44 @@ export function syncModSwitches(client: QueryClient, notify: (message: string) =
         throw error;
       });
       if (disposed) return;
-      for (const key of [["game", gameId], ["mod-library", gameId], ["games"], ["trash"]]) {
+      for (const key of [["game", gameId], ["mod-library", gameId], ["mod-tags", gameId], ["games"], ["trash"]]) {
         void client.invalidateQueries({ queryKey: key });
       }
-      const notices: { entry: Readback; message: string }[] = [];
-      for (const entry of entries) {
-        if (useModSwitch.getState().pending[entry.id] !== entry) continue;
-        forget(entry.id);
-        notices.push({ entry, message: feedback(entry, entry.settlement, rows) });
-      }
-      notifyReadbacks(gameId, notices);
+      completeReadback(gameId, entries, { rows });
     } catch (error) {
-      if (disposed) return;
-      const notices: { entry: Readback; message: string }[] = [];
-      for (const entry of entries) {
-        if (useModSwitch.getState().pending[entry.id] !== entry) continue;
-        const state = entry.kind === "remove" ? "管理列表" : "安装状态";
-        const message = `无法读取「${entry.name}」的最新${state}：${errorText(error)}。可重试读取。`;
-        put({ ...entry, status: "readback_failed", error: message });
-        notices.push({ entry, message });
-      }
-      notifyReadbacks(gameId, notices);
+      if (!disposed) completeReadback(gameId, entries, { error });
     } finally {
       readingGames.delete(gameId);
       update();
     }
   }
 
+  let settling = false;
   function update(conversationId?: string) {
-    if (disposed) return;
+    if (disposed || settling) return;
     for (const gameId of removalNotices.keys()) {
       if (!readingGames.has(gameId) && !hasPendingRemoval(gameId)) removalNotices.delete(gameId);
     }
-    for (const entry of Object.values(useModSwitch.getState().pending)) {
-      if (entry.status === "running" && (!conversationId || entry.conversationId === conversationId)) observe(entry);
+    const { pending } = useModSwitch.getState();
+    const byTurn = new Map<string, Running[]>();
+    for (const entry of Object.values(pending)) {
+      if (entry.status !== "running" || (conversationId && entry.conversationId !== conversationId)) continue;
+      const key = turnKey(entry);
+      const entries = byTurn.get(key);
+      if (entries) entries.push(entry);
+      else byTurn.set(key, [entry]);
+    }
+    const settled = Array.from(byTurn.values()).flatMap(observe);
+    if (settled.length) {
+      const next = { ...pending };
+      for (const entry of settled) next[entry.id] = entry;
+      // Publish every settlement before a store subscriber can start a read.
+      settling = true;
+      try {
+        useModSwitch.setState({ pending: next });
+      } finally {
+        settling = false;
+      }
     }
     const byGame = new Map<string, Readback[]>();
     for (const entry of Object.values(useModSwitch.getState().pending)) {
@@ -404,9 +472,11 @@ export function syncModSwitches(client: QueryClient, notify: (message: string) =
     if (milestones === before.milestones) return;
     // Remember a live start if a rewrite later removes it before another replay.
     for (const entry of Object.values(useModSwitch.getState().pending)) {
-      if (entry.status !== "running" || startSeqs.has(entry.id)) continue;
+      if (entry.status !== "running") continue;
+      const key = turnKey(entry);
+      if (startSeqs.has(key)) continue;
       const start = milestones[entry.conversationId]?.find(event => event.turnId === entry.turnId && event.kind === "turn-start");
-      if (start) startSeqs.set(entry.id, start.seq);
+      if (start) startSeqs.set(key, start.seq);
     }
   });
   update();
