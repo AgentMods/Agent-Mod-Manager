@@ -53,6 +53,52 @@ fn fixture() -> (tempfile::TempDir, McpServers, Settings, ToolContext) {
     (dir, servers, settings, context)
 }
 
+#[test]
+fn credential_status_reports_only_nonblank_local_values_for_the_requested_server() {
+    let (_dir, servers, settings, _) = fixture();
+    let mut config = ServerConfig::stdio("status-stdio", "Status Stdio", "fixture-mcp", vec![]);
+    let key = "mcp.status_stdio.saved";
+    let missing = "mcp.status_stdio.missing";
+    let bearer = "mcp.status_http.bearer";
+    config.env_secret_refs = [
+        ("FIRST_TOKEN".into(), key.into()),
+        ("SHARED_API_KEY".into(), key.into()),
+        ("SECOND_TOKEN".into(), missing.into()),
+    ]
+    .into();
+    servers.create(&config).unwrap();
+    let mut http = ServerConfig::http("status-http", "Status HTTP", "https://example.test/mcp");
+    http.bearer_secret_ref = Some(bearer.into());
+    servers.create(&http).unwrap();
+
+    assert_eq!(
+        servers.credential_status(&settings, &config.id).unwrap(),
+        [(key.into(), false), (missing.into(), false)].into()
+    );
+    settings.write_secret(key, "saved-test-value").unwrap();
+    settings.write_secret(missing, "  ").unwrap();
+    settings.write_secret(bearer, "saved-bearer-value").unwrap();
+    assert_eq!(
+        servers.credential_status(&settings, &config.id).unwrap(),
+        [(key.into(), true), (missing.into(), false)].into()
+    );
+    assert_eq!(
+        servers.credential_status(&settings, &http.id).unwrap(),
+        [(bearer.into(), true)].into()
+    );
+
+    // A registered reference alone (with no encrypted value) is not configured.
+    let empty_store =
+        Settings::with_secret_store(servers.db.clone(), Arc::new(MockSecrets::default()));
+    assert_eq!(
+        servers.credential_status(&empty_store, &http.id).unwrap(),
+        [(bearer.into(), false)].into()
+    );
+    assert!(servers
+        .credential_status(&settings, "missing-server")
+        .is_err());
+}
+
 const LEGACY_PLAYWRIGHT_COMMAND: &str = if cfg!(windows) { "npx.cmd" } else { "npx" };
 const LEGACY_PLAYWRIGHT_DESCRIPTION: &str = "在独立的浏览器会话中打开、浏览和操作网页。";
 const EXPECTED_PLAYWRIGHT_DESCRIPTION: &str =

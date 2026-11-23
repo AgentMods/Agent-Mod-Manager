@@ -23,6 +23,7 @@ export async function installMockTauri(page: Page, {
   workspaceGames = [],
   conversationFixtures,
   appUpdate,
+  mcpCredentialStatuses = {}, failMcpCredentialStatusIds = [], failFirstMcpSecretWrites = [], holdNextMcpCredentialStatus = false,
 }: {
   modLibrary?: Array<{artifactId: string; gameId: string | null; gameName: string; name: string; filename: string; version: string | null; sha256: string; projectPage?: string | null}>;
   onboarding?: boolean;
@@ -46,6 +47,10 @@ export async function installMockTauri(page: Page, {
   askUser?: {preview: AskUserPreviewFixture; approvalId?: string; toolCallId?: string; deferResult?: boolean};
   workspaceGames?: WorkspaceGameFixture[];
   conversationFixtures?: Array<Record<string, unknown>>;
+  mcpCredentialStatuses?: Record<string, Record<string, boolean>>;
+  failMcpCredentialStatusIds?: string[];
+  failFirstMcpSecretWrites?: string[];
+  holdNextMcpCredentialStatus?: boolean;
   appUpdate?: {
     status?: 'idle' | 'checking' | 'downloading' | 'ready' | 'upToDate' | 'error' | 'unsupported';
     version?: string;
@@ -64,7 +69,7 @@ export async function installMockTauri(page: Page, {
 } = {}) {
   // The public-looking manifest image is served offline in browser tests.
   await page.route("https://covers.example.org/minecraft-java.jpg", route => route.fulfill({contentType: "image/png", path: "public/favicon.png"}));
-  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage, workspaceGames, conversationFixtures, appUpdate}) => {
+  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage, workspaceGames, conversationFixtures, appUpdate, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus}) => {
     type Args = Record<string, any>;
     const now = "2026-11-18T00:00:00Z";
     const draftUpdatedAtField = pluginDateFixture === "valid" ? {updatedAt: pluginUpdatedAt} : {};
@@ -78,6 +83,11 @@ export async function installMockTauri(page: Page, {
     let updateStatus = {status: appUpdate?.status ?? 'idle', version: appUpdate?.version, message: appUpdate?.message};
     const updatePollStatuses = structuredClone(appUpdate?.pollStatuses ?? []);
     let updatePollingStarted = false;
+    const credentialStatuses = structuredClone(mcpCredentialStatuses);
+    const failedCredentialStatusIds = new Set(failMcpCredentialStatusIds);
+    const failedSecretWrites = new Set(failFirstMcpSecretWrites);
+    let holdCredentialStatus = holdNextMcpCredentialStatus;
+    let releaseCredentialStatus: (() => void) | undefined;
     const storageBootstrapKey = "amm.test.storageBootstrapAfterMigration";
     const restoredStorage = storage?.nextBootstrap ? JSON.parse(sessionStorage.getItem(storageBootstrapKey) ?? "{}") : {};
     let pendingGameConflicts = structuredClone(gamePlanConflicts ?? []);
@@ -425,7 +435,16 @@ export async function installMockTauri(page: Page, {
         case "set_settings": settings = args.settings; onboardingCompleted = settings.onboarding_completed; return null;
         case "get_composer_preferences": return composerPreferences;
         case "set_composer_preferences": composerPreferences = args.preferences; return null;
-        case "set_secret": return null;
+        case "set_secret": {
+          if (failedSecretWrites.has(args.key)) {
+            failedSecretWrites.delete(args.key);
+            throw new Error("模拟后端写入失败");
+          }
+          for (const status of Object.values(credentialStatuses)) {
+            if (Object.hasOwn(status, args.key)) status[args.key] = true;
+          }
+          return null;
+        }
         case "start_onboarding": onboardingInProgress = true; return null;
         case "set_onboarding_completed": onboardingCompleted = !!args.completed; settings = {...settings, onboarding_completed: onboardingCompleted}; return null;
         case "list_conversations": return conversations.filter((c) => c.archived === !!args.archived);
@@ -600,6 +619,14 @@ export async function installMockTauri(page: Page, {
           return importedEntry;
         }
         case "mcp_list": return [];
+        case "mcp_credential_status": {
+          if (failedCredentialStatusIds.has(args.id)) throw new Error("模拟读取配置状态失败");
+          if (holdCredentialStatus) {
+            holdCredentialStatus = false;
+            await new Promise<void>((resolve) => { releaseCredentialStatus = resolve; });
+          }
+          return structuredClone(credentialStatuses[args.id] ?? {});
+        }
         case "mcp_startup_requests": return [];
         case "mcp_connections": return [];
         case "mcp_server_status": return {startupRequested: false, running: false, stopping: false, endpoint: null, tokenRef: "mcp.local_server.token", activeCalls: 0};
@@ -838,6 +865,10 @@ export async function installMockTauri(page: Page, {
         releaseStorageMigration?.();
         releaseStorageMigration = undefined;
       },
+      finishMcpCredentialStatus() {
+        releaseCredentialStatus?.();
+        releaseCredentialStatus = undefined;
+      },
       get pending() { return pending; },
       get modsFolderMissing() { return modsFolderMissing; },
       set modsFolderMissing(value: boolean) { modsFolderMissing = value; },
@@ -850,5 +881,5 @@ export async function installMockTauri(page: Page, {
         seq = Math.max(seq, ...values.map((event) => event.seq).filter(Number.isSafeInteger));
       },
     };
-  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage, workspaceGames, conversationFixtures, appUpdate});
+  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage, workspaceGames, conversationFixtures, appUpdate, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus});
 }

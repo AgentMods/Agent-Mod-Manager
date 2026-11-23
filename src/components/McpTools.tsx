@@ -1,9 +1,9 @@
 import { startMcpConnection, type McpConfig } from "@/lib/mcp-connection";
 import { Fragment, useEffect, useId, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { useMutation, useMutationState, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ChevronDownIcon, ExternalLinkIcon, KeyRoundIcon, PencilIcon, PlayIcon, PlusIcon, SaveIcon, ServerIcon, SquareIcon, Trash2Icon } from "lucide-react";
+import { ChevronDownIcon, CircleCheckIcon, CircleHelpIcon, CircleIcon, ExternalLinkIcon, KeyRoundIcon, PencilIcon, PlayIcon, PlusIcon, SaveIcon, ServerIcon, SquareIcon, Trash2Icon } from "lucide-react";
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { useUI } from "@/lib/store";
 import { Badge, EmptyState, ErrorState, IconButton, Modal, PathText } from "@/components/ui";
@@ -64,6 +64,15 @@ function mcpCredentialFields(config: McpConfig) {
 function McpCredentialDialog({ config, trigger, onClose }: { config: McpConfig; trigger: HTMLButtonElement; onClose: () => void }) {
   const formId = useId();
   const fields = mcpCredentialFields(config);
+  const client = useQueryClient();
+  const statusKey = ["mcp", "credential-status", config.id] as const;
+  const statuses = useQuery({
+    queryKey: statusKey,
+    queryFn: () => api<Record<string, boolean>>("mcp_credential_status", { id: config.id }),
+    enabled: backendAvailable,
+    networkMode: "always",
+    staleTime: 0,
+  });
   const [values, setValues] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -75,15 +84,25 @@ function McpCredentialDialog({ config, trigger, onClose }: { config: McpConfig; 
     if (saving || !pending.length) return;
     setSaving(true);
     setError(null);
-    for (const { reference, label } of pending) {
-      try {
-        await api("set_secret", { key: reference, value: values[reference] });
-        setValues((current) => ({ ...current, [reference]: "" }));
-      } catch (failure) {
-        setError(`${label} 保存失败：${errorText(failure)}`);
-        setSaving(false);
-        return;
+    let saved = false;
+    try {
+      for (const { reference, label } of pending) {
+        try {
+          await api("set_secret", { key: reference, value: values[reference] });
+          saved = true;
+          setValues((current) => ({ ...current, [reference]: "" }));
+        } catch (failure) {
+          setError(`${label} 保存失败：${errorText(failure)}`);
+          return;
+        }
       }
+    } finally {
+      if (saved) {
+        // Refresh even after a partial save; discard any pre-write status still in flight.
+        await client.cancelQueries({ queryKey: statusKey });
+        void client.invalidateQueries({ queryKey: statusKey });
+      }
+      setSaving(false);
     }
     notify("MCP 凭据已保存");
     onClose();
@@ -101,22 +120,36 @@ function McpCredentialDialog({ config, trigger, onClose }: { config: McpConfig; 
     <p className="text-sm text-muted-foreground">凭据仅在本机加密保存。输入新值可替换已保存的凭据。</p>
     <form id={formId} onSubmit={(event) => { event.preventDefault(); void save(); }}>
       <FieldGroup className="gap-4">
-        {fields.map(({ reference, label }, index) => <Field key={reference}>
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <FieldLabel htmlFor={`secret-${reference}`}>{label}</FieldLabel>
-            {index === 0 && credentialUrl && isCredentialUrl(credentialUrl) && <Button asChild variant="link" size="xs">
-              <a href={credentialUrl} target="_blank" rel="noreferrer" onClick={(event) => {
-                if (!backendAvailable) return;
-                event.preventDefault();
-                setError(null);
-                void openUrl(credentialUrl).catch(setError);
-              }}>获取 Key <ExternalLinkIcon aria-hidden="true" /></a>
-            </Button>}
-          </div>
-          <Input id={`secret-${reference}`} type="password" autoComplete="new-password" placeholder={reference}
-            value={values[reference] ?? ""} disabled={!backendAvailable || saving}
-            onChange={(event) => setValues({ ...values, [reference]: event.target.value })} />
-        </Field>)}
+        {fields.map(({ reference, label }, index) => {
+          const inputId = `${formId}-secret-${index}`;
+          const statusId = `${inputId}-status`;
+          const configured = statuses.isError ? undefined : statuses.data?.[reference];
+          const checking = configured === undefined && statuses.isFetching;
+          const StatusIcon = configured === true ? CircleCheckIcon : configured === false ? CircleIcon : CircleHelpIcon;
+          return <Field key={reference}>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <FieldLabel htmlFor={inputId}>{label}</FieldLabel>
+              {index === 0 && credentialUrl && isCredentialUrl(credentialUrl) && <Button asChild variant="link" size="xs">
+                <a href={credentialUrl} target="_blank" rel="noreferrer" onClick={(event) => {
+                  if (!backendAvailable) return;
+                  event.preventDefault();
+                  setError(null);
+                  void openUrl(credentialUrl).catch(setError);
+                }}>获取 Key <ExternalLinkIcon aria-hidden="true" /></a>
+              </Button>}
+            </div>
+            <div className="space-y-1.5">
+              <Input id={inputId} type="password" autoComplete="new-password" placeholder={reference}
+                aria-describedby={statusId} value={values[reference] ?? ""} disabled={!backendAvailable || saving}
+                onChange={(event) => setValues({ ...values, [reference]: event.target.value })} />
+              <FieldDescription id={statusId} role="status" className="flex items-center gap-1.5 text-xs">
+                {checking ? <Spinner className="size-3.5 motion-reduce:animate-none" /> :
+                  <StatusIcon aria-hidden="true" className={cn("size-3.5 shrink-0", configured === true && "text-success")} />}
+                {checking ? "正在检查配置状态…" : configured === true ? "已配置" : configured === false ? "未配置" : "无法读取配置状态"}
+              </FieldDescription>
+            </div>
+          </Field>;
+        })}
       </FieldGroup>
     </form>
     <ErrorState error={error} />

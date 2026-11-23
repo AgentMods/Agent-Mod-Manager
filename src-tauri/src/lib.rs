@@ -196,6 +196,7 @@ pub fn run() {
             commands::read_logs,
             commands::diagnose_game,
             commands::mcp_list,
+            commands::mcp_credential_status,
             commands::mcp_create,
             commands::mcp_update,
             commands::mcp_remove,

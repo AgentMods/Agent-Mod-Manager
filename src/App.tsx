@@ -15,7 +15,6 @@ import { BackgroundApprovalLink } from "./components/AgentConfirmation";
 import { PlanDialog } from "./components/PlanDialog";
 import { AppLogo } from "./components/AppLogo";
 import { ErrorState, IconButton } from "./components/ui";
-import { Button } from "@/components/ui/button";
 import { Breadcrumb, BreadcrumbItem, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
 import { Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarRail, SidebarTrigger } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
@@ -242,16 +241,18 @@ export default function App() {
       <SidebarFooter className="p-3">
         <div className="flex items-center justify-between gap-2 group-data-[collapsible=icon]:flex-col">
           <IconButton title={settingsItem.label} variant={view === "settings" ? "secondary" : "ghost"} aria-current={view === "settings" ? "page" : undefined} onClick={() => navigate("settings")}><settingsItem.icon /></IconButton>
-          <Button asChild variant="ghost" size="sm" className="group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:px-0">
-            <a href={SPONSOR_URL} target="_blank" rel="noreferrer" aria-label="赞助" title="赞助" onClick={(event) => {
-              if (!backendAvailable) return;
-              event.preventDefault();
-              void openUrl(SPONSOR_URL).catch((error) => notify(`无法打开赞助页面：${errorText(error)}`));
-            }}>
-              <HeartIcon aria-hidden="true" /><span className="group-data-[collapsible=icon]:hidden">赞助</span>
-            </a>
-          </Button>
-          <IconButton title={theme === "light" ? "切换暗色主题" : "切换亮色主题"} onClick={toggleTheme}>{theme === "light" ? <MoonIcon className="motion-safe:animate-icon-swap" /> : <SunIcon className="motion-safe:animate-icon-swap" />}</IconButton>
+          <div className="flex items-center group-data-[collapsible=icon]:flex-col">
+            <IconButton asChild title="赞助">
+              <a href={SPONSOR_URL} target="_blank" rel="noreferrer" onClick={(event) => {
+                if (!backendAvailable) return;
+                event.preventDefault();
+                void openUrl(SPONSOR_URL).catch((error) => notify(`无法打开赞助页面：${errorText(error)}`));
+              }}>
+                <HeartIcon aria-hidden="true" />
+              </a>
+            </IconButton>
+            <IconButton title={theme === "light" ? "切换暗色主题" : "切换亮色主题"} onClick={toggleTheme}>{theme === "light" ? <MoonIcon className="motion-safe:animate-icon-swap" /> : <SunIcon className="motion-safe:animate-icon-swap" />}</IconButton>
+          </div>
         </div>
       </SidebarFooter>
       <SidebarRail />

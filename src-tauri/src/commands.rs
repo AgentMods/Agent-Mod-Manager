@@ -119,6 +119,22 @@ pub async fn mcp_list(state: State<'_, AppServices>) -> AppResult<Vec<crate::mcp
     })
     .await
 }
+/// Desktop-only: return presence for this server's saved references, never their values.
+#[tauri::command]
+pub async fn mcp_credential_status(
+    state: State<'_, AppServices>,
+    agent: State<'_, AgentRuntime>,
+    id: String,
+) -> AppResult<std::collections::BTreeMap<String, bool>> {
+    crate::mcp_connections::require_external(&id)?;
+    let servers = crate::mcp::McpServers::new(state.engine.db.clone());
+    let settings = agent.settings.clone();
+    blocking(servers, move |servers| {
+        servers.credential_status(&settings, &id)
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn mcp_create(
     state: State<'_, AppServices>,

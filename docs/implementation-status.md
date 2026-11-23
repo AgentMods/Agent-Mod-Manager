@@ -9,6 +9,10 @@ decoding errors and rejects entries without a validated data offset. The Linux
 GTK 3 stack uses `glib 0.18.5` with the two-line `VariantStrIter` fix from
 `gtk-rs/gtk-rs-core#1343`, pinned to commit `7e91f1a9`. Remove the Cargo
 patch once GTK's dependency constraints accept a fixed registry release.
+On Windows, 1,146 Rust library tests passed and 15 were ignored. The old and new
+ZIP writers produced byte-identical plugin packages for the comparison fixture,
+preserving its preview hash. A Linux release-mode smoke test exercised both
+directions of `VariantStrIter` against the pinned patch.
 
 **Desktop application updates (2026-11-24).** Signed desktop builds check the
 GitHub Releases manifest on launch. Settings offers a manual check and shows
@@ -970,7 +974,10 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   include Chinese descriptions, custom connections can be edited in Settings,
   and adapters can supply a `description` per service in `mcpServers`.
   The per-service credentials dialog handles Bearer and stdio environment secrets.
-  Its footer has 返回 and 保存.
+  Each password field shows whether a nonblank value is saved locally, or whether
+  its status could not be read. The desktop status command returns booleans for
+  the selected connection's references only; it never returns credential values
+  or validates them with the provider. Its footer has 返回 and 保存.
   保存 submits the nonblank fields together. Each connection can store an
   optional `credential_url`. The 获取 Key link opens that page in the system
   browser. The credential-backed Mod service presets include their key-management pages.
