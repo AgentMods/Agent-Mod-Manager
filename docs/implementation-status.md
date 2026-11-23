@@ -3,6 +3,51 @@
 Updated: 2026-11-23. The full project goal remains active. This is an
 implementation and verification snapshot, not a release-completion claim.
 
+**Windows MCP startup windows (2026-11-23).** Restoring saved stdio connections
+could open a terminal for each bundled uvx or npx launcher. Bundled and custom
+MCP commands now use the same Windows no-console creation flag as the browser
+helpers. The desktop still restores the selected connections through stdio.
+The packaged npx launcher completed an offline MCP handshake
+and listed a fixture tool. A local wheel started by the packaged uvx launcher
+echoed piped input and reported no console window handle.
+
+**Agent and MCP game-library controls (2026-11-23).** Desktop conversations and
+clients of the authenticated local MCP server can list registrations, add a local
+game directory, edit the display name or launch program, remove a registration,
+launch a game, and bind an installed adapter. Listing supports pagination and
+respects the desktop conversation's workspace. External calls identify existing
+games by ID. Updates, removals, registrations, bindings and launches recheck the
+reviewed target at execution. The regular approval matrix applies to manager
+changes and game launches. Removal preserves files and checks active installs,
+file recovery and pending reviews. Successful changes refresh the desktop library.
+Windows verification passed 1,135 Rust library tests with 15 ignored, all-target
+Clippy, Rust formatting and the frontend production build. A loopback model test
+removed two selected registrations in one turn while keeping their save files
+and a third registration. Authenticated MCP tests exercised all five operations
+under each permission mode using a temporary library and a fixture executable.
+Thirty Playwright checks across three viewport sizes covered game and adapter
+cache refresh, including delivery through the persisted Agent event log.
+
+**Chat links and app logo (2026-11-23, Windows).** Pasted URLs and Markdown
+links wrap within chat bubbles and stay underlined in both themes. User links
+inherit the bubble text color. Assistant links use the theme accent foreground.
+The sidebar and onboarding header use the dark GA mark on light surfaces and
+the white mark on dark surfaces. The frontend build and 39 Playwright checks
+for message actions, theme switching, motion and sidebar state passed across
+three viewport sizes, including link contrast checks in both themes.
+
+**Desktop usage counts (2026-11-23).** Release builds send fixed startup and
+feature events to the self-hosted Aptabase instance at `analytics.gloscai.com`
+with OS and application versions. Desktop setup
+counts a successful start once. Managed Mod installs count after the transaction
+commits across desktop and Agent paths. Other feature events count accepted
+desktop actions. Each process keeps its daily session ID and outbound queue in
+memory. Debug builds, stdio proxies and package smoke runs skip collection.
+See the event names, counting rules and opt-out in [the README](../README.md#匿名使用统计).
+The Windows release binary built successfully. The Rust library suite passed
+1,124 tests with 15 ignored, including local HTTP payload checks. All-target
+Clippy and Rust formatting checks passed.
+
 **Removing Mods with overlapping legacy installations (2026-11-23, Windows).**
 Installation inspection can identify the last writer of a shared path by matching
 file identities and fingerprints in the committed copy and backup journals.
@@ -1354,8 +1399,9 @@ All requirements in the original approved plan remain in scope.
 ## Desktop game card actions (2026-11-19)
 
 - Implemented desktop IPC commands `update_game`, `remove_game`,
-  `open_game_location`, and `launch_game`. The Agent and inbound MCP registries
-  exclude these commands. The existing opener capability is sufficient.
+  `open_game_location`, and `launch_game`. These originally shipped as desktop
+  card actions. The November 23 game-library tools also expose edit, remove and
+  launch through the Agent and inbound MCP.
 - Editing preserves game identity and unrelated metadata. A custom launch path
   is checked on save and launch. The macOS `.app` path resolves its declared
   bundle executable. A valid custom executable takes priority over the numeric

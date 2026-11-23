@@ -4,6 +4,7 @@ use super::{
 };
 use crate::{
     db::Db,
+    games::AUTOMATIC_GAME_NAME,
     paths::user_path,
     plugins::test_fixtures,
     transaction::{FileOp, FilePlan},
@@ -1969,4 +1970,267 @@ async fn resolving_live_approval_rejects_the_waiter_without_overwriting_an_in_fl
         .unwrap()
         .is_empty());
     assert!(!f.root.join("~mods").exists());
+}
+
+#[test]
+fn registration_review_commits_the_previewed_id_and_automatic_adapter() {
+    let f = Fixture::new();
+    test_fixtures::install(&f.engine.db, &f.engine.paths).unwrap();
+    let root = make_dir(&f.outside.join("New Skyrim installation"));
+    executable(&root.join("SkyrimSE.exe"));
+    executable(&make_dir(&root.join("Data")).join("Skyrim.esm"));
+
+    let preview = prepare_registration(&f.engine, &root).unwrap();
+    let encoded = json!(&preview);
+    assert_eq!(encoded["gameId"], preview.game_id);
+    assert_eq!(encoded["rootPath"], paths::display_path(&root));
+    assert_eq!(encoded["adapterSlug"], "skyrim-se");
+    assert_eq!(encoded["platform"], "windows");
+    assert_eq!(encoded["steamAppId"], "489830");
+    assert_eq!(games::list_games(&f.engine.db).unwrap().len(), 1);
+    let reviewed: RegistrationPreview = serde_json::from_value(encoded).unwrap();
+    let game = apply_registration(&f.engine, &reviewed).unwrap();
+    assert_eq!(game.id, reviewed.game_id);
+    assert_eq!(game.name, reviewed.game_name);
+    assert_eq!(game.metadata[AUTOMATIC_GAME_NAME], game.name);
+    assert_eq!(game.metadata["registration"]["kind"], "explicit");
+    assert_eq!(game.adapter_slug, reviewed.adapter_slug);
+    assert_eq!(game.adapter_version, reviewed.adapter_version);
+    assert_eq!(game.steam_app_id, reviewed.steam_app_id);
+    let error = apply_registration(&f.engine, &reviewed).unwrap_err();
+    assert!(matches!(error, AppError::Conflict(_)));
+    assert!(error.to_string().contains("已登记"));
+}
+
+#[test]
+fn registration_review_rejects_replacement_and_new_marker_evidence() {
+    let f = Fixture::new();
+    test_fixtures::install(&f.engine.db, &f.engine.paths).unwrap();
+    let root = make_dir(&f.outside.join("new-game"));
+    let preview = prepare_registration(&f.engine, &root).unwrap();
+    executable(&root.join("SkyrimSE.exe"));
+    executable(&make_dir(&root.join("Data")).join("Skyrim.esm"));
+    assert!(matches!(
+        apply_registration(&f.engine, &preview),
+        Err(AppError::Conflict(_))
+    ));
+
+    let root = make_dir(&f.outside.join("replaced-game"));
+    let preview = prepare_registration(&f.engine, &root).unwrap();
+    fs::rename(&root, f.outside.join("old-object")).unwrap();
+    make_dir(&root);
+    assert!(matches!(
+        apply_registration(&f.engine, &preview),
+        Err(AppError::Conflict(_))
+    ));
+    assert_eq!(games::list_games(&f.engine.db).unwrap().len(), 1);
+}
+
+#[test]
+fn agent_rejects_duplicate_registration_without_changing_desktop_refresh() {
+    let f = Fixture::new();
+    test_fixtures::install(&f.engine.db, &f.engine.paths).unwrap();
+    let root = make_dir(&f.outside.join("new-game"));
+    let preview = prepare_registration(&f.engine, &root).unwrap();
+    let game = register_local_from_desktop(&f.engine, &root, None, false).unwrap();
+    assert_ne!(game.id, preview.game_id);
+    assert!(matches!(
+        apply_registration(&f.engine, &preview),
+        Err(AppError::Conflict(_))
+    ));
+    assert!(matches!(
+        prepare_registration(&f.engine, &root),
+        Err(AppError::Conflict(_))
+    ));
+    assert_eq!(
+        games::get_game(&f.engine.db, &game.id).unwrap().metadata,
+        game.metadata
+    );
+
+    executable(&root.join("SkyrimSE.exe"));
+    executable(&make_dir(&root.join("Data")).join("Skyrim.esm"));
+    let refreshed =
+        register_local_from_desktop(&f.engine, &root, Some("skyrim-se"), false).unwrap();
+    assert_eq!(refreshed.id, game.id);
+    assert_eq!(refreshed.created_at, game.created_at);
+    assert_eq!(refreshed.adapter_slug.as_deref(), Some("skyrim-se"));
+    assert!(prepare_registration(&f.engine, &f.engine.paths.root).is_err());
+    assert!(prepare_registration(&f.engine, Path::new("relative")).is_err());
+}
+
+#[test]
+fn update_review_keeps_omitted_fields_and_clears_only_on_request() {
+    let f = Fixture::new();
+    let program = executable(&f.root.join("custom.exe"));
+    let set = prepare_update(
+        &f.engine,
+        "g",
+        None,
+        LaunchPathUpdate::Set(program.to_str().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(set.game_id, "g");
+    assert_eq!(set.target_game_name, "Original");
+    assert!(set.current_launch_path.is_none());
+    assert_eq!(set.target_launch_path, Some(paths::display_path(&program)));
+    assert!(f.game().metadata.get("launchPath").is_none());
+    apply_update(&f.engine, &serde_json::from_value(json!(set)).unwrap()).unwrap();
+
+    let rename =
+        prepare_update(&f.engine, "g", Some(" New name "), LaunchPathUpdate::Keep).unwrap();
+    assert!(!rename.changes_launch_path);
+    assert_eq!(rename.current_launch_path, rename.target_launch_path);
+    f.engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE games SET metadata_json=json_set(metadata_json,'$.unrelated',42) WHERE id='g'",
+            [],
+        )
+        .unwrap();
+    let renamed = apply_update(&f.engine, &rename).unwrap();
+    assert_eq!(renamed.name, "New name");
+    assert_eq!(renamed.metadata["launchPath"], program.to_str().unwrap());
+    assert_eq!(renamed.metadata["unrelated"], 42);
+
+    // Clearing works even after the selected executable no longer exists.
+    fs::remove_file(&program).unwrap();
+    let clear = prepare_update(&f.engine, "g", None, LaunchPathUpdate::Clear).unwrap();
+    assert!(clear.changes_launch_path);
+    assert!(clear.target_launch_path.is_none());
+    let cleared = apply_update(&f.engine, &clear).unwrap();
+    assert_eq!(cleared.name, "New name");
+    assert!(cleared.metadata.get("launchPath").is_none());
+}
+
+#[test]
+fn update_review_rejects_changes_to_game_or_selected_executable() {
+    let f = Fixture::new();
+    let program = executable(&f.root.join("custom.exe"));
+    let prepare = || {
+        prepare_update(
+            &f.engine,
+            "g",
+            None,
+            LaunchPathUpdate::Set(program.to_str().unwrap()),
+        )
+        .unwrap()
+    };
+    let preview = prepare();
+    f.engine
+        .db
+        .conn()
+        .execute("UPDATE games SET name='New name' WHERE id='g'", [])
+        .unwrap();
+    assert!(matches!(
+        apply_update(&f.engine, &preview),
+        Err(AppError::Conflict(_))
+    ));
+    let preview = prepare();
+    fs::write(&program, b"changed while waiting").unwrap();
+    assert!(matches!(
+        apply_update(&f.engine, &preview),
+        Err(AppError::Conflict(_))
+    ));
+    assert!(f.game().metadata.get("launchPath").is_none());
+}
+
+#[test]
+fn removal_review_rechecks_authorization_changes_and_new_blockers() {
+    let f = Fixture::new();
+    let preview = prepare_removal(&f.engine, "g").unwrap();
+    assert_eq!(preview.game_name, "Original");
+    assert!(preview.user_roots.is_empty());
+    f.engine
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO game_user_roots VALUES ('g','data',?1,'now')",
+            [f.outside.to_str().unwrap()],
+        )
+        .unwrap();
+    assert!(matches!(
+        apply_removal(&f.engine, &preview),
+        Err(AppError::Conflict(_))
+    ));
+    let preview = prepare_removal(&f.engine, "g").unwrap();
+    assert_eq!(preview.user_roots[0].path, paths::display_path(&f.outside));
+    let preview: RemovalPreview = serde_json::from_value(json!(preview)).unwrap();
+    let plan = unbound_mods_directory_preview(&f);
+    assert!(matches!(
+        apply_removal(&f.engine, &preview),
+        Err(AppError::Conflict(_))
+    ));
+    assert_eq!(f.game().id, preview.game_id);
+    f.engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE file_transactions SET status='abandoned' WHERE id=?1",
+            [&plan.id],
+        )
+        .unwrap();
+    apply_removal(&f.engine, &preview).unwrap();
+    assert!(f.root.is_dir() && f.outside.is_dir());
+    assert!(matches!(
+        games::get_game(&f.engine.db, "g"),
+        Err(AppError::NotFound(_))
+    ));
+}
+
+#[test]
+fn launch_review_dispatches_only_the_revalidated_program_or_steam_target() {
+    let f = Fixture::new();
+    let program = executable(&f.root.join("custom.exe"));
+    update_game(&f.engine, "g", "Original", program.to_str()).unwrap();
+    f.engine
+        .db
+        .conn()
+        .execute("UPDATE games SET steam_app_id='123' WHERE id='g'", [])
+        .unwrap();
+    let approved = prepare_launch(&f.engine, "g").unwrap();
+    let encoded = json!(&approved);
+    assert_eq!(
+        encoded["target"],
+        json!({"kind":"program", "programPath": paths::display_path(&program)})
+    );
+    let approved: LaunchPreview = serde_json::from_value(encoded).unwrap();
+    super::review::apply_launch_with(&f.engine, &approved, |action| {
+        assert_eq!(action, LaunchAction::Program(program.clone()));
+        Ok(())
+    })
+    .unwrap();
+
+    fs::write(&program, b"new bytes").unwrap();
+    let never_launch = |_| panic!("a stale approval must not dispatch");
+    assert!(matches!(
+        super::review::apply_launch_with(&f.engine, &approved, never_launch),
+        Err(AppError::Conflict(_))
+    ));
+    fs::remove_file(&program).unwrap();
+    assert!(matches!(
+        super::review::apply_launch_with(&f.engine, &approved, never_launch),
+        Err(AppError::NotFound(_))
+    ));
+
+    update_game(&f.engine, "g", "Original", None).unwrap();
+    let steam = prepare_launch(&f.engine, "g").unwrap();
+    assert_eq!(
+        json!(&steam)["target"],
+        json!({"kind":"steam", "url":"steam://rungameid/123"})
+    );
+    super::review::apply_launch_with(&f.engine, &steam, |action| {
+        assert_eq!(action, LaunchAction::Steam("steam://rungameid/123".into()));
+        Ok(())
+    })
+    .unwrap();
+    f.engine
+        .db
+        .conn()
+        .execute("UPDATE games SET steam_app_id='456' WHERE id='g'", [])
+        .unwrap();
+    assert!(matches!(
+        super::review::apply_launch_with(&f.engine, &steam, never_launch),
+        Err(AppError::Conflict(_))
+    ));
 }

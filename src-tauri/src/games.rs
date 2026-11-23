@@ -762,6 +762,61 @@ fn persist_registration(
     candidate: &GameCandidate,
     selection: AdapterSelection<'_>,
 ) -> AppResult<Game> {
+    let prepared = plan_registration(tx, root, adapters, candidate, selection, None)?;
+    if prepared.already_registered {
+        return Ok(prepared.game);
+    }
+    write_registration(tx, &prepared.game, true)
+}
+
+struct RegistrationWrite {
+    game: Game,
+    already_registered: bool,
+}
+
+/// The Agent supplies the reviewed ID and may only create a new registration.
+/// It uses the same automatic selection and metadata construction as desktop.
+pub(crate) fn prepare_new_registration(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    new_id: &str,
+) -> AppResult<(Game, Option<GameAdapter>)> {
+    let adapters = active_adapters_from(conn)?;
+    let candidate = identify_at(
+        root,
+        &adapters,
+        vec![DiscoverySource::simple(DiscoveryKind::User)],
+    )?;
+    let game = plan_registration(
+        conn,
+        root,
+        &adapters,
+        &candidate,
+        AdapterSelection::Automatic,
+        Some(new_id),
+    )?
+    .game;
+    let adapter = adapters
+        .into_iter()
+        .find(|adapter| Some(adapter.slug.as_str()) == game.adapter_slug.as_deref());
+    Ok((game, adapter))
+}
+
+pub(crate) fn apply_new_registration(
+    tx: &rusqlite::Transaction<'_>,
+    game: &Game,
+) -> AppResult<Game> {
+    write_registration(tx, game, false)
+}
+
+fn plan_registration(
+    conn: &rusqlite::Connection,
+    root: &Path,
+    adapters: &[GameAdapter],
+    candidate: &GameCandidate,
+    selection: AdapterSelection<'_>,
+    new_id: Option<&str>,
+) -> AppResult<RegistrationWrite> {
     let suggested = candidate.suggested_adapter_slug.as_deref();
     let selected_slug = match selection {
         AdapterSelection::Automatic => suggested,
@@ -788,18 +843,26 @@ fn persist_registration(
     };
     let root_text = path_text(root)?;
     let now = chrono::Utc::now().to_rfc3339();
-    let existing = tx
+    let existing = conn
         .query_row(
             &format!("SELECT {GAME_COLUMNS} FROM games WHERE root_path=?1"),
             [&root_text],
             game_from_row,
         )
         .optional()?;
+    if new_id.is_some() && existing.is_some() {
+        return Err(AppError::Conflict(
+            "该目录已登记，请使用现有游戏记录".into(),
+        ));
+    }
     if let (AdapterSelection::Catalog { slug, .. }, Some(game)) = (&selection, &existing) {
         if game.adapter_slug.as_deref() == Some(*slug)
             && game.adapter_version.as_deref() == selected.map(|m| m.version.as_str())
         {
-            return Ok(game.clone());
+            return Ok(RegistrationWrite {
+                game: game.clone(),
+                already_registered: true,
+            });
         }
         return Err(AppError::Conflict(
             "该目录已在游戏库中，不会更改其适配包".into(),
@@ -835,7 +898,8 @@ fn persist_registration(
         .unwrap();
     let id = old
         .map(|g| g.id.clone())
-        .unwrap_or_else(|| format!("game_{}", uuid::Uuid::new_v4().simple()));
+        .or_else(|| new_id.map(str::to_owned))
+        .unwrap_or_else(|| util::new_id("game"));
     let adapter_slug = if retain_identity {
         old.unwrap().adapter_slug.clone()
     } else {
@@ -868,15 +932,63 @@ fn persist_registration(
     if let Some(name) = automatic_name {
         metadata[AUTOMATIC_GAME_NAME] = json!(name);
     }
+    Ok(RegistrationWrite {
+        game: Game {
+            id,
+            name: name.to_owned(),
+            slug,
+            root_path: root_text,
+            platform,
+            adapter_slug,
+            adapter_version: version,
+            confidence,
+            cover_path: old.and_then(|game| game.cover_path.clone()),
+            steam_app_id: app_id,
+            last_scanned_at: Some(now.clone()),
+            installed_mod_count: old.map_or(0, |game| game.installed_mod_count),
+            enabled_mod_count: old.map_or(0, |game| game.enabled_mod_count),
+            metadata,
+            created_at: old.map_or_else(|| now.clone(), |game| game.created_at.clone()),
+            updated_at: now,
+        },
+        already_registered: false,
+    })
+}
+
+fn write_registration(
+    tx: &rusqlite::Transaction<'_>,
+    game: &Game,
+    allow_refresh: bool,
+) -> AppResult<Game> {
+    const INSERT: &str = "INSERT INTO games (id,name,slug,root_path,platform,adapter_slug,adapter_version,confidence,steam_app_id,last_scanned_at,metadata_json,created_at,updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)";
+    const REFRESH: &str = " ON CONFLICT(root_path) DO UPDATE SET name=excluded.name,slug=excluded.slug,platform=excluded.platform,adapter_slug=excluded.adapter_slug,adapter_version=excluded.adapter_version,confidence=excluded.confidence,steam_app_id=excluded.steam_app_id,last_scanned_at=excluded.last_scanned_at,metadata_json=excluded.metadata_json,updated_at=excluded.updated_at";
+    let sql = if allow_refresh {
+        std::borrow::Cow::Owned(format!("{INSERT}{REFRESH}"))
+    } else {
+        std::borrow::Cow::Borrowed(INSERT)
+    };
     tx.execute(
-        "INSERT INTO games (id,name,slug,root_path,platform,adapter_slug,adapter_version,confidence,steam_app_id,last_scanned_at,metadata_json,created_at,updated_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?10,?10)
-         ON CONFLICT(root_path) DO UPDATE SET name=excluded.name,slug=excluded.slug,platform=excluded.platform,adapter_slug=excluded.adapter_slug,adapter_version=excluded.adapter_version,confidence=excluded.confidence,steam_app_id=excluded.steam_app_id,last_scanned_at=excluded.last_scanned_at,metadata_json=excluded.metadata_json,updated_at=excluded.updated_at",
-        params![id,name,slug,root_text,platform,adapter_slug,version,confidence,app_id,now,metadata.to_string()],
+        &sql,
+        params![
+            game.id,
+            game.name,
+            game.slug,
+            game.root_path,
+            game.platform,
+            game.adapter_slug,
+            game.adapter_version,
+            game.confidence,
+            game.steam_app_id,
+            game.last_scanned_at,
+            game.metadata.to_string(),
+            game.created_at,
+            game.updated_at
+        ],
     )?;
     Ok(tx.query_row(
         &format!("SELECT {GAME_COLUMNS} FROM games WHERE root_path=?1"),
-        [&root_text],
+        [&game.root_path],
         game_from_row,
     )?)
 }

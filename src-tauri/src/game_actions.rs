@@ -1,16 +1,16 @@
-//! Desktop library actions and their path checks. File operations stay in FileEngine.
+//! Game-library actions and path checks shared by desktop IPC, Agent conversations and MCP.
 use crate::{
     error::{AppError, AppResult},
     game_roots,
-    games::{self, Game, AUTOMATIC_GAME_NAME},
-    install::INSTALL_STATE,
+    games::{self, Game},
     paths,
     plugins::{GameAdapter, Platform, RootKind},
     storage::AppPaths,
     transaction::{self, FileEngine, FileOp, FilePlan},
     util,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -28,46 +28,118 @@ fn validate_name(name: &str) -> AppResult<&str> {
     Ok(name)
 }
 
+mod registration;
+mod review;
+pub(crate) use registration::{
+    apply_registration, prepare_registration, register_local_from_desktop,
+};
+pub(crate) use review::{
+    apply_launch, apply_removal, apply_update, launch_from_desktop, prepare_launch,
+    prepare_removal, prepare_update,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RegistrationPreview {
+    pub game_id: String,
+    pub game_name: String,
+    pub root_path: String,
+    pub platform: String,
+    pub adapter_slug: Option<String>,
+    pub adapter_version: Option<String>,
+    pub steam_app_id: Option<String>,
+    requested_directory: String,
+    state_sha256: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LaunchPathUpdate<'a> {
+    Keep,
+    Clear,
+    Set(&'a str),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "path")]
+enum LaunchPathEdit {
+    Keep,
+    Clear,
+    Set(String),
+}
+
+impl LaunchPathEdit {
+    fn as_update(&self) -> LaunchPathUpdate<'_> {
+        match self {
+            Self::Keep => LaunchPathUpdate::Keep,
+            Self::Clear => LaunchPathUpdate::Clear,
+            Self::Set(path) => LaunchPathUpdate::Set(path),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct UpdatePreview {
+    pub game_id: String,
+    pub game_name: String,
+    pub root_path: String,
+    pub target_game_name: String,
+    pub current_launch_path: Option<String>,
+    pub target_launch_path: Option<String>,
+    pub changes_launch_path: bool,
+    launch_path_edit: LaunchPathEdit,
+    state_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RemovalPreview {
+    pub game_id: String,
+    pub game_name: String,
+    pub root_path: String,
+    pub user_roots: Vec<RemovalUserRoot>,
+    state_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RemovalUserRoot {
+    pub root_id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+pub(crate) enum LaunchTarget {
+    Program { program_path: String },
+    Steam { url: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct LaunchPreview {
+    pub game_id: String,
+    pub game_name: String,
+    pub root_path: String,
+    pub launch_path: Option<String>,
+    pub target: LaunchTarget,
+    state_sha256: String,
+}
+
 pub(crate) fn update_game(
     engine: &FileEngine,
     id: &str,
     name: &str,
     launch_path: Option<&str>,
 ) -> AppResult<Game> {
-    let name = validate_name(name)?;
-    let _guard = transaction::write_lock();
-    let mut conn = engine.db.conn();
-    let tx = conn.transaction()?;
-    let mut game = games::get_game_from(&tx, id)?;
-    let root = Path::new(&game.root_path);
-    let launch = launch_path
+    let launch_path = launch_path
         .filter(|path| !path.trim().is_empty())
-        .map(|path| validate_launch_path(&engine.paths, root, Path::new(path)))
-        .transpose()?;
-    let metadata = game
-        .metadata
-        .as_object_mut()
-        .ok_or_else(|| AppError::Invalid("现有游戏 metadata 必须是 JSON 对象".into()))?;
-    if let Some(launch) = launch {
-        let path = launch
-            .selected
-            .to_str()
-            .ok_or_else(|| AppError::Invalid("启动程序路径包含无法表示的字符".into()))?;
-        metadata.insert("launchPath".into(), path.into());
-    } else {
-        metadata.remove("launchPath");
-    }
-    if game.name != name {
-        metadata.remove(AUTOMATIC_GAME_NAME);
-    }
-    game.name = name.to_owned();
-    game.updated_at = util::now();
-    tx.execute(
-        "UPDATE games SET name=?1,metadata_json=?2,updated_at=?3 WHERE id=?4",
-        params![game.name, game.metadata.to_string(), game.updated_at, id],
-    )?;
-    tx.commit()?;
-    Ok(game)
+        .map_or(LaunchPathUpdate::Clear, LaunchPathUpdate::Set);
+    review::commit_update(engine, id, Some(validate_name(name)?), launch_path, None)
 }
 
 /// The reviewed choice. Paths here are display paths; execution always uses
@@ -287,55 +359,7 @@ fn check_adapter_change(
 }
 
 pub(crate) fn remove_game(engine: &FileEngine, id: &str) -> AppResult<()> {
-    let _guard = transaction::write_lock();
-    let mut conn = engine.db.conn();
-    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let root_path: String = tx
-        .query_row("SELECT root_path FROM games WHERE id=?1", [id], |row| {
-            row.get(0)
-        })
-        .optional()?
-        .ok_or_else(|| AppError::NotFound(format!("游戏: {id}")))?;
-    let installed: i64 = tx.query_row(
-        &format!(
-            "SELECT count(*) FROM installs WHERE game_id=?1 AND (
-          status='installed' OR (CASE WHEN EXISTS(
-            SELECT 1 FROM install_transactions it WHERE it.install_id=installs.id
-          ) THEN {INSTALL_STATE} ELSE status END) IN ('enabled','partially_restored'))"
-        ),
-        [id],
-        |row| row.get(0),
-    )?;
-    if installed > 0 {
-        return Err(AppError::Conflict(format!(
-            "该游戏仍有 {installed} 个已安装的 Mod，请先在游戏详情中卸载后再移除"
-        )));
-    }
-    // Recovery can depend on path authorizations even when a journal has no game_id.
-    let needs_recovery: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM file_transactions
-           WHERE status IN ('applying','rolling_back','recovery_failed'))",
-        [],
-        |row| row.get(0),
-    )?;
-    if needs_recovery {
-        return Err(AppError::Conflict(
-            "存在待恢复的文件事务，请先恢复后再移除游戏".into(),
-        ));
-    }
-    if has_pending_review(&tx, id, PathBuf::from(root_path), GameChange::Remove)? {
-        return Err(AppError::Conflict(
-            "该游戏仍有待审批或待执行的计划，请先处理后再移除".into(),
-        ));
-    }
-
-    // Preserve the journal and related historical records. A user root grants
-    // access only through a live registration keyed by (game_id, root_id).
-    tx.execute("DELETE FROM game_user_roots WHERE game_id=?1", [id])?;
-    crate::history::remove_game_from_workspaces(&tx, id)?;
-    tx.execute("DELETE FROM games WHERE id=?1", [id])?;
-    tx.commit()?;
-    Ok(())
+    review::commit_removal(engine, id, None)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]

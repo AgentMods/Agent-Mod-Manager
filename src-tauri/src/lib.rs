@@ -1,6 +1,7 @@
 pub mod agent;
 mod agent_attachment;
 mod agent_notifications;
+mod analytics;
 pub mod app;
 pub mod archive;
 pub mod artifacts;
@@ -291,8 +292,14 @@ pub fn run() {
                     .restore_requested(&agent.settings, &agent.registry, progress)
                     .await;
             });
+            analytics::start(app.package_info().version.to_string());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run Agent Mod Manager");
+        .build(tauri::generate_context!())
+        .expect("failed to build Agent Mod Manager")
+        .run(|_, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                analytics::finish();
+            }
+        });
 }

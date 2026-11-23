@@ -17,13 +17,14 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { McpTools } from "@/components/McpTools";
+import { AppUpdateSettings } from "@/components/AppUpdateSettings";
 import { StorageDirectory } from "@/components/StorageDirectory";
 import { ModOrganizationLanguage } from "@/components/ModOrganizationLanguage";
 
-const sections = [["model", "AI 与模型"], ["mcp", "工具"], ["skills", "Skills"], ["appearance", "外观与存储"]] as const;
+const sections = [["appearance", "外观与存储"], ["model", "AI 与模型"], ["mcp", "工具"], ["skills", "Skills"]] as const;
 
 export default function SettingsPage() {
-  const [tab, setTab] = useState("model");
+  const [tab, setTab] = useState("appearance");
   return <Page>
     <PageHeader title="设置" subtitle="模型、工具、Skills 与外观" />
     <Tabs value={tab} onValueChange={setTab} className="gap-6">
@@ -66,6 +67,7 @@ function AppearanceSettings() {
         <StorageDirectory renderExtraActions={(disabled) => <Button variant="outline" disabled={disabled} onClick={() => navigate("onboarding")}><RotateCcwIcon data-icon="inline-start" />重新查看新手引导</Button>} />
       </CardContent>
     </Card>
+    <AppUpdateSettings />
   </div>;
 }
 

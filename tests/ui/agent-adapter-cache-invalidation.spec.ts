@@ -25,7 +25,9 @@ async function openGameDetail(page: Page, name = gameName) {
 
 async function openPlugins(page: Page) {
   await page.getByRole("button", { name: "插件中心", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "适配包", exact: true })).toBeVisible();
+  const pluginsPage = page.getByTestId("plugins-page");
+  await expect(pluginsPage).toBeVisible();
+  await expect(pluginsPage.getByRole("heading", { name: "插件中心", exact: true })).toBeVisible();
   await expect.poll(() => callCount(page, "list_plugins")).toBeGreaterThan(0);
   await expect.poll(() => callCount(page, "list_plugin_drafts")).toBeGreaterThan(0);
 }

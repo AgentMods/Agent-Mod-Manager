@@ -6,6 +6,7 @@ import { api, errorText, useBackendQuery } from "@/lib/api";
 import { pendingOnboardingMigration, rememberOnboardingMigration, useUI } from "@/lib/store";
 import type { AppSettings, BootstrapState, Game, GameCandidate, ScanReport } from "@/lib/types";
 import { AgentConfiguration } from "@/components/AgentConfiguration";
+import { AppLogo } from "@/components/AppLogo";
 import { StorageDirectory } from "@/components/StorageDirectory";
 import { McpTools } from "@/components/McpTools";
 import { GameMatchBadge } from "@/components/GameMatchBadge";
@@ -145,7 +146,7 @@ export default function OnboardingPage({ automatic = false, bootstrap }: { autom
 
   return <div className="min-h-dvh bg-[radial-gradient(ellipse_at_top_right,var(--accent),transparent_55%)] bg-muted/40 text-foreground">
     <header data-tauri-drag-region className="flex items-center justify-between gap-4 border-b bg-background px-4 py-3 sm:px-8">
-      <div className="flex items-center gap-2.5"><img src="/favicon.png" width={32} height={32} alt="" className="size-8 rounded-lg" /><strong>Agent Mod Manager</strong></div>
+      <div className="flex items-center gap-2.5"><AppLogo /><strong>Agent Mod Manager</strong></div>
       <Button variant="ghost" size="icon" onClick={toggleTheme} aria-label={theme === "light" ? "切换暗色主题" : "切换亮色主题"}>
         {theme === "light" ? <MoonIcon /> : <SunIcon />}
       </Button>

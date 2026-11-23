@@ -404,6 +404,8 @@ async function fixtureProcessAlive(pid, dataHome) {
     assert.match(binary, /\/agent-mod-manager(?: \(deleted\))?$/);
     assert.equal((await stat(`/proc/${pid}`)).uid, process.getuid());
     assert.ok(env.split('\0').includes(`XDG_DATA_HOME=${dataHome}`), 'Application is outside the smoke profile');
+    assert.ok(env.split('\0').includes('AMM_DISABLE_ANALYTICS=1'),
+      'Analytics opt-out did not reach the packaged application process');
     return true;
   } catch (error) {
     if (error.code === 'ENOENT' || error.code === 'ESRCH') return false;

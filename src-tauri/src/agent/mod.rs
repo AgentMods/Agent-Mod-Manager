@@ -7,6 +7,7 @@ mod context;
 pub mod diagnostic_tools;
 pub mod events;
 mod game_adapter_tool;
+mod game_library_tools;
 pub mod identity_tools;
 pub mod install_tools;
 #[cfg(test)]

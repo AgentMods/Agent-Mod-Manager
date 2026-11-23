@@ -7,6 +7,25 @@ use crate::{
 pub(super) fn selection(db: &Db, conversation: &str) -> AppResult<Option<Vec<String>>> {
     History::new(db.clone()).conversation_workspace(conversation)
 }
+/// Desktop chats use their current workspace. Inbound clients address registrations by ID.
+pub(super) fn tool_selection(
+    context: &super::tools::ToolContext,
+) -> AppResult<Option<Vec<String>>> {
+    use crate::sources::resolutions::ResolutionScope;
+    match &context.resolution_scope {
+        ResolutionScope::Agent(id) => selection(&context.engine.db, id),
+        ResolutionScope::Mcp(_) => Ok(None),
+        ResolutionScope::Desktop => {
+            Err(AppError::Denied("游戏库工具需要 Agent 或 MCP 会话".into()))
+        }
+    }
+}
+pub(super) fn tool_target(
+    context: &super::tools::ToolContext,
+    requested: Option<&str>,
+) -> AppResult<String> {
+    resolve(tool_selection(context)?.as_deref(), requested)
+}
 pub(crate) fn resolve(ids: Option<&[String]>, requested: Option<&str>) -> AppResult<String> {
     if let Some(id) = requested {
         if ids.is_none_or(|ids| ids.iter().any(|candidate| candidate == id)) {

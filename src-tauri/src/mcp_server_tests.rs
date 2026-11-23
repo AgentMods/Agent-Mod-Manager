@@ -30,6 +30,9 @@ use std::{
 };
 use tokio::sync::{mpsc, Notify};
 
+#[path = "mcp_server_game_tests.rs"]
+mod game_tests;
+
 #[derive(Default)]
 struct MockSecrets(StdMutex<HashMap<String, String>>);
 impl SecretStore for MockSecrets {
@@ -344,7 +347,6 @@ async fn tools_are_allowlisted_and_real_reads_reuse_desktop_file_guards() {
         "plan_file_ops",
         "download_web_mod",
         "retry_mod_library_download",
-        "set_game_adapter",
     ]);
     let count = Arc::new(AtomicUsize::new(0));
     for name in [
@@ -352,6 +354,8 @@ async fn tools_are_allowlisted_and_real_reads_reuse_desktop_file_guards() {
         "purge_trash",
         "configure_settings",
         "start_process",
+        "open_game_location",
+        "remove_game_adapter",
     ] {
         fixture
             .runtime
@@ -387,10 +391,11 @@ async fn tools_are_allowlisted_and_real_reads_reuse_desktop_file_guards() {
         "purge_trash",
         "configure_settings",
         "start_process",
+        "open_game_location",
+        "remove_game_adapter",
         "amm_approve",
         "download_web_mod",
         "retry_mod_library_download",
-        "set_game_adapter",
     ] {
         assert_eq!(
             call(&client, name, json!({"approved":true})).await.is_error,

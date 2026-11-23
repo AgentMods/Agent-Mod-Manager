@@ -29,3 +29,15 @@ test("损坏的侧边栏记录被忽略", async ({page}) => {
   await page.goto("/");
   await expect(rail(page)).toBeVisible();
 });
+
+test("侧栏赞助链接通过系统浏览器打开赞助页", async ({page}) => {
+  await installMockTauri(page);
+  await page.goto("/");
+  const sponsor = page.getByRole("link", {name: "赞助"});
+  await expect(sponsor).toHaveAttribute("href", "https://sponsor.aoe.top/");
+  await sponsor.focus();
+  await sponsor.press("Enter");
+  expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls)).toContainEqual({
+    command: "plugin:opener|open_url", args: {url: "https://sponsor.aoe.top/"},
+  });
+});

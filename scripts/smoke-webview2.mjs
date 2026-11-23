@@ -103,6 +103,8 @@ export async function startWebView2(application, scratch) {
   // Set test-only flags on this child. Do not enable debugging in shipped settings.
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) =>
     !/^(AMM_|WEBVIEW2_)/i.test(name)));
+  // Keep unrelated AMM_ variables isolated while explicitly disabling analytics in the app.
+  env.AMM_DISABLE_ANALYTICS = '1';
   env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = `--remote-debugging-address=${loopback} --remote-debugging-port=${port}`;
   env.WEBVIEW2_USER_DATA_FOLDER = await mkdtemp(join(scratch, 'webview2-'));
   const app = spawn(application, [], { cwd: scratch, env, stdio: ['ignore', 'inherit', 'inherit'] });

@@ -22,6 +22,7 @@ export async function installMockTauri(page: Page, {
   storage,
   workspaceGames = [],
   conversationFixtures,
+  appUpdate,
 }: {
   modLibrary?: Array<{artifactId: string; gameId: string | null; gameName: string; name: string; filename: string; version: string | null; sha256: string; projectPage?: string | null}>;
   onboarding?: boolean;
@@ -45,6 +46,13 @@ export async function installMockTauri(page: Page, {
   askUser?: {preview: AskUserPreviewFixture; approvalId?: string; toolCallId?: string; deferResult?: boolean};
   workspaceGames?: WorkspaceGameFixture[];
   conversationFixtures?: Array<Record<string, unknown>>;
+  appUpdate?: {
+    status?: 'idle' | 'checking' | 'downloading' | 'ready' | 'upToDate' | 'error' | 'unsupported';
+    version?: string;
+    message?: string;
+    checkResult?: {status: 'idle' | 'checking' | 'downloading' | 'ready' | 'upToDate' | 'error' | 'unsupported'; version?: string; message?: string};
+    pollStatuses?: {status: 'idle' | 'checking' | 'downloading' | 'ready' | 'upToDate' | 'error' | 'unsupported'; version?: string; message?: string}[];
+  };
   storage?: {
     dataRoot: string;
     parent: string;
@@ -56,7 +64,7 @@ export async function installMockTauri(page: Page, {
 } = {}) {
   // The public-looking manifest image is served offline in browser tests.
   await page.route("https://covers.example.org/minecraft-java.jpg", route => route.fulfill({contentType: "image/png", path: "public/favicon.png"}));
-  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage, workspaceGames, conversationFixtures}) => {
+  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage, workspaceGames, conversationFixtures, appUpdate}) => {
     type Args = Record<string, any>;
     const now = "2026-11-18T00:00:00Z";
     const draftUpdatedAtField = pluginDateFixture === "valid" ? {updatedAt: pluginUpdatedAt} : {};
@@ -67,6 +75,9 @@ export async function installMockTauri(page: Page, {
     let seq = 0;
     let migrationAttempts = 0;
     let releaseStorageMigration: (() => void) | undefined;
+    let updateStatus = {status: appUpdate?.status ?? 'idle', version: appUpdate?.version, message: appUpdate?.message};
+    const updatePollStatuses = structuredClone(appUpdate?.pollStatuses ?? []);
+    let updatePollingStarted = false;
     const storageBootstrapKey = "amm.test.storageBootstrapAfterMigration";
     const restoredStorage = storage?.nextBootstrap ? JSON.parse(sessionStorage.getItem(storageBootstrapKey) ?? "{}") : {};
     let pendingGameConflicts = structuredClone(gamePlanConflicts ?? []);
@@ -346,7 +357,7 @@ export async function installMockTauri(page: Page, {
           if (!args.options?.directory) return "/sandbox/incoming/Fixture.jar";
           return ++directoryPickCount === 1 ? "/sandbox/new-game" : null;
         }
-        case "list_games": return games;
+        case "list_games": return structuredClone(games);
         case "list_game_conflicts": return structuredClone(pendingGameConflicts
           .filter((conflict: any) => !Array.isArray(conflict.blockedChanges) || conflict.blockedChanges.includes(args.change))
           .map((conflict: any) => {
@@ -383,6 +394,13 @@ export async function installMockTauri(page: Page, {
         case "get_game": return games.find((game) => game.id === args.id) ?? games[0];
         case "get_game_adapter": return {modTypes: [{id: "java-mod", name: "Java 加载器模组", root: "mods", notes: "请核对加载器和依赖"}], installRoots: [{id: "mods", kind: "game", notes: ""}]};
         case "get_settings": return settings;
+        case "get_app_update_status":
+          if (updatePollingStarted && updatePollStatuses.length) updateStatus = updatePollStatuses.shift()!;
+          return structuredClone(updateStatus);
+        case "check_app_update":
+          updatePollingStarted = true;
+          updateStatus = structuredClone(appUpdate?.checkResult ?? {status: 'upToDate'});
+          return structuredClone(updateStatus);
         case "get_mod_organization_locale": return {
           locale: modOrganizationLocale,
           effective_locale: modOrganizationLocale ?? "zh-CN",
@@ -832,5 +850,5 @@ export async function installMockTauri(page: Page, {
         seq = Math.max(seq, ...values.map((event) => event.seq).filter(Number.isSafeInteger));
       },
     };
-  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage, workspaceGames, conversationFixtures});
+  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage, workspaceGames, conversationFixtures, appUpdate});
 }

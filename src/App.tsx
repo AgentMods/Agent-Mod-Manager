@@ -1,17 +1,21 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
-import { Gamepad2Icon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
+import { Gamepad2Icon, HeartIcon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
-import { backendAvailable, useBackendQuery } from "./lib/api";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { backendAvailable, errorText, useBackendQuery } from "./lib/api";
 import { subscribeAgentToolResults, syncAgentEvents } from "./lib/agent-store";
 import { invalidateAgentModQueries } from "./lib/agent-mod-cache";
+import { gameMutationsFromResults, invalidateGameQueries } from "./lib/game-cache";
 import { syncModSwitches, withoutModSwitchWrites } from "./lib/mod-switch-store";
 import { useUI } from "./lib/store";
 import { t } from "./lib/i18n";
 import type { BootstrapState, PageName } from "./lib/types";
 import { BackgroundApprovalLink } from "./components/AgentConfirmation";
 import { PlanDialog } from "./components/PlanDialog";
+import { AppLogo } from "./components/AppLogo";
 import { ErrorState, IconButton } from "./components/ui";
+import { Button } from "@/components/ui/button";
 import { Breadcrumb, BreadcrumbItem, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
 import { Sidebar, SidebarContent, SidebarFooter, SidebarGroup, SidebarGroupContent, SidebarHeader, SidebarInset, SidebarMenu, SidebarMenuButton, SidebarMenuItem, SidebarProvider, SidebarRail, SidebarTrigger } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
@@ -37,6 +41,7 @@ const navigation = [
   // { id: "history", label: "历史对话", icon: HistoryIcon },
 ] as const;
 const settingsItem = { id: "settings", label: "设置", icon: SettingsIcon } as const;
+const SPONSOR_URL = "https://sponsor.aoe.top/";
 const APP_VERSION = "v0.1.0";
 const pages = { library: LibraryPage, detail: GameDetailPage, agent: AgentPage, plugins: PluginsPage, trash: TrashPage, history: HistoryPage, settings: SettingsPage };
 
@@ -97,6 +102,19 @@ export default function App() {
   useEffect(() => subscribeAgentToolResults((results) => {
     // Read back durable changes as soon as the tool finishes; the Agent may
     // keep working in this turn. An unknown publication is not a receipt.
+    const gameMutations = gameMutationsFromResults(results);
+    if (gameMutations.length) {
+      const removedGameIds = new Set(gameMutations.flatMap(({ name, gameId }) =>
+        name === "remove_game" ? [gameId] : []));
+      const current = useUI.getState();
+      if (current.view === "detail" && current.gameId && removedGameIds.has(current.gameId)) {
+        current.navigate("library");
+      }
+      void invalidateGameQueries(client, {
+        gameIds: gameMutations.map(({ gameId }) => gameId),
+        workspaceChanged: removedGameIds.size > 0,
+      });
+    }
     const published = results.some(({ payload: { name, status, result } }) =>
       name === "publish_plugin" && status === "done" && result &&
       typeof result === "object" && "state" in result && result.state === "completed");
@@ -158,20 +176,6 @@ export default function App() {
   useEffect(() => syncAgentEvents(visibleConversation, (id, events) => {
     void client.invalidateQueries({ queryKey: ["conversation", id] });
     void client.invalidateQueries({ queryKey: ["conversations"] });
-    const boundGameIds = new Set(events.flatMap((event) => {
-      if (event.kind !== "tool-result" || event.payload.name !== "set_game_adapter" || event.payload.status !== "done") return [];
-      const result = event.payload.result;
-      if (!result || typeof result !== "object" || !("gameId" in result)) return [];
-      const gameId = result.gameId;
-      return typeof gameId === "string" && gameId.length > 0 ? [gameId] : [];
-    }));
-    if (boundGameIds.size) {
-      void client.invalidateQueries({ queryKey: ["games"] });
-      for (const gameId of boundGameIds) {
-        void client.invalidateQueries({ queryKey: ["game", gameId] });
-        void client.invalidateQueries({ queryKey: ["mod-library", gameId] });
-      }
-    }
     const successfulTools = new Set(events.filter(event => event.kind === "tool-result" && event.payload.status === "done")
       .map(event => event.payload.name));
     const createdDraft = successfulTools.has("write_plugin_draft") || successfulTools.has("import_cloud_plugin");
@@ -211,7 +215,7 @@ export default function App() {
         <SidebarMenu>
           <SidebarMenuItem>
             <SidebarMenuButton size="lg" tooltip={appName} aria-label={appName} onClick={() => navigate("agent")}>
-              <img src="/favicon.png" width={32} height={32} alt="" className="size-8 rounded-lg" />
+              <AppLogo />
               <span className="truncate text-sm font-semibold">{appName}</span>
             </SidebarMenuButton>
           </SidebarMenuItem>
@@ -238,6 +242,15 @@ export default function App() {
       <SidebarFooter className="p-3">
         <div className="flex items-center justify-between gap-2 group-data-[collapsible=icon]:flex-col">
           <IconButton title={settingsItem.label} variant={view === "settings" ? "secondary" : "ghost"} aria-current={view === "settings" ? "page" : undefined} onClick={() => navigate("settings")}><settingsItem.icon /></IconButton>
+          <Button asChild variant="ghost" size="sm" className="group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:px-0">
+            <a href={SPONSOR_URL} target="_blank" rel="noreferrer" aria-label="赞助" title="赞助" onClick={(event) => {
+              if (!backendAvailable) return;
+              event.preventDefault();
+              void openUrl(SPONSOR_URL).catch((error) => notify(`无法打开赞助页面：${errorText(error)}`));
+            }}>
+              <HeartIcon aria-hidden="true" /><span className="group-data-[collapsible=icon]:hidden">赞助</span>
+            </a>
+          </Button>
           <IconButton title={theme === "light" ? "切换暗色主题" : "切换亮色主题"} onClick={toggleTheme}>{theme === "light" ? <MoonIcon className="motion-safe:animate-icon-swap" /> : <SunIcon className="motion-safe:animate-icon-swap" />}</IconButton>
         </div>
       </SidebarFooter>

@@ -69,14 +69,26 @@ test("a theme switch fades colours, then removes its helper class", async ({ pag
   await installMockTauri(page);
   await page.goto("/");
   const html = page.locator("html");
+  const logo = page.locator('[data-slot="sidebar-header"] [data-slot="sidebar-menu-button"] img');
   await expect(html).toHaveAttribute("data-theme", /light|dark/);
+  await expect(logo).toBeVisible();
+  await expect.poll(() => logo.evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth > 0)).toBe(true);
+  const initialLogoSource = await logo.getAttribute("src");
   expect(await page.evaluate(() => (window as any).__sawThemeFade), "first paint must not animate").toBe(false);
 
   const before = await html.getAttribute("data-theme");
   await page.getByRole("button", { name: before === "dark" ? "切换亮色主题" : "切换暗色主题", exact: true }).click();
   await expect.poll(() => page.evaluate(() => (window as any).__sawThemeFade)).toBe(true);
   await expect(html).not.toHaveClass(/theme-switching/);
-  await expect(html).toHaveAttribute("data-theme", before === "dark" ? "light" : "dark");
+  const switchedTheme = before === "dark" ? "light" : "dark";
+  await expect(html).toHaveAttribute("data-theme", switchedTheme);
+  await expect.poll(() => logo.evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth > 0)).toBe(true);
+  expect(await logo.getAttribute("src")).not.toBe(initialLogoSource);
+
+  await page.getByRole("button", {name: switchedTheme === "dark" ? "切换亮色主题" : "切换暗色主题", exact: true}).click();
+  await expect(html).toHaveAttribute("data-theme", before!);
+  await expect.poll(() => logo.evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth > 0)).toBe(true);
+  await expect(logo).toHaveAttribute("src", initialLogoSource!);
 });
 
 test("stagger delays grow per row and are capped", async ({ page }) => {

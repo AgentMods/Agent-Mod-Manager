@@ -7,6 +7,7 @@ import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { useUI } from "@/lib/store";
 import { displayPath, gameDirectoryKey } from "@/lib/paths";
 import { reconcileCandidates } from "@/lib/game-discovery";
+import { invalidateGameQueries } from "@/lib/game-cache";
 import type { BootstrapState, Game, GameCandidate, Plugin, ScanReport } from "@/lib/types";
 import { Badge, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, PathText } from "@/components/ui";
 import { GameConflictPanel, useGameConflicts } from "@/components/GameConflictPanel";
@@ -396,15 +397,24 @@ export default function LibraryPage() {
           event.preventDefault();
           (identity.trigger.isConnected ? identity.trigger : directoryInput.current)?.focus();
         }}
-        onConfirmed={async (game) => { finishRegistration(identity.directory, game); await games.refetch(); }} />}
+        onConfirmed={async (game) => {
+          finishRegistration(identity.directory, game);
+          await invalidateGameQueries(client, { gameIds: [game.id] });
+        }} />}
     </Modal>}
 
-    {editing && <EditGameDialog key={editing.id} game={editing} onClose={() => setEditing(null)} onSaved={async () => { await games.refetch(); notify("已保存游戏设置"); }} />}
+    {editing && <EditGameDialog key={editing.id} game={editing} onClose={() => setEditing(null)} onSaved={async () => {
+      await invalidateGameQueries(client, { gameIds: [editing.id] });
+      notify("已保存游戏设置");
+    }} />}
     {choosingAdapter && <ChooseAdapterDialog key={choosingAdapter.id} game={choosingAdapter} writable={writable} plugins={plugins.data ?? []} onClose={() => setChoosingAdapter(null)} onSaved={async (updated) => {
       client.setQueryData(["game", updated.id], updated);
-      await games.refetch();
+      await invalidateGameQueries(client, { gameIds: [updated.id] });
       notify(updated.adapterSlug ? "已应用游戏适配包" : "已移除游戏适配包");
     }} />}
-    {removing && <RemoveGameDialog key={removing.id} game={removing} onClose={() => setRemoving(null)} onRemoved={async () => { await games.refetch(); notify("已从游戏库移除"); }} />}
+    {removing && <RemoveGameDialog key={removing.id} game={removing} onClose={() => setRemoving(null)} onRemoved={async () => {
+      await invalidateGameQueries(client, { gameIds: [removing.id], workspaceChanged: true });
+      notify("已从游戏库移除");
+    }} />}
   </Page>;
 }

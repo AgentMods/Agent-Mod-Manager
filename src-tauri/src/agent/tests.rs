@@ -29,6 +29,9 @@ mod tool_loop_regression;
 #[path = "game_adapter_flow_tests.rs"]
 mod game_adapter_flow;
 
+#[path = "game_library_flow_tests.rs"]
+mod game_library_flow;
+
 #[path = "live_modrinth_tests.rs"]
 mod live_modrinth;
 

@@ -132,7 +132,7 @@ export default function PluginsPage() {
 
   const plural = (n: number) => `${n}`;
   return <Page data-testid="plugins-page">
-    <PageHeader title="适配包" subtitle={backendAvailable ? `${plugins.data?.length ?? 0} 个已安装适配包` : '桌面能力未连接'} actions={<>
+    <PageHeader title="插件中心" subtitle={backendAvailable ? `${plugins.data?.length ?? 0} 个已安装插件` : '桌面能力未连接'} actions={<>
       <IconButton title="刷新适配包" variant="outline" size="icon" disabled={!backendAvailable || busy} onClick={() => { void plugins.refetch(); void drafts.refetch(); if (tab === 'installed') void catalog.refetch(); }}><RefreshCwIcon /></IconButton>
       <Button disabled={!writable || busy} onClick={() => startAdapterChat()}><SparklesIcon data-icon="inline-start" />用 Agent 创建</Button>
       <Button variant="outline" disabled={!writable || busy} onClick={() => { setDraftOpen(true); setError(null); }}><PlusIcon data-icon="inline-start" />新建草稿</Button>
@@ -154,7 +154,7 @@ export default function PluginsPage() {
         <section className="min-w-0">
           <div className="rounded-lg border">
             <Table>
-              <TableHeader><TableRow><TableHead>适配包</TableHead><TableHead>版本</TableHead><TableHead>更新时间</TableHead><TableHead>来源</TableHead><TableHead>验证</TableHead><TableHead>状态</TableHead><TableHead className="sticky right-0 bg-background text-right">操作</TableHead></TableRow></TableHeader>
+              <TableHeader><TableRow><TableHead>插件</TableHead><TableHead>版本</TableHead><TableHead>更新时间</TableHead><TableHead>来源</TableHead><TableHead>验证</TableHead><TableHead>状态</TableHead><TableHead className="sticky right-0 bg-background text-right">操作</TableHead></TableRow></TableHeader>
               <TableBody>{filtered.map((plugin, index) => <TableRow key={plugin.slug} data-state={selectedSlug === plugin.slug ? 'selected' : undefined} className="cursor-pointer motion-safe:animate-soft-fade" style={stagger(index, 30)} onClick={() => setSelectedSlug(plugin.slug)}>
                 <TableCell>
                   <button type="button" className="flex items-center gap-3 rounded-md text-left outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" onClick={() => setSelectedSlug(plugin.slug)}>

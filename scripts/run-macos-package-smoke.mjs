@@ -65,6 +65,7 @@ async function run() {
     cwd: profile,
     env: {
       ...process.env,
+      AMM_DISABLE_ANALYTICS: '1',
       HOME: profile,
       TMPDIR: join(profile, 'tmp'),
       XDG_CONFIG_HOME: join(profile, 'config'),

@@ -1,7 +1,7 @@
 //! Application-owned MCP launchers. Bare aliases never fall back to a binary on PATH.
 use crate::error::{AppError, AppResult};
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, File},
     io::{self, Seek},
     path::{Path, PathBuf},
@@ -59,8 +59,7 @@ impl McpRuntime {
     ) -> AppResult<Command> {
         let path = std::env::var_os("PATH");
         let Some(launcher) = Launcher::from_command(executable) else {
-            let mut cmd = Command::new(executable);
-            cmd.env_clear();
+            let mut cmd = background_command(executable);
             if let Some(path) = path {
                 cmd.env("PATH", path);
             }
@@ -234,20 +233,26 @@ fn windows_installer_proxy(install: &mut Command) {
     }
 }
 
+fn background_command(program: impl AsRef<OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_clear();
+    // MCP helpers communicate over pipes and can be restored before the first UI interaction.
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    cmd
+}
+
 fn browser_node(root: &Path, script: &str) -> Command {
     let root = dunce::simplified(root);
-    let mut cmd = Command::new(root.join("bin").join(NODE));
+    let mut cmd = background_command(root.join("bin").join(NODE));
     cmd.arg("--no-global-search-paths")
         .arg(root.join(script))
-        .kill_on_drop(true)
-        .env_clear();
+        .kill_on_drop(true);
     for key in BROWSER_ENV {
         if let Some(value) = std::env::var_os(key) {
             cmd.env(key, value);
         }
     }
-    #[cfg(windows)]
-    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     cmd
 }
 
@@ -259,8 +264,8 @@ fn bundled_command(launcher: Launcher, root: &Path, path: Option<OsString>) -> A
         std::iter::once(bin.clone()).chain(path.iter().flat_map(std::env::split_paths)),
     )
     .map_err(|_| AppError::Invalid("内置运行时路径无法加入子进程 PATH".into()))?;
-    let mut cmd = Command::new(bin.join(if launcher == Launcher::Npx { NODE } else { UVX }));
-    cmd.env_clear().env("PATH", path);
+    let mut cmd = background_command(bin.join(if launcher == Launcher::Npx { NODE } else { UVX }));
+    cmd.env("PATH", path);
     match launcher {
         Launcher::Npx => {
             cmd.arg(root.join(NPX_CLI))

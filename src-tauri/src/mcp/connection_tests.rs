@@ -14,6 +14,70 @@ fn wire_plugin_revocation(
     });
 }
 
+/// Ensure a Windows MCP child has no console and still supports stdio.
+#[cfg(windows)]
+#[tokio::test]
+async fn runtime_command_stdio_child_has_no_console_and_keeps_pipes_working() {
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::sync::CancellationToken;
+
+    let root = std::env::var_os("SystemRoot").expect("Windows sets SystemRoot");
+    let powershell =
+        std::path::PathBuf::from(&root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    assert!(powershell.is_file(), "Windows PowerShell is required");
+    let script = r#"
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class Probe { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool IsWindowVisible(IntPtr h); }'
+$inputLine = [Console]::In.ReadLine()
+$handle = [Probe]::GetConsoleWindow()
+$state = @{
+    input = $inputLine
+    handle = $handle.ToInt64()
+    present = ($handle -ne [IntPtr]::Zero)
+    visible = ($handle -ne [IntPtr]::Zero -and [Probe]::IsWindowVisible($handle))
+}
+[Console]::Out.WriteLine((ConvertTo-Json -InputObject $state -Compress))
+[Console]::Out.Flush()
+"#;
+    let cancel = CancellationToken::new();
+    let mut command = McpRuntime::default()
+        .command(powershell.to_str().unwrap(), &cancel)
+        .await
+        .unwrap();
+    let temp = std::env::temp_dir();
+    command
+        .args(["-NoProfile", "-Command", script])
+        .env("SYSTEMROOT", &root)
+        .env("WINDIR", &root)
+        .env("TEMP", &temp)
+        .env("TMP", &temp)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"stdio-roundtrip\n")
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .expect("helper must respond and exit")
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "helper exited with {}",
+        output.status
+    );
+    let probe: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(probe["input"], "stdio-roundtrip", "stdin must reach helper");
+    assert_eq!(probe["handle"], 0, "console probe: {probe}");
+    assert_eq!(probe["present"], false, "console probe: {probe}");
+    assert_eq!(probe["visible"], false, "console probe: {probe}");
+}
+
 #[test]
 fn custom_http_authentication_uses_the_endpoint_to_select_the_key_format() {
     let (_dir, servers, settings, _) = fixture();

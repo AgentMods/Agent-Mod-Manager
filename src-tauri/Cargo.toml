@@ -68,6 +68,7 @@ rmcp = { version = "=3.10.0", default-features = false, features = ["client", "t
 reqwest-mcp = { package = "reqwest", version = "0.13.2", default-features = false, features = ["rustls"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 subtle = "2.6"
+os_info = { version = "3", default-features = false }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 rustix = { version = "1.1", features = ["fs"] }
