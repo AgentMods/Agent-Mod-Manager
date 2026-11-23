@@ -21,6 +21,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-store = "2"
+tauri-plugin-updater = { version = "2.14.1", default-features = false, features = ["rustls-tls", "system-proxy"] }
 aes-gcm = "0.10"
 base64 = "0.22"
 dotenvy = "0.15"
@@ -38,7 +39,7 @@ anyhow = "1"
 
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip", "brotli"] }
-zip = { version = "2", default-features = false, features = ["deflate", "bzip2", "zstd", "time"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate", "bzip2", "zstd", "time"] }
 sevenz-rust2 = { version = "=0.25.0", default-features = false, features = ["bzip2"] }
 flate2 = "1"
 bzip2 = "0.5"
@@ -90,3 +91,7 @@ tauri = { version = "2", features = ["test"] }
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]
+
+[patch.crates-io]
+# GTK3 still requires glib 0.18; backport the RUSTSEC-2024-0429 fix from gtk-rs/gtk-rs-core PR #1343.
+glib = { git = "https://github.com/andrew-wommack-ministries/glib-rustsec-2024-0429-backport", rev = "7e91f1a9420fd3e6c58b7913bbbf201888304ea9" }

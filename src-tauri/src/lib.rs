@@ -3,6 +3,7 @@ mod agent_attachment;
 mod agent_notifications;
 mod analytics;
 pub mod app;
+mod app_update;
 pub mod archive;
 pub mod artifacts;
 pub mod commands;
@@ -60,6 +61,7 @@ pub mod util;
 #[cfg(not(test))]
 pub fn run() {
     use tauri::Manager;
+    let mut normal_exit = true;
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
@@ -83,6 +85,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
+            app_update::get_app_update_status,
+            app_update::check_app_update,
             commands::migrate_storage,
             commands::start_onboarding,
             commands::set_onboarding_completed,
@@ -293,13 +297,23 @@ pub fn run() {
                     .await;
             });
             analytics::start(app.package_info().version.to_string());
+            app_update::setup(app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("failed to build Agent Mod Manager")
-        .run(|_, event| {
-            if matches!(event, tauri::RunEvent::Exit) {
-                analytics::finish();
+        .run(move |app, event| match event {
+            tauri::RunEvent::ExitRequested { code, .. } => {
+                // In particular, storage migration requests a Tauri restart.
+                normal_exit = code.is_none_or(|code| code == 0);
             }
+            tauri::RunEvent::Exit => {
+                let staged = app_update::take_at_exit(app, normal_exit);
+                analytics::finish();
+                if let Some(staged) = staged {
+                    staged.install_at_exit();
+                }
+            }
+            _ => {}
         });
 }

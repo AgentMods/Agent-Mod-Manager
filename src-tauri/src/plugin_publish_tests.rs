@@ -130,7 +130,8 @@ fn deterministic_zip_has_exact_entries_raw_text_hashes_and_no_preview_side_effec
     assert_eq!(zip.len(), 2);
     for (i, expected) in ["adapter.json", "SKILL.md"].iter().enumerate() {
         let mut entry = zip.by_index(i).unwrap();
-        assert_eq!(entry.name(), *expected);
+        assert_eq!(entry.name().unwrap(), *expected);
+        assert_eq!(entry.system(), zip::System::Unix);
         assert_eq!(entry.compression(), zip::CompressionMethod::Stored);
         assert_eq!(entry.unix_mode().unwrap() & 0o777, 0o644);
         let mut raw = String::new();

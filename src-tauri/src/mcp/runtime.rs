@@ -354,7 +354,7 @@ fn extract(input: File, root: &Path) -> AppResult<()> {
     let mut zip = zip::ZipArchive::new(input)?;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
-        let path = crate::paths::safe_join(root, entry.name())?;
+        let path = crate::paths::safe_join(root, &entry.name()?)?;
         if entry.is_symlink() {
             return Err(AppError::UnsafeArchive(
                 "内置运行时不允许包含符号链接".into(),

@@ -1,7 +1,27 @@
 # Agent Mod Manager implementation status
 
-Updated: 2026-11-23. The full project goal remains active. This is an
+Updated: 2026-11-24. The full project goal remains active. This is an
 implementation and verification snapshot, not a release-completion claim.
+
+**Archive and Linux dependency security fixes (2026-11-24).** The Rust lockfile
+selects `zip 9.8.2` for archive handling. ZIP preflight propagates filename
+decoding errors and rejects entries without a validated data offset. The Linux
+GTK 3 stack uses `glib 0.18.5` with the two-line `VariantStrIter` fix from
+`gtk-rs/gtk-rs-core#1343`, pinned to commit `7e91f1a9`. Remove the Cargo
+patch once GTK's dependency constraints accept a fixed registry release.
+
+**Desktop application updates (2026-11-24).** Signed desktop builds check the
+GitHub Releases manifest on launch. Settings offers a manual check and shows
+progress and errors. A verified update waits in a temporary file until normal
+process exit, when installation waits for active file transactions. The installer
+leaves the app closed. The tag workflow assembles a draft release with separate
+signed payloads for NSIS, MSI, AppImage, Debian, and both macOS architectures.
+Windows verification produced MSI and NSIS updater signatures with the Tauri CLI.
+Ten Rust updater tests passed, including signature rejection, staging errors,
+and shutdown races. Fifteen Playwright checks passed across three viewport sizes. A release assembly
+test verified all six manifest entries and rejected a modified payload. A live
+upgrade between two published versions still needs a public signed release
+channel. See the [release setup](../README.md#维护者发布流程).
 
 **Windows MCP startup windows (2026-11-23).** Restoring saved stdio connections
 could open a terminal for each bundled uvx or npx launcher. Bundled and custom

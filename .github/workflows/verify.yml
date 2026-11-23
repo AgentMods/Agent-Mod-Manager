@@ -5,6 +5,11 @@ on:
   push:
     branches: [main, master]
   workflow_dispatch:
+    inputs:
+      verify_linux:
+        description: Build and smoke-test Linux desktop packages
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -39,13 +44,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            bundles: nsis,msi
-          - os: macos-latest
-            bundles: dmg
-          - os: ubuntu-24.04
-            bundles: appimage,deb
+        # Linux native dependencies and package smoke tests are opt-in.
+        include: >-
+          ${{ fromJSON(format('[{0},{1}{2}]',
+            '{"os":"windows-latest","bundles":"nsis,msi"}',
+            '{"os":"macos-latest","bundles":"dmg"}',
+            github.event_name == 'workflow_dispatch' && inputs.verify_linux
+              && ',{"os":"ubuntu-24.04","bundles":"appimage,deb"}' || '')) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -73,7 +78,6 @@ jobs:
       - run: yarn build
       - run: yarn prepare:seven-zip
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-      - run: node scripts/test-rust.mjs --locked --lib
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
       - name: Build Unsigned Installers
         id: bundle

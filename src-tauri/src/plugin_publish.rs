@@ -247,7 +247,9 @@ fn archive(files: &[PublicationFile; 2]) -> AppResult<PackageBytes> {
         .try_reserve_exact(expected)
         .map_err(|_| invalid("Buffer unavailable for publication ZIP"))?;
     let mut writer = zip::ZipWriter::new(Cursor::new(bytes));
+    // Use the same ZIP host metadata on every platform so Unix modes round-trip.
     let options = zip::write::SimpleFileOptions::default()
+        .system(zip::System::Unix)
         .compression_method(zip::CompressionMethod::Stored)
         .last_modified_time(zip::DateTime::default())
         .unix_permissions(0o644);

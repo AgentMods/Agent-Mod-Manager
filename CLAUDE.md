@@ -28,7 +28,7 @@ Run Rust tests through `scripts/test-rust.mjs`. Each run gets a private director
 
 Run a single Rust test by name filter: `node scripts/test-rust.mjs --lib transaction::tests::`. Single Playwright test: `yarn test:ui -g "trash restore"`; viewport projects are `desktop-1280`, `desktop-1440`, `narrow-390`.
 
-CI (`.github/workflows/verify.yml`) runs `yarn build`,  `cargo fmt --check`, `node scripts/test-rust.mjs --lib`, `cargo clippy --all-targets -D warnings`, then unsigned bundles for Windows/macOS/Linux.
+CI (`.github/workflows/verify.yml`) runs `yarn build`, `cargo fmt --check`, and `cargo clippy --all-targets -D warnings`, then builds and verifies unsigned Windows and macOS bundles. To build and smoke-test the Linux AppImage and Debian packages, manually run Verify And Package with `verify_linux` enabled. Tagged releases still build Linux packages through `release.yml`. Run the full Rust library test suite locally with `node scripts/test-rust.mjs --locked --lib`.
 
 ## Hard invariants
 

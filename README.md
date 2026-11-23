@@ -14,6 +14,17 @@
 
 启用本地 MCP 服务后，已认证客户端也可以调用 `list_games`、`register_game`、`update_game`、`remove_game`、`launch_game` 和 `set_game_adapter`。添加时传入游戏目录的绝对路径，操作已有游戏时传入 `game_id`。桌面对话使用本轮权限，本地 MCP 使用宿主全局权限。查询可直接执行，其余五项在“逐次审批”和“游戏内自动批准”下都会展示审批，在“完全信任”下直接执行。
 
+## 更新桌面应用
+
+签名发行版会在启动时检查 GitHub Releases，发现新版本后在后台下载。也可以打开 **设置 → 外观与存储 → 应用更新**，点击 **检查更新**。显示「已下载」后，正常退出程序即可安装，下次打开时使用新版本。下载过程中退出，下次启动会重新检查。系统安装器可能要求管理员授权。
+
+### 维护者发布流程
+
+1. 首次配置时，运行 `yarn tauri signer generate -w <仓库外的私钥文件路径>` 并备份密钥。把 `.pub` 文件内容存入 GitHub Actions 仓库变量 `TAURI_UPDATER_PUBLIC_KEY`，私钥文件内容和密码分别存入 Secrets `TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。后续发行沿用同一对密钥。
+2. 默认更新源是当前仓库的公开 Releases。如果源码仓库为私有，将变量 `AMM_RELEASE_REPOSITORY` 设为公开分发仓库的 `owner/repo`，并设置对该仓库有 Contents 写权限的 Secret `AMM_RELEASE_TOKEN`。客户端可匿名下载。
+3. 同步 `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`package.json` 及 Cargo 锁文件中的应用版本，推送对应的稳定标签（例如版本 `1.2.3` 对应 `v1.2.3`）。**Build signed desktop release** 会构建 Windows x64（NSIS、MSI）、Linux x64（AppImage、Debian）、macOS（Apple Silicon、Intel）安装包，校验签名并创建带 `latest.json` 的 Release 草稿。
+4. 审核安装包后在 GitHub 发布草稿，并将其设为 **Latest**。更新器读取 `/releases/latest/download/latest.json`。此前未集成更新器的用户需要手动安装一次签名发行版。
+
 ## 安装、更新和移除插件
 
 在 **插件中心 → 云端插件** 浏览或搜索插件，点击卡片上的 **安装** 即可，无需创建草稿。**查看详情** 可选，用于查看发布内容和声明的工具。
