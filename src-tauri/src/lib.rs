@@ -3,6 +3,7 @@ mod agent_attachment;
 mod agent_notifications;
 mod analytics;
 pub mod app;
+pub mod app_locale;
 mod app_update;
 pub mod archive;
 pub mod artifacts;
@@ -85,6 +86,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
+            commands::get_app_locale,
+            commands::set_app_locale,
             app_update::get_app_update_status,
             app_update::check_app_update,
             commands::migrate_storage,

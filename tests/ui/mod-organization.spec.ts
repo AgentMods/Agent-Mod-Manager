@@ -291,25 +291,31 @@ test("tag controls remain usable without horizontal overflow on a narrow screen 
   }
 });
 
-test("Mod organization language can be saved and switched back to follow the system", async ({ page }) => {
+test("the unified app language controls the UI and future Mod organization", async ({ page }) => {
   await installMockTauri(page);
   await page.goto("/");
+  const before = await page.evaluate((id) => (window as any).__TAURI_INTERNALS__.invoke("list_installs", { gameId: id }), gameId);
   await page.getByRole("button", { name: "设置", exact: true }).click();
   await page.getByRole("tab", { name: "外观与存储", exact: true }).click();
 
-  const locale = page.getByRole("combobox", { name: "Mod 整理目标语言", exact: true });
+  const locale = page.locator("#app-locale");
   await expect(locale).toHaveValue("");
   await expect(locale).toBeEnabled();
   await locale.selectOption("ja");
   await expect(locale).toHaveValue("ja");
   await expect.poll(async () => page.evaluate(() => (window as any).__AMM_TEST__.calls
-    .filter((call: any) => call.command === "set_mod_organization_locale")
+    .filter((call: any) => call.command === "set_app_locale")
     .map((call: any) => call.args))).toEqual([{ locale: "ja" }]);
+  expect(await page.evaluate(() => (window as any).__TAURI_INTERNALS__.invoke("get_app_locale")))
+    .toEqual({ locale: "ja", effective_locale: "ja" });
+  expect(await page.evaluate((id) => (window as any).__TAURI_INTERNALS__.invoke("list_installs", { gameId: id }), gameId))
+    .toEqual(before);
 
   await locale.selectOption("");
   await expect(locale).toHaveValue("");
-  await expect(locale.locator("option:checked")).toHaveText("跟随系统（简体中文）");
   await expect.poll(async () => page.evaluate(() => (window as any).__AMM_TEST__.calls
-    .filter((call: any) => call.command === "set_mod_organization_locale")
+    .filter((call: any) => call.command === "set_app_locale")
     .map((call: any) => call.args))).toEqual([{ locale: "ja" }, { locale: null }]);
+  expect(await page.evaluate((id) => (window as any).__TAURI_INTERNALS__.invoke("list_installs", { gameId: id }), gameId))
+    .toEqual(before);
 });

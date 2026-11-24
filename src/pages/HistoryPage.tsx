@@ -1,3 +1,6 @@
+import { conversationTitle } from "@/lib/conversation-groups";
+import { tr } from "@/lib/i18n";
+import { conversationCountSources } from "@/locales/plurals";
 import { useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArchiveIcon, ArchiveRestoreIcon, Clock3Icon, MessageSquareIcon, PinIcon, RefreshCwIcon, SearchIcon, XIcon } from "lucide-react";
@@ -25,7 +28,7 @@ export default function HistoryPage() {
   const gameNames = new Map((games.data ?? []).map((game) => [game.id, game.name]));
   const term = search.trim().toLocaleLowerCase();
   const rows = (conversations.data ?? []).filter((conversation) =>
-    [conversation.title, conversation.task_summary, conversation.game_id, conversation.game_id && gameNames.get(conversation.game_id)]
+    [conversationTitle(conversation), conversation.task_summary, conversation.game_id, conversation.game_id && gameNames.get(conversation.game_id)]
       .some((value) => value?.toLocaleLowerCase().includes(term)));
 
   async function toggleArchive(conversation: Conversation) {
@@ -38,7 +41,7 @@ export default function HistoryPage() {
       await api<void>("archive_conversation", {id: conversation.id, archived: next});
       await client.invalidateQueries({queryKey: ["conversations"]});
       await client.invalidateQueries({queryKey: ["conversation", conversation.id]});
-      notify(next ? "对话已归档" : "对话已取消归档");
+      notify(next ? tr("对话已归档") : tr("对话已取消归档"));
     } catch (failure) {
       setError(failure);
     } finally {
@@ -49,18 +52,18 @@ export default function HistoryPage() {
 
   const tab = archived ? "archived" : "active";
   return <Page data-testid="history-page" className="min-w-0">
-    <PageHeader title="历史对话" subtitle={!backendAvailable ? "桌面服务未连接" : conversations.data ? `${conversations.data.length} 个${archived ? "已归档" : "活动"}对话` : undefined}
-      actions={<IconButton title="刷新历史对话" variant="outline" size="icon" disabled={!backendAvailable || !!busyId || conversations.isFetching} onClick={() => { void conversations.refetch(); }}><RefreshCwIcon className={conversations.isFetching ? "animate-spin" : undefined}/></IconButton>}/>
+    <PageHeader title={tr("历史对话")} subtitle={!backendAvailable ? tr("桌面服务未连接") : conversations.data ? tr(conversationCountSources[tab], { length: conversations.data.length }) : undefined}
+      actions={<IconButton title={tr("刷新历史对话")} variant="outline" size="icon" disabled={!backendAvailable || !!busyId || conversations.isFetching} onClick={() => { void conversations.refetch(); }}><RefreshCwIcon className={conversations.isFetching ? "animate-spin" : undefined}/></IconButton>}/>
 
     <Tabs value={tab} onValueChange={(value) => { setArchived(value === "archived"); setError(null); }} className="min-w-0 gap-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <TabsList aria-label="对话状态">
-          <TabsTrigger value="active"><Clock3Icon/>活动对话</TabsTrigger>
-          <TabsTrigger value="archived"><ArchiveIcon/>已归档</TabsTrigger>
+        <TabsList aria-label={tr("对话状态")}>
+          <TabsTrigger value="active"><Clock3Icon/>{tr("活动对话")}</TabsTrigger>
+          <TabsTrigger value="archived"><ArchiveIcon/>{tr("已归档")}</TabsTrigger>
         </TabsList>
         <InputGroup className="max-w-full flex-1 basis-60 sm:max-w-sm">
           <InputGroupAddon><SearchIcon/></InputGroupAddon>
-          <InputGroupInput type="search" aria-label="搜索历史对话" placeholder="搜索标题、摘要或游戏" value={search} disabled={!backendAvailable} onChange={(event) => setSearch(event.target.value)}/>
+          <InputGroupInput type="search" aria-label={tr("搜索历史对话")} placeholder={tr("搜索标题、摘要或游戏")} value={search} disabled={!backendAvailable} onChange={(event) => setSearch(event.target.value)}/>
         </InputGroup>
       </div>
 
@@ -68,37 +71,37 @@ export default function HistoryPage() {
       <ErrorState error={games.error}/>
       <ErrorState error={error}/>
       <TabsContent value={tab} id="history-panel" aria-busy={conversations.isFetching || !!busyId} className="min-w-0">
-        {!backendAvailable ? <EmptyState title="桌面服务未连接"/> : conversations.isLoading ?
-          <div role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner/>正在读取历史对话…</div> :
-          rows.length > 0 ? <ItemGroup className="gap-2" aria-label={archived ? "已归档对话" : "活动对话"}>
+        {!backendAvailable ? <EmptyState title={tr("桌面服务未连接")}/> : conversations.isLoading ?
+          <div role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner/>{tr("正在读取历史对话…")}</div> :
+          rows.length > 0 ? <ItemGroup className="gap-2" aria-label={archived ? tr("已归档对话") : tr("活动对话")}>
             {rows.map((conversation) => <Item key={conversation.id} variant="outline" role="listitem" className="min-w-0">
-              <button type="button" aria-label={`打开对话：${conversation.title || "未命名对话"}`} disabled={!backendAvailable} onClick={() => openConversation(conversation.id)}
+              <button type="button" aria-label={tr("打开对话：{value1}", { value1: conversationTitle(conversation) })} disabled={!backendAvailable} onClick={() => openConversation(conversation.id)}
                 className="flex min-w-0 flex-[1_1_14rem] items-start gap-3 rounded-md text-left outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 disabled:opacity-50">
                 <ItemMedia variant="icon"><MessageSquareIcon/></ItemMedia>
                 <ItemContent className="min-w-0">
                   <ItemTitle className="flex-wrap break-words">
-                    {conversation.title || "未命名对话"}
-                    {conversation.pinned && <span title="已置顶" aria-label="已置顶"><PinIcon className="size-3.5 text-muted-foreground" aria-hidden="true"/></span>}
-                    {conversation.archived && <Badge>已归档</Badge>}
+                    {conversationTitle(conversation)}
+                    {conversation.pinned && <span title={tr("已置顶")} aria-label={tr("已置顶")}><PinIcon className="size-3.5 text-muted-foreground" aria-hidden="true"/></span>}
+                    {conversation.archived && <Badge>{tr("已归档")}</Badge>}
                   </ItemTitle>
                   {conversation.task_summary && <ItemDescription className="line-clamp-none break-words">{conversation.task_summary}</ItemDescription>}
                   <span className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                    <span>{conversation.game_id ? gameNames.get(conversation.game_id) ?? conversation.game_id : "未关联游戏"}</span>
-                    <span>{conversation.message_count} 条消息</span>
+                    <span>{conversation.game_id ? gameNames.get(conversation.game_id) ?? conversation.game_id : tr("未关联游戏")}</span>
+                    <span>{tr("{message_count} 条消息", { message_count: conversation.message_count })}</span>
                     <time dateTime={conversation.updated_at}>{date(conversation.updated_at)}</time>
                   </span>
                 </ItemContent>
               </button>
               <ItemActions>
-                <Button variant="outline" size="sm" title={`${conversation.archived ? "取消归档" : "归档"}：${conversation.title || "未命名对话"}`}
+                <Button variant="outline" size="sm" title={`${conversation.archived ? tr("取消归档") : tr("归档")}：${conversationTitle(conversation)}`}
                   disabled={!backendAvailable || !!busyId || conversations.isFetching || conversations.isError} onClick={() => { void toggleArchive(conversation); }}>
                   {busyId === conversation.id ? <Spinner data-icon="inline-start"/> : conversation.archived ? <ArchiveRestoreIcon data-icon="inline-start"/> : <ArchiveIcon data-icon="inline-start"/>}
-                  {conversation.archived ? "取消归档" : "归档"}
+                  {conversation.archived ? tr("取消归档") : tr("归档")}
                 </Button>
               </ItemActions>
             </Item>)}
-          </ItemGroup> : !conversations.isError && <EmptyState title={term ? "没有匹配的对话" : archived ? "暂无归档对话" : "暂无历史对话"}
-            action={term ? <Button variant="outline" onClick={() => setSearch("")}><XIcon data-icon="inline-start"/>清除搜索</Button> : undefined}/>}
+          </ItemGroup> : !conversations.isError && <EmptyState title={term ? tr("没有匹配的对话") : archived ? tr("暂无归档对话") : tr("暂无历史对话")}
+            action={term ? <Button variant="outline" onClick={() => setSearch("")}><XIcon data-icon="inline-start"/>{tr("清除搜索")}</Button> : undefined}/>}
       </TabsContent>
     </Tabs>
   </Page>;

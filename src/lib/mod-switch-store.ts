@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { isCancelledError, type QueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
 import { getReplayedAgentMilestones, subscribeAgentReplays, trackAgentTurn, useAgent } from "./agent-store";
@@ -190,19 +191,19 @@ function turnSettlement(entry: ModSwitchAction, events: AgentEvent[], done: Agen
         // receipt must itself identify both the game and the install exactly.
         if (call.name !== "forget_uninstalled_mod") continue;
         if (payload.name !== call.name || receipt.status !== "removed") {
-          failure = { outcome: "failed", detail: "Agent 未返回有效的删除回执。" };
+          failure = { outcome: "failed", detail: tr("Agent 未返回有效的删除回执。") };
         } else if (receipt.gameId !== entry.gameId || receipt.installId !== entry.installId) {
-          failure = { outcome: "failed", detail: "Agent 返回的删除目标与请求不符。" };
+          failure = { outcome: "failed", detail: tr("Agent 返回的删除目标与请求不符。") };
         } else {
           committed = { outcome: "committed", rollback: false };
         }
       } else if (receipt.status !== (call.name === "rollback_transaction" ? "rolled_back" : "committed")) {
-        failure = { outcome: "failed", detail: "Agent 未返回已提交的操作结果。" };
+        failure = { outcome: "failed", detail: tr("Agent 未返回已提交的操作结果。") };
       } else if ((receipt.gameId !== undefined && receipt.gameId !== entry.gameId) ||
           (receipt.artifactId !== undefined && receipt.artifactId !== entry.artifactId) ||
           (entry.kind === "uninstall" && receipt.installId !== undefined && receipt.installId !== entry.installId) ||
           (call.transactionId && receipt.transactionId !== undefined && receipt.transactionId !== call.transactionId)) {
-        failure = { outcome: "failed", detail: "Agent 返回的操作目标与请求不符。" };
+        failure = { outcome: "failed", detail: tr("Agent 返回的操作目标与请求不符。") };
       } else {
         committed = { outcome: "committed", installId: text(receipt.installId),
           transactionId: call.transactionId ?? text(receipt.transactionId), rollback: call.name === "rollback_transaction" };
@@ -213,13 +214,13 @@ function turnSettlement(entry: ModSwitchAction, events: AgentEvent[], done: Agen
   // state in that case, not the outcome of the model's final reply.
   if (committed) return committed;
   if (rejected) return { outcome: "rejected" };
-  if (done.payload.status === "interrupted") return { outcome: "failed", detail: text(done.payload.reason) ?? "任务已中断。" };
+  if (done.payload.status === "interrupted") return { outcome: "failed", detail: text(done.payload.reason) ?? tr("任务已中断。") };
   if (done.payload.status === "cancelled") return { outcome: "cancelled" };
   if (cancelled && !failure?.detail) return { outcome: "cancelled" };
   if (failure) return failure;
   if (done.payload.status === "error" || turnError) return { outcome: "failed", detail: turnError };
   if (entry.kind === "remove" && [...calls.values()].some(call => call.name === "forget_uninstalled_mod")) {
-    return { outcome: "failed", detail: "Agent 未返回有效的删除回执。" };
+    return { outcome: "failed", detail: tr("Agent 未返回有效的删除回执。") };
   }
   // This is a read-only outcome, not a successful uninstall or removal.
   return { outcome: filesMissing && ![...calls.values()].some(call => call.mutation) ? "files_missing" : "no_action" };
@@ -278,38 +279,38 @@ function removalFeedback(entry: Extract<ModSwitchAction, { kind: "remove" }>, se
   const target = `「${entry.name}」`;
   const row = rows.find(row => row.gameId === entry.gameId && row.id === entry.installId);
   if (settlement.outcome === "committed") {
-    return row ? `未能确认${target}的删除结果：收到删除回执，但该记录仍在管理列表中。`
-      : `${target}已从管理列表删除。`;
+    return row ? tr("未能确认{target}的删除结果：收到删除回执，但该记录仍在管理列表中。", { target })
+      : tr("{target}已从管理列表删除。", { target });
   }
 
-  const state = !row ? "管理列表中已无该记录，但没有有效删除回执，无法确认是否由本次任务删除。"
-    : row.status === "uninstalled" ? "该记录当前为已卸载，仍在管理列表中。"
-    : row.status === "rolled_back" ? "该记录当前为已回滚，仍在管理列表中。"
-    : "该记录仍在管理列表中。";
+  const state = !row ? tr("管理列表中已无该记录，但没有有效删除回执，无法确认是否由本次任务删除。")
+    : row.status === "uninstalled" ? tr("该记录当前为已卸载，仍在管理列表中。")
+    : row.status === "rolled_back" ? tr("该记录当前为已回滚，仍在管理列表中。")
+    : tr("该记录仍在管理列表中。");
   switch (settlement.outcome) {
-    case "rejected": return `已拒绝删除${target}。${state}`;
-    case "cancelled": return `已取消删除${target}。${state}`;
-    case "failed": return `未能确认${target}的删除结果。${settlement.detail ? ` ${settlement.detail} ` : ""}${state}`;
-    case "files_missing": return `${target}的安装文件已不在，Agent 未执行删除。${state}`;
-    case "no_action": return `Agent 已结束，未执行${target}的删除。${state}`;
+    case "rejected": return tr("已拒绝删除{target}。{state}", { target, state });
+    case "cancelled": return tr("已取消删除{target}。{state}", { target, state });
+    case "failed": return tr("未能确认{target}的删除结果。{value2}{state}", { target, value2: settlement.detail ? ` ${settlement.detail} ` : "", state });
+    case "files_missing": return tr("{target}的安装文件已不在，Agent 未执行删除。{state}", { target, state });
+    case "no_action": return tr("Agent 已结束，未执行{target}的删除。{state}", { target, state });
   }
 }
 
 function feedback(entry: PendingModSwitch, settlement: Settlement, rows: InstallRecord[]) {
   if (entry.kind === "remove") return removalFeedback(entry, settlement, rows);
-  const action = entry.kind === "install" ? "安装" : "卸载";
+  const action = entry.kind === "install" ? tr("安装") : tr("卸载");
   const target = `「${entry.name}」`;
   switch (settlement.outcome) {
     case "committed":
-      return isVerified(entry, settlement, rows) ? `${target}已${action}。` : `未能确认${target}的${action}结果：管理列表状态与操作回执不符。`;
-    case "rejected": return `已拒绝${action}${target}。`;
-    case "cancelled": return `已取消${action}${target}。`;
-    case "failed": return `${action}${target}失败。${settlement.detail ? ` ${settlement.detail}` : ""}`;
+      return isVerified(entry, settlement, rows) ? tr("{target}已{action}。", { target, action }) : tr("未能确认{target}的{action}结果：管理列表状态与操作回执不符。", { target, action });
+    case "rejected": return tr("已拒绝{action}{target}。", { action, target });
+    case "cancelled": return tr("已取消{action}{target}。", { action, target });
+    case "failed": return tr("{action}{target}失败。{value3}", { action, target, value3: settlement.detail ? ` ${settlement.detail}` : "" });
     case "files_missing":
       return rows.some(row => row.gameId === entry.gameId && row.id === entry.installId)
-        ? `${target}的安装文件已不在，管理记录已保留。`
-        : `${target}的安装文件已不在，但未能确认管理记录仍在列表中。`;
-    case "no_action": return `Agent 已结束，未执行${target}的${action}。`;
+        ? tr("{target}的安装文件已不在，管理记录已保留。", { target })
+        : tr("{target}的安装文件已不在，但未能确认管理记录仍在列表中。", { target });
+    case "no_action": return tr("Agent 已结束，未执行{target}的{action}。", { target, action });
   }
 }
 
@@ -367,7 +368,7 @@ export function syncModSwitches(client: QueryClient, notify: (message: string) =
       event.seq > startSeq && typeof event.payload.historyThroughSeq === "number" && event.payload.historyThroughSeq < startSeq)) return [];
     startSeqs.delete(key);
     return entries.map(entry => ({ ...entry, status: "verifying",
-      settlement: { outcome: "failed", detail: "原任务已被重试或编辑；请核对当前状态。" } }));
+      settlement: { outcome: "failed", detail: tr("原任务已被重试或编辑；请核对当前状态。") } }));
   }
 
   function completeReadback(gameId: string, entries: Readback[], result: { rows: InstallRecord[] } | { error: unknown }) {
@@ -380,8 +381,8 @@ export function syncModSwitches(client: QueryClient, notify: (message: string) =
         delete next[entry.id];
         notices.push({ entry, message: feedback(entry, entry.settlement, result.rows) });
       } else {
-        const state = entry.kind === "remove" ? "管理列表" : "安装状态";
-        const message = `无法读取「${entry.name}」的最新${state}：${errorText(result.error)}。可重试读取。`;
+        const state = entry.kind === "remove" ? tr("管理列表") : tr("安装状态");
+        const message = tr("无法读取「{name}」的最新{state}：{value3}。可重试读取。", { name: entry.name, state, value3: errorText(result.error) });
         next[entry.id] = { ...entry, status: "readback_failed", error: message };
         notices.push({ entry, message });
       }
@@ -400,7 +401,7 @@ export function syncModSwitches(client: QueryClient, notify: (message: string) =
         const rows = await api<InstallRecord[]>("list_installs", { gameId });
         if (!Array.isArray(rows) || rows.some(row => !row || row.gameId !== gameId ||
             typeof row.id !== "string" || typeof row.status !== "string")) {
-          throw new Error("安装列表返回无效数据。");
+          throw new Error(tr("安装列表返回无效数据。"));
         }
         return rows;
       },

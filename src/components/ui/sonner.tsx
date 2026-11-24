@@ -6,13 +6,16 @@ import {
   TriangleAlertIcon,
 } from "lucide-react"
 import { Toaster as Sonner, type ToasterProps } from "sonner"
+import { tr, useLocale } from "@/lib/i18n"
 import { useUI } from "@/lib/store"
 
 const Toaster = ({ ...props }: ToasterProps) => {
+  useLocale();
   const theme = useUI((state) => state.theme)
 
   return (
     <Sonner
+      containerAriaLabel={tr("通知")}
       theme={theme}
       className="toaster group"
       icons={{

@@ -339,16 +339,21 @@ use crate::{
     agent::{
         approval::ApprovalResponse,
         events::AgentEvent,
-        runtime::{AgentRuntime, TurnRequest},
+        runtime::{AgentRuntime, PromptOrigin, TurnRequest},
     },
     history::{Conversation, ConversationDetail, History},
     settings::AppSettings,
 };
 
 #[tauri::command]
-pub async fn start_turn(state: State<'_, AgentRuntime>, request: TurnRequest) -> AppResult<String> {
-    let turn_id = blocking(state.inner().clone(), move |agent| {
-        agent.start_turn(request)
+pub async fn start_turn(
+    state: State<'_, AgentRuntime>,
+    request: TurnRequest,
+    origin: Option<PromptOrigin>,
+) -> AppResult<String> {
+    let turn_id = blocking(state.inner().clone(), move |agent| match origin {
+        Some(origin) => agent.start_turn_with_origin(request, origin),
+        None => agent.start_turn(request),
     })
     .await?;
     crate::analytics::track("agent_turn_accepted");
@@ -820,7 +825,12 @@ pub async fn open_game_location(
             return app
                 .opener()
                 .reveal_item_in_dir(&directory)
-                .map_err(|error| AppError::Other(format!("无法打开目录: {error}")));
+                .map_err(|error| {
+                    AppError::Presented(crate::error::NativeMessage::new(
+                        "game.open_folder_failed",
+                        [("detail", error.to_string())],
+                    ))
+                });
         }
         let directory = user_path(&directory)
             .into_owned()
@@ -829,7 +839,12 @@ pub async fn open_game_location(
             .map_err(|_| AppError::Invalid("目录路径包含无法表示的字符".into()))?;
         app.opener()
             .open_path(directory, None::<&str>)
-            .map_err(|error| AppError::Other(format!("无法打开目录: {error}")))
+            .map_err(|error| {
+                AppError::Presented(crate::error::NativeMessage::new(
+                    "game.open_folder_failed",
+                    [("detail", error.to_string())],
+                ))
+            })
     })
     .await
 }
@@ -883,6 +898,19 @@ pub(crate) async fn migrate_storage(
     storage.schedule(&state.engine, &parent)?;
     app.request_restart();
     Ok(())
+}
+
+#[tauri::command]
+pub fn get_app_locale(state: State<'_, AppServices>) -> AppResult<crate::app_locale::AppLocale> {
+    crate::app_locale::get(&state.engine.db)
+}
+
+#[tauri::command]
+pub fn set_app_locale(
+    state: State<'_, AppServices>,
+    locale: Option<String>,
+) -> AppResult<crate::app_locale::AppLocale> {
+    crate::app_locale::set(&state.engine.db, locale)
 }
 
 #[tauri::command]

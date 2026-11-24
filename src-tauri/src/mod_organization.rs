@@ -184,7 +184,7 @@ pub fn set_mod_tags(db: &Db, game_id: &str, install_id: &str, tag_ids: &[String]
 }
 
 pub(crate) fn stage(db: &Db, metadata: &mut Value, suggestion: Option<OrganizationSuggestion>) {
-    let locale = crate::settings::mod_organization_locale(db);
+    let locale = crate::app_locale::effective(db);
     let display_name = suggestion
         .as_ref()
         .and_then(|value| clean(&value.display_name, 200));
@@ -262,8 +262,9 @@ pub fn finalize(tx: &Transaction<'_>, transaction_id: &str) -> AppResult<bool> {
     let stable = |field: &str| metadata[field].as_str().filter(|value| !value.is_empty());
     // An explicit replacement wins; otherwise use catalog/library identity or an
     // exact local artifact digest. Names and paths are never identity keys.
-    let prior: Option<(String,Option<String>,bool)> = tx.query_row("SELECT p.id,json_extract(CASE WHEN json_valid(p.metadata_json) THEN p.metadata_json END,'$.organization.locale'),coalesce(o.tags_edited,0)
+    let prior: Option<(String,Option<String>,bool)> = tx.query_row("SELECT p.id,coalesce(j.locale,json_extract(CASE WHEN json_valid(p.metadata_json) THEN p.metadata_json END,'$.organization.locale')),coalesce(o.tags_edited,0)
        FROM installs p LEFT JOIN install_organizations o ON o.install_id=p.id
+       LEFT JOIN mod_organization_jobs j ON j.install_id=p.id
        LEFT JOIN install_transactions a ON a.install_id=p.id AND a.action='install'
        LEFT JOIN file_transactions f ON f.id=a.transaction_id
        WHERE p.game_id=?1 AND p.id<>?2 AND (f.status='committed' OR (f.status='rolled_back' AND o.install_id IS NOT NULL) OR (a.install_id IS NULL AND p.status NOT IN ('planned','rolled_back')))
@@ -275,14 +276,14 @@ pub fn finalize(tx: &Transaction<'_>, transaction_id: &str) -> AppResult<bool> {
          coalesce(f.finished_at,p.installed_at) DESC,p.rowid DESC LIMIT 1",
        params![game_id,id,transaction_id,stable("libraryEntryId"),source,stable("sourceModId"),stable("artifactSha256")],
        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
-    let suggestion = &metadata["organization"];
-    let legacy_locale;
-    let locale = match suggestion["locale"].as_str() {
-        Some(staged) => staged,
-        None => {
-            legacy_locale = crate::settings::effective_mod_locale(tx);
-            &legacy_locale
-        }
+    // A new job uses the current app language; suggestions staged before a
+    // language change must not populate display names and tags in the old language.
+    let locale = &crate::app_locale::effective_conn(tx);
+    let staged = &metadata["organization"];
+    let suggestion = if staged["locale"].as_str() == Some(locale) {
+        staged
+    } else {
+        &Value::Null
     };
     tx.execute(
         "INSERT INTO mod_organization_jobs(install_id,locale) VALUES (?1,?2)",

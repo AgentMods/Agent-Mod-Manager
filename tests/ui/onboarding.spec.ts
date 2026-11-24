@@ -288,15 +288,16 @@ test.describe("首次启动引导", () => {
 
     const registrations = () => page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "register_game"));
     expect(await registrations()).toHaveLength(0);
-    await expect(fixture.getByRole("button", {name: "添加", exact: true})).toBeDisabled();
-    await broken.getByRole("checkbox", {name: "选择 Broken Fixture"}).check();
+    await expect(fixture.getByRole("button", {name: "添加", exact: true})).toBeEnabled();
+    await expect(broken.getByRole("button", {name: "添加", exact: true})).toBeEnabled();
     await broken.getByRole("button", {name: "添加", exact: true}).click();
     await expect(broken.getByRole("alert")).toContainText("目录已变化，请重新扫描");
     await expect(fixture).toBeVisible();
+    await expect(fixture.getByText("管理中", {exact: true})).toHaveCount(0);
 
-    await fixture.getByRole("checkbox", {name: "选择 Fixture Game"}).check();
     await fixture.getByRole("button", {name: "添加", exact: true}).click();
     await expect(fixture.getByText("管理中", {exact: true})).toBeVisible();
+    await expect(broken.getByText("管理中", {exact: true})).toHaveCount(0);
     await expect(broken.getByRole("button", {name: "添加", exact: true})).toBeEnabled();
     const calls = await page.evaluate(() => (window as any).__AMM_TEST__.calls.map((call: any) => call.command));
     expect(calls.filter((command: string) => command === "start_onboarding")).toHaveLength(1);
@@ -311,10 +312,23 @@ test.describe("首次启动引导", () => {
     await page.goto("/");
     await continueToGameScan(page);
     await page.getByRole("button", {name: "扫描已安装游戏"}).click();
-    const broken = page.getByRole("listitem").filter({hasText: "Broken Fixture"});
-    await broken.getByRole("checkbox", {name: "选择 Broken Fixture"}).check();
-    await broken.getByRole("button", {name: "添加", exact: true}).click();
+    const directory = "/sandbox/steam/Broken";
+    const rows = page.getByRole("list", {name: "扫描候选游戏", exact: true});
+    // Registration can replace the discovery title with the library name; the directory stays the same.
+    const broken = rows.getByRole("listitem").filter({has: page.getByText(directory, {exact: true})});
+    const add = broken.getByRole("button", {name: "添加", exact: true});
+    await expect(add).toBeEnabled();
+    await add.click();
     await expect(broken.getByText("管理中", {exact: true})).toBeVisible();
+    await expect(broken.getByText("Broken", {exact: true})).toBeVisible();
+    await expect(broken.getByText("未关联适配包", {exact: true})).toBeVisible();
+    await expect(broken.getByRole("button", {name: "添加", exact: true})).toHaveCount(0);
+    const fixture = rows.getByRole("listitem").filter({has: page.getByText("/sandbox/steam/Fixture", {exact: true})});
+    await expect(fixture.getByRole("button", {name: "添加", exact: true})).toBeEnabled();
+    await expect(fixture.getByText("管理中", {exact: true})).toHaveCount(0);
+    const registrations = await page.evaluate(() => (window as any).__AMM_TEST__.calls
+      .filter((call: any) => call.command === "register_game").map((call: any) => call.args));
+    expect(registrations).toEqual([{directory, adapterSlug: null, fromDiscovery: true}]);
     await page.getByRole("button", {name: "下一步", exact: true}).click();
     await expectOnboardingStep(page, 4);
     await expect(page.getByText("1 款游戏", {exact: true})).toBeVisible();

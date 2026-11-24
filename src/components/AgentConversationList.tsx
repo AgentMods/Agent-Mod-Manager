@@ -1,8 +1,10 @@
+import { getLocale, useLocale, tr } from "@/lib/i18n";
+import { conversationCountSources } from "@/locales/plurals";
 import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { ArchiveIcon, ChevronRightIcon, CircleCheckIcon, CircleHelpIcon, EllipsisIcon, LoaderCircleIcon, SquarePenIcon, PencilIcon, PinIcon, PinOffIcon, ShieldIcon, Trash2Icon } from "lucide-react";
 import { api } from "@/lib/api";
-import { conversationCategoryLabels, groupConversations, type ConversationGroup } from "@/lib/conversation-groups";
+import { conversationCategoryLabels, conversationTitle, groupConversations, type ConversationGroup } from "@/lib/conversation-groups";
 import { type AgentConversationStatus, useAgentConversationStatuses } from "@/lib/agent-conversation-status";
 import { useUI } from "@/lib/store";
 import type { Conversation } from "@/lib/types";
@@ -32,18 +34,18 @@ interface Props {
 
 type Action = "rename" | "pin" | "archive" | "delete";
 const successMessages = {
-  rename: "对话已重命名",
-  pin: "对话已置顶",
-  archive: "对话已归档",
-  delete: "对话已删除",
+  get rename() { return tr("对话已重命名"); },
+  get pin() { return tr("对话已置顶"); },
+  get archive() { return tr("对话已归档"); },
+  get delete() { return tr("对话已删除"); },
 };
 
 const statusIndicators = {
-  running: { text: "进行中", Icon: LoaderCircleIcon, color: "text-agent-running" },
-  completed: { text: "已完成", Icon: CircleCheckIcon, color: "text-success" },
-  "waiting-answer": { text: "等待回答", Icon: CircleHelpIcon, color: "text-agent-question" },
-  "waiting-input": { text: "等待输入", Icon: SquarePenIcon, color: "text-muted-foreground" },
-  "waiting-approval": { text: "等待授权", Icon: ShieldIcon, color: "text-warning" },
+  running: { get text() { return tr("进行中"); }, Icon: LoaderCircleIcon, color: "text-agent-running" },
+  completed: { get text() { return tr("已完成"); }, Icon: CircleCheckIcon, color: "text-success" },
+  "waiting-answer": { get text() { return tr("等待回答"); }, Icon: CircleHelpIcon, color: "text-agent-question" },
+  "waiting-input": { get text() { return tr("等待输入"); }, Icon: SquarePenIcon, color: "text-muted-foreground" },
+  "waiting-approval": { get text() { return tr("等待授权"); }, Icon: ShieldIcon, color: "text-warning" },
 } satisfies Record<AgentConversationStatus, { text: string; Icon: typeof CircleCheckIcon; color: string }>;
 
 function ConversationStatus({ id, status }: { id: string; status: AgentConversationStatus }) {
@@ -89,7 +91,8 @@ function CategoryDisclosure({ group, selectedId, statuses, renderRow }: {
           <span>{label}</span>
           <span id={descriptionId} className="ms-auto flex items-center gap-2 text-xs text-muted-foreground tabular-nums">
             {activeStatus && <ConversationStatus id={`${descriptionId}-status`} status={activeStatus} />}
-            {rows.length}<span className="sr-only">个对话{!open && selectedMember ? "，含当前对话" : ""}</span>
+            <span aria-hidden="true">{rows.length.toLocaleString(getLocale())}</span>
+            <span className="sr-only">{tr(conversationCountSources.group, { length: rows.length })}{!open && selectedMember ? tr("，含当前对话") : ""}</span>
           </span>
         </Button>
       </CollapsibleTrigger>
@@ -103,6 +106,7 @@ function CategoryDisclosure({ group, selectedId, statuses, renderRow }: {
 }
 
 export const AgentConversationList = memo(function AgentConversationList({ conversations, selectedId, disabled, onSelect }: Props) {
+  useLocale();
   const client = useQueryClient();
   const notify = useUI((state) => state.notify);
   const statuses = useAgentConversationStatuses(conversations);
@@ -118,7 +122,7 @@ export const AgentConversationList = memo(function AgentConversationList({ conve
 
   function launch(action: "rename" | "delete", conversation: Conversation) {
     setError(null);
-    setTitle(conversation.title);
+    setTitle(conversationTitle(conversation));
     setDialog({ action, conversation });
   }
 
@@ -153,7 +157,7 @@ export const AgentConversationList = memo(function AgentConversationList({ conve
       else void client.invalidateQueries({ queryKey: ["conversation", id] });
       await client.invalidateQueries({ queryKey: ["conversations"] });
       setDialog(null);
-      notify(action === "pin" && conversation.pinned ? "已取消置顶" : successMessages[action]);
+      notify(action === "pin" && conversation.pinned ? tr("已取消置顶") : successMessages[action]);
     } catch (failure) {
       setError(failure);
     } finally {
@@ -167,7 +171,7 @@ export const AgentConversationList = memo(function AgentConversationList({ conve
   function renderConversation(conversation: Conversation, index: number) {
     // The group already names the operation; leave more space for the Mod name.
     const label = !conversation.pinned && conversation.category ? conversationCategoryLabels[conversation.category] : null;
-    const title = conversation.title;
+    const title = conversationTitle(conversation);
     const visibleTitle = label && (title.startsWith(label + "：") || title.startsWith(label + ":"))
       ? title.slice(label.length + 1).trim() || title : title;
     const current = conversation.id === selectedId;
@@ -179,7 +183,7 @@ export const AgentConversationList = memo(function AgentConversationList({ conve
       <Tooltip>
         <TooltipTrigger asChild>
           <Button type="button" variant="ghost" size="sm" disabled={disabled || pending} aria-current={current || undefined}
-            aria-label={conversation.title} aria-describedby={state ? statusId : undefined} onClick={() => onSelect(conversation.id)}
+            aria-label={title} aria-describedby={state ? statusId : undefined} onClick={() => onSelect(conversation.id)}
             className="min-w-0 flex-1 justify-start text-left">
             {conversation.pinned && <PinIcon aria-hidden="true" className="text-muted-foreground" />}
             <span className="min-w-0 truncate" title={title}>{visibleTitle}</span>
@@ -191,7 +195,7 @@ export const AgentConversationList = memo(function AgentConversationList({ conve
       <DropdownMenu modal={false}>
         <DropdownMenuTrigger asChild>
           <Button type="button" size="icon-xs" variant="ghost" className="shrink-0 text-muted-foreground"
-            aria-label={`对话操作：${conversation.title}`} disabled={disabled || pending}
+            aria-label={tr("对话操作：{title}", { title })} disabled={disabled || pending}
             onPointerDown={(event) => { opener.current = event.currentTarget; }}
             onFocus={(event) => { opener.current = event.currentTarget; }}>
             <EllipsisIcon aria-hidden="true" />
@@ -201,14 +205,14 @@ export const AgentConversationList = memo(function AgentConversationList({ conve
           if (dialog) event.preventDefault();
         }}>
           <DropdownMenuGroup>
-            <DropdownMenuItem onSelect={() => launch("rename", conversation)}><PencilIcon />重命名</DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => launch("rename", conversation)}><PencilIcon />{tr("重命名")}</DropdownMenuItem>
             <DropdownMenuItem onSelect={() => void apply("pin", conversation)}>
-              <PinActionIcon />{conversation.pinned ? "取消置顶" : "置顶"}
+              <PinActionIcon />{conversation.pinned ? tr("取消置顶") : tr("置顶")}
             </DropdownMenuItem>
-            <DropdownMenuItem disabled={state?.active} onSelect={() => void apply("archive", conversation)}><ArchiveIcon />归档</DropdownMenuItem>
+            <DropdownMenuItem disabled={state?.active} onSelect={() => void apply("archive", conversation)}><ArchiveIcon />{tr("归档")}</DropdownMenuItem>
           </DropdownMenuGroup>
           <DropdownMenuSeparator />
-          <DropdownMenuItem variant="destructive" disabled={state?.active} onSelect={() => launch("delete", conversation)}><Trash2Icon />删除</DropdownMenuItem>
+          <DropdownMenuItem variant="destructive" disabled={state?.active} onSelect={() => launch("delete", conversation)}><Trash2Icon />{tr("删除")}</DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
     </li>;
@@ -218,7 +222,7 @@ export const AgentConversationList = memo(function AgentConversationList({ conve
     const grouped = entries.some(entry => "rows" in entry);
     return <div className="flex min-w-0 flex-col gap-2">
       <div className="flex items-center justify-between px-2 text-xs font-medium text-muted-foreground">
-        <span>{label}</span><span className="tabular-nums">{count}</span>
+        <span>{label}</span><span className="tabular-nums">{count.toLocaleString(getLocale())}</span>
       </div>
       <ul aria-label={label} className={cn("flex gap-1 md:flex-col", grouped ? "flex-col" : "overflow-x-auto md:overflow-visible")}>
         {entries.map((entry, index) => "rows" in entry
@@ -229,29 +233,29 @@ export const AgentConversationList = memo(function AgentConversationList({ conve
   }
 
   return <div ref={list} tabIndex={-1} className="flex flex-col gap-3 outline-none">
-    {pinned.length > 0 && renderSection("置顶对话", pinned, pinned.length)}
-    {(recent.length > 0 || !pinned.length) && renderSection("最近对话", recent, conversations.length - pinned.length)}
-    {!conversations.length && <p className="px-2 text-xs text-muted-foreground">还没有已保存的对话</p>}
+    {pinned.length > 0 && renderSection(tr("置顶对话"), pinned, pinned.length)}
+    {(recent.length > 0 || !pinned.length) && renderSection(tr("最近对话"), recent, conversations.length - pinned.length)}
+    {!conversations.length && <p className="px-2 text-xs text-muted-foreground">{tr("还没有已保存的对话")}</p>}
     {!dialog && <ErrorState error={error} />}
     <Dialog open={dialog?.action === "rename"} onOpenChange={closeDialog}>
       <DialogContent onCloseAutoFocus={restoreFocus} showCloseButton={!pending}>
         <DialogHeader>
-          <DialogTitle>重命名对话</DialogTitle>
-          <DialogDescription>输入 1–60 个字符的对话名称。</DialogDescription>
+          <DialogTitle>{tr("重命名对话")}</DialogTitle>
+          <DialogDescription>{tr("输入 1–60 个字符的对话名称。")}</DialogDescription>
         </DialogHeader>
         <form className="flex flex-col gap-4" onSubmit={(event) => {
           event.preventDefault();
           if (validTitle && dialog?.action === "rename") void apply("rename", dialog.conversation);
         }}>
           <Field>
-            <FieldLabel htmlFor={titleId}>对话名称</FieldLabel>
+            <FieldLabel htmlFor={titleId}>{tr("对话名称")}</FieldLabel>
             <Input id={titleId} value={title} onChange={(event) => setTitle(event.target.value)} disabled={pending}
               onFocus={(event) => event.currentTarget.select()} />
           </Field>
           <ErrorState error={error} />
           <DialogFooter>
-            <Button variant="outline" type="button" disabled={pending} onClick={() => closeDialog(false)}>取消</Button>
-            <Button type="submit" disabled={!validTitle || pending}>{pending ? "保存中…" : "保存"}</Button>
+            <Button variant="outline" type="button" disabled={pending} onClick={() => closeDialog(false)}>{tr("取消")}</Button>
+            <Button type="submit" disabled={!validTitle || pending}>{pending ? tr("保存中…") : tr("保存")}</Button>
           </DialogFooter>
         </form>
       </DialogContent>
@@ -259,17 +263,15 @@ export const AgentConversationList = memo(function AgentConversationList({ conve
     <AlertDialog open={dialog?.action === "delete"} onOpenChange={closeDialog}>
       <AlertDialogContent onCloseAutoFocus={restoreFocus}>
         <AlertDialogHeader>
-          <AlertDialogTitle>删除对话</AlertDialogTitle>
-          <AlertDialogDescription className="wrap-anywhere">
-            将永久删除「{dialog?.conversation.title}」及其消息。已执行的游戏文件操作仍可在事务记录中查看。
-          </AlertDialogDescription>
+          <AlertDialogTitle>{tr("删除对话")}</AlertDialogTitle>
+          <AlertDialogDescription className="wrap-anywhere">{tr("将永久删除「{title}」及其消息。已执行的游戏文件操作仍可在事务记录中查看。", { title: dialog && conversationTitle(dialog.conversation) })}</AlertDialogDescription>
         </AlertDialogHeader>
         <ErrorState error={error} />
         <AlertDialogFooter>
-          <AlertDialogCancel disabled={pending}>取消</AlertDialogCancel>
+          <AlertDialogCancel disabled={pending}>{tr("取消")}</AlertDialogCancel>
           <Button variant="destructive" disabled={pending} onClick={() => {
             if (dialog?.action === "delete") void apply("delete", dialog.conversation);
-          }}>{pending ? "删除中…" : "删除对话"}</Button>
+          }}>{pending ? tr("删除中…") : tr("删除对话")}</Button>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>

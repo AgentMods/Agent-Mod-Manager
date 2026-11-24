@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useEffect, useState, type ReactNode } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { FolderOpenIcon } from "lucide-react";
@@ -34,7 +35,7 @@ export function StorageDirectory({ onBusyChange, onMigrationRequest, renderExtra
     setChoosing(true);
     setStorageError(null);
     try {
-      const selected = await open({ directory: true, multiple: false, title: "选择存储位置" });
+      const selected = await open({ directory: true, multiple: false, title: tr("选择存储位置") });
       if (typeof selected === "string" && selected) setParent(selected);
     } catch (error) {
       setStorageError(error);
@@ -60,27 +61,27 @@ export function StorageDirectory({ onBusyChange, onMigrationRequest, renderExtra
 
   return <div className="flex min-w-0 flex-col items-start gap-4">
     <div className="grid min-w-0 gap-1.5 self-stretch rounded-lg border bg-muted/30 px-4 py-3">
-      <span className="text-sm font-medium">当前存储目录</span>
-      <PathText>{currentRoot ? displayPath(currentRoot) : "未连接桌面服务"}</PathText>
+      <span className="text-sm font-medium">{tr("当前存储目录")}</span>
+      <PathText>{currentRoot ? displayPath(currentRoot) : tr("未连接桌面服务")}</PathText>
     </div>
     <div className="flex flex-wrap gap-2">
-      <Button variant="outline" disabled={disabled} onClick={chooseStorage}><FolderOpenIcon data-icon="inline-start" />更改存储目录</Button>
+      <Button variant="outline" disabled={disabled} onClick={chooseStorage}><FolderOpenIcon data-icon="inline-start" />{tr("更改存储目录")}</Button>
       {renderExtraActions?.(disabled)}
     </div>
-    <ErrorState error={bootstrap.error || (previousError && `迁移失败，仍在使用原目录。${previousError}`) || (!parent && storageError)} />
+    <ErrorState error={bootstrap.error || (previousError && tr("迁移失败，仍在使用原目录。{previousError}", { previousError })) || (!parent && storageError)} />
     <AlertDialog open={parent !== null} onOpenChange={(open) => { if (!open && !restarting) setParent(null); }}>
       <AlertDialogContent>
         <AlertDialogHeader>
-          <AlertDialogTitle>迁移存储目录</AlertDialogTitle>
-          <AlertDialogDescription>应用将重启并把管理器数据复制到下方的新目录。原目录会保留为备份。</AlertDialogDescription>
+          <AlertDialogTitle>{tr("迁移存储目录")}</AlertDialogTitle>
+          <AlertDialogDescription>{tr("应用将重启并把管理器数据复制到下方的新目录。原目录会保留为备份。")}</AlertDialogDescription>
         </AlertDialogHeader>
         {parent && <PathText>{displayPath(appendPathLeaf(parent, "Agent Mod Manager"))}</PathText>}
         <ErrorState error={storageError} />
         <AlertDialogFooter>
-          <AlertDialogCancel disabled={restarting}>取消</AlertDialogCancel>
+          <AlertDialogCancel disabled={restarting}>{tr("取消")}</AlertDialogCancel>
           <Button disabled={restarting || !currentRoot} onClick={migrateStorage}>
             {restarting && <Spinner data-icon="inline-start" />}
-            {restarting ? "正在重启…" : "迁移并重启"}
+            {restarting ? tr("正在重启…") : tr("迁移并重启")}
           </Button>
         </AlertDialogFooter>
       </AlertDialogContent>

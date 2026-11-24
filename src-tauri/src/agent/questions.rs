@@ -93,12 +93,12 @@ pub(super) fn schema() -> Value {
                         },
                         "multiSelect": {
                             "type": "boolean", "default": false,
-                            "description": "仅在提供 options 且多个选项可同时选择时设为 true；默认单选"
+                            "description": "Set true only when options are provided and more than one can be selected together. Defaults to single choice."
                         }
                     }
                 }
             },
-            "question": {"type": "string", "minLength": 1, "description": "仅用于兼容旧版单题；新请求请用 questions，且不要与 questions 或 title 同时提供"}
+            "question": {"type": "string", "minLength": 1, "description": "Legacy single question only. Use questions for new requests. Do not combine this field with questions or title."}
         },
         "required": ["questions"],
         "additionalProperties": false

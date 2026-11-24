@@ -36,13 +36,10 @@ async function installBatchProtocolMock(page: Page) {
       if (!transport || transport.invoke.__batchProtocolWrapped) return;
       const invoke = transport.invoke;
       const wrapped = async (command: string, args: Record<string, any> = {}) => {
-        const content = args.request?.content;
-        const match = command === "start_turn" && typeof content === "string"
-          ? /目标（精确 ID）：(\[[^\n]+\])。/.exec(content)
-          : null;
-        if (!match) return invoke(command, args);
-        const targets = JSON.parse(match[1]);
-        if (!Array.isArray(targets) || targets.length === 0) return invoke(command, args);
+        const origin = args.origin;
+        if (command !== "start_turn" || origin?.kind !== "mod_request" || !origin.batch || !origin.targets.length) {
+          return invoke(command, args);
+        }
 
         const controls = target.__AMM_TEST__;
         const failuresRemaining = controls.batchStartFailuresRemaining ?? 0;
@@ -52,13 +49,10 @@ async function installBatchProtocolMock(page: Page) {
           throw new Error("模拟批量 Agent 启动失败");
         }
 
-        // The shared mock understands one target. Preserve the actual batch call
-        // for assertions, and translate only the protocol presented to that mock.
+        // The shared mock simulates one target. Preserve the real request and
+        // its provenance for history and return them unchanged in assertions.
         const callStart = controls.calls.length;
-        const mockArgs = {
-          ...args,
-          request: {...args.request, content: content.replace(match[1], JSON.stringify(targets[0]))},
-        };
+        const mockArgs = { ...args, mockFirstBatchTarget: true };
         try {
           return await invoke(command, mockArgs);
         } finally {
@@ -92,6 +86,7 @@ async function expectBatchSession(page: Page, category: "install" | "uninstall" 
   const starts = await calls(page, "start_turn");
   expect(starts).toHaveLength(1);
   expect(exactTargets(starts[0])).toEqual(targets);
+  expect(starts[0].args.origin).toEqual({ kind: "mod_request", version: 1, action: category, batch: true, targets });
   expect(starts[0].args.request.permissionMode).toBeNull();
 
   const conversations = await calls(page, "create_conversation");
@@ -152,7 +147,7 @@ async function addEnabledRecord(page: Page) {
     const invoke = target.__TAURI_INTERNALS__.invoke;
     target.__TAURI_INTERNALS__.invoke = async (command: string, args: Record<string, any> = {}) => {
       if (command === "start_turn" && args.request?.content?.includes('"installId":"install-second-fixture"') &&
-          !args.request.content.includes("精确 ID）：[")) {
+          !args.origin?.batch) {
         target.__AMM_TEST__.calls.push({command, args});
         return "turn-second-fixture";
       }
@@ -262,7 +257,7 @@ test("batch install skips a row that already has an Agent action in progress", a
   await page.getByRole("button", {name: "批量安装", exact: true}).click();
   await expect.poll(async () => (await calls(page, "start_turn")).length).toBe(2);
   const starts = await calls(page, "start_turn");
-  const batchStart = starts.find((call: any) => call.args.request.content.includes("精确 ID）：["));
+  const batchStart = starts.find((call: any) => call.args.origin?.batch);
   expect(batchStart).toBeDefined();
   expect(exactTargets(batchStart)).toEqual([{gameId, artifactId: archives[0].artifactId}]);
   expect(await calls(page, "create_conversation")).toHaveLength(2);

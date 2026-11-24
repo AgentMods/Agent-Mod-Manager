@@ -198,20 +198,19 @@ test("首次设置等待云目录后以 release.gameName 显示并注册", async
   });
   await startOnboardingScan(page);
   const row = page.getByRole("listitem").filter({ has: page.getByText(steam.rootPath, { exact: true }) });
-  await expect(row.getByRole("checkbox", { name: `选择 ${scannedName}`, exact: true })).toBeVisible();
+  await expect(row.getByText(scannedName, { exact: true })).toBeVisible();
   const waitingButton = row.getByRole("button", { name: "正在匹配…", exact: true });
   await expect(waitingButton).toBeVisible();
   await expect(waitingButton).toBeDisabled();
+  await expect(row.getByRole("button", { name: "仅添加本地", exact: true })).toBeEnabled();
   await page.evaluate(() => (window as any).__AMM_TEST__.releaseManagerPluginCatalog());
 
-  const checkbox = row.getByRole("checkbox", { name: `选择 ${gameName}`, exact: true });
-  await expect(checkbox).toBeVisible();
   await expect(row.getByText(scannedName, { exact: true })).toHaveCount(0);
   await expect(row.getByText(gameName, { exact: true })).toBeVisible();
   await expect(row.locator("p").filter({ hasText: pluginTitle })).toBeVisible();
   await expect(row.getByText("云端已匹配", { exact: true })).toBeVisible();
 
-  await checkbox.check();
+  await expect(row.getByRole("button", { name: "添加", exact: true })).toBeEnabled();
   await row.getByRole("button", { name: "添加", exact: true }).click();
   await expect(row.getByText("管理中", { exact: true })).toBeVisible();
   expect(await commandArgs(page, "register_game")).toMatchObject([{
@@ -278,11 +277,11 @@ test("首次设置的云适配包添加失败后可重试，成功仍按 Game �
   await expect(row.locator("p").filter({ hasText: cloudPluginName })).toBeVisible();
   await expect(row.getByText("云端已匹配", { exact: true })).toBeVisible();
   await expect(row).toContainText(cloudPluginName);
-  await expect(row.getByRole("button", { name: "添加", exact: true })).toBeDisabled();
-  await expect(row.getByRole("button", { name: "添加", exact: true })).toHaveCount(1);
+  const add = row.getByRole("button", { name: "添加", exact: true });
+  await expect(add).toHaveCount(1);
   await expect(row.getByRole("button", { name: "联网识别", exact: true })).toHaveCount(0);
-  await row.getByRole("checkbox", { name: `选择 ${matchedGameName}`, exact: true }).check();
-  await row.getByRole("button", { name: "添加", exact: true }).click();
+  await expect(add).toBeEnabled();
+  await add.click();
   await expect(row.getByRole("alert")).toContainText("模拟云端适配包安装失败");
   await expect(row.getByRole("button", { name: "添加", exact: true })).toBeEnabled();
   await expect(row.getByRole("button", { name: "仅添加本地", exact: true })).toBeEnabled();
@@ -309,8 +308,6 @@ test("云目录离线时首次设置仍保留本地添加", async ({ page }) => 
   await openGameAdapterMatchingFixture(page, { onboarding: true, candidates: [local], catalogStatus: "offline" });
   await startOnboardingScan(page);
   const row = page.getByRole("listitem").filter({ has: page.getByText(local.name, { exact: true }) });
-  await expect(row.getByRole("button", { name: "添加", exact: true })).toBeDisabled();
-  await row.getByRole("checkbox", { name: `选择 ${local.name}`, exact: true }).check();
   await expect(row.getByRole("button", { name: "添加", exact: true })).toBeEnabled();
   await row.getByRole("button", { name: "添加", exact: true }).click();
   await expect(row.getByText("管理中", { exact: true })).toBeVisible();
@@ -329,8 +326,7 @@ test("已安装但版本不匹配的本地适配包不会被云命中覆盖", as
   await openGameAdapterMatchingFixture(page, { onboarding: true, candidates: [steam], installedPlugin: true });
   await startOnboardingScan(page);
   const row = page.getByRole("listitem").filter({ has: page.getByText(steam.name, { exact: true }) });
-  await expect(row.getByRole("button", { name: "添加", exact: true })).toBeDisabled();
-  await row.getByRole("checkbox", { name: `选择 ${steam.name}`, exact: true }).check();
+  await expect(row.getByRole("button", { name: "添加", exact: true })).toBeEnabled();
   await row.getByRole("button", { name: "添加", exact: true }).click();
   await expect(row.getByText("管理中", { exact: true })).toBeVisible();
   const args = (await commandArgs(page, "register_game"))[0];

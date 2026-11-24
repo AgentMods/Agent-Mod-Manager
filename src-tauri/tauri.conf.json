@@ -65,7 +65,19 @@
       "nsis": {
         "installerHooks": "installer/wizard.nsh",
         "installerIcon": "icons/icon.ico",
-        "languages": ["English", "SimpChinese"]
+        "languages": [
+          "English",
+          "SimpChinese",
+          "Japanese",
+          "Korean",
+          "German",
+          "French",
+          "Spanish",
+          "PortugueseBR",
+          "Russian",
+          "Italian"
+        ],
+        "displayLanguageSelector": false
       }
     },
     "resources": {

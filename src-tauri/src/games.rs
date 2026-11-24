@@ -3,7 +3,7 @@
 //! Format references: ValveSoftware/source-sdk-2013 src/tier1/KeyValues.cpp;
 //! legendary-gl/legendary legendary/{lfs,models}/egl.py (checked 2026-11-17).
 use crate::db::Db;
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, NativeMessage};
 use crate::paths::{display_path, user_path};
 use crate::plugins::{self, GameAdapter, MarkerKind, Platform};
 use crate::util;
@@ -22,6 +22,8 @@ const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const MAX_KV_DEPTH: usize = 32;
 const MAX_KV_TOKENS: usize = 65_536;
 const MAX_KV_STRING: usize = 65_536;
+// Steamworks Common Redistributables and Ubisoft Connect Services, respectively.
+const STEAM_NON_GAME_APP_IDS: [u32; 2] = [228980, 4099820];
 pub const HIGH_CONFIDENCE: f64 = 0.80;
 pub(crate) const AUTOMATIC_GAME_NAME: &str = "automaticName";
 
@@ -211,6 +213,15 @@ pub struct GameCandidate {
     pub requires_confirmation: bool,
     pub registered_game_id: Option<String>,
     pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warning_details: Vec<NativeMessage>,
+}
+
+impl GameCandidate {
+    fn add_warning(&mut self, warning: NativeMessage) {
+        self.warnings.push(warning.message.clone());
+        self.warning_details.push(warning);
+    }
 }
 
 fn host_platform() -> Platform {
@@ -418,13 +429,13 @@ fn identify_at(
     };
     let mut warnings = Vec::new();
     if ambiguous {
-        warnings.push("多个适配包具有接近的得分，需要人工选择".into());
+        warnings.push(NativeMessage::new("scan.adapter_ambiguous", []));
     }
     if let Some(matched) = suggested {
         if matched.platform != host_platform() {
-            warnings.push(format!(
-                "标记显示 {} 布局；尚未确认当前主机的运行环境",
-                platform_name(matched.platform)
+            warnings.push(NativeMessage::new(
+                "scan.foreign_layout",
+                [("platform", platform_name(matched.platform).into())],
             ));
         }
     }
@@ -450,7 +461,11 @@ fn identify_at(
         sources,
         requires_confirmation: true,
         registered_game_id: None,
-        warnings,
+        warnings: warnings
+            .iter()
+            .map(|warning| warning.message.clone())
+            .collect(),
+        warning_details: warnings,
     })
 }
 
@@ -1261,6 +1276,14 @@ pub fn parse_appmanifest(input: &str) -> AppResult<SteamManifest> {
     })
 }
 
+fn read_steam_appmanifest(file: &Path, expected_id: u32) -> AppResult<SteamManifest> {
+    let manifest = parse_appmanifest(&read_metadata(file)?)?;
+    if manifest.app_id != expected_id {
+        return Err(invalid("manifest 文件名与 AppState App ID 不一致"));
+    }
+    Ok(manifest)
+}
+
 /// Both legacy `"1" "D:\\Library"` and modern `"1" { "path" ... }`.
 /// Paths remain strings here: Windows paths must also parse on a Unix host.
 pub fn parse_library_folders(input: &str) -> AppResult<Vec<String>> {
@@ -1402,7 +1425,8 @@ pub fn common_roots() -> CommonRoots {
 #[serde(rename_all = "camelCase")]
 pub struct ScanWarning {
     pub path: String,
-    pub message: String,
+    #[serde(flatten)]
+    pub presentation: NativeMessage,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1478,18 +1502,22 @@ fn install_hint(root: &Path, name: &std::ffi::OsStr, directory: bool) -> bool {
             .any(|prefix| name.starts_with(prefix)))
 }
 impl Scanner<'_> {
-    fn warn(&mut self, path: &Path, message: impl ToString) {
+    fn warn(&mut self, path: &Path, presentation: NativeMessage) {
         // Warnings are also bounded if a directory contains many broken files.
         if self.report.warnings.len() < 256 {
             self.report.warnings.push(ScanWarning {
                 path: display_path(path),
-                message: message.to_string(),
+                presentation,
             });
         }
     }
+    fn warn_error(&mut self, path: &Path, error: impl Into<AppError>) {
+        self.warn(path, error.into().presentation());
+    }
+
     fn limit(&mut self, path: &Path) {
         self.report.truncated = true;
-        self.warn(path, "达到扫描数量上限，结果不完整");
+        self.warn(path, NativeMessage::new("scan.limit", []));
     }
     fn checkpoint(&self) -> AppResult<()> {
         if self.cancel.is_cancelled() {
@@ -1507,10 +1535,13 @@ impl Scanner<'_> {
             }
             Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 if source.metadata_path.is_some() {
-                    self.warn(path, "启动器记录的安装目录不存在");
+                    self.warn(
+                        path,
+                        NativeMessage::new("scan.launcher_directory_missing", []),
+                    );
                 }
             }
-            Err(e) => self.warn(path, e),
+            Err(e) => self.warn_error(path, e),
         }
         Ok(())
     }
@@ -1556,10 +1587,58 @@ impl Scanner<'_> {
             Ok(entries) => Some(entries),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                self.warn(path, e);
+                self.warn_error(path, e);
                 None
             }
         }
+    }
+
+    fn is_steam_non_game_directory(&self, root: &Path) -> AppResult<bool> {
+        let named = |path: &Path, name: &str| {
+            path.file_name()
+                .is_some_and(|file_name| file_name.eq_ignore_ascii_case(name))
+        };
+        let Some(common) = root.parent().filter(|p| named(p, "common")) else {
+            return Ok(false);
+        };
+        let Some(apps) = common.parent().filter(|p| named(p, "steamapps")) else {
+            return Ok(false);
+        };
+
+        // An explicit tree scan may run without Steam discovery. Use the sibling
+        // manifest to avoid guessing from an installation directory's name.
+        let cached: Option<String> = self
+            .spool
+            .query_row(
+                "SELECT roots FROM steam_non_game_dirs WHERE common = ?1",
+                [common.to_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let excluded: Vec<String> = match cached {
+            Some(roots) => serde_json::from_str(&roots)?,
+            None => {
+                let roots: Vec<String> = STEAM_NON_GAME_APP_IDS
+                    .into_iter()
+                    .filter_map(|id| {
+                        let file = apps.join(format!("appmanifest_{id}.acf"));
+                        let manifest = read_steam_appmanifest(&file, id).ok()?;
+                        let path = common.join(&manifest.install_dir);
+                        // A link or junction must not mark a different app's directory.
+                        crate::safe_fs::identity(&path).ok().flatten()?;
+                        let path = canonical_directory(&path).ok()?;
+                        (path.parent() == Some(common)).then_some(())?;
+                        path.to_str().map(str::to_owned)
+                    })
+                    .collect();
+                self.spool.execute(
+                    "INSERT INTO steam_non_game_dirs(common, roots) VALUES (?1, ?2)",
+                    params![common.to_str(), serde_json::to_string(&roots)?],
+                )?;
+                roots
+            }
+        };
+        Ok(excluded.iter().any(|path| Path::new(path) == root))
     }
 
     fn trees<'a>(
@@ -1580,10 +1659,13 @@ impl Scanner<'_> {
                 }
                 Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                     if kind == DiscoveryKind::User {
-                        self.warn(path, "所选扫描目录不存在");
+                        self.warn(
+                            path,
+                            NativeMessage::new("scan.selected_directory_missing", []),
+                        );
                     }
                 }
-                Err(e) => self.warn(path, e),
+                Err(e) => self.warn_error(path, e),
             }
         }
         while let Some((id, path, level, remaining)) = self
@@ -1609,15 +1691,17 @@ impl Scanner<'_> {
             match canonical_directory(root) {
                 Ok(current) if current == root => {}
                 Ok(_) => {
-                    self.warn(root, "目录已被链接替换，跳过扫描");
+                    self.warn(root, NativeMessage::new("scan.directory_replaced", []));
                     continue;
                 }
                 Err(e) => {
-                    self.warn(root, e);
+                    self.warn_error(root, e);
                     continue;
                 }
             }
-            if !self.record_probe(root, DiscoverySource::simple(kind.clone()))? {
+            if self.is_steam_non_game_directory(root)?
+                || !self.record_probe(root, DiscoverySource::simple(kind.clone()))?
+            {
                 continue;
             }
             let check_hints = kind == DiscoveryKind::User && level <= 1;
@@ -1647,7 +1731,7 @@ impl Scanner<'_> {
                                 let (name, directory) = match entry {
                                     Ok(entry) => entry,
                                     Err(e) => {
-                                        self.warn(root, e);
+                                        self.warn_error(root, e);
                                         continue;
                                     }
                                 };
@@ -1677,7 +1761,7 @@ impl Scanner<'_> {
                                 }
                             }
                         }
-                        Err(e) => self.warn(root, e),
+                        Err(e) => self.warn_error(root, e),
                     }
                     self.spool.execute(
                         "INSERT INTO listings(root,hint) VALUES (?1,?2)",
@@ -1705,7 +1789,7 @@ impl Scanner<'_> {
                 [path],
             )?;
         } else {
-            self.warn(path, "忽略非 Unicode Steam 库路径");
+            self.warn(path, NativeMessage::new("scan.steam_non_unicode", []));
         }
         Ok(())
     }
@@ -1734,7 +1818,7 @@ impl Scanner<'_> {
                 Ok(path) => path,
                 Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    self.warn(&path, e);
+                    self.warn_error(&path, e);
                     continue;
                 }
             };
@@ -1757,12 +1841,15 @@ impl Scanner<'_> {
                             if path.is_absolute() {
                                 self.enqueue_steam(&path)?;
                             } else {
-                                self.warn(&file, "忽略非当前平台绝对路径的 Steam 库");
+                                self.warn(
+                                    &file,
+                                    NativeMessage::new("scan.steam_library_not_absolute", []),
+                                );
                             }
                         }
                     }
                     Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => self.warn(&file, e),
+                    Err(e) => self.warn_error(&file, e),
                 }
             }
             let apps = library.join("steamapps");
@@ -1770,12 +1857,12 @@ impl Scanner<'_> {
             let common = match canonical_directory(&common) {
                 Ok(common) if common.starts_with(&library) => common,
                 Ok(_) => {
-                    self.warn(&common, "Steam common 符号链接越出库根");
+                    self.warn(&common, NativeMessage::new("scan.steam_common_escape", []));
                     continue;
                 }
                 Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    self.warn(&common, e);
+                    self.warn_error(&common, e);
                     continue;
                 }
             };
@@ -1786,7 +1873,7 @@ impl Scanner<'_> {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(e) => {
-                        self.warn(&apps, e);
+                        self.warn_error(&apps, e);
                         continue;
                     }
                 };
@@ -1801,18 +1888,11 @@ impl Scanner<'_> {
                     continue;
                 };
                 let file = entry.path();
-                let parsed = (|| -> AppResult<SteamManifest> {
-                    let id = app_id(id)?;
-                    let manifest = parse_appmanifest(&read_metadata(&file)?)?;
-                    if manifest.app_id != id {
-                        return Err(invalid("manifest 文件名与 AppState App ID 不一致"));
-                    }
-                    Ok(manifest)
-                })();
-                let manifest = match parsed {
+                let manifest = match app_id(id).and_then(|id| read_steam_appmanifest(&file, id)) {
+                    Ok(m) if STEAM_NON_GAME_APP_IDS.contains(&m.app_id) => continue,
                     Ok(m) => m,
                     Err(e) => {
-                        self.warn(&file, e);
+                        self.warn_error(&file, e);
                         continue;
                     }
                 };
@@ -1848,8 +1928,8 @@ impl Scanner<'_> {
                             self.probe(&path, source)?;
                         }
                     }
-                    Ok(_) => self.warn(&game, "Steam 安装目录越出 common，忽略"),
-                    Err(e) => self.warn(&game, e),
+                    Ok(_) => self.warn(&game, NativeMessage::new("scan.steam_install_escape", [])),
+                    Err(e) => self.warn_error(&game, e),
                 }
             }
         }
@@ -1863,7 +1943,7 @@ impl Scanner<'_> {
                 Ok(path) => path,
                 Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    self.warn(directory, e);
+                    self.warn_error(directory, e);
                     continue;
                 }
             };
@@ -1877,7 +1957,7 @@ impl Scanner<'_> {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(e) => {
-                        self.warn(&directory, e);
+                        self.warn_error(&directory, e);
                         continue;
                     }
                 };
@@ -1890,11 +1970,14 @@ impl Scanner<'_> {
                 match parsed {
                     Ok(manifest) => {
                         if let Err(e) = display_text(&manifest.display_name) {
-                            self.warn(&file, e);
+                            self.warn_error(&file, e);
                             continue;
                         }
                         if !manifest.install_location.is_absolute() {
-                            self.warn(&file, "Epic InstallLocation 必须是当前平台绝对路径");
+                            self.warn(
+                                &file,
+                                NativeMessage::new("scan.epic_install_not_absolute", []),
+                            );
                             continue;
                         }
                         self.probe(
@@ -1910,7 +1993,7 @@ impl Scanner<'_> {
                             },
                         )?;
                     }
-                    Err(e) => self.warn(&file, e),
+                    Err(e) => self.warn_error(&file, e),
                 }
             }
         }
@@ -1924,7 +2007,7 @@ impl Scanner<'_> {
                 Ok(path) => path,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    self.warn(file, e);
+                    self.warn_error(file, e);
                     continue;
                 }
             };
@@ -1938,7 +2021,7 @@ impl Scanner<'_> {
                 Ok(entries) => entries,
                 Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(e) => {
-                    self.warn(file, e);
+                    self.warn_error(file, e);
                     continue;
                 }
             };
@@ -1950,16 +2033,19 @@ impl Scanner<'_> {
                 let entry: LegendaryInstall = match serde_json::from_value(entry) {
                     Ok(entry) => entry,
                     Err(e) => {
-                        self.warn(file, e);
+                        self.warn_error(file, e);
                         continue;
                     }
                 };
                 if !entry.install_path.is_absolute() {
-                    self.warn(file, "忽略非当前平台绝对路径的 Legendary 安装目录");
+                    self.warn(
+                        file,
+                        NativeMessage::new("scan.legendary_install_not_absolute", []),
+                    );
                     continue;
                 }
                 if let Err(e) = display_text(&entry.title) {
-                    self.warn(file, e);
+                    self.warn_error(file, e);
                     continue;
                 }
                 self.probe(
@@ -2060,6 +2146,7 @@ fn scan_with(
         CREATE TABLE steam_queue(id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,pending INTEGER NOT NULL DEFAULT 1);
         CREATE INDEX steam_pending ON steam_queue(pending,id);
         CREATE TABLE steam_seen(path TEXT NOT NULL PRIMARY KEY);
+        CREATE TABLE steam_non_game_dirs(common TEXT PRIMARY KEY, roots TEXT NOT NULL);
         BEGIN;")?;
     let mut scanner = Scanner {
         adapters: &adapters,
@@ -2128,17 +2215,13 @@ fn scan_with(
         apply_registered_game_name(&db.conn(), &root, &mut candidate)?;
         if candidate.matches.is_empty() && !metadata {
             if hint {
-                candidate
-                    .warnings
-                    .push("检测到可能的游戏文件，未匹配适配包，请核对后再添加。".into());
+                candidate.add_warning(NativeMessage::new("scan.no_adapter_match", []));
             } else if candidate.registered_game_id.is_none() || !user {
                 continue;
             }
         }
         if overflow {
-            candidate
-                .warnings
-                .push("同一目录的重复来源证据过多，仅显示部分来源。".into());
+            candidate.add_warning(NativeMessage::new("scan.source_limit", []));
         }
         let bytes = serde_json::to_vec(&candidate)?.len();
         if !scanner.report.candidates.is_empty()
@@ -2747,6 +2830,194 @@ mod tests {
     }
 
     #[test]
+    fn steam_skips_only_the_redistributables_app_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db(&temp);
+        let steam = temp.path().join("Steam");
+        let apps = steam.join("steamapps");
+        let common = apps.join("common");
+        make_file(&common.join("Steamworks Shared"), "runtime.exe");
+        make_file(&common.join("Localized Runtime"), "runtime.exe");
+        make_file(&common.join("Steamworks Adventure"), "game.exe");
+        for (directory, name) in [
+            ("Steamworks Shared", "Steamworks Common Redistributables"),
+            ("Localized Runtime", "共享运行库"),
+        ] {
+            fs::write(
+                apps.join("appmanifest_228980.acf"),
+                acf("228980", directory).replace("A game", name),
+            )
+            .unwrap();
+            fs::write(
+                apps.join("appmanifest_123.acf"),
+                acf("123", "Steamworks Adventure").replace("A game", "Steamworks Adventure"),
+            )
+            .unwrap();
+            let report = scan_games(
+                &db,
+                &ScanOptions {
+                    steam_roots: vec![steam.clone()],
+                    ..scan_options()
+                },
+            )
+            .unwrap();
+            assert!(report.warnings.is_empty());
+            assert_eq!(report.candidates.len(), 1);
+            let source = &report.candidates[0].sources[0];
+            assert_eq!(source.steam_app_id.as_deref(), Some("123"));
+            assert_eq!(source.display_name.as_deref(), Some("Steamworks Adventure"));
+        }
+    }
+
+    #[test]
+    fn steam_redistributables_are_not_rediscovered_under_a_selected_common_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db_with_adapters(&temp);
+        let steam = temp.path().join("Steam");
+        let apps = steam.join("steamapps");
+        let common = apps.join("common");
+        let redist = common.join("Steamworks Shared");
+        let other_shared = temp.path().join("Local Games/Steamworks Shared");
+        let game = common.join("Steamworks Adventure");
+        make_file(&redist, "runtime.exe");
+        skyrim(&redist.join("nested"));
+        make_file(&other_shared, "game.exe");
+        make_file(&game, "game.exe");
+        fs::write(
+            apps.join("appmanifest_228980.acf"),
+            acf("228980", "Steamworks Shared"),
+        )
+        .unwrap();
+        fs::write(
+            apps.join("appmanifest_123.acf"),
+            acf("123", "Steamworks Adventure"),
+        )
+        .unwrap();
+        let expected =
+            [&game, &other_shared].map(|path| display_path(&path.canonicalize().unwrap()));
+        for steam_roots in [vec![], vec![steam.clone()]] {
+            let report = scan_games(
+                &db,
+                &ScanOptions {
+                    steam_roots,
+                    user_roots: vec![common.clone(), other_shared.clone()],
+                    ..scan_options()
+                },
+            )
+            .unwrap();
+            let candidates: BTreeSet<_> =
+                report.candidates.into_iter().map(|c| c.root_path).collect();
+            assert_eq!(candidates, BTreeSet::from(expected.clone()));
+        }
+        let report = scan_games(
+            &db,
+            &ScanOptions {
+                user_roots: vec![redist],
+                ..scan_options()
+            },
+        )
+        .unwrap();
+        assert!(report.candidates.is_empty());
+        assert!(list_games(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn steam_redistributables_folder_name_without_matching_metadata_is_not_excluded() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db(&temp);
+        let apps = temp.path().join("Steam/steamapps");
+        let common = apps.join("common");
+        let game = common.join("Steamworks Shared");
+        make_file(&game, "game.exe");
+        let options = ScanOptions {
+            user_roots: vec![common],
+            ..scan_options()
+        };
+        let assert_game_visible = || {
+            let report = scan_games(&db, &options).unwrap();
+            assert_eq!(report.candidates.len(), 1);
+            assert_eq!(
+                report.candidates[0].root_path,
+                display_path(&game.canonicalize().unwrap())
+            );
+        };
+        assert_game_visible();
+        fs::write(
+            apps.join("appmanifest_228980.acf"),
+            acf("123", "Steamworks Shared"),
+        )
+        .unwrap();
+        assert_game_visible();
+        fs::write(
+            apps.join("appmanifest_228980.acf"),
+            acf("228980", "Another Directory"),
+        )
+        .unwrap();
+        assert_game_visible();
+    }
+
+    #[test]
+    fn steam_excludes_ubisoft_connect_services_but_not_similarly_named_games() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = db(&temp);
+        let steam = temp.path().join("Steam");
+        let apps = steam.join("steamapps");
+        let common = apps.join("common");
+        let services = "Ubisoft Connect Services";
+        let game = "Ubisoft Connect Services Adventure";
+        let game_directory = common.join(game);
+        let unrelated = temp.path().join("Local Games").join(services);
+        make_file(&common.join(services), "service.exe");
+        make_file(&common.join("Steamworks Shared"), "runtime.exe");
+        make_file(&game_directory, "game.exe");
+        make_file(&unrelated, "game.exe");
+        for (id, directory) in [
+            ("4099820", services),
+            ("228980", "Steamworks Shared"),
+            ("123", game),
+        ] {
+            fs::write(
+                apps.join(format!("appmanifest_{id}.acf")),
+                acf(id, directory).replace("A game", directory),
+            )
+            .unwrap();
+        }
+        let expected =
+            [&game_directory, &unrelated].map(|path| display_path(&path.canonicalize().unwrap()));
+        for steam_roots in [vec![], vec![steam.clone()]] {
+            let report = scan_games(
+                &db,
+                &ScanOptions {
+                    steam_roots,
+                    user_roots: vec![common.clone(), unrelated.clone()],
+                    ..scan_options()
+                },
+            )
+            .unwrap();
+            assert_eq!(report.candidates.len(), 2);
+            let actual: BTreeSet<_> = report.candidates.into_iter().map(|c| c.root_path).collect();
+            assert_eq!(actual, BTreeSet::from(expected.clone()));
+        }
+        let report = scan_games(
+            &db,
+            &ScanOptions {
+                steam_roots: vec![steam],
+                ..scan_options()
+            },
+        )
+        .unwrap();
+        assert_eq!(report.candidates.len(), 1);
+        assert_eq!(
+            report.candidates[0].sources[0].steam_app_id.as_deref(),
+            Some("123")
+        );
+        assert_eq!(
+            report.candidates[0].sources[0].display_name.as_deref(),
+            Some(game)
+        );
+    }
+
+    #[test]
     fn corrupt_or_mismatched_steam_manifest_does_not_hide_other_games() {
         let temp = tempfile::tempdir().unwrap();
         let db = db(&temp);
@@ -2899,7 +3170,18 @@ mod tests {
         assert_eq!(portable.name, "Portable");
         assert_eq!(portable.status, IdentificationStatus::Unidentified);
         assert!(portable.suggested_adapter_slug.is_none());
-        assert!(report.warnings.iter().any(|w| w.message.contains("不存在")));
+        let warning = report
+            .warnings
+            .iter()
+            .find(|w| w.presentation.key == "scan.selected_directory_missing")
+            .unwrap();
+        let wire = serde_json::to_value(warning).unwrap();
+        assert_eq!(wire["path"], warning.path);
+        assert_eq!(wire["message"], "所选扫描目录不存在");
+        assert_eq!(wire["args"], json!({}));
+        assert_eq!(wire["key"], "scan.selected_directory_missing");
+        assert_eq!(portable.warning_details[0].key, "scan.no_adapter_match");
+        assert_eq!(portable.warning_details[0].message, portable.warnings[0]);
         assert!(list_games(&db).unwrap().is_empty());
     }
 

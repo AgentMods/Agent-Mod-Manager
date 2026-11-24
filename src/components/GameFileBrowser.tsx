@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useEffect, useState } from 'react';
 import { useQueries, useQueryClient, type UseQueryResult } from '@tanstack/react-query';
 import { ChevronRightIcon, FileIcon, FolderIcon, FolderOpenIcon, FolderTreeIcon, RefreshCwIcon, SearchIcon } from 'lucide-react';
@@ -76,10 +77,10 @@ function FileTreeNode({ node, selected, onSelect, onToggle, searching }: {
     </CollapsibleTrigger>
     <CollapsibleContent className="motion-safe:overflow-hidden motion-safe:data-[state=closed]:animate-collapsible-up motion-safe:data-[state=open]:animate-collapsible-down">
       <div className="ml-3 flex min-w-0 flex-col border-l pl-1 sm:ml-4">
-        {node.loading && <p role="status" className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground"><Spinner />正在读取目录…</p>}
+        {node.loading && <p role="status" className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground"><Spinner />{tr("正在读取目录…")}</p>}
         <ErrorState error={node.error} />
         {!node.loading && !node.error && !node.children.length && <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
-          {searching ? '没有匹配的文件或文件夹' : '目录中没有可显示的文件'}
+          {searching ? tr("没有匹配的文件或文件夹") : tr("目录中没有可显示的文件")}
         </p>}
         {node.children.map(child => <FileTreeNode key={child.type === 'file' ? child.entry.path : child.path}
           node={child} selected={selected} onSelect={onSelect} onToggle={onToggle} searching={searching} />)}
@@ -128,28 +129,28 @@ export function GameFileBrowser({ root, roots, onRootChange, active, busy, writa
       <CardHeader className="gap-3 px-4">
         <div className="flex min-w-0 items-start justify-between gap-2">
           <div className="flex min-w-0 flex-col gap-2">
-            <CardTitle className="flex items-center gap-2"><FolderTreeIcon aria-hidden="true" className="size-4" />文件浏览器</CardTitle>
+            <CardTitle className="flex items-center gap-2"><FolderTreeIcon aria-hidden="true" className="size-4" />{tr("文件浏览器")}</CardTitle>
             <PathText>{displayPath(root.path)}</PathText>
           </div>
-          <IconButton title="刷新目录" disabled={!backendAvailable || fetching || expanded.length === 0} onClick={refresh}>
+          <IconButton title={tr("刷新目录")} disabled={!backendAvailable || fetching || expanded.length === 0} onClick={refresh}>
             <RefreshCwIcon className={fetching ? 'motion-safe:animate-spin' : undefined} />
           </IconButton>
         </div>
         <div className="flex min-w-0 flex-wrap gap-2">
-          {roots.length > 1 && <NativeSelect aria-label="浏览根目录" value={root.path} onChange={event => onRootChange(event.target.value)}>
+          {roots.length > 1 && <NativeSelect aria-label={tr("浏览根目录")} value={root.path} onChange={event => onRootChange(event.target.value)}>
             {roots.map(option => <NativeSelectOption key={option.path + option.name} value={option.path}>{option.name}</NativeSelectOption>)}
           </NativeSelect>}
           <InputGroup className="min-w-32 flex-1"><InputGroupAddon><SearchIcon /></InputGroupAddon>
-            <InputGroupInput type="search" aria-label="搜索已展开目录" placeholder="搜索已展开目录…" value={search} onChange={event => setSearch(event.target.value)} />
+            <InputGroupInput type="search" aria-label={tr("搜索已展开目录")} placeholder={tr("搜索已展开目录…")} value={search} onChange={event => setSearch(event.target.value)} />
           </InputGroup>
         </div>
       </CardHeader>
       <CardContent className="px-4">
         <div className="@container min-w-0 overflow-hidden rounded-md border">
           <div aria-hidden="true" className="flex items-center gap-2 border-b bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
-            <span className="flex-1">名称</span><span className={sizeClass}>大小</span><span className={dateClass}>修改时间</span>
+            <span className="flex-1">{tr("名称")}</span><span className={sizeClass}>{tr("大小")}</span><span className={dateClass}>{tr("修改时间")}</span>
           </div>
-          <div role="group" aria-label="文件树" aria-busy={fetching} className="max-h-[60dvh] overflow-auto p-1">
+          <div role="group" aria-label={tr("文件树")} aria-busy={fetching} className="max-h-[60dvh] overflow-auto p-1">
             <FileTreeNode node={tree.root} selected={selected} onSelect={setSelected} searching={!!term}
               onToggle={(path, open) => setExpanded(current => open ? [...current, path] : current.filter(item => item !== path))} />
           </div>

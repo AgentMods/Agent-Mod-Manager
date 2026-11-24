@@ -1,34 +1,56 @@
 //! Dispatch from the committed live event sink only. Replaying a conversation must not notify again.
-use crate::agent::events::AgentEvent;
+use crate::agent::{chat_strings, events::AgentEvent};
 
-fn notification_body(event: &AgentEvent) -> Option<&'static str> {
-    match event.kind.as_str() {
-        // An inbound MCP tool call has its own synthetic turn, not a completed chat task.
-        "done" if event.payload["status"] == "done" && event.payload["origin"] != "mcp" => {
-            Some("Agent 任务已完成。")
+#[derive(Clone, Copy)]
+enum Notice {
+    Completed,
+    AwaitingAnswer,
+    AwaitingApproval,
+}
+
+impl Notice {
+    fn from_event(event: &AgentEvent) -> Option<Self> {
+        match event.kind.as_str() {
+            // An inbound MCP tool call has its own synthetic turn, not a completed chat task.
+            "done" if event.payload["status"] == "done" && event.payload["origin"] != "mcp" => {
+                Some(Self::Completed)
+            }
+            "approval-request" => match event.payload["title"].as_str()? {
+                "ask_user" => Some(Self::AwaitingAnswer),
+                _ => Some(Self::AwaitingApproval),
+            },
+            _ => None,
         }
-        "approval-request" => match event.payload["title"].as_str()? {
-            "ask_user" => Some("Agent 正在等待你的回答。"),
-            _ => Some("Agent 正在等待你的批准。"),
-        },
-        _ => None,
+    }
+
+    fn body(self, locale: &str) -> &'static str {
+        let strings = chat_strings::for_locale(locale);
+        match self {
+            Self::Completed => strings.completed,
+            Self::AwaitingAnswer => strings.awaiting_answer,
+            Self::AwaitingApproval => strings.awaiting_approval,
+        }
     }
 }
 
 #[cfg(not(test))]
 pub(crate) fn notify<R: tauri::Runtime>(app: &tauri::AppHandle<R>, event: &AgentEvent) {
+    use tauri::Manager;
     use tauri_plugin_notification::NotificationExt;
-    let Some(body) = notification_body(event) else {
+    let Some(notice) = Notice::from_event(event) else {
         return;
     };
     let app = app.clone();
     // OS notification delivery is best-effort and must not delay model streaming or approval.
     tauri::async_runtime::spawn_blocking(move || {
+        let locale = app
+            .try_state::<crate::app::AppServices>()
+            .map(|services| crate::app_locale::effective(&services.engine.db));
         if let Err(error) = app
             .notification()
             .builder()
             .title("Agent Mod Manager")
-            .body(body)
+            .body(notice.body(locale.as_deref().unwrap_or("en")))
             .show()
         {
             tracing::debug!(%error, "native Agent notification unavailable");
@@ -53,11 +75,16 @@ mod tests {
             .id;
         let notices = Arc::new(Mutex::new(Vec::new()));
         let observed = notices.clone();
+        let locale_db = db.clone();
+        crate::app_locale::set(&db, Some("zh-CN".into())).unwrap();
         let events = Events {
             db,
             sink: Arc::new(move |event| {
-                if let Some(body) = notification_body(event) {
-                    observed.lock().unwrap().push(body);
+                if let Some(notice) = Notice::from_event(event) {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push(notice.body(&crate::app_locale::effective(&locale_db)));
                 }
             }),
         };
@@ -82,6 +109,9 @@ mod tests {
             ("done", json!({"status":"cancelled"})),
             ("done", json!({"status":"interrupted"})),
         ] {
+            if kind == "done" {
+                crate::app_locale::set(&events.db, Some("fr".into())).unwrap();
+            }
             events.emit("turn", &conv, None, kind, payload).unwrap();
         }
         assert!(!events.replay(&conv, 0, 100).unwrap().is_empty());
@@ -90,7 +120,7 @@ mod tests {
             [
                 "Agent 正在等待你的回答。",
                 "Agent 正在等待你的批准。",
-                "Agent 任务已完成。"
+                "L’agent a terminé la tâche."
             ]
         );
     }

@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useCloudGameMatch } from '@/lib/cloud-game-match';
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -6,7 +7,7 @@ import { EllipsisIcon, FolderOpenIcon, Gamepad2Icon, GlobeIcon, PencilIcon, Play
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { useUI } from "@/lib/store";
 import { displayPath, gameDirectoryKey } from "@/lib/paths";
-import { reconcileCandidates } from "@/lib/game-discovery";
+import { candidateWarnings, reconcileCandidates } from "@/lib/game-discovery";
 import { invalidateGameQueries } from "@/lib/game-cache";
 import type { BootstrapState, Game, GameCandidate, Plugin, ScanReport } from "@/lib/types";
 import { Badge, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, PathText } from "@/components/ui";
@@ -41,29 +42,29 @@ function GameCard({ game, index, coverUrl, disabled, busy, onOpen, onLaunch, onL
       <GameCover name={game.name} url={coverUrl} decorative />
       <CardHeader className="gap-1 px-5 pt-4 pb-4">
         <CardTitle className="truncate text-base">{game.name}</CardTitle>
-        <CardDescription>{game.platform} · {game.installedModCount} 个 Mod</CardDescription>
+        <CardDescription>{tr("{platform} · {installedModCount} 个 Mod", { platform: game.platform, installedModCount: game.installedModCount })}</CardDescription>
       </CardHeader>
     </button>
     <CardFooter className="gap-2 border-t px-5 py-3">
       <Button size="sm" className="flex-1" disabled={disabled || working} onClick={onLaunch}>
-        {working ? <Spinner data-icon="inline-start" /> : <PlayIcon data-icon="inline-start" />}启动游戏
+        {working ? <Spinner data-icon="inline-start" /> : <PlayIcon data-icon="inline-start" />}{tr("启动游戏")}
       </Button>
-      {!game.adapterSlug && <IconButton title="创建适配包" disabled={disabled} onClick={onCreateAdapter}>
+      {!game.adapterSlug && <IconButton title={tr("创建适配包")} disabled={disabled} onClick={onCreateAdapter}>
         <SparklesIcon />
       </IconButton>}
       <DropdownMenu>
         <Tooltip>
-          <TooltipTrigger asChild><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-sm" aria-label="更多操作" disabled={disabled || working}><EllipsisIcon /></Button></DropdownMenuTrigger></TooltipTrigger>
-          <TooltipContent>更多操作</TooltipContent>
+          <TooltipTrigger asChild><DropdownMenuTrigger asChild><Button variant="ghost" size="icon-sm" aria-label={tr("更多操作")} disabled={disabled || working}><EllipsisIcon /></Button></DropdownMenuTrigger></TooltipTrigger>
+          <TooltipContent>{tr("更多操作")}</TooltipContent>
         </Tooltip>
         <DropdownMenuContent align="end">
           <DropdownMenuGroup>
-            <DropdownMenuItem onSelect={() => onLocation("root")}><FolderOpenIcon />打开目录</DropdownMenuItem>
-            <DropdownMenuItem onSelect={() => onLocation("mods")}><PuzzleIcon />Mod 文件夹</DropdownMenuItem>
-            <DropdownMenuItem onSelect={onEdit}><PencilIcon />编辑</DropdownMenuItem>
-            <DropdownMenuItem onSelect={onChooseAdapter}><PuzzleIcon />选择适配包</DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => onLocation("root")}><FolderOpenIcon />{tr("打开目录")}</DropdownMenuItem>
+            <DropdownMenuItem onSelect={() => onLocation("mods")}><PuzzleIcon />{tr("Mod 文件夹")}</DropdownMenuItem>
+            <DropdownMenuItem onSelect={onEdit}><PencilIcon />{tr("编辑")}</DropdownMenuItem>
+            <DropdownMenuItem onSelect={onChooseAdapter}><PuzzleIcon />{tr("选择适配包")}</DropdownMenuItem>
             <DropdownMenuSeparator />
-            <DropdownMenuItem variant="destructive" onSelect={onRemove}><Trash2Icon />移除</DropdownMenuItem>
+            <DropdownMenuItem variant="destructive" onSelect={onRemove}><Trash2Icon />{tr("移除")}</DropdownMenuItem>
           </DropdownMenuGroup>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -81,7 +82,7 @@ function EditGameDialog({ game, onClose, onSaved }: { game: Game; onClose: () =>
     setError(null);
     try {
       const windows = navigator.userAgent.includes("Windows");
-      const selected = await open({ multiple: false, directory: false, defaultPath: game.rootPath, title: "选择游戏启动程序", filters: windows ? [{ name: "可执行文件", extensions: ["exe"] }] : undefined });
+      const selected = await open({ multiple: false, directory: false, defaultPath: game.rootPath, title: tr("选择游戏启动程序"), filters: windows ? [{ name: tr("可执行文件"), extensions: ["exe"] }] : undefined });
       if (typeof selected === "string") setLaunchPath(launchPathDraft(selected));
     } catch (failure) { setError(failure); }
   }
@@ -94,27 +95,27 @@ function EditGameDialog({ game, onClose, onSaved }: { game: Game; onClose: () =>
     } catch (failure) { setError(failure); }
     finally { setBusy(false); }
   }
-  return <Modal title="编辑游戏" description="修改显示名称，或指定一个游戏启动程序。" onClose={() => { if (!busy) onClose(); }} className="sm:max-w-lg"
+  return <Modal title={tr("编辑游戏")} description={tr("修改显示名称，或指定一个游戏启动程序。")} onClose={() => { if (!busy) onClose(); }} className="sm:max-w-lg"
     actions={<>
-      <Button variant="outline" disabled={busy} onClick={onClose}>取消</Button>
-      <Button disabled={busy || !trimmed} onClick={() => { void save(); }}>{busy && <Spinner data-icon="inline-start" />}保存</Button>
+      <Button variant="outline" disabled={busy} onClick={onClose}>{tr("取消")}</Button>
+      <Button disabled={busy || !trimmed} onClick={() => { void save(); }}>{busy && <Spinner data-icon="inline-start" />}{tr("保存")}</Button>
     </>}>
     <ErrorState error={error} />
     <FieldGroup>
       <Field>
-        <FieldLabel htmlFor="game-name">游戏名称</FieldLabel>
+        <FieldLabel htmlFor="game-name">{tr("游戏名称")}</FieldLabel>
         <InputGroup><InputGroupInput id="game-name" value={name} disabled={busy} onChange={(event) => setName(event.target.value)} /></InputGroup>
       </Field>
       <Field>
-        <FieldLabel htmlFor="game-launch-path">启动程序</FieldLabel>
+        <FieldLabel htmlFor="game-launch-path">{tr("启动程序")}</FieldLabel>
         <InputGroup>
-          <InputGroupInput id="game-launch-path" value={launchPath.text} placeholder={game.steamAppId ? "留空则通过 Steam 启动" : "选择游戏的可执行文件"} disabled={busy} onChange={(event) => setLaunchPath({ raw: event.target.value, text: event.target.value })} />
+          <InputGroupInput id="game-launch-path" value={launchPath.text} placeholder={game.steamAppId ? tr("留空则通过 Steam 启动") : tr("选择游戏的可执行文件")} disabled={busy} onChange={(event) => setLaunchPath({ raw: event.target.value, text: event.target.value })} />
           <InputGroupAddon align="inline-end">
-            {launchPath.text && <InputGroupButton size="icon-xs" aria-label="清除启动程序" disabled={busy} onClick={() => setLaunchPath(launchPathDraft(""))}><XIcon /></InputGroupButton>}
-            <InputGroupButton disabled={busy || !backendAvailable} onClick={() => { void choose(); }}><FolderOpenIcon />选择</InputGroupButton>
+            {launchPath.text && <InputGroupButton size="icon-xs" aria-label={tr("清除启动程序")} disabled={busy} onClick={() => setLaunchPath(launchPathDraft(""))}><XIcon /></InputGroupButton>}
+            <InputGroupButton disabled={busy || !backendAvailable} onClick={() => { void choose(); }}><FolderOpenIcon />{tr("选择")}</InputGroupButton>
           </InputGroupAddon>
         </InputGroup>
-        <FieldDescription>程序必须位于游戏目录内。留空时，已识别的 Steam 游戏会通过 Steam 启动。</FieldDescription>
+        <FieldDescription>{tr("程序必须位于游戏目录内。留空时，已识别的 Steam 游戏会通过 Steam 启动。")}</FieldDescription>
       </Field>
     </FieldGroup>
   </Modal>;
@@ -157,26 +158,26 @@ function ChooseAdapterDialog({ game, plugins, writable, onClose, onSaved }: {
     }
     requestAnimationFrame(() => (installedSlug && !adapterSelect.current?.disabled ? adapterSelect.current : catalogButton.current)?.focus());
   }
-  return <Modal title="选择适配包" description={showCatalog ? `为「${game.name}」查找云端适配包。` : removing
-    ? `将解除「${game.name}」与适配包的绑定，保留游戏和已安装的 Mod。`
-    : `为「${game.name}」选择已启用的适配包。应用时会核对游戏目录中的识别标记。`} onClose={() => { if (!working) onClose(); }}
-    actions={showCatalog ? <Button variant="outline" onClick={() => returnToSelection()}>返回选择适配包</Button> : <>
-      <Button variant="outline" disabled={working} onClick={onClose}>取消</Button>
-      <Button disabled={!writable || !canApply || working} onClick={() => { void apply(); }}>{busy && <Spinner data-icon="inline-start" />}{removing ? "移除适配包" : "应用适配包"}</Button>
+  return <Modal title={tr("选择适配包")} description={showCatalog ? tr("为「{name}」查找云端适配包。", { name: game.name }) : removing
+    ? tr("将解除「{name}」与适配包的绑定，保留游戏和已安装的 Mod。", { name: game.name })
+    : tr("为「{name}」选择已启用的适配包。应用时会核对游戏目录中的识别标记。", { name: game.name })} onClose={() => { if (!working) onClose(); }}
+    actions={showCatalog ? <Button variant="outline" onClick={() => returnToSelection()}>{tr("返回选择适配包")}</Button> : <>
+      <Button variant="outline" disabled={working} onClick={onClose}>{tr("取消")}</Button>
+      <Button disabled={!writable || !canApply || working} onClick={() => { void apply(); }}>{busy && <Spinner data-icon="inline-start" />}{removing ? tr("移除适配包") : tr("应用适配包")}</Button>
     </>}>
     <ErrorState error={error} />
     {showCatalog ? <ManagerPluginCatalog writable={writable} initialQuery={game.steamAppId || game.name} onReturnToGame={returnToSelection} /> : <>
       <GameConflictPanel state={conflicts} busy={busy} />
       <Field>
-        <FieldLabel htmlFor="game-adapter">游戏适配包</FieldLabel>
+        <FieldLabel htmlFor="game-adapter">{tr("游戏适配包")}</FieldLabel>
         <NativeSelect ref={adapterSelect} id="game-adapter" value={slug} disabled={working || (!currentSlug && !choices.length)} onChange={(event) => setSlug(event.target.value)}>
-          <NativeSelectOption value="" disabled={!currentSlug}>{currentSlug ? "移除适配包" : choices.length ? "请选择适配包" : "暂无已启用的适配包"}</NativeSelectOption>
-          {currentSlug && !choices.some((plugin) => plugin.slug === currentSlug) && <NativeSelectOption value={currentSlug} disabled>{currentSlug}（当前适配包不可用）</NativeSelectOption>}
+          <NativeSelectOption value="" disabled={!currentSlug}>{currentSlug ? tr("移除适配包") : choices.length ? tr("请选择适配包") : tr("暂无已启用的适配包")}</NativeSelectOption>
+          {currentSlug && !choices.some((plugin) => plugin.slug === currentSlug) && <NativeSelectOption value={currentSlug} disabled>{tr("{currentSlug}（当前适配包不可用）", { currentSlug })}</NativeSelectOption>}
           {choices.map((plugin) => <NativeSelectOption key={plugin.slug} value={plugin.slug}>{plugin.name} · {plugin.slug}</NativeSelectOption>)}
         </NativeSelect>
       </Field>
-      {importedSlug && !choices.some((plugin) => plugin.slug === importedSlug) && <p role="status" className="text-sm text-muted-foreground">请在插件中心确认 {importedSlug} 已启用并通过验证，再绑定到游戏。</p>}
-      <Button ref={catalogButton} className="self-start" variant="outline" disabled={!backendAvailable || working} onClick={() => { setError(null); setShowCatalog(true); }}><GlobeIcon data-icon="inline-start" />查找云端插件</Button>
+      {importedSlug && !choices.some((plugin) => plugin.slug === importedSlug) && <p role="status" className="text-sm text-muted-foreground">{tr("请在插件中心确认 {importedSlug} 已启用并通过验证，再绑定到游戏。", { importedSlug })}</p>}
+      <Button ref={catalogButton} className="self-start" variant="outline" disabled={!backendAvailable || working} onClick={() => { setError(null); setShowCatalog(true); }}><GlobeIcon data-icon="inline-start" />{tr("查找云端插件")}</Button>
     </>}
   </Modal>;
 }
@@ -198,14 +199,14 @@ function RemoveGameDialog({ game, onClose, onRemoved }: { game: Game; onClose: (
   return <AlertDialog open onOpenChange={(next) => { if (!next && !working) onClose(); }}>
     <AlertDialogContent className="max-h-[calc(100dvh-2rem)] overflow-y-auto">
       <AlertDialogHeader>
-        <AlertDialogTitle>移除游戏</AlertDialogTitle>
-        <AlertDialogDescription>将「{game.name}」从游戏库移除。只移出管理，不会删除游戏文件、Mod 或存档。仍有已安装的 Mod 时，需要先在游戏详情中卸载。</AlertDialogDescription>
+        <AlertDialogTitle>{tr("移除游戏")}</AlertDialogTitle>
+        <AlertDialogDescription>{tr("将「{name}」从游戏库移除。只移出管理，不会删除游戏文件、Mod 或存档。仍有已安装的 Mod 时，需要先在游戏详情中卸载。", { name: game.name })}</AlertDialogDescription>
       </AlertDialogHeader>
       <ErrorState error={error} />
       <GameConflictPanel state={conflicts} busy={busy} />
       <AlertDialogFooter>
-        <AlertDialogCancel disabled={working}>取消</AlertDialogCancel>
-        <Button variant="destructive" disabled={working || !conflicts.canContinue} onClick={() => { void remove(); }}>{busy && <Spinner data-icon="inline-start" />}移除</Button>
+        <AlertDialogCancel disabled={working}>{tr("取消")}</AlertDialogCancel>
+        <Button variant="destructive" disabled={working || !conflicts.canContinue} onClick={() => { void remove(); }}>{busy && <Spinner data-icon="inline-start" />}{tr("移除")}</Button>
       </AlertDialogFooter>
     </AlertDialogContent>
   </AlertDialog>;
@@ -281,7 +282,7 @@ export default function LibraryPage() {
     setCandidates([await api<GameCandidate>("identify_game", { directory })]);
   }
   async function chooseDirectory() {
-    const selected = await open({ directory: true, multiple: false, title: "选择游戏目录" });
+    const selected = await open({ directory: true, multiple: false, title: tr("选择游戏目录") });
     if (typeof selected === "string" && selected) {
       setDirectory(selected);
       await scan(selected);
@@ -291,7 +292,7 @@ export default function LibraryPage() {
     const key = gameDirectoryKey(directory);
     setCandidates((items) => items.map((item) => gameDirectoryKey(item.rootPath) === key
       ? { ...item, name: game.name, registeredGameId: game.id, suggestedAdapterSlug: game.adapterSlug } : item));
-    notify(`已将「${game.name}」添加到游戏库`);
+    notify(tr("已将「{name}」添加到游戏库", { name: game.name }));
   }
   async function register(candidate: GameCandidate, localOnly = false) {
     if (!writable || candidate.registeredGameId) return;
@@ -318,14 +319,14 @@ export default function LibraryPage() {
   const rows = (games.data ?? []).filter((game) => game.name.toLowerCase().includes(search.toLowerCase()));
   const actionsDisabled = !backendAvailable || !!actionBusy;
   return <Page data-testid="library-page">
-    <PageHeader title="游戏库" subtitle={backendAvailable ? `${games.data?.length ?? 0} 个管理中的游戏` : "桌面能力未连接"}
+    <PageHeader title={tr("游戏库")} subtitle={backendAvailable ? tr("{value1} 个管理中的游戏", { value1: games.data?.length ?? 0 }) : tr("桌面能力未连接")}
       actions={<Button ref={scanButton} variant="outline" aria-haspopup="dialog" disabled={!backendAvailable} onClick={() => {
         setScanOpen(true);
         void discover(() => scan());
-      }}><RefreshCwIcon data-icon="inline-start" />扫描游戏</Button>} />
+      }}><RefreshCwIcon data-icon="inline-start" />{tr("扫描游戏")}</Button>} />
     <div className="flex flex-wrap items-center gap-3">
-      <InputGroup className="max-w-sm"><InputGroupAddon><SearchIcon /></InputGroupAddon><InputGroupInput aria-label="搜索游戏" placeholder="搜索游戏…" value={search} onChange={(event) => setSearch(event.target.value)} /></InputGroup>
-      <Badge className="ml-auto">{backendAvailable ? "本机游戏" : "浏览器预览"}</Badge>
+      <InputGroup className="max-w-sm"><InputGroupAddon><SearchIcon /></InputGroupAddon><InputGroupInput aria-label={tr("搜索游戏")} placeholder={tr("搜索游戏…")} value={search} onChange={(event) => setSearch(event.target.value)} /></InputGroup>
+      <Badge className="ml-auto">{backendAvailable ? tr("本机游戏") : tr("浏览器预览")}</Badge>
     </div>
     {games.error && <ErrorState error={games.error} />}
     {error != null && <ErrorState error={error} />}
@@ -335,43 +336,43 @@ export default function LibraryPage() {
         onCreateAdapter={() => startAdapterChat({ name: game.name, gameId: game.id })}
         onChooseAdapter={() => setChoosingAdapter(game)}
         onOpen={() => selectGame(game.id)}
-        onLaunch={() => { void perform(game, "launch_game", { id: game.id }, "已发出启动请求"); }}
+        onLaunch={() => { void perform(game, "launch_game", { id: game.id }, tr("已发出启动请求")); }}
         onLocation={(target) => { void perform(game, "open_game_location", { id: game.id, target }); }}
         onEdit={() => setEditing(game)} onRemove={() => setRemoving(game)} />)}
     </div>}
-    {!rows.length && !games.error && <EmptyState icon={<Gamepad2Icon />} title={!backendAvailable ? "桌面能力未连接" : games.isLoading ? "正在读取游戏库…" : search ? "没有匹配的游戏" : "尚无管理中的游戏"} />}
+    {!rows.length && !games.error && <EmptyState icon={<Gamepad2Icon />} title={!backendAvailable ? tr("桌面能力未连接") : games.isLoading ? tr("正在读取游戏库…") : search ? tr("没有匹配的游戏") : tr("尚无管理中的游戏")} />}
 
-    {scanOpen && <Modal title="扫描游戏" description="扫描常用位置或指定目录，然后选择要添加的游戏。" className="sm:max-w-3xl"
+    {scanOpen && <Modal title={tr("扫描游戏")} description={tr("扫描常用位置或指定目录，然后选择要添加的游戏。")} className="sm:max-w-3xl"
       onClose={() => { stopScan(); setScanOpen(false); }} onCloseAutoFocus={(event) => { event.preventDefault(); scanButton.current?.focus(); }}>
       <form className="flex flex-col gap-2" onSubmit={(event) => { event.preventDefault(); if (directory.trim()) void discover(() => scan(directory)); }}>
         <div className="flex items-center gap-2">
-          <InputGroup className="min-w-0 flex-1"><InputGroupInput ref={directoryInput} aria-label="游戏目录" placeholder="输入游戏或游戏库目录的完整路径" value={directory} disabled={busy} onChange={(event) => setDirectory(event.target.value)} /></InputGroup>
-          <IconButton type="button" title="选择游戏目录" variant="outline" size="icon" disabled={busy} onClick={() => { void discover(chooseDirectory); }}><FolderOpenIcon /></IconButton>
+          <InputGroup className="min-w-0 flex-1"><InputGroupInput ref={directoryInput} aria-label={tr("游戏目录")} placeholder={tr("输入游戏或游戏库目录的完整路径")} value={directory} disabled={busy} onChange={(event) => setDirectory(event.target.value)} /></InputGroup>
+          <IconButton type="button" title={tr("选择游戏目录")} variant="outline" size="icon" disabled={busy} onClick={() => { void discover(chooseDirectory); }}><FolderOpenIcon /></IconButton>
         </div>
         <div className="flex flex-wrap gap-2">
-          <Button type="submit" disabled={!directory.trim() || busy}>扫描此目录</Button>
-          <Button type="button" variant="outline" disabled={!directory.trim() || busy} onClick={() => { void discover(identify); }}>检查单个游戏</Button>
-          <Button type="button" variant="ghost" disabled={busy} onClick={() => { void discover(() => scan()); }}>扫描常用位置</Button>
+          <Button type="submit" disabled={!directory.trim() || busy}>{tr("扫描此目录")}</Button>
+          <Button type="button" variant="outline" disabled={!directory.trim() || busy} onClick={() => { void discover(identify); }}>{tr("检查单个游戏")}</Button>
+          <Button type="button" variant="ghost" disabled={busy} onClick={() => { void discover(() => scan()); }}>{tr("扫描常用位置")}</Button>
         </div>
       </form>
-      {scanning && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner />{scanRoot ? "正在扫描指定目录…" : "正在扫描常用位置…"}</p>}
+      {scanning && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner />{scanRoot ? tr("正在扫描指定目录…") : tr("正在扫描常用位置…")}</p>}
       <div className="flex flex-wrap gap-2">
-        {report?.nextCursor && !scanning && <Button type="button" variant="outline" disabled={busy} onClick={() => void discover(() => scan(scanRoot ?? undefined, report.nextCursor!))}>下一批候选</Button>}
-        {(scanning || report?.nextCursor) && <Button type="button" variant="ghost" onClick={stopScan}>停止扫描</Button>}
+        {report?.nextCursor && !scanning && <Button type="button" variant="outline" disabled={busy} onClick={() => void discover(() => scan(scanRoot ?? undefined, report.nextCursor!))}>{tr("下一批候选")}</Button>}
+        {(scanning || report?.nextCursor) && <Button type="button" variant="ghost" onClick={stopScan}>{tr("停止扫描")}</Button>}
       </div>
       <ErrorState error={discoveryError} />
       {report && <div role="status" className="flex flex-col gap-1 text-sm text-muted-foreground">
-        {scanRoot && <PathText>扫描目录：{displayPath(scanRoot)}</PathText>}
-        <p>已检查 {report.directoriesChecked} 个目录、{report.entriesChecked} 个条目，本批 {discoveryRows.length} 个候选目录{report.truncated ? " · 已达到扫描上限" : ""}</p>
-        {!report.candidates.length && !report.nextCursor && <p>{scanRoot ? "未发现候选游戏。若已选择单个游戏的安装目录，可使用“检查单个游戏”。" : "未在常用位置发现候选游戏，可指定目录扫描。"}</p>}
+        {scanRoot && <PathText>{tr("扫描目录：{value1}", { value1: displayPath(scanRoot) })}</PathText>}
+        <p>{tr("已检查 {directoriesChecked} 个目录、{entriesChecked} 个条目，本批 {length} 个候选目录{value4}", { directoriesChecked: report.directoriesChecked, entriesChecked: report.entriesChecked, length: discoveryRows.length, value4: report.truncated ? tr(" · 已达到扫描上限") : "" })}</p>
+        {!report.candidates.length && !report.nextCursor && <p>{scanRoot ? tr("未发现候选游戏。若已选择单个游戏的安装目录，可使用“检查单个游戏”。") : tr("未在常用位置发现候选游戏，可指定目录扫描。")}</p>}
       </div>}
       {!!report?.warnings.length && <details className="min-w-0 text-sm">
-        <summary className="w-fit cursor-pointer text-muted-foreground">扫描警告（{report.warnings.length}）</summary>
+        <summary className="w-fit cursor-pointer text-muted-foreground">{tr("扫描警告（{length}）", { length: report.warnings.length })}</summary>
         <ul className="mt-2 flex flex-col gap-1">
-          {report.warnings.map((warning, index) => <li key={index}><PathText className="text-warning">{displayPath(warning.path)}：{warning.message}</PathText></li>)}
+          {report.warnings.map((warning, index) => <li key={index}><PathText className="text-warning">{displayPath(warning.path)}：{errorText(warning)}</PathText></li>)}
         </ul>
       </details>}
-      {discoveryRows.length > 0 && <ItemGroup aria-label="扫描候选游戏" className="gap-2">
+      {discoveryRows.length > 0 && <ItemGroup aria-label={tr("扫描候选游戏")} className="gap-2">
         {discoveryRows.map((candidate, index) => {
           const matched = cloud.match(candidate);
           const waiting = cloud.waiting(candidate);
@@ -380,14 +381,14 @@ export default function LibraryPage() {
             <ItemContent className="min-w-0">
               <ItemTitle className="max-w-full break-all">{matched?.gameName ?? candidate.name}</ItemTitle>
               <ItemDescription className="line-clamp-none"><PathText>{displayPath(candidate.rootPath)}</PathText></ItemDescription>
-              {matched && <p className="wrap-anywhere text-xs text-muted-foreground">{matched.pluginName} · {matched.reusable ? "将校验并复用已安装适配包" : "适配包将随添加安装"}</p>}
-              {candidate.warnings.map((warning) => <p key={warning} className="text-xs text-warning">{warning}</p>)}
+              {matched && <p className="wrap-anywhere text-xs text-muted-foreground">{matched.pluginName} · {matched.reusable ? tr("将校验并复用已安装适配包") : tr("适配包将随添加安装")}</p>}
+              {candidateWarnings(candidate).map((warning) => <p key={warning} className="text-xs text-warning">{warning}</p>)}
             </ItemContent>
             <ItemActions className="w-full flex-wrap sm:w-auto">
               <GameMatchBadge loading={waiting} candidate={candidate} cloudMatched={!!matched} />
-              {!matched && !waiting && !candidate.suggestedAdapterSlug && !candidate.registeredGameId && <Button variant="outline" size="sm" disabled={!backendAvailable || busy || games.isLoading} onClick={(event) => setIdentity({ directory: candidate.rootPath, trigger: event.currentTarget })}><GlobeIcon data-icon="inline-start" />联网识别</Button>}
-              <Button size="sm" variant={candidate.registeredGameId ? "outline" : "default"} disabled={!writable || busy || cloud.pending || waiting || games.isLoading || !!candidate.registeredGameId} onClick={() => { void register(candidate); }}>{candidate.registeredGameId ? "管理中" : waiting ? "正在匹配…" : "添加"}</Button>
-              {!candidate.registeredGameId && (waiting || failedRegistrations[candidate.rootPath]) && <Button variant="outline" size="sm" disabled={!writable || busy || cloud.pending || games.isLoading} onClick={() => void register(candidate, true)}>仅添加本地</Button>}
+              {!matched && !waiting && !candidate.suggestedAdapterSlug && !candidate.registeredGameId && <Button variant="outline" size="sm" disabled={!backendAvailable || busy || games.isLoading} onClick={(event) => setIdentity({ directory: candidate.rootPath, trigger: event.currentTarget })}><GlobeIcon data-icon="inline-start" />{tr("联网识别")}</Button>}
+              <Button size="sm" variant={candidate.registeredGameId ? "outline" : "default"} disabled={!writable || busy || cloud.pending || waiting || games.isLoading || !!candidate.registeredGameId} onClick={() => { void register(candidate); }}>{candidate.registeredGameId ? tr("管理中") : waiting ? tr("正在匹配…") : tr("添加")}</Button>
+              {!candidate.registeredGameId && (waiting || failedRegistrations[candidate.rootPath]) && <Button variant="outline" size="sm" disabled={!writable || busy || cloud.pending || games.isLoading} onClick={() => void register(candidate, true)}>{tr("仅添加本地")}</Button>}
             </ItemActions>
           </Item>;
         })}
@@ -405,16 +406,16 @@ export default function LibraryPage() {
 
     {editing && <EditGameDialog key={editing.id} game={editing} onClose={() => setEditing(null)} onSaved={async () => {
       await invalidateGameQueries(client, { gameIds: [editing.id] });
-      notify("已保存游戏设置");
+      notify(tr("已保存游戏设置"));
     }} />}
     {choosingAdapter && <ChooseAdapterDialog key={choosingAdapter.id} game={choosingAdapter} writable={writable} plugins={plugins.data ?? []} onClose={() => setChoosingAdapter(null)} onSaved={async (updated) => {
       client.setQueryData(["game", updated.id], updated);
       await invalidateGameQueries(client, { gameIds: [updated.id] });
-      notify(updated.adapterSlug ? "已应用游戏适配包" : "已移除游戏适配包");
+      notify(updated.adapterSlug ? tr("已应用游戏适配包") : tr("已移除游戏适配包"));
     }} />}
     {removing && <RemoveGameDialog key={removing.id} game={removing} onClose={() => setRemoving(null)} onRemoved={async () => {
       await invalidateGameQueries(client, { gameIds: [removing.id], workspaceChanged: true });
-      notify("已从游戏库移除");
+      notify(tr("已从游戏库移除"));
     }} />}
   </Page>;
 }

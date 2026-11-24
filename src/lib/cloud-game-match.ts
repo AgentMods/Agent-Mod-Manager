@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useMutation, useIsMutating, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, backendAvailable } from './api';
 import { pluginChangeKey } from './plugin-change';
@@ -64,7 +65,7 @@ export function useCloudGameMatch(enabled: boolean) {
   const mutation = useMutation({
     mutationKey: pluginChangeKey, networkMode: 'always',
     mutationFn: async ({ candidate, localOnly }: { action: 'register-game'; candidate: GameCandidate; localOnly: boolean }) => {
-      if (!localOnly && waiting(candidate)) throw new Error('云目录正在加载，请稍后重试，或选择仅添加本地。');
+      if (!localOnly && waiting(candidate)) throw new Error(tr("云目录正在加载，请稍后重试，或选择仅添加本地。"));
       const release = localOnly ? undefined : match(candidate);
       const game = await api<Game>('register_game', {
         directory: candidate.rootPath, adapterSlug: candidate.suggestedAdapterSlug, fromDiscovery: true,
@@ -82,7 +83,7 @@ export function useCloudGameMatch(enabled: boolean) {
     },
   });
   async function register(candidate: GameCandidate, localOnly = false) {
-    if (client.isMutating({ mutationKey: pluginChangeKey })) throw new Error('适配包操作正在进行，请稍后重试。');
+    if (client.isMutating({ mutationKey: pluginChangeKey })) throw new Error(tr("适配包操作正在进行，请稍后重试。"));
     return (await mutation.mutateAsync({ action: 'register-game', candidate, localOnly })).game;
   }
   return { match, register, waiting, pending };

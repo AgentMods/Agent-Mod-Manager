@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { displayPath } from "@/lib/paths";
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -32,7 +33,7 @@ export function useGameConflicts(gameId: string, change: GameChange) {
     setError(null);
     try {
       await api("resolve_game_conflict", {gameId, change, conflictId: conflict.id, confirmApproved});
-      notify("已解除待处理任务");
+      notify(tr("已解除待处理任务"));
     } catch (failure) {
       setError(failure);
     } finally {
@@ -47,7 +48,7 @@ export function useGameConflicts(gameId: string, change: GameChange) {
 }
 
 const statusLabels: Record<string, string> = {
-  planned: "待执行", pending: "待审批", approved: "已批准，待执行", applying: "执行中", rolling_back: "回滚中", recovery_failed: "需恢复",
+  get planned() { return tr("待执行"); }, get pending() { return tr("待审批"); }, get approved() { return tr("已批准，待执行"); }, get applying() { return tr("执行中"); }, get rolling_back() { return tr("回滚中"); }, get recovery_failed() { return tr("需恢复"); },
 };
 
 function ConflictRow({conflict, disabled, resolving, onResolve}: {
@@ -69,18 +70,18 @@ function ConflictRow({conflict, disabled, resolving, onResolve}: {
     {conflict.summary && conflict.summary !== conflict.title && <p className="wrap-anywhere text-sm">{conflict.summary}</p>}
     {conflict.paths[0] && <PathText>{displayPath(conflict.paths[0])}</PathText>}
     <div className="flex flex-wrap items-center gap-2">
-      <Button variant="ghost" size="sm" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>{expanded ? "收起" : "查看"}</Button>
+      <Button variant="ghost" size="sm" aria-expanded={expanded} onClick={() => setExpanded(!expanded)}>{expanded ? tr("收起") : tr("查看")}</Button>
       {conflict.canResolve && <Button variant="outline" size="sm" disabled={disabled} onClick={release}>
-        {resolving && <Spinner data-icon="inline-start" />}{confirming ? "确认解除" : "解除"}
+        {resolving && <Spinner data-icon="inline-start" />}{confirming ? tr("确认解除") : tr("解除")}
       </Button>}
-      {confirming && <Button variant="ghost" size="sm" onClick={() => setConfirming(false)}>保留计划</Button>}
+      {confirming && <Button variant="ghost" size="sm" onClick={() => setConfirming(false)}>{tr("保留计划")}</Button>}
     </div>
     {conflict.resolutionHint && (!conflict.canResolve || confirming || expanded) && <p className="text-xs text-muted-foreground">{conflict.resolutionHint}</p>}
     {expanded && <div className="flex flex-col gap-1.5 border-t pt-2 text-sm">
       {conflict.detail && <p className="whitespace-pre-wrap wrap-anywhere">{conflict.detail}</p>}
       {conflict.paths.slice(1).map((path) => <PathText key={path}>{displayPath(path)}</PathText>)}
-      <PathText>任务 ID：{conflict.id}</PathText>
-      {conflict.planId && conflict.planId !== conflict.id && <PathText>关联计划：{conflict.planId}</PathText>}
+      <PathText>{tr("任务 ID：{id}", { id: conflict.id })}</PathText>
+      {conflict.planId && conflict.planId !== conflict.id && <PathText>{tr("关联计划：{planId}", { planId: conflict.planId })}</PathText>}
     </div>}
   </li>;
 }
@@ -90,18 +91,18 @@ export function GameConflictPanel({state, busy}: {state: ReturnType<typeof useGa
   const items = query.data ?? [];
   return <>
     <ErrorState error={state.error || query.error} />
-    {query.isError && <Button variant="outline" size="sm" disabled={query.isFetching} onClick={() => void state.refresh()}>重新检查任务</Button>}
-    {query.isLoading && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner />正在检查待处理任务…</p>}
-    {items.length > 0 && <section className="flex min-w-0 flex-col gap-2" aria-label="待处理任务">
+    {query.isError && <Button variant="outline" size="sm" disabled={query.isFetching} onClick={() => void state.refresh()}>{tr("重新检查任务")}</Button>}
+    {query.isLoading && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner />{tr("正在检查待处理任务…")}</p>}
+    {items.length > 0 && <section className="flex min-w-0 flex-col gap-2" aria-label={tr("待处理任务")}>
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h3 className="flex items-center gap-2 text-sm font-medium"><AlertTriangleIcon className="size-4 text-warning" />{change === "remove" ? "移除前需处理的任务" : "适配包选择已阻止"}（{items.length}）</h3>
-        <Button variant="ghost" size="sm" disabled={busy || !!resolving || query.isFetching} onClick={() => void state.refresh()}>刷新</Button>
+        <h3 className="flex items-center gap-2 text-sm font-medium"><AlertTriangleIcon className="size-4 text-warning" />{change === "remove" ? tr("移除前需处理的任务") : tr("适配包选择已阻止")}（{items.length}）</h3>
+        <Button variant="ghost" size="sm" disabled={busy || !!resolving || query.isFetching} onClick={() => void state.refresh()}>{tr("刷新")}</Button>
       </div>
-      {items.some((task) => task.canResolve) && <p className="text-xs text-muted-foreground">解除将取消所选任务，保留磁盘上的文件。</p>}
+      {items.some((task) => task.canResolve) && <p className="text-xs text-muted-foreground">{tr("解除将取消所选任务，保留磁盘上的文件。")}</p>}
       <ul className="flex max-h-80 min-w-0 flex-col gap-2 overflow-y-auto">
         {items.map((conflict) => <ConflictRow key={`${conflict.kind}-${conflict.id}`} conflict={conflict} disabled={busy || !!resolving || query.isFetching} resolving={resolving === conflict.id} onResolve={(confirm) => void state.resolve(conflict, confirm)} />)}
       </ul>
     </section>}
-    {change === "select_adapter" && state.canContinue && <p className="flex items-center gap-2 text-sm text-muted-foreground"><CheckCircle2Icon className="size-4 text-success" />没有发现会阻止适配包选择的待处理任务。</p>}
+    {change === "select_adapter" && state.canContinue && <p className="flex items-center gap-2 text-sm text-muted-foreground"><CheckCircle2Icon className="size-4 text-success" />{tr("没有发现会阻止适配包选择的待处理任务。")}</p>}
   </>;
 }

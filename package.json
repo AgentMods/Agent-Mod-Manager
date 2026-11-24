@@ -10,7 +10,9 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "test:ui": "playwright test",
+    "build": "yarn check:locales && tsc -b && vite build",
+    "check:locales": "node scripts/check-locales.mjs",
     "preview": "vite preview",
     "prepare:mcp-runtime": "node scripts/prepare-mcp-runtime.mjs",
     "prepare:seven-zip": "node scripts/prepare-mcp-runtime.mjs --seven-zip-only",

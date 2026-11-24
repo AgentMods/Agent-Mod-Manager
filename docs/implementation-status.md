@@ -3,6 +3,42 @@
 Updated: 2026-11-24. The full project goal remains active. This is an
 implementation and verification snapshot, not a release-completion claim.
 
+**Desktop languages (2026-11-24).** Settings → Appearance and storage has one
+Language selector for the interface and newly queued Mod organization jobs.
+It follows system preferences by default, falls back to English, and persists a
+manual choice across restarts. Supported languages are Simplified Chinese,
+English, Japanese, Korean, German, French, Spanish, Brazilian Portuguese,
+Russian and Italian. The SQLite migration carries forward a supported legacy
+Mod language preference. Previously queued jobs keep their recorded language.
+
+Chat honors an explicit language request, then the language of the user's own
+current message. For attachment-only or ambiguous input it consults previous
+authored messages and falls back to the effective app language. This also
+applies to questionnaires and resumed turns. The UI can switch language while
+a chat draft or a dialog is open. Dates, counts, app-authored scan warnings and
+known native errors use the effective locale. User content and diagnostic
+paths retain their original text. The Windows NSIS wizard selects from the same
+ten languages using the Windows display language.
+
+The production build validated 1,238 UI messages and 711 native error details.
+Twelve focused checks exercised plural forms, confirmation text and native
+error rendering. On Windows the full Rust library suite passed 1,163 tests
+with 15 ignored. All-target Clippy and Rust formatting also passed.
+Playwright passed 1,022 checks with four skipped, covering all ten choices,
+reload persistence, fallback, drafts, open dialogs and narrow layouts. The
+final x64 NSIS package passed its archive test. All ten installer language
+resources passed their compiler checks, and the wizard opened in Simplified
+Chinese on the test host. Desktop WebView relaunch with a disposable Windows
+profile and live model response-language checks remain unverified.
+
+**Windows installer welcome page (2026-11-24).** The NSIS setup wizard now uses
+GA artwork, native English and Simplified Chinese text, and the Windows app
+color preference. Open wizard pages refresh on a system theme change. A native
+NSIS fixture switched both languages between light and dark using a private
+registry subtree and navigated through directory selection and completion.
+The packaged x64 installer was opened on Windows and exercised through Next,
+Back and Cancel. The package smoke job covers installation on a disposable host.
+
 **Archive and Linux dependency security fixes (2026-11-24).** The Rust lockfile
 selects `zip 9.8.2` for archive handling. ZIP preflight propagates filename
 decoding errors and rejects entries without a validated data offset. The Linux
@@ -110,8 +146,12 @@ The worker uses recorded source titles and meaningful relative component names
 when download filenames are opaque. It preserves manual tag assignments and
 leaves names alone when the available evidence is insufficient. Transient
 failures retry with backoff. Disabling the skill pauses pending work, and a
-completed record stays complete across restarts. The target language defaults
-to the system language and can be set in Settings → Appearance and storage.
+completed record stays complete across restarts. The shared Language setting
+(under Settings → Appearance and storage) controls the interface and the
+language of newly queued Mod organization jobs. It defaults to the first
+supported system language, or English. Earlier supported Mod language
+overrides migrate to this setting; changing it does not alter queued or completed
+jobs. Agent chat still follows the current prompt.
 Game Details shows customizable color tags before the Mod name and supports
 filtering by tag. Organization updates manager metadata only.
 A local model fixture exercised both a new approved installation and startup
@@ -581,7 +621,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   picker and migration confirmation. After a migration restart, the guide opens
   at model configuration when the active root has changed, or returns to the
   storage step to show a migration error. Model setup, tool activation and game
-  scanning can be deferred. Adding a discovered game requires explicit selection.
+  scanning can be deferred. Clicking “添加” on a scan result adds that game directly.
   The completion screen shows the current directory, default model, running tool
   services and library count. The guide supports light and dark themes, a compact
   progress indicator on narrow screens, and reopening from Settings.
@@ -1016,6 +1056,36 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   cross-platform or release acceptance.
 
 ## Verification
+
+**Windows release smoke, 2026-11-24.** The production desktop was opened with
+its existing data to inspect the library, plugin catalog, history, settings and
+themes. Write scenarios used a separate release build of the same source with an
+isolated application identifier and temporary game files. The sidebar now exposes
+archived conversations, Settings names the install and uninstall Skills in Chinese,
+and the file approval preview shows the import description, operation and impact
+in Chinese. Steam discovery excludes the manifest IDs for Steamworks Common
+Redistributables and Ubisoft Connect Services, including directory-scan fallback.
+
+The native WebView2 flow covered first launch, adapter creation and deployment,
+Minecraft registration and Fabric diagnostics. Windows selected a local JAR,
+approval installed it, and the installed bytes matched the reviewed archive.
+A loopback model exercised streamed tool calls, cancellation and archival. After
+relaunch the archived conversation was read-only and the recycled test file was
+restored byte-for-byte. SQLite integrity and the six committed file transactions
+were checked. The local Fabric 1.21.1 bootstrap also produced real English and
+Chinese missing-dependency and version-mismatch logs, plus a successful test Mod
+entrypoint before the EULA prompt. The native diagnostic parser replayed all five.
+Anonymous live checks downloaded a pinned Modrinth JAR and resolved and downloaded
+a Thunderstore release. The integrity checks used the downloaded bytes.
+The final native scan of the workstation returned seven candidates from 63 entries,
+retaining the games and omitting both platform services. Across three viewport
+sizes, Playwright passed 995 cases with four viewport-specific skips. The Rust
+library suite passed 1,151 cases with 15 opt-in or helper cases ignored. After
+the import wording change, all 14 import tests passed. Rust formatting, all-target
+Clippy, the frontend production build, and 19 browser-search tests passed.
+The final Windows x64 ZIP was unpacked and all seven files matched the release
+build. Installer lifecycle, a signed live upgrade, external publication and paid
+model credentials were outside this workstation smoke run.
 
 On Windows with the Mihomo tunnel active, system DNS returned both IPv4 and IPv6
 benchmark addresses for Mod Inn and Modrinth. The native downloader recovered the

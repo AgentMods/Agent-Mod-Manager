@@ -1,5 +1,6 @@
+import { tr, useLocale } from "@/lib/i18n";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
-import { Gamepad2Icon, HeartIcon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
+import { Gamepad2Icon, HeartIcon, HistoryIcon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -9,7 +10,7 @@ import { invalidateAgentModQueries } from "./lib/agent-mod-cache";
 import { gameMutationsFromResults, invalidateGameQueries } from "./lib/game-cache";
 import { syncModSwitches, withoutModSwitchWrites } from "./lib/mod-switch-store";
 import { useUI } from "./lib/store";
-import { t } from "./lib/i18n";
+import { useLanguageSync } from "./lib/app-language";
 import type { BootstrapState, PageName } from "./lib/types";
 import { BackgroundApprovalLink } from "./components/AgentConfirmation";
 import { PlanDialog } from "./components/PlanDialog";
@@ -33,13 +34,13 @@ const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 const OnboardingPage = lazy(() => import("./pages/OnboardingPage"));
 
 const navigation = [
-  { id: "agent", label: "Agent ", icon: MessageSquareIcon },
-  { id: "library", label: "游戏库", icon: LibraryIcon },
-  { id: "plugins", label: "插件中心", icon: PuzzleIcon },
-  { id: "trash", label: "回收站", icon: Trash2Icon },
-  // { id: "history", label: "历史对话", icon: HistoryIcon },
+  { id: "agent", label: "Agent", icon: MessageSquareIcon },
+  { id: "library", get label() { return tr("游戏库"); }, icon: LibraryIcon },
+  { id: "plugins", get label() { return tr("插件中心"); }, icon: PuzzleIcon },
+  { id: "trash", get label() { return tr("回收站"); }, icon: Trash2Icon },
+  { id: "history", get label() { return tr("历史对话"); }, icon: HistoryIcon },
 ] as const;
-const settingsItem = { id: "settings", label: "设置", icon: SettingsIcon } as const;
+const settingsItem = { id: "settings", get label() { return tr("设置"); }, icon: SettingsIcon } as const;
 const SPONSOR_URL = "https://sponsor.aoe.top/";
 const APP_VERSION = "v0.1.0";
 const pages = { library: LibraryPage, detail: GameDetailPage, agent: AgentPage, plugins: PluginsPage, trash: TrashPage, history: HistoryPage, settings: SettingsPage };
@@ -78,6 +79,8 @@ function invalidateOrganizedModQueries(client: ReturnType<typeof useQueryClient>
 }
 
 export default function App() {
+  useLocale();
+  useLanguageSync();
   const view = useUI((state) => state.view);
   const navigate = useUI((state) => state.navigate);
   const theme = useUI((state) => state.theme);
@@ -139,7 +142,7 @@ export default function App() {
       if (!disposed) refresh(); // A native update can finish while the webview is starting.
       return stop;
     }).catch(error => {
-      if (!disposed) notify(`无法订阅适配包更新：${String(error)}`);
+      if (!disposed) notify(tr("无法订阅适配包更新：{value1}", { value1: String(error) }));
     });
     return () => { disposed = true; void subscription.then(stop => stop?.()); };
   }, [client, notify]);
@@ -165,7 +168,7 @@ export default function App() {
         invalidateOrganizedModQueries(client, current.gameId);
       }
     }).catch((error) => {
-      if (!disposed) notify(`无法订阅 Mod 整理更新：${String(error)}`);
+      if (!disposed) notify(tr("无法订阅 Mod 整理更新：{value1}", { value1: String(error) }));
     });
     return () => {
       disposed = true;
@@ -191,22 +194,22 @@ export default function App() {
       }
     }
   }, (error) => notify(String(error))), [client, visibleConversation, notify]);
-  const appName = t("app.name");
+  const appName = "Agent Mod Manager";
   const wide = useWideWindow();
   const [railOpen, setRailOpen] = useState<boolean | null>(storedRail);
   const changeRail = (open: boolean) => { setRailOpen(open); storeRail(open); };
 
-  if (backendAvailable && bootstrap.isLoading && !bootstrap.data) return <div className="flex min-h-dvh items-center justify-center bg-background"><Loading>正在准备桌面服务…</Loading></div>;
+  if (backendAvailable && bootstrap.isLoading && !bootstrap.data) return <div className="flex min-h-dvh items-center justify-center bg-background"><Loading>{tr("正在准备桌面服务…")}</Loading></div>;
   const automaticOnboarding = !!(bootstrap.data?.isFirstRun || bootstrap.data?.resumeOnboarding);
   if (backendAvailable && bootstrap.data && (view === "onboarding" || automaticOnboarding)) {
-    return <Suspense fallback={<main className="flex min-h-dvh items-center justify-center bg-background"><Loading>正在加载引导…</Loading></main>}>
+    return <Suspense fallback={<main className="flex min-h-dvh items-center justify-center bg-background"><Loading>{tr("正在加载引导…")}</Loading></main>}>
       <OnboardingPage automatic={automaticOnboarding} bootstrap={bootstrap.data} />
     </Suspense>;
   }
 
   const shellView = view === "onboarding" ? "settings" : view;
   const Page = pages[shellView];
-  const current = shellView === "detail" ? "游戏详情" : [...navigation, settingsItem].find((item) => item.id === shellView)?.label;
+  const current = shellView === "detail" ? tr("游戏详情") : [...navigation, settingsItem].find((item) => item.id === shellView)?.label;
   const macos = backendAvailable && navigator.platform.startsWith("Mac");
   return <SidebarProvider open={railOpen ?? wide} onOpenChange={changeRail} className="h-dvh min-h-0 overflow-hidden" style={{ "--sidebar-width": "13.5rem" } as React.CSSProperties}>
     <Sidebar collapsible="icon" className="[&_[data-slot=sidebar-inner]]:bg-sidebar">
@@ -223,7 +226,7 @@ export default function App() {
       <SidebarContent>
         <SidebarGroup>
           <SidebarGroupContent>
-            <nav aria-label="主导航">
+            <nav aria-label={tr("主导航")}>
               <SidebarMenu>
                 {navigation.map(({ id, label, icon: Icon }, index) => {
                   const active = view === id || (id === "library" && view === "detail");
@@ -242,16 +245,16 @@ export default function App() {
         <div className="flex items-center justify-between gap-2 group-data-[collapsible=icon]:flex-col">
           <IconButton title={settingsItem.label} variant={view === "settings" ? "secondary" : "ghost"} aria-current={view === "settings" ? "page" : undefined} onClick={() => navigate("settings")}><settingsItem.icon /></IconButton>
           <div className="flex items-center group-data-[collapsible=icon]:flex-col">
-            <IconButton asChild title="赞助">
+            <IconButton asChild title={tr("赞助")}>
               <a href={SPONSOR_URL} target="_blank" rel="noreferrer" onClick={(event) => {
                 if (!backendAvailable) return;
                 event.preventDefault();
-                void openUrl(SPONSOR_URL).catch((error) => notify(`无法打开赞助页面：${errorText(error)}`));
+                void openUrl(SPONSOR_URL).catch((error) => notify(tr("无法打开赞助页面：{value1}", { value1: errorText(error) })));
               }}>
                 <HeartIcon aria-hidden="true" />
               </a>
             </IconButton>
-            <IconButton title={theme === "light" ? "切换暗色主题" : "切换亮色主题"} onClick={toggleTheme}>{theme === "light" ? <MoonIcon className="motion-safe:animate-icon-swap" /> : <SunIcon className="motion-safe:animate-icon-swap" />}</IconButton>
+            <IconButton title={theme === "light" ? tr("切换暗色主题") : tr("切换亮色主题")} onClick={toggleTheme}>{theme === "light" ? <MoonIcon className="motion-safe:animate-icon-swap" /> : <SunIcon className="motion-safe:animate-icon-swap" />}</IconButton>
           </div>
         </div>
       </SidebarFooter>
@@ -272,11 +275,11 @@ export default function App() {
         </div>
         <BackgroundApprovalLink visibleConversation={visibleConversation} />
       </header>
-      {!backendAvailable && <Alert role="status" className="rounded-none border-x-0 border-t-0 bg-muted/50"><AlertDescription>未连接桌面服务，游戏目录与文件操作不可用。</AlertDescription></Alert>}
-      {bootstrap.data?.recoveryError && <ErrorState className="rounded-none border-x-0 border-t-0" error={`文件事务恢复需要处理：${bootstrap.data.recoveryError}`} />}
+      {!backendAvailable && <Alert role="status" className="rounded-none border-x-0 border-t-0 bg-muted/50"><AlertDescription>{tr("未连接桌面服务，游戏目录与文件操作不可用。")}</AlertDescription></Alert>}
+      {bootstrap.data?.recoveryError && <ErrorState className="rounded-none border-x-0 border-t-0" error={tr("文件事务恢复需要处理：{recoveryError}", { recoveryError: bootstrap.data.recoveryError })} />}
       <ErrorState className="rounded-none border-x-0 border-t-0" error={bootstrap.error} />
       <main className="min-h-0 min-w-0 flex-1 overflow-auto">
-        <Suspense fallback={<Loading>正在加载...</Loading>}><Page /></Suspense>
+        <Suspense fallback={<Loading>{tr("正在加载...")}</Loading>}><Page /></Suspense>
       </main>
     </SidebarInset>
     <PlanDialog />

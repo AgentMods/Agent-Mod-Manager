@@ -1,3 +1,5 @@
+import { tr } from "@/lib/i18n";
+import { trashPurgeSources } from "@/locales/plurals";
 import { useState } from "react";
 import { Trash2Icon, TriangleAlertIcon } from "lucide-react";
 import { Modal, PathText, bytes } from "@/components/ui";
@@ -20,16 +22,19 @@ export function TrashPurgeDialog({request, busy, onClose, onConfirm}: {
   const {items, scope} = request;
   const all = scope === "all";
   const size = DEFAULT_TRASH_PAGE_SIZE;
-  return <Modal title={all ? "清空回收站" : "永久删除回收站文件"} onClose={onClose} className="sm:max-w-xl" actions={<>
-    <Button variant="outline" disabled={busy} onClick={onClose}>取消</Button>
+  return <Modal title={all ? tr("清空回收站") : tr("永久删除回收站文件")} onClose={onClose} className="sm:max-w-xl" actions={<>
+    <Button variant="outline" disabled={busy} onClick={onClose}>{tr("取消")}</Button>
     <Button variant="destructive" disabled={busy || !acknowledged} onClick={() => {if (acknowledged && !busy) onConfirm();}}>
-      {busy ? <Spinner data-icon="inline-start"/> : <Trash2Icon data-icon="inline-start"/>}{all ? "确认清空" : "永久删除"}
+      {busy ? <Spinner data-icon="inline-start"/> : <Trash2Icon data-icon="inline-start"/>}{all ? tr("确认清空") : tr("永久删除")}
     </Button>
   </>}>
     <Alert variant="warning"><TriangleAlertIcon aria-hidden="true"/><AlertDescription>
-      <p>将永久删除{all ? "回收站内全部" : "所选的"} {items.length} 项（{bytes(items.reduce((sum, item) => sum + item.size, 0))}）。此操作不可撤销。</p>
-      {all && <p>包括所有游戏和所有分页中的文件，不受当前筛选或勾选范围限制。</p>}
-      {items.some((item) => item.restore_requires_rollback) && <p>删除被替换的 Mod 文件后，相关替换事务也将无法回滚。</p>}
+      <p>{tr(trashPurgeSources[scope], {
+        length: items.length,
+        size: bytes(items.reduce((sum, item) => sum + item.size, 0)),
+      })}</p>
+      {all && <p>{tr("包括所有游戏和所有分页中的文件，不受当前筛选或勾选范围限制。")}</p>}
+      {items.some((item) => item.restore_requires_rollback) && <p>{tr("删除被替换的 Mod 文件后，相关替换事务也将无法回滚。")}</p>}
     </AlertDescription></Alert>
     <div className="min-w-0 rounded-md border">
       <ul className="max-h-44 divide-y overflow-y-auto text-sm break-all">
@@ -38,7 +43,7 @@ export function TrashPurgeDialog({request, busy, onClose, onConfirm}: {
       {items.length > size && <TrashPagination page={page} pageSize={size} total={items.length} onPageChange={setPage}/>}
     </div>
     <Label className="font-normal leading-snug"><Switch checked={acknowledged} disabled={busy} onCheckedChange={setAcknowledged}/>
-      <span>我确认永久删除以上文件，且无法再从回收站恢复。</span>
+      <span>{tr("我确认永久删除以上文件，且无法再从回收站恢复。")}</span>
     </Label>
   </Modal>;
 }

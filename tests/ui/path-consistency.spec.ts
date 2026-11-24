@@ -1,9 +1,11 @@
 import { expect, test, type Page } from "@playwright/test";
+import type { Game } from "../../src/lib/types";
 import { installMockTauri } from "./mock-tauri";
 
 const ordinaryUnc = String.raw`\\Server\Mods\Game`;
 const verbatimUnc = String.raw`\\?\UNC\Server\Mods\Game`;
 const verbatimDrive = String.raw`\\?\C:\Games\Fixture`;
+const ordinaryDrive = String.raw`C:\Games\Fixture`;
 const unix = "/sandbox/Game\\Data ";
 
 function argsFor(page: Page, command: string) {
@@ -29,29 +31,40 @@ const scanCandidates = [
   candidate("Unix 大写", unix),
   candidate("Unix 小写", "/sandbox/game\\Data "),
   candidate("从扫描添加", verbatimDrive),
-  candidate("普通拼法", String.raw`C:\Games\Fixture`),
+  candidate("普通拼法", ordinaryDrive),
   candidate("保留尾空格", `${verbatimDrive} `),
   candidate("服务端已登记", String.raw`D:\Games\Existing`, "existing-by-server"),
 ];
 
 async function installDiscoveryResponses(page: Page) {
-  await page.evaluate(({ scanCandidates, verbatimUnc, unix }) => {
+  const scannedGame: Game = {
+    id: "game-from-scan", name: "Fixture", slug: "unknown", rootPath: ordinaryDrive, platform: "unknown",
+    adapterSlug: null, adapterVersion: null, confidence: 0, coverPath: null, steamAppId: null,
+    installedModCount: 0, enabledModCount: 0, metadata: {},
+    createdAt: "2026-11-21T00:00:00Z", updatedAt: "2026-11-21T00:00:00Z",
+  };
+  await page.evaluate(({ scanCandidates, verbatimUnc, verbatimDrive, unix, scannedGame }) => {
     const target = window as any;
     const transport = target.__TAURI_INTERNALS__;
     const invoke = transport.invoke;
+    let registered = false;
     transport.invoke = async (command: string, args: any = {}) => {
+      if (command === "list_games" && registered) return [...await invoke(command, args), scannedGame];
       if (command === "scan_games" || command === "identify_game" || command === "register_game" ||
           (command === "plugin:dialog|open" && args.options?.title === "选择游戏目录")) {
         target.__AMM_TEST__.calls.push({ command, args });
         if (command === "scan_games") return { candidates: scanCandidates, warnings: [{ path: verbatimUnc, message: "检查路径" }], directoriesChecked: 9, entriesChecked: 9, truncated: false };
         if (command === "identify_game" && args.directory === unix) return scanCandidates[3];
-        if (command === "register_game") return { id: "game-fixture", name: "从扫描添加" };
+        if (command === "register_game" && args.directory === verbatimDrive) {
+          registered = true;
+          return scannedGame;
+        }
         if (command === "plugin:dialog|open") return verbatimUnc;
         throw new Error("目录未按原样传递");
       }
       return invoke(command, args);
     };
-  }, { scanCandidates, verbatimUnc, unix });
+  }, { scanCandidates, verbatimUnc, verbatimDrive, unix, scannedGame });
 }
 
 test("扫描候选合并旧路径别名，UNC 与 Unix 大小写不合并，发送原始路径", async ({ page }) => {
@@ -102,9 +115,9 @@ test("扫描候选合并旧路径别名，UNC 与 Unix 大小写不合并，发�
   expect(await argsFor(page, "identify_game")).toEqual([{ directory: unix }]);
   await discovery.getByRole("button", { name: "扫描此目录", exact: true }).click();
   await row("从扫描添加").getByRole("button", { name: "添加", exact: true }).click();
-  await expect(page.getByText("已将「从扫描添加」添加到游戏库", { exact: true })).toBeVisible();
+  await expect(page.getByText("已将「Fixture」添加到游戏库", { exact: true })).toBeVisible();
   await expect(discovery).toBeVisible();
-  await expect(row("从扫描添加").getByRole("button", { name: "管理中", exact: true })).toBeDisabled();
+  await expect(row("Fixture").getByRole("button", { name: "管理中", exact: true })).toBeDisabled();
   expect((await argsFor(page, "scan_games")).at(-1)).toEqual({ options: { userRoots: [unix], includeCommonRoots: false, page: { requestId: expect.any(String) } } });
   expect(await argsFor(page, "register_game")).toEqual([{ directory: verbatimDrive, adapterSlug: null, fromDiscovery: true }]);
   await page.keyboard.press("Escape");
@@ -123,15 +136,38 @@ test("新手引导合并别名并保持原始注册路径", async ({ page }) => 
   await page.getByRole("button", { name: "下一步", exact: true }).click();
   await expect(page.getByRole("heading", { name: "扫描游戏列表", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "扫描已安装游戏", exact: true }).click();
-  const row = (name: string) => page.getByRole("listitem").filter({ has: page.getByText(name, { exact: true }) });
-  await expect(row("已登记").getByText("管理中", { exact: true })).toBeVisible();
+  const candidates = page.getByRole("list", { name: "扫描候选游戏", exact: true });
+  const row = (text: string) => candidates.getByRole("listitem").filter({ has: page.getByText(text, { exact: true }) });
+  const existing = row(ordinaryUnc);
+  await expect(existing).toHaveCount(1);
+  await expect(existing.getByText("Minecraft Java Edition", { exact: true })).toBeVisible();
+  await expect(existing.getByText("管理中", { exact: true })).toBeVisible();
+  await expect(row("已登记的另一拼法")).toHaveCount(0);
   await expect(row("普通拼法")).toHaveCount(0);
-  const picked = row("从扫描添加");
-  await picked.getByRole("checkbox").check();
+  const picked = row(ordinaryDrive);
+  await expect(picked).toHaveCount(1);
+  await expect(picked.getByText("从扫描添加", { exact: true })).toBeVisible();
+  await expect(picked.getByRole("button", { name: "添加", exact: true })).toBeEnabled();
+  const trailingSpace = row("保留尾空格");
+  await expect(trailingSpace.getByRole("button", { name: "添加", exact: true })).toBeEnabled();
+  await expect(trailingSpace.getByText("管理中", { exact: true })).toHaveCount(0);
   await picked.getByRole("button", { name: "添加", exact: true }).click();
   await expect(picked.getByText("管理中", { exact: true })).toBeVisible();
-  await expect(row("保留尾空格").getByRole("checkbox")).not.toBeChecked();
+  await expect(picked.getByText("Fixture", { exact: true })).toBeVisible();
+  await expect(trailingSpace.getByRole("button", { name: "添加", exact: true })).toBeEnabled();
+  await expect(trailingSpace.getByText("管理中", { exact: true })).toHaveCount(0);
   expect(await argsFor(page, "register_game")).toEqual([{ directory: verbatimDrive, adapterSlug: null, fromDiscovery: true }]);
+
+  // A fresh report still contains the old discovery aliases, so the managed state must come from the library readback.
+  const rescan = page.getByRole("button", { name: "重新扫描", exact: true });
+  await rescan.click();
+  await expect.poll(async () => (await argsFor(page, "scan_games")).length).toBe(2);
+  await expect(rescan).toBeEnabled();
+  await expect(picked.getByText("管理中", { exact: true })).toBeVisible();
+  await expect(picked.getByText("Fixture", { exact: true })).toBeVisible();
+  await expect(picked.getByRole("button", { name: "添加", exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "下一步", exact: true }).click();
+  await expect(page.getByText("2 款游戏", { exact: true })).toBeVisible();
 });
 
 test("原生文件选择、预览与回收站使用原路径，复制与展示一致", async ({ page }) => {
@@ -369,8 +405,12 @@ test("归档计划沿用现有审批和路径展示", async ({ page }) => {
     { op: "compress", src: `${shownDrive}\\folder`, dst: `${ordinaryUnc}\\new.zip` },
     { op: "extract", src: `${shownDrive}\\source.7z`, dst: `${ordinaryUnc}\\output` },
   ];
-  for (const op of expected) {
-    for (const value of [op.op, op.src, op.dst]) await expect(approval.getByText(value, { exact: true })).toBeVisible();
+  await expect(approval.getByText("新增：2", { exact: true })).toBeVisible();
+  for (const [op, label] of [[expected[0], "压缩"], [expected[1], "解压"]] as const) {
+    const cell = `td[data-operation="${op.op}"]`;
+    const row = approval.getByRole("row").filter({ has: page.locator(cell) });
+    await expect(row.locator(cell)).toHaveText(label);
+    for (const value of [op.src, op.dst]) await expect(row.getByText(value, { exact: true })).toBeVisible();
   }
   await approval.getByText("完整请求", { exact: true }).click();
   const preview = JSON.parse(await approval.locator("pre").innerText());

@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useState } from "react";
 import { Gamepad2Icon } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -19,7 +20,7 @@ export function GameCover({ name, url, decorative = false, className }: { name: 
   const src = url !== failedUrl ? publicCoverUrl(url) : null;
   return <div aria-hidden={decorative || undefined} className={cn("group/cover relative flex aspect-[16/8] w-full flex-col items-center justify-center overflow-hidden bg-gradient-to-br from-accent via-muted to-secondary", className)}>
     <Gamepad2Icon className="max-h-[35%] size-12 text-primary/40" aria-hidden="true" />
-    {!src && <span className="text-xs text-muted-foreground">无游戏封面</span>}
-    {src && <img key={src} src={src} alt={decorative ? "" : `${name}的游戏封面`} loading="lazy" decoding="async" referrerPolicy="no-referrer" className={cn("absolute inset-0 size-full object-cover motion-safe:transition-[opacity,scale] motion-safe:duration-500 motion-safe:ease-out", loadedUrl === src ? "scale-100 opacity-100 motion-safe:group-hover/cover:scale-105" : "motion-safe:scale-105 motion-safe:opacity-0")} onLoad={() => setLoadedUrl(src)} onError={() => setFailedUrl(src)} />}
+    {!src && <span className="text-xs text-muted-foreground">{tr("无游戏封面")}</span>}
+    {src && <img key={src} src={src} alt={decorative ? "" : tr("{name}的游戏封面", { name })} loading="lazy" decoding="async" referrerPolicy="no-referrer" className={cn("absolute inset-0 size-full object-cover motion-safe:transition-[opacity,scale] motion-safe:duration-500 motion-safe:ease-out", loadedUrl === src ? "scale-100 opacity-100 motion-safe:group-hover/cover:scale-105" : "motion-safe:scale-105 motion-safe:opacity-0")} onLoad={() => setLoadedUrl(src)} onError={() => setFailedUrl(src)} />}
   </div>;
 }

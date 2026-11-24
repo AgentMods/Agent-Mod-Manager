@@ -18,6 +18,8 @@ export async function installMockTauri(page: Page, {
   duplicatePluginDraftSlug = false, failPluginDraftDeletion = false, seedPublishedPluginRecord = false,
   providerModels = ["fixture-thinking", "fixture-standard"],
   configuredModels,
+  appLocale,
+  systemLocale = "zh-CN",
   askUser,
   storage,
   workspaceGames = [],
@@ -44,6 +46,8 @@ export async function installMockTauri(page: Page, {
   seedPublishedPluginRecord?: boolean;
   providerModels?: string[];
   configuredModels?: import("../../src/lib/types").AgentModelSettings[];
+  appLocale?: string | null;
+  systemLocale?: string | null;
   askUser?: {preview: AskUserPreviewFixture; approvalId?: string; toolCallId?: string; deferResult?: boolean};
   workspaceGames?: WorkspaceGameFixture[];
   conversationFixtures?: Array<Record<string, unknown>>;
@@ -69,7 +73,7 @@ export async function installMockTauri(page: Page, {
 } = {}) {
   // The public-looking manifest image is served offline in browser tests.
   await page.route("https://covers.example.org/minecraft-java.jpg", route => route.fulfill({contentType: "image/png", path: "public/favicon.png"}));
-  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage, workspaceGames, conversationFixtures, appUpdate, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus}) => {
+  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus}) => {
     type Args = Record<string, any>;
     const now = "2026-11-18T00:00:00Z";
     const draftUpdatedAtField = pluginDateFixture === "valid" ? {updatedAt: pluginUpdatedAt} : {};
@@ -181,12 +185,20 @@ export async function installMockTauri(page: Page, {
     }] : [])];
     let settings: Args = { base_url: "https://example.com/v1", model: onboarding ? "" : "mock-model", models: configuredModels, permission_mode: "request_approval", api_key_ref: "model.api_key", onboarding_completed: !onboarding };
     let composerPreferences: Args = {model: null, reasoning_effort: null, permission_mode: null};
-    const modOrganizationLanguages: Array<[string, string]> = [
-      ["zh-CN", "简体中文"], ["zh-TW", "繁體中文"], ["en", "English"], ["ja", "日本語"], ["ko", "한국어"],
-      ["fr", "Français"], ["de", "Deutsch"], ["es", "Español"], ["pt-BR", "Português (Brasil)"], ["it", "Italiano"],
-      ["ru", "Русский"], ["pl", "Polski"], ["uk", "Українська"], ["tr", "Türkçe"],
+    const appLocales: Array<[string, string]> = [
+      ["zh-CN", "简体中文"], ["en", "English"], ["ja", "日本語"], ["ko", "한국어"], ["de", "Deutsch"],
+      ["fr", "Français"], ["es", "Español"], ["pt-BR", "Português (Brasil)"], ["ru", "Русский"], ["it", "Italiano"],
     ];
-    let modOrganizationLocale: string | null = null;
+    const appLocaleStorageKey = "amm.test.appLocale";
+    const storedAppLocale = sessionStorage.getItem(appLocaleStorageKey);
+    let selectedAppLocale: string | null = appLocales.some(([code]) => code === storedAppLocale)
+      ? storedAppLocale
+      : appLocales.some(([code]) => code === appLocale) ? appLocale : null;
+    let simulatedSystemLocale = systemLocale;
+    const effectiveLocale = () => selectedAppLocale ?? (
+      appLocales.find(([code]) => code.split("-")[0].toLowerCase() === (simulatedSystemLocale ?? "").trim().split(/[-_.@]/)[0].toLowerCase())?.[0]
+      ?? "en"
+    );
     let onboardingCompleted = !onboarding;
     let onboardingInProgress = onboardingStarted;
     const plan = {
@@ -204,8 +216,8 @@ export async function installMockTauri(page: Page, {
       entries: [{...plan.entries[0], operation: {op: "move", src: "/sandbox/minecraft/options.txt", dst: "/sandbox/data/trash/trash_options/payload"}}],
     };
     const importPlan = {
-      ...plan, id: "txn-import-fixture", summary: "导入本地归档到管理器",
-      entries: [{...plan.entries[0], operation: {op: "copy", src: "/sandbox/data/staging/import-scratch/fixture/Fixture.jar", dst: "/sandbox/data/staging/imports/fixture/Fixture.jar"}}],
+      ...plan, id: "txn-import-fixture", summary: "导入本地归档到管理器：Fixture.jar",
+      entries: [{...plan.entries[0], impact: "add", operation: {op: "copy", src: "/sandbox/data/staging/import-scratch/fixture/Fixture.jar", dst: "/sandbox/data/staging/imports/fixture/Fixture.jar"}}],
     };
     const installPlan = {
       ...plan, id: "txn-install-fixture", summary: "安装 Fixture",
@@ -217,6 +229,8 @@ export async function installMockTauri(page: Page, {
       {name: "system-web-search", description: "查找游戏、模组和加载器资料。", instruction: "仅发送公开的搜索关键词。"},
       {name: "system-mod-download", description: "从来源定位版本并下载 Mod。", instruction: "先核对目标版本和加载器。"},
       {name: "system-mod-commission", description: "引导玩家到 Mod 客栈创建委托。", instruction: "先区分查找现有作品和定制需求。"},
+      {name: "system-mod-install", description: "从游戏分类库安装指定 Mod。", instruction: "先核对本地归档和安装规则。"},
+      {name: "system-mod-uninstall", description: "卸载已登记的 Mod。", instruction: "先核对安装记录和文件归属。"},
       {name: "system-mod-organize", description: "安装成功后由管理器自动整理 Mod 展示名与分类标签。", instruction: "根据已知资料生成展示名和分类标签。"},
     ].map(({name, description, instruction}) => ({
       skill: {name, description, location: `plugins/skills/${name}/SKILL.md`, source: "system", kind: "system", valid: true, enabled: true, issues: []},
@@ -411,17 +425,15 @@ export async function installMockTauri(page: Page, {
           updatePollingStarted = true;
           updateStatus = structuredClone(appUpdate?.checkResult ?? {status: 'upToDate'});
           return structuredClone(updateStatus);
-        case "get_mod_organization_locale": return {
-          locale: modOrganizationLocale,
-          effective_locale: modOrganizationLocale ?? "zh-CN",
-          languages: modOrganizationLanguages,
-        };
-        case "set_mod_organization_locale": {
-          if (args.locale !== null && !modOrganizationLanguages.some(([code]) => code === args.locale)) {
-            throw new Error("不支持的 Mod 整理目标语言");
+        case "get_app_locale": return {locale: selectedAppLocale, effective_locale: effectiveLocale()};
+        case "set_app_locale": {
+          if (args.locale !== null && !appLocales.some(([code]) => code === args.locale)) {
+            throw new Error("不支持的应用语言");
           }
-          modOrganizationLocale = args.locale;
-          return null;
+          selectedAppLocale = args.locale;
+          if (selectedAppLocale === null) sessionStorage.removeItem(appLocaleStorageKey);
+          else sessionStorage.setItem(appLocaleStorageKey, selectedAppLocale);
+          return {locale: selectedAppLocale, effective_locale: effectiveLocale()};
         }
         case "list_agent_models": return providerModels;
         case "get_agent_model_metadata": {
@@ -477,9 +489,12 @@ export async function installMockTauri(page: Page, {
           modAction = null;
           const conversation = conversations.find(c => c.id === args.request.conversationId);
           const permissionMode = args.request.permissionMode ?? conversation?.permission_mode ?? settings.permission_mode;
-          const match = /目标（精确 ID）：(\{[^\n]+\})。/.exec(args.request.content);
-          if (match) {
-            const target = JSON.parse(match[1]);
+          const origin = args.origin ?? {kind: "user"};
+          // Single-target tool simulation. The batch protocol fixture may ask
+          // to replay only its first target without altering persisted content.
+          const target = origin.kind === "mod_request" && (!origin.batch || args.mockFirstBatchTarget)
+            ? origin.targets[0] : undefined;
+          if (target) {
             const game = conversation?.game_id;
             if (game !== target.gameId || game !== initialGame.id) {
               throw new Error("Mod action requires exact game context");
@@ -503,6 +518,7 @@ export async function installMockTauri(page: Page, {
           activeConversation = args.request.conversationId;
           const history = messages.get(activeConversation) ?? [];
           history.push({ id: "user-fixture", role: "user", content: args.request.content,
+            origin: origin.kind === "mod_request" ? {...origin, originalContent: args.request.content} : origin,
             ...(args.request.attachments?.length ? { attachments: args.request.attachments } : {}),
             reasoning: null, tool_calls: null, tool_call_id: null });
           history.push({ id: "assistant-fixture", role: "assistant", content: "", reasoning: null, tool_calls: null, tool_call_id: null });
@@ -857,6 +873,7 @@ export async function installMockTauri(page: Page, {
     target.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: (_event: string, id: number) => listeners.delete(id) };
     target.__AMM_TEST__ = {
       calls, emit, emitEvent, persistOnly, replayedEvents, events, conversations, games, modLibrary, pluginDrafts, installedPlugins, cloudPluginSlugs, modActionControls,
+      setSystemLocale(locale: string | null) { simulatedSystemLocale = locale; },
       publishQuestionResult() {
         deferredQuestionResult?.();
         deferredQuestionResult = undefined;
@@ -881,5 +898,5 @@ export async function installMockTauri(page: Page, {
         seq = Math.max(seq, ...values.map((event) => event.seq).filter(Number.isSafeInteger));
       },
     };
-  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage, workspaceGames, conversationFixtures, appUpdate, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus});
+  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus});
 }

@@ -134,7 +134,7 @@ test.describe("游戏卡片操作", () => {
     await expect(page.getByRole("heading", {name: "扫描游戏列表", exact: true})).toBeVisible();
     await page.getByRole("button", {name: "扫描已安装游戏"}).click();
     const fixture = page.getByRole("listitem").filter({hasText: "Fixture Game"});
-    await fixture.getByRole("checkbox", {name: "选择 Fixture Game"}).check();
+    await expect(fixture.getByRole("button", {name: "添加", exact: true})).toBeEnabled();
     await fixture.getByRole("button", {name: "添加"}).click();
     await expect(fixture.getByText("管理中", {exact: true})).toBeVisible();
     await page.getByRole("button", {name: "退出引导"}).click();

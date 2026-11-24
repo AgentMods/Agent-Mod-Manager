@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useMemo, useRef, useState } from "react";
 import { ShieldCheckIcon } from "lucide-react";
 import { toast } from "sonner";
@@ -26,9 +27,9 @@ function publicationReview(value: unknown) {
       !listing.tags.every(tag => typeof tag === "string") || typeof preview.version !== "string") return null;
   const target = preview.target;
   if (!target || typeof target !== "object" || !("kind" in target)) return null;
-  let label = "首次发布";
+  let label = tr("首次发布");
   if (target.kind === "release" && "pluginId" in target && typeof target.pluginId === "number") {
-    label = `更新插件 #${target.pluginId}`;
+    label = tr("更新插件 #{pluginId}", { pluginId: target.pluginId });
   } else if (target.kind !== "first") return null;
   const version = "remoteVersion" in preview && typeof preview.remoteVersion === "string" ? `${preview.remoteVersion} → ${preview.version}` : preview.version;
   return { listing: listing as PublicationListing, label, version, files: "files" in preview ? preview.files : undefined };
@@ -51,7 +52,7 @@ export function AgentConfirmation({ request }: { request: AgentEvent }) {
   const renameSummary = title === "set_game_adapter" && preview && typeof preview === "object" &&
     "gameName" in preview && typeof preview.gameName === "string" &&
     "targetGameName" in preview && typeof preview.targetGameName === "string" && preview.gameName !== preview.targetGameName
-    ? `绑定后，游戏库中的「${preview.gameName}」将改名为「${preview.targetGameName}」。` : null;
+    ? tr("绑定后，游戏库中的「{gameName}」将改名为「{targetGameName}」。", { gameName: preview.gameName, targetGameName: preview.targetGameName }) : null;
 
   async function respond(approved: boolean) {
     if (submitting.current || (approved && publication?.listing.coverPng)) return;
@@ -74,27 +75,27 @@ export function AgentConfirmation({ request }: { request: AgentEvent }) {
     {JSON.stringify(displayApprovalPreview(title, preview), null, 2)}
   </CodeBlockContent></CodeBlock>;
 
-  return <Item role="group" aria-label="操作审批" aria-busy={busy} variant="outline" size="sm" className="w-full min-w-0 max-w-3xl bg-card">
+  return <Item role="group" aria-label={tr("操作审批")} aria-busy={busy} variant="outline" size="sm" className="w-full min-w-0 max-w-3xl bg-card">
     <ItemMedia variant="icon"><ShieldCheckIcon aria-hidden="true" /></ItemMedia>
     <ItemContent className="min-w-0">
-      <ItemTitle>{publication ? "确认发布管理器插件" : "是否允许执行此操作？"}</ItemTitle>
-      <ItemDescription className="line-clamp-none break-all font-mono text-xs">{publication ? `Mod客栈 · ${publication.label} · ${publication.version}` : String(title || "待确认操作")}</ItemDescription>
+      <ItemTitle>{publication ? tr("确认发布管理器插件") : tr("是否允许执行此操作？")}</ItemTitle>
+      <ItemDescription className="line-clamp-none break-all font-mono text-xs">{publication ? tr("Mod客栈 · {label} · {version}", { label: publication.label, version: publication.version }) : String(title || tr("待确认操作"))}</ItemDescription>
     </ItemContent>
     <div className="flex min-w-0 basis-full flex-col gap-2">
       {renameSummary && <p className="wrap-anywhere text-sm">{renameSummary}</p>}
       {publication ? <>
         <PublicationListingPreview listing={publication.listing} files={publication.files} />
-        {publication.listing.coverPng && <p className="text-sm text-muted-foreground">请拒绝此旧预览，重新发起发布以使用游戏封面。</p>}
-        <details><summary className="cursor-pointer text-xs text-muted-foreground">查看完整发布请求</summary>{jsonPreview}</details>
+        {publication.listing.coverPng && <p className="text-sm text-muted-foreground">{tr("请拒绝此旧预览，重新发起发布以使用游戏封面。")}</p>}
+        <details><summary className="cursor-pointer text-xs text-muted-foreground">{tr("查看完整发布请求")}</summary>{jsonPreview}</details>
       </> : plan ? <>
         <PlanPreview plan={plan} />
-        <details><summary className="cursor-pointer text-xs text-muted-foreground">完整请求</summary><div className="mt-2">{jsonPreview}</div></details>
+        <details><summary className="cursor-pointer text-xs text-muted-foreground">{tr("完整请求")}</summary><div className="mt-2">{jsonPreview}</div></details>
       </> : jsonPreview}
       <ErrorState error={error} />
     </div>
     <ItemActions className="ms-auto">
-      <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void respond(false)}>拒绝</Button>
-      <Button type="button" size="sm" disabled={busy || !!publication?.listing.coverPng} onClick={() => void respond(true)}>{publication ? "发布" : "批准并执行"}</Button>
+      <Button type="button" size="sm" variant="outline" disabled={busy} onClick={() => void respond(false)}>{tr("拒绝")}</Button>
+      <Button type="button" size="sm" disabled={busy || !!publication?.listing.coverPng} onClick={() => void respond(true)}>{publication ? tr("发布") : tr("批准并执行")}</Button>
     </ItemActions>
   </Item>;
 }
@@ -120,6 +121,6 @@ export function BackgroundApprovalLink({ visibleConversation }: { visibleConvers
     else useUI.getState().selectGame(pending.operation.gameId);
   }
   return pending ? <Button type="button" size="sm" variant="outline" onClick={showPending}>
-    <ShieldCheckIcon aria-hidden="true" data-icon="inline-start" />查看待授权操作
+    <ShieldCheckIcon aria-hidden="true" data-icon="inline-start" />{tr("查看待授权操作")}
   </Button> : null;
 }

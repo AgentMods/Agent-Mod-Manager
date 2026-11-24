@@ -195,10 +195,20 @@ impl Db {
             if version < 21 {
                 crate::history::migrate_workspaces(&tx)?;
             }
+            if version < 24 {
+                let has_message_origin: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name='origin_json')",
+                    [], |row| row.get(0),
+                )?;
+                if !has_message_origin {
+                    tx.execute("ALTER TABLE messages ADD COLUMN origin_json TEXT", [])?;
+                }
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
         drop(c);
+        crate::app_locale::migrate(self)?;
         crate::skills::migrate(self)?;
         crate::plugin_publish::migrate(&self.conn())?;
         crate::manager_publication::migrate(&self.conn())?;
@@ -207,7 +217,7 @@ impl Db {
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 23;
+pub const SCHEMA_VERSION: i64 = 24;
 
 // SQLite appends rowid to the index key: these indexes bound scans to the
 // conversation's insertion-order suffix and the most recent retained user.
@@ -628,6 +638,7 @@ CREATE TABLE IF NOT EXISTS messages (
   content TEXT NOT NULL DEFAULT '',
   reasoning TEXT,
   attachments_json TEXT,
+  origin_json TEXT,
   tool_calls_json TEXT,
   tool_call_id TEXT,
   name TEXT,

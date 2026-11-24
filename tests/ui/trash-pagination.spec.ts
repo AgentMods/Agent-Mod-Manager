@@ -235,7 +235,8 @@ test("大型回收站按后端上限分批删除确认时的 ID", async ({page},
   const trash = await openTrashWithFixture(page, items);
   await trash.getByRole("button", {name: "清空回收站", exact: true}).click();
   const dialog = page.getByRole("dialog", {name: "清空回收站", exact: true});
-  await expect(dialog.getByRole("alert")).toContainText("5001 项");
+  const formattedCount = await page.evaluate(count => new Intl.NumberFormat(document.documentElement.lang || undefined).format(count), items.length);
+  await expect(dialog.getByRole("alert")).toContainText(`${formattedCount} 项`);
   await expect(dialog.getByRole("listitem")).toHaveCount(10);
   await dialog.getByRole("switch").click();
   await dialog.getByRole("button", {name: "确认清空", exact: true}).click();

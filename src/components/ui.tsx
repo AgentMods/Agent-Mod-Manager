@@ -1,3 +1,4 @@
+import { getLocale } from "@/lib/i18n";
 import type { ComponentProps, ReactNode } from "react";
 import { AlertTriangleIcon, InboxIcon } from "lucide-react";
 import { errorText } from "@/lib/api";
@@ -72,11 +73,11 @@ export function bytes(value: number) {
   const units = ["B", "KiB", "MiB", "GiB"];
   let index = 0;
   while (value >= 1024 && index < units.length - 1) { value /= 1024; index++; }
-  return `${value.toFixed(index ? 1 : 0)} ${units[index]}`;
+  return `${value.toLocaleString(getLocale(), { minimumFractionDigits: index ? 1 : 0, maximumFractionDigits: index ? 1 : 0 })} ${units[index]}`;
 }
 export function date(value: string) {
   const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("zh-CN", { dateStyle: "short", timeStyle: "short" });
+  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString(getLocale(), { dateStyle: "short", timeStyle: "short" });
 }
 
 /**

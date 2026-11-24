@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import type { ModSwitchTarget } from './mod-switch-store';
 
 type DownloadOrigin = { artifactId: string; sourceId: string; projectId: string; versionId: string };
@@ -16,7 +17,17 @@ export type ModRow = {
   key: string; item: Installed | LibraryMod; target: ModSwitchTarget; installed: boolean;
   install?: LibraryMod; removal?: Removal;
 };
-export const modStatusLabels: Record<string, string> = { installed: '已安装', enabled: '已安装', superseded: '已被替换', uninstalled: '已卸载', rolled_back: '已卸载（已回滚）', partially_restored: '部分文件已恢复', pending: '待执行', planned: '待审批', purged: '已永久删除' };
+export const modStatusLabels: Record<string, string> = {
+  get installed() { return tr("已安装"); },
+  get enabled() { return tr("已安装"); },
+  get superseded() { return tr("已被替换"); },
+  get uninstalled() { return tr("已卸载"); },
+  get rolled_back() { return tr("已卸载（已回滚）"); },
+  get partially_restored() { return tr("部分文件已恢复"); },
+  get pending() { return tr("待执行"); },
+  get planned() { return tr("待审批"); },
+  get purged() { return tr("已永久删除"); },
+};
 
 export function replacementTransaction(mod?: Installed) {
   const { replacesInstallId, transactionId } = mod?.metadata ?? {};

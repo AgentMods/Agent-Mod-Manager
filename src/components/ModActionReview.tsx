@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useState } from "react";
 import { AgentConfirmation } from "@/components/AgentConfirmation";
 import { AgentQuestionnaire, describeQuestionnaire, respondToQuestionnaire } from "@/components/AgentQuestionnaire";
@@ -20,8 +21,8 @@ export function ModActionReview({ operationId, name, conversationId, turnId }: {
   const [submitted, setSubmitted] = useState<number | null>(null);
   const [error, setError] = useState<unknown>(null);
   if (!approvals.length && !question) return null;
-  return <section id={operationId} tabIndex={-1} className="flex min-w-0 flex-col gap-2" aria-label={`处理 ${name}`}>
-    <h3 className="wrap-anywhere text-sm font-medium">{name} · 需要你的确认</h3>
+  return <section id={operationId} tabIndex={-1} className="flex min-w-0 flex-col gap-2" aria-label={tr("处理 {name}", { name })}>
+    <h3 className="wrap-anywhere text-sm font-medium">{tr("{name} · 需要你的确认", { name })}</h3>
     {approvals.map(request => <AgentConfirmation key={request.seq} request={request} />)}
     {question && <AgentQuestionnaire key={question.request.seq} questionnaire={question}
       disabled={submitted === question.request.seq} onSubmit={async answers => {

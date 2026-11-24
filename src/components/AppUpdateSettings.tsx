@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { RefreshCwIcon } from "lucide-react";
 import { api, backendAvailable } from "@/lib/api";
@@ -16,13 +17,13 @@ const queryKey = ["app-update"];
 function describeUpdate(update?: UpdateStatus) {
   const version = update?.version ? ` ${update.version}` : "";
   switch (update?.status) {
-    case "checking": return "正在检查更新…";
-    case "downloading": return `正在后台下载新版本${version}…`;
-    case "ready": return `新版本${version} 已下载，关闭程序后将自动安装。`;
-    case "upToDate": return "当前已是最新版本。";
-    case "error": return update.message || "检查更新失败，请稍后重试。";
-    case "unsupported": return update.message || "当前安装方式不支持自动更新。";
-    default: return "启动时自动检查并下载新版本，关闭程序后安装。";
+    case "checking": return tr("正在检查更新…");
+    case "downloading": return tr("正在后台下载新版本{version}…", { version });
+    case "ready": return tr("新版本{version} 已下载，关闭程序后将自动安装。", { version });
+    case "upToDate": return tr("当前已是最新版本。");
+    case "error": return update.message || tr("检查更新失败，请稍后重试。");
+    case "unsupported": return update.message || tr("当前安装方式不支持自动更新。");
+    default: return tr("启动时自动检查并下载新版本，关闭程序后安装。");
   }
 }
 
@@ -42,17 +43,17 @@ export function AppUpdateSettings() {
   });
   const state = status.data?.status;
   const busy = check.isPending || state === "checking" || state === "downloading";
-  const message = !backendAvailable ? "请在桌面应用中检查更新。"
-    : check.isPending ? "正在检查更新…"
+  const message = !backendAvailable ? tr("请在桌面应用中检查更新。")
+    : check.isPending ? tr("正在检查更新…")
     : check.error?.message || status.error?.message || describeUpdate(status.data);
 
   return <Card>
     <CardHeader>
-      <CardTitle>应用更新</CardTitle>
+      <CardTitle>{tr("应用更新")}</CardTitle>
       <CardDescription role="status">{message}</CardDescription>
       <CardAction>
         <Button variant="outline" disabled={!backendAvailable || busy || state === "ready" || state === "unsupported"} onClick={() => check.mutate()}>
-          {busy ? <Spinner data-icon="inline-start" /> : <RefreshCwIcon data-icon="inline-start" />}检查更新
+          {busy ? <Spinner data-icon="inline-start" /> : <RefreshCwIcon data-icon="inline-start" />}{tr("检查更新")}
         </Button>
       </CardAction>
     </CardHeader>

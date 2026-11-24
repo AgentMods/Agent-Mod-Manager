@@ -121,7 +121,19 @@ async fn agent_attachment_send_edit_and_retry_reach_model_and_history() {
     for conversation_id in [&retry, &edit_omit, &edit_replace, &edit_remove] {
         assert_eq!(conversation_id, &conv);
     }
-    let sent = job.await.unwrap();
+    let mut sent = job.await.unwrap();
+    // These assertions cover transcript layout and multipart transport, not
+    // the independent language evidence note.
+    for request in &mut sent {
+        request["messages"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|message| {
+                !message["content"].as_str().is_some_and(|content| {
+                    content.starts_with(crate::agent::response_language::EVIDENCE_PREFIX)
+                })
+            });
+    }
     let parts = &sent[0]["messages"][1]["content"];
     assert_eq!(parts[0], json!({"type":"text","text":"Read these"}));
     assert_eq!(
@@ -294,12 +306,19 @@ async fn agent_attachment_compression_removes_old_image_bytes_not_current_attach
                     .contains("# Latest attachment")
         })
         .expect("the normal request should retain current attachments");
-    assert_eq!(current_request["messages"][1]["role"], "assistant");
-    assert_eq!(
-        current_request["messages"][2]["content"][1]["image_url"]["url"],
-        PNG
-    );
-    assert!(current_request["messages"][2]["content"][2]["text"]
+    let messages = current_request["messages"].as_array().unwrap();
+    assert!(messages.iter().any(|message| message["role"] == "assistant"
+        && message["content"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("[Untrusted conversation summary")));
+    let current_user = messages
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "user")
+        .unwrap();
+    assert_eq!(current_user["content"][1]["image_url"]["url"], PNG);
+    assert!(current_user["content"][2]["text"]
         .as_str()
         .unwrap()
         .contains("# Latest attachment"));

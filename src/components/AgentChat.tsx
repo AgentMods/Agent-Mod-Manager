@@ -23,8 +23,8 @@ import {
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { composerPreferencesQuery, rememberComposerPreferences, resolveComposerPermission, turnPermission } from "@/lib/composer-preferences";
 import { activeTurnStart, describeAgentTools, isQuestionRequest, latestHistoryRewrite, pendingToolApproval, replayConversation, trackAgentTurn, useAgent, type AgentToolActivity } from "../lib/agent-store";
-import { useUI } from "../lib/store";
-import type { AgentAttachment, AgentEvent, AppSettings, ComposerPreferences, Conversation, Game, GameWorkspace, Message as ChatMessage, ReasoningEffort } from "../lib/types";
+import { emptyDraft, useUI } from "../lib/store";
+import type { AgentAttachment, AgentEvent, AppSettings, ComposerPreferences, Conversation, Game, GameWorkspace, Message as ChatMessage, PromptOrigin, ReasoningEffort } from "../lib/types";
 import { readyAttachment, usePrepareAttachments, type DraftAttachment } from "@/lib/agent-attachments";
 import { AttachmentGroup } from "@/components/ui/attachment";
 import { MessageAttachment } from "./AgentAttachments";
@@ -45,10 +45,12 @@ import {
   TraceTitle,
 } from "@/components/ui/trace";
 import { cn } from "@/lib/utils";
+import { tr, useLocale } from "@/lib/i18n";
 import { ModRequestCard } from "./ModRequestCard";
 import { parseModRequest, type ModRequest } from "@/lib/mod-request";
 import { AgentConfirmation } from "./AgentConfirmation";
 import { AgentWorkspaceDialog } from "./AgentWorkspaceDialog";
+import { conversationTitle } from "@/lib/conversation-groups";
 import { conversationWorkspace, workspaceLabel } from "@/lib/game-workspace";
 import { AgentComposer } from "./AgentComposer";
 import { AgentConversationList } from "./AgentConversationList";
@@ -57,7 +59,6 @@ import { useDidChange } from "@/lib/motion";
 
 const EMPTY_EVENTS: AgentEvent[] = [];
 const EMPTY_CONVERSATIONS: Conversation[] = [];
-const emptyDraft = (text = "") => ({ text, attachments: [] as DraftAttachment[] });
 
 function groupByMessage<T>(items: T[], messageId: (item: T) => string | null) {
   const groups = new Map<string | null, T[]>();
@@ -71,6 +72,7 @@ function groupByMessage<T>(items: T[], messageId: (item: T) => string | null) {
 }
 
 export function AgentChat() {
+  const locale = useLocale();
   const conversationId = useUI((s) => s.conversationId);
   const adapterChat = useUI((s) => s.adapterChat);
   const draftWorkspace = useUI((s) => s.draftWorkspace);
@@ -78,11 +80,13 @@ export function AgentChat() {
   const [picker, setPicker] = useState<{ id: string | null; adapter: typeof adapterChat; opener: HTMLButtonElement } | null>(null);
   const setConversation = useUI((s) => s.setConversation);
   const client = useQueryClient();
-  const [composer, setComposer] = useState(() => emptyDraft(adapterChat?.prompt));
+  const composer = useUI(s => s.composer);
+  const setComposer = useUI(s => s.setComposer);
   const [submitting, setSubmitting] = useState<"start" | "restart" | null>(null);
   const submittingRef = useRef(false);
   const composerInput = useRef<HTMLTextAreaElement>(null);
-  const [edit, setEdit] = useState<(typeof composer & { conversationId: string; messageId: string }) | null>(null);
+  const edit = useUI(s => s.editDraft);
+  const setEdit = useUI(s => s.setEditDraft);
   const [reanswerRequest, setReanswerRequest] = useState<AgentEvent | null>(null);
   const [submittedAnswers, setSubmittedAnswers] = useState(() => new Map<AgentEvent, Answer[]>());
   const [error, setError] = useState<unknown>(null);
@@ -115,7 +119,7 @@ export function AgentChat() {
   const games = useBackendQuery<Game[]>(["games"], "list_games");
   const currentConversation = detail.data?.conversation ?? conversations.data?.find(row => row.id === conversationId);
   const workspace = conversationId ? (currentConversation ? conversationWorkspace(currentConversation) : undefined) : draftWorkspace;
-  const gameName = workspace === undefined ? "正在读取工作区…" : workspaceLabel(workspace, games.data);
+  const gameName = workspace === undefined ? tr("正在读取工作区…") : workspaceLabel(workspace, games.data);
   const openPicker = (opener: HTMLButtonElement) => setPicker({ id: conversationId, adapter: adapterChat, opener });
 
   async function applyWorkspace(next: GameWorkspace) {
@@ -170,18 +174,13 @@ export function AgentChat() {
   }, [preferences.data, model]);
 
   useEffect(() => {
-    setComposer(emptyDraft(adapterChat?.prompt));
-  }, [adapterChat]);
-
-  useEffect(() => {
     end.current?.scrollIntoView({ block: "end", behavior: "auto" });
   }, [stream.length]);
 
   const modRequests = useMemo(() => {
     const requests = new Map<string, ModRequest>();
     for (const message of detail.data?.messages ?? []) {
-      if (message.role !== "user") continue;
-      const request = parseModRequest(message.content);
+      const request = parseModRequest(message);
       if (request) requests.set(message.id, request);
     }
     return requests;
@@ -232,7 +231,7 @@ export function AgentChat() {
     setEdit(null);
     setComposer(emptyDraft());
     setError(null);
-  }, [setConversation]);
+  }, [setConversation, setComposer, setEdit]);
 
   function editMessage(message: ChatMessage) {
     if (!conversationId || busy) return;
@@ -240,8 +239,9 @@ export function AgentChat() {
     composerInput.current?.focus();
   }
 
-  async function send(content: string, options: { attachments?: AgentAttachment[]; restart?: { messageId: string; edit: boolean }; questionnaire?: boolean } = {}) {
-    const { attachments, restart, questionnaire } = options;
+  async function send(content: string, options: { attachments?: AgentAttachment[]; restart?: { messageId: string; edit: boolean }; origin?: PromptOrigin } = {}) {
+    const { attachments, restart, origin } = options;
+    const questionnaire = origin?.kind === "questionnaire_answer";
     if (busy || submittingRef.current || (restart ? !conversationId : !content && !attachments?.length) || archivedConversation) return false;
     submittingRef.current = true;
     setSubmitting(restart ? "restart" : "start"); setError(null);
@@ -271,7 +271,7 @@ export function AgentChat() {
         await api<string>("restart_turn", { request, ...restart });
         trackAgentTurn(id);
       } else {
-        const turnId = await api<string>("start_turn", { request });
+        const turnId = await api<string>("start_turn", { request, ...(origin && { origin }) });
         trackAgentTurn(id, turnId);
       }
       started = true;
@@ -316,7 +316,7 @@ export function AgentChat() {
       toolsByMessage: groupByMessage(tools, ({ event }) => event.messageId),
       questionsByMessage: groupByMessage(questions, ({ request }) => request.messageId),
     };
-  }, [milestones, archivedConversation, submittedAnswers]);
+  }, [milestones, archivedConversation, submittedAnswers, locale]);
   const writableChat = backendAvailable && detail.data?.conversation.id === conversationId && !archivedConversation;
   const activeQuestion = pendingQuestion ?? (writableChat ? questions.find(({ request, canReanswer }) => request === reanswerRequest && canReanswer) : undefined);
   const activeRequest = activeQuestion?.request;
@@ -334,11 +334,11 @@ export function AgentChat() {
       // Historical answers start a new turn in the same chat. The original approval is final.
       const lines = steps.map((item, index) => {
         const answer = answers[index];
-        const reply = Array.isArray(answer) ? "\n" + answer.map((label) => `- ${label}`).join("\n") : answer ?? "已跳过";
-        return `${index + 1}. ${item!.question}\n回答：${reply}`;
+        const reply = Array.isArray(answer) ? "\n" + answer.map((label) => `- ${label}`).join("\n") : answer ?? tr("已跳过");
+        return tr("{index}. {question}\n回答：{reply}", { index: index + 1, question: item!.question, reply });
       });
-      const started = await send(`补充回答：${title}\n\n${lines.join("\n\n")}`, { questionnaire: true });
-      if (!started) throw new Error("当前对话正在处理其他请求，请稍后提交。");
+      const started = await send(tr("补充回答：{title}\n\n{answers}", { title, answers: lines.join("\n\n") }), { origin: { kind: "questionnaire_answer" } });
+      if (!started) throw new Error(tr("当前对话正在处理其他请求，请稍后提交。"));
       setReanswerRequest((current) => current === request ? null : current);
       return;
     }
@@ -357,7 +357,7 @@ export function AgentChat() {
   const renderQuestion = (questionnaire: (typeof questions)[number]) => <QuestionnaireTrace
     key={questionnaire.request.seq} questionnaire={questionnaire} disabled={busy || !!activeQuestion}
     onReanswer={writableChat ? () => setReanswerRequest(questionnaire.request) : undefined} />;
-  const title = detail.data?.conversation.title || "Agent 对话";
+  const title = detail.data ? conversationTitle(detail.data.conversation) : tr("Agent 对话");
   const hasMessages = messages.length > 0 || tools.length > 0 || unlinkedErrors.length > 0 || questions.length > 0;
 
   return <div className="agent-chat-shell flex h-full min-h-0 flex-col overflow-hidden bg-background motion-safe:animate-soft-fade md:flex-row">
@@ -368,20 +368,20 @@ export function AgentChat() {
         </div>
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-semibold">Agent Mod Manager</p>
-          <p className="truncate text-xs text-muted-foreground">本地工作区</p>
+          <p className="truncate text-xs text-muted-foreground">{tr("本地工作区")}</p>
         </div>
       </div>
       <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-3">
         <Button className="w-full justify-start gap-2 rounded-lg" onClick={() => selectConversation(null)} disabled={submitting === "start"}>
           <MessageSquarePlusIcon data-icon="inline-start" />
-          新建对话
+          {tr("新建对话")}
         </Button>
         <AgentConversationList conversations={conversations.data ?? EMPTY_CONVERSATIONS} selectedId={conversationId}
           disabled={submitting === "start"} onSelect={selectConversation} />
       </div>
       <div className="hidden shrink-0 flex-col gap-2 border-t p-3 md:flex">
-        <div className="flex items-center gap-2 px-2 text-xs font-medium text-muted-foreground"><FolderIcon className="size-3.5" />工作区</div>
-        <Button variant="ghost" size="sm" aria-label={`切换工作区：${gameName}`} aria-haspopup="dialog"
+        <div className="flex items-center gap-2 px-2 text-xs font-medium text-muted-foreground"><FolderIcon className="size-3.5" />{tr("工作区")}</div>
+        <Button variant="ghost" size="sm" aria-label={tr("切换工作区：{gameName}", { gameName })} aria-haspopup="dialog"
           className="w-full justify-start gap-2 bg-sidebar-accent/60" disabled={workspaceDisabled}
           onClick={event => openPicker(event.currentTarget)}>
           <span className="size-1.5 rounded-full bg-sidebar-primary" />
@@ -397,7 +397,7 @@ export function AgentChat() {
         <div className="flex min-w-0 flex-col gap-0.5">
           <h1 className="truncate text-base font-semibold tracking-tight sm:text-lg">{title}</h1>
           <span className="hidden truncate text-xs text-muted-foreground md:block">{gameName}</span>
-          <Button variant="ghost" size="xs" aria-label={`切换工作区：${gameName}`} aria-haspopup="dialog"
+          <Button variant="ghost" size="xs" aria-label={tr("切换工作区：{gameName}", { gameName })} aria-haspopup="dialog"
             disabled={workspaceDisabled} className="min-w-0 max-w-full justify-start self-start md:hidden"
             onClick={event => openPicker(event.currentTarget)}>
             <Settings2Icon aria-hidden="true" /><span className="truncate">{gameName}</span>
@@ -405,9 +405,9 @@ export function AgentChat() {
         </div>
         <div className="flex max-w-[45%] flex-col items-end gap-0.5">
           <Badge className="min-w-0" tone={busy ? "warning" : "neutral"}>
-            <span className="truncate">{pendingQuestion ? "等待你的回答" : awaitingApproval ? "等待授权" : busy ? "运行中" : selectedModelLabel || "未配置模型"}</span>
+            <span className="truncate">{pendingQuestion ? tr("等待你的回答") : awaitingApproval ? tr("等待授权") : busy ? tr("运行中") : selectedModelLabel || tr("未配置模型")}</span>
           </Badge>
-          {totalTokens !== undefined && <span className="whitespace-nowrap text-xs text-muted-foreground tabular-nums">{totalTokens.toLocaleString()} tokens</span>}
+          {totalTokens !== undefined && <span className="whitespace-nowrap text-xs text-muted-foreground tabular-nums">{totalTokens.toLocaleString(locale)} tokens</span>}
         </div>
       </header>
 
@@ -419,8 +419,8 @@ export function AgentChat() {
               <BotIcon aria-hidden="true" className="size-7 text-primary" />
             </div>
             <div className="flex flex-col gap-2">
-              <h2 className="text-2xl font-semibold tracking-tight sm:text-3xl">Agent 对话</h2>
-              <p className="text-sm leading-6 text-muted-foreground sm:text-base">与 Agent 协作，管理、分析并优化你的 Mod 工作流。</p>
+              <h2 className="text-2xl font-semibold tracking-tight sm:text-3xl">{tr("Agent 对话")}</h2>
+              <p className="text-sm leading-6 text-muted-foreground sm:text-base">{tr("与 Agent 协作，管理、分析并优化你的 Mod 工作流。")}</p>
             </div>
           </div>}
 
@@ -431,7 +431,7 @@ export function AgentChat() {
             const attachments = message.attachments ?? [];
             const hasAttachments = attachments.length > 0;
             const modRequest = modRequests.get(message.id);
-            const attachmentGroup = hasAttachments && <AttachmentGroup aria-label="消息附件" className="flex-wrap gap-1.5">
+            const attachmentGroup = hasAttachments && <AttachmentGroup aria-label={tr("消息附件")} className="flex-wrap gap-1.5">
               {attachments.map((value, index) => <MessageAttachment key={index} value={value} />)}
             </AttachmentGroup>;
             const canAct = writableChat && !detail.isPlaceholderData && !busy && !activeQuestion;
@@ -461,12 +461,12 @@ export function AgentChat() {
                     {toolsByMessage.get(message.id)?.map(renderTool)}
                     {questionsByMessage.get(message.id)?.map(renderQuestion)}
                     {isAssistant && <TurnError message={failure} />}
-                    {(hasContent || hasAttachments || failure) && <MessageFooter className="mt-1" role="group" aria-label="消息操作">
+                    {(hasContent || hasAttachments || failure) && <MessageFooter className="mt-1" role="group" aria-label={tr("消息操作")}>
                       {hasContent && <CopyMessage content={message.content} />}
-                      {!isAssistant && (hasContent || hasAttachments) && <MessageAction label="编辑消息" disabled={!canAct} onClick={() => editMessage(message)}>
+                      {!isAssistant && (hasContent || hasAttachments) && <MessageAction label={tr("编辑消息")} disabled={!canAct} onClick={() => editMessage(message)}>
                         <PencilIcon aria-hidden="true" />
                       </MessageAction>}
-                      {(isAssistant || failure) && <MessageAction label="重试" disabled={!canAct} onClick={() => void send("", { restart: { messageId: message.id, edit: false } })}>
+                      {(isAssistant || failure) && <MessageAction label={tr("重试")} disabled={!canAct} onClick={() => void send("", { restart: { messageId: message.id, edit: false } })}>
                         <RefreshCcwIcon aria-hidden="true" />
                       </MessageAction>}
                     </MessageFooter>}
@@ -480,7 +480,7 @@ export function AgentChat() {
           {tools.filter(({ event }) => !event.messageId || !visibleIds.has(event.messageId)).map(renderTool)}
           {questions.filter(({ request }) => !request.messageId || !visibleIds.has(request.messageId)).map(renderQuestion)}
           {unlinkedErrors.map(({ seq, message }) => <div className="chat-message" key={seq}><TurnError message={message} /></div>)}
-          {busy && !pendingQuestion && !awaitingApproval && <Trace className="max-w-3xl motion-safe:animate-soft-fade"><TraceLine status="running"><TraceIcon><LoaderCircleIcon className="animate-spin" /></TraceIcon><TraceTitle>正在处理请求</TraceTitle><TypingDots /></TraceLine></Trace>}
+          {busy && !pendingQuestion && !awaitingApproval && <Trace className="max-w-3xl motion-safe:animate-soft-fade"><TraceLine status="running"><TraceIcon><LoaderCircleIcon className="animate-spin" /></TraceIcon><TraceTitle>{tr("正在处理请求")}</TraceTitle><TypingDots /></TraceLine></Trace>}
           <ErrorState error={error || detail.error} />
           <div ref={end} />
         </div>
@@ -507,9 +507,11 @@ export function AgentChat() {
             onSend={(attachments, newGameName) => {
               const restart = activeEdit ? { messageId: activeEdit.messageId, edit: true } : undefined;
               const content = newGameName
-                ? `${draft.text.trim()}\n\n请在绑定适配包时，将这款游戏在游戏库中的显示名称改为 ${JSON.stringify(newGameName)}。`
+                ? `${draft.text.trim()}\n\n${tr("请在绑定适配包时，将这款游戏在游戏库中的显示名称改为 {name}。", { name: JSON.stringify(newGameName) })}`
                 : draft.text.trim();
-              void send(content, { attachments: attachments.length || activeEdit ? attachments : undefined, restart });
+              const origin: PromptOrigin | undefined = restart ? undefined : newGameName ? { kind: "game_rename" }
+                : adapterChat && draft.text === adapterChat.prompt && !attachments.length ? { kind: "adapter_prompt" } : undefined;
+              void send(content, { attachments: attachments.length || activeEdit ? attachments : undefined, restart, origin });
             }}
             onCancel={turn ? () => { void cancel(); } : undefined}
             disabled={!backendAvailable || archivedConversation || (permissionSelection === undefined && preferences.isLoading)}
@@ -539,7 +541,7 @@ export function AgentChat() {
 // React Markdown parses synchronously; skip unchanged history when the turn or draft changes.
 const MessageMarkdown = memo(function MessageMarkdown({ content, onError }: { content: string; onError: (error: unknown) => void }) {
   const components = useMemo<Components>(() => ({
-    img: ({ alt }) => <span>{alt || "远程图片"}</span>,
+    img: ({ alt }) => <span>{alt || tr("远程图片")}</span>,
     a: ({ children, href }) => href && /^https?:\/\//i.test(href) ? <a href={href} target="_blank" rel="noreferrer" onClick={(event) => {
       if (backendAvailable) {
         event.preventDefault();
@@ -569,11 +571,11 @@ function CopyMessage({ content }: { content: string }) {
       clearTimeout(reset.current);
       reset.current = setTimeout(() => setCopied(false), 2000);
     } catch {
-      toast.error("复制失败，请重试");
+      toast.error(tr("复制失败，请重试"));
     }
   }
 
-  return <MessageAction label={copied ? "已复制" : "复制消息"} onClick={() => void copy()}>
+  return <MessageAction label={copied ? tr("已复制") : tr("复制消息")} onClick={() => void copy()}>
     {copied ? <CheckIcon aria-hidden="true" className="motion-safe:animate-pop-in" /> : <CopyIcon aria-hidden="true" />}
   </MessageAction>;
 }
@@ -591,8 +593,8 @@ function ReasoningTrace({ reasoning, streaming }: { reasoning: string; streaming
       <TraceCollapsibleTrigger>
         <TraceLine status={streaming ? "running" : undefined}>
           <TraceIcon>{streaming ? <LoaderCircleIcon className="animate-spin" /> : <CircleCheckIcon className={cn(finished && "motion-safe:animate-pop-in")} />}</TraceIcon>
-          <TraceTitle>{streaming ? "思考中" : "思考过程"}</TraceTitle>
-          <TraceDescription>{streaming ? "进行中" : "已完成"}</TraceDescription>
+          <TraceTitle>{streaming ? tr("思考中") : tr("思考过程")}</TraceTitle>
+          <TraceDescription>{streaming ? tr("进行中") : tr("已完成")}</TraceDescription>
         </TraceLine>
       </TraceCollapsibleTrigger>
       <TraceCollapsibleContent className="text-sm whitespace-pre-wrap">{reasoning}</TraceCollapsibleContent>
@@ -604,7 +606,7 @@ function TurnError({ message }: { message?: string }) {
   if (!message) return null;
   return <Alert variant="destructive" className="agent-turn-error">
     <TriangleAlertIcon aria-hidden="true" />
-    <AlertTitle>本轮回复未完成</AlertTitle>
+    <AlertTitle>{tr("本轮回复未完成")}</AlertTitle>
     <AlertDescription className="min-w-0">
       <pre className="max-w-full overflow-auto font-mono text-xs break-all whitespace-pre-wrap"><code>{message}</code></pre>
     </AlertDescription>
@@ -612,6 +614,7 @@ function TurnError({ message }: { message?: string }) {
 }
 
 const ToolTrace = memo(function ToolTrace({ tool }: { tool: AgentToolActivity }) {
+  useLocale();
   const { event, request, result, resolution, completion } = tool;
   const name = event.payload.name ?? request?.payload.title;
   const settled = useDidChange(!!result);
@@ -620,9 +623,9 @@ const ToolTrace = memo(function ToolTrace({ tool }: { tool: AgentToolActivity })
     (!result && completion?.payload.status === "cancelled");
   const failed = !rejected && !cancelled && result?.payload.status === "error";
   const running = !result && !rejected && !cancelled && !completion;
-  const label = rejected ? "已拒绝" : cancelled ? "已取消" : failed ? "执行失败" : result ? "已执行"
-    : completion ? (completion.payload.status === "interrupted" ? "已中断" : "已结束")
-    : resolution?.payload.status === "approved" ? "已批准，正在执行" : "正在执行";
+  const label = rejected ? tr("已拒绝") : cancelled ? tr("已取消") : failed ? tr("执行失败") : result ? tr("已执行")
+    : completion ? (completion.payload.status === "interrupted" ? tr("已中断") : tr("已结束"))
+    : resolution?.payload.status === "approved" ? tr("已批准，正在执行") : tr("正在执行");
   const Icon = failed ? TriangleAlertIcon : rejected || cancelled ? CircleXIcon : result ? CheckIcon : CircleDotIcon;
   const payload = useMemo(() => JSON.stringify({
     arguments: displayToolArguments(name, event.payload.arguments),

@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { RefreshCwIcon, RotateCcwIcon, SearchIcon, Trash2Icon } from "lucide-react";
@@ -118,7 +119,7 @@ export default function TrashPage() {
       for (let start = 0; start < ids.length; start += PURGE_BATCH_SIZE) {
         freed += await api<number>("purge_trash", {ids: ids.slice(start, start + PURGE_BATCH_SIZE), confirmation: "PURGE_TRASH"});
       }
-      notify(`已永久删除 ${ids.length} 项，释放 ${bytes(freed)}`);
+      notify(tr("已永久删除 {length} 项，释放 {value2}", { length: ids.length, value2: bytes(freed) }));
     } catch (failure) {
       // Some entries may already be gone. Retrying requires reviewing a fresh list.
       setError(failure);
@@ -130,41 +131,41 @@ export default function TrashPage() {
     }
   }
 
-  const subtitle = !backendAvailable ? "桌面服务未连接" : trash.data ? `${items.length} 项 · ${bytes(items.reduce((sum, item) => sum + item.size, 0))}` : undefined;
+  const subtitle = !backendAvailable ? tr("桌面服务未连接") : trash.data ? tr("{length} 项 · {value2}", { length: items.length, value2: bytes(items.reduce((sum, item) => sum + item.size, 0)) }) : undefined;
   return <Page data-testid="trash-page" className="min-w-0 gap-4">
-    <PageHeader title="回收站" subtitle={subtitle} actions={<>
-      <IconButton title="刷新回收站" variant="outline" disabled={!backendAvailable || !!busy || trash.isFetching} onClick={() => {void trash.refetch();}}><RefreshCwIcon className={trash.isFetching ? "animate-spin" : undefined}/></IconButton>
-      <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" disabled={disabled || !items.length} onClick={() => requestPurge("all")}><Trash2Icon data-icon="inline-start"/>清空回收站</Button>
+    <PageHeader title={tr("回收站")} subtitle={subtitle} actions={<>
+      <IconButton title={tr("刷新回收站")} variant="outline" disabled={!backendAvailable || !!busy || trash.isFetching} onClick={() => {void trash.refetch();}}><RefreshCwIcon className={trash.isFetching ? "animate-spin" : undefined}/></IconButton>
+      <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" disabled={disabled || !items.length} onClick={() => requestPurge("all")}><Trash2Icon data-icon="inline-start"/>{tr("清空回收站")}</Button>
     </>}/>
 
     <div className="flex flex-wrap items-center gap-2">
       <InputGroup className="max-w-full flex-1 basis-56 sm:max-w-sm">
         <InputGroupAddon><SearchIcon/></InputGroupAddon>
-        <InputGroupInput type="search" aria-label="搜索回收站" placeholder="搜索文件或原始路径" value={search} disabled={!backendAvailable} onChange={(event) => {setSearch(event.target.value); setPage(1);}}/>
+        <InputGroupInput type="search" aria-label={tr("搜索回收站")} placeholder={tr("搜索文件或原始路径")} value={search} disabled={!backendAvailable} onChange={(event) => {setSearch(event.target.value); setPage(1);}}/>
       </InputGroup>
-      <NativeSelect aria-label="按游戏筛选回收站" className="max-w-full sm:w-48" value={gameId} disabled={!backendAvailable} onChange={(event) => {setGameId(event.target.value); setPage(1);}}>
-        <NativeSelectOption value="">全部游戏</NativeSelectOption>
+      <NativeSelect aria-label={tr("按游戏筛选回收站")} className="max-w-full sm:w-48" value={gameId} disabled={!backendAvailable} onChange={(event) => {setGameId(event.target.value); setPage(1);}}>
+        <NativeSelectOption value="">{tr("全部游戏")}</NativeSelectOption>
         {gameOptions.map((id) => <NativeSelectOption key={id} value={id}>{gameNames.get(id) ?? id}</NativeSelectOption>)}
       </NativeSelect>
     </div>
 
     <ErrorState error={trash.error}/><ErrorState error={games.error}/><ErrorState error={error}/>
-    {!backendAvailable ? <EmptyState title="桌面服务未连接"/> : trash.isLoading ?
-      <div role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner/>正在读取回收站…</div> :
-      items.length > 0 ? <section aria-label="回收站列表" aria-busy={trash.isFetching || !!busy} className="min-w-0 overflow-hidden rounded-lg border">
+    {!backendAvailable ? <EmptyState title={tr("桌面服务未连接")}/> : trash.isLoading ?
+      <div role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner/>{tr("正在读取回收站…")}</div> :
+      items.length > 0 ? <section aria-label={tr("回收站列表")} aria-busy={trash.isFetching || !!busy} className="min-w-0 overflow-hidden rounded-lg border">
         <div className="flex flex-wrap items-center gap-2 border-b bg-muted/40 px-3 py-2">
-          <span className="mr-auto basis-full text-xs text-muted-foreground sm:basis-auto" role="status">已选择 {selectedItems.length} 项{selectedItems.length > 0 ? ` · ${bytes(selectedBytes)}` : ""}</span>
+          <span className="mr-auto basis-full text-xs text-muted-foreground sm:basis-auto" role="status">{tr("已选择 {length} 项", { length: selectedItems.length })}{selectedItems.length > 0 ? ` · ${bytes(selectedBytes)}` : ""}</span>
           <Button size="sm" variant="outline" disabled={disabled || !canRestore} aria-describedby={restoreRequiresRollback ? "trash-restore-restriction" : undefined} onClick={() => {void restore();}}>
-            {busy === "restore" ? <Spinner data-icon="inline-start"/> : <RotateCcwIcon data-icon="inline-start"/>}恢复所选
+            {busy === "restore" ? <Spinner data-icon="inline-start"/> : <RotateCcwIcon data-icon="inline-start"/>}{tr("恢复所选")}
           </Button>
-          <Button size="sm" variant="outline" disabled={disabled || !selectedItems.length} onClick={() => requestPurge("selected")}><Trash2Icon data-icon="inline-start"/>永久删除所选</Button>
-          {restoreRequiresRollback && <p id="trash-restore-restriction" className="basis-full text-xs text-warning" role="status">所选项目包含被替换的 Mod 文件，请通过回滚替换事务恢复。</p>}
+          <Button size="sm" variant="outline" disabled={disabled || !selectedItems.length} onClick={() => requestPurge("selected")}><Trash2Icon data-icon="inline-start"/>{tr("永久删除所选")}</Button>
+          {restoreRequiresRollback && <p id="trash-restore-restriction" className="basis-full text-xs text-warning" role="status">{tr("所选项目包含被替换的 Mod 文件，请通过回滚替换事务恢复。")}</p>}
         </div>
         {filtered.length > 0 ? <>
           <TrashFileTable rows={pageRows} gameNames={gameNames} selected={selected} disabled={disabled} onSelect={toggleItem} onSelectPage={selectPage}/>
           <TrashPagination page={currentPage} pageSize={pageSize} total={filtered.length} onPageChange={setPage} onPageSizeChange={(size) => {setPageSize(size); setPage(1);}}/>
-        </> : <EmptyState title="没有匹配的文件" action={<Button variant="outline" onClick={() => {setSearch(""); setGameId(""); setPage(1);}}><RotateCcwIcon data-icon="inline-start"/>重置筛选</Button>}/>}
-      </section> : !trash.isError && <EmptyState title="回收站为空"/>}
+        </> : <EmptyState title={tr("没有匹配的文件")} action={<Button variant="outline" onClick={() => {setSearch(""); setGameId(""); setPage(1);}}><RotateCcwIcon data-icon="inline-start"/>{tr("重置筛选")}</Button>}/>}
+      </section> : !trash.isError && <EmptyState title={tr("回收站为空")}/>}
 
     {purgeRequest && <TrashPurgeDialog request={purgeRequest} busy={!!busy} onClose={() => {if (!operationPending.current) setPurgeRequest(null);}} onConfirm={() => {void purge();}}/>}
   </Page>;

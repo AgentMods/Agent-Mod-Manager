@@ -1081,7 +1081,12 @@ pub(crate) fn launch_program(program: &Path) -> AppResult<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    spawn_program(command).map_err(|error| AppError::Other(format!("无法启动游戏: {error}")))
+    spawn_program(command).map_err(|error| {
+        AppError::Presented(crate::error::NativeMessage::new(
+            "game.launch_failed",
+            [("detail", error.to_string())],
+        ))
+    })
 }
 
 #[cfg(windows)]
