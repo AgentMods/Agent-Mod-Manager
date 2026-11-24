@@ -6,6 +6,12 @@ installation limitations. This page records implementation and verification
 evidence; it does not establish that the release workflow or CI has passed.
 The broader project scope remains active.
 
+**macOS package verification (2026-11-24).** CI copies the app from the DMG,
+detaches the image and launches the installed copy from a canonical path. Tauri
+rejects executable paths containing symlinked components, including `/var` in
+the runner’s temporary directory. The smoke checks SQLite initialization in a
+fresh home directory.
+
 **Nexus Mod downloads (2026-11-24).** The stock Nexus MCP can now save files
 whose GraphQL `uri` is an opaque storage path. A public Phantom Blade Zero
 file (Mod 266, file 623) supplied the regression example. The bundled provider
