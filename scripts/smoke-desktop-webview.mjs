@@ -108,7 +108,6 @@ class Session {
 
   async selectOption(xpath, value) {
     await this.click(`${xpath}/option[@value=${literal(value)}]`);
-    assert.equal(await this.inputValue(xpath), value);
   }
 
   async fill(xpath, text) {
@@ -295,6 +294,9 @@ async function registerAndOpen(ui, root) {
   await ui.click(iconButton('settings'));
   const appLocale = '//*[@id="app-locale"]';
   await ui.selectOption(appLocale, 'zh-CN');
+  // The native settings save completes before React applies the selected language.
+  await ui.visible("/html[@lang='zh-CN']//*[@id='app-locale' and not(@disabled)]");
+  assert.equal(await ui.inputValue(appLocale), 'zh-CN');
   await ui.click(nav('游戏库'));
   console.log('Pinned zh-CN through the language selector in the fresh smoke profile.');
   await installExternalMinecraftAdapter(ui);

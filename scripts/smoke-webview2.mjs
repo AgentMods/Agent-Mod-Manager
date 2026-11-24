@@ -58,7 +58,6 @@ class WebView2Session {
   async selectOption(xpath, value) {
     const select = await this.visible(xpath);
     await select.selectOption(value, { timeout });
-    assert.equal(await select.inputValue({ timeout }), value);
   }
 
   async inputValue(xpath) {
