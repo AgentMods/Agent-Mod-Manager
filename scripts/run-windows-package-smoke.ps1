@@ -15,11 +15,13 @@ if (-not $IsWindows -or -not $DisposableMachine) {
     throw 'Run with PowerShell 7 on a disposable Windows machine and profile only. Pass -DisposableMachine to confirm.'
 }
 
-if ($Kind -eq 'msi') {
-    $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw 'The Tauri MSI is per-machine. Run from elevated PowerShell in the same disposable profile.'
-    }
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+try {
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    $elevated = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} finally { $identity.Dispose() }
+if ($Kind -eq 'msi' -and -not $elevated) {
+    throw 'The Tauri MSI is per-machine. Run from elevated PowerShell in the same disposable profile.'
 }
 
 function Get-ExistingItem([string] $Path) {
@@ -179,6 +181,24 @@ function Write-RunLog([string] $Message) {
     Add-Content -LiteralPath $runLog -Value $Message
 }
 
+function Get-LoopbackPort {
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    try {
+        $listener.ExclusiveAddressUse = $true
+        $listener.Start()
+        return $listener.LocalEndpoint.Port
+    } finally { $listener.Stop() }
+}
+
+function Assert-NoWebViewPolicy([Microsoft.Win32.RegistryKey] $Key, [string] $ExeName) {
+    # WebView2 tries the AppUserModelID, executable name, and wildcard in that order.
+    foreach ($name in $Key.GetValueNames()) {
+        if ($name -in @('com.glossmod.amm', $ExeName, '*')) {
+            throw "Refusing to use the existing WebView2 policy '$name' in $($Key.Name)."
+        }
+    }
+}
+
 function Start-LoggedProcess([string] $Executable, [string] $Arguments, [string] $Directory, [string] $Label, [switch] $Wait) {
     Start-Process -FilePath $Executable -ArgumentList $Arguments -WorkingDirectory $Directory `
         -RedirectStandardOutput (Join-Path $evidence "$Label.log") `
@@ -275,28 +295,63 @@ try {
     $screenshot = Join-Path $evidence 'native-smoke.png'
     $smokeArguments = '"{0}" "{1}" "{2}"' -f $smoke, $app, $screenshot
     Write-RunLog "Running native smoke: $app"
-    $savedProfile = $env:AMM_WINDOWS_SMOKE_PROFILE
-    $savedPowerShell = $env:AMM_WINDOWS_SMOKE_POWERSHELL
-    $savedTemp = $env:TEMP
-    $savedTmp = $env:TMP
+    $debugPort = $null
+    $argumentsPolicy = $null
+    $policySet = $false
     try {
-        $env:AMM_WINDOWS_SMOKE_PROFILE = $appData
-        $env:AMM_WINDOWS_SMOKE_POWERSHELL = $powerShell
-        $env:TEMP = $work
-        $env:TMP = $work
-        $test = Start-LoggedProcess $node $smokeArguments $repo 'smoke'
+        if ($elevated) {
+            # Elevated WebView2 hosts ignore WEBVIEW2_* env and HKCU overrides.
+            $machine = [Microsoft.Win32.Registry]::LocalMachine
+            $policyPath = 'SOFTWARE\Policies\Microsoft\Edge\WebView2'
+            $dataPolicy = $machine.OpenSubKey("$policyPath\UserDataFolder")
+            if ($dataPolicy) {
+                # The elevated lane relies on Tauri's default, freshly checked WebView2 profile.
+                try { Assert-NoWebViewPolicy $dataPolicy $appItem.Name } finally { $dataPolicy.Dispose() }
+            }
+            $argumentsPolicy = $machine.CreateSubKey("$policyPath\AdditionalBrowserArguments")
+            Assert-NoWebViewPolicy $argumentsPolicy $appItem.Name
+            $debugPort = Get-LoopbackPort
+            $browserArguments = "--remote-debugging-address=127.0.0.1 --remote-debugging-port=$debugPort"
+            $argumentsPolicy.SetValue($appItem.Name, $browserArguments, 'String')
+            $policySet = $true
+            Write-RunLog "Using temporary HKLM WebView2 policy for $($appItem.Name) on 127.0.0.1:$debugPort"
+        }
+
+        $savedProfile = $env:AMM_WINDOWS_SMOKE_PROFILE
+        $savedPowerShell = $env:AMM_WINDOWS_SMOKE_POWERSHELL
+        $savedDebugPort = $env:AMM_WINDOWS_SMOKE_CDP_PORT
+        $savedTemp = $env:TEMP
+        $savedTmp = $env:TMP
+        try {
+            $env:AMM_WINDOWS_SMOKE_PROFILE = $appData
+            $env:AMM_WINDOWS_SMOKE_POWERSHELL = $powerShell
+            $env:AMM_WINDOWS_SMOKE_CDP_PORT = $debugPort
+            $env:TEMP = $work
+            $env:TMP = $work
+            $test = Start-LoggedProcess $node $smokeArguments $repo 'smoke'
+        } finally {
+            $env:AMM_WINDOWS_SMOKE_PROFILE = $savedProfile
+            $env:AMM_WINDOWS_SMOKE_POWERSHELL = $savedPowerShell
+            $env:AMM_WINDOWS_SMOKE_CDP_PORT = $savedDebugPort
+            $env:TEMP = $savedTemp
+            $env:TMP = $savedTmp
+        }
+        try {
+            # The shared script owns the app and WebView2 session and verifies SQLite read-only.
+            $test.WaitForExit()
+            Write-RunLog "Smoke exit code: $($test.ExitCode)"
+            if ($test.ExitCode -ne 0) { throw 'The shared desktop smoke failed. See smoke.log and smoke.stderr.log.' }
+        } finally { $test.Dispose() }
     } finally {
-        $env:AMM_WINDOWS_SMOKE_PROFILE = $savedProfile
-        $env:AMM_WINDOWS_SMOKE_POWERSHELL = $savedPowerShell
-        $env:TEMP = $savedTemp
-        $env:TMP = $savedTmp
+        if ($argumentsPolicy) {
+            try {
+                # Remove only our value, never the shared key or a replacement made during the test.
+                if ($policySet -and $argumentsPolicy.GetValue($appItem.Name) -ceq $browserArguments) {
+                    $argumentsPolicy.DeleteValue($appItem.Name, $false)
+                }
+            } finally { $argumentsPolicy.Dispose() }
+        }
     }
-    try {
-        # The shared script owns the app and WebView2 session and verifies SQLite read-only.
-        $test.WaitForExit()
-        Write-RunLog "Smoke exit code: $($test.ExitCode)"
-        if ($test.ExitCode -ne 0) { throw 'The shared desktop smoke failed. See smoke.log and smoke.stderr.log.' }
-    } finally { $test.Dispose() }
 
     $image = Get-ExistingItem $screenshot
     if ($image -isnot [IO.FileInfo] -or $image.Length -eq 0) {

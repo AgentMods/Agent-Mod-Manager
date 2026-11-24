@@ -125,20 +125,33 @@ jobs:
           test "$(gh api "repos/$RELEASE_REPOSITORY" --jq .visibility)" = public || { echo 'The updater needs a public release repository'; exit 1; }
           target=()
           if [[ "$RELEASE_REPOSITORY" == "$GITHUB_REPOSITORY" ]]; then
-            target=(--target "$GITHUB_SHA")
             remote_tag=$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG")
             if [[ -n "$remote_tag" ]]; then
               git fetch --depth=1 origin "refs/tags/$RELEASE_TAG"
               test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA" || { echo 'Existing tag points to a different commit'; exit 1; }
+            else
+              target=(--target "$GITHUB_SHA")
             fi
           fi
-          notes=(--notes "Agent Mod Manager $RELEASE_TAG")
           notes_file="docs/releases/${RELEASE_TAG#v}.md"
-          if [[ -f "$notes_file" ]]; then notes=(--notes-file "$notes_file"); fi
-          if gh release view "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --json isDraft > release-state.json; then
+          if [[ ! -f "$notes_file" ]]; then
+            notes_file="$RUNNER_TEMP/release-notes.md"
+            printf '%s\n' "Agent Mod Manager $RELEASE_TAG" > "$notes_file"
+          fi
+          if gh release view "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --json isDraft,body,targetCommitish > release-state.json; then
             jq -e .isDraft release-state.json >/dev/null
+            # Editing a draft's target can require elevated permissions even when it already matches.
+            edit=()
+            if [[ ${#target[@]} -gt 0 ]] && ! jq -e --arg sha "$GITHUB_SHA" '.targetCommitish == $sha' release-state.json >/dev/null; then
+              edit+=(--tag "$RELEASE_TAG" "${target[@]}")
+            fi
+            if ! jq -e --rawfile notes "$notes_file" 'def normalize: gsub("\r\n"; "\n") | sub("\n+$"; ""); (.body | normalize) == ($notes | normalize)' release-state.json >/dev/null; then
+              edit+=(--notes-file "$notes_file")
+            fi
+            if [[ ${#edit[@]} -gt 0 ]]; then
+              gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" "${edit[@]}"
+            fi
             gh release upload "$RELEASE_TAG" release/* --repo "$RELEASE_REPOSITORY" --clobber
-            gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" "${target[@]}" "${notes[@]}"
           else
-            gh release create "$RELEASE_TAG" release/* --repo "$RELEASE_REPOSITORY" --draft "${target[@]}" --title "Agent Mod Manager $RELEASE_TAG" "${notes[@]}"
+            gh release create "$RELEASE_TAG" release/* --repo "$RELEASE_REPOSITORY" --draft "${target[@]}" --title "Agent Mod Manager $RELEASE_TAG" --notes-file "$notes_file"
           fi

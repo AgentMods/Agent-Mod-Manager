@@ -12,6 +12,12 @@ rejects executable paths containing symlinked components, including `/var` in
 the runner’s temporary directory. The smoke checks SQLite initialization in a
 fresh home directory.
 
+**Windows package verification (2026-11-24).** Both installer formats installed
+successfully on the disposable Windows runner. Elevated WebView2 hosts ignore
+the environment flag the smoke used to enable debugging. The elevated test
+now scopes a temporary loopback debugging policy to the installed executable
+and removes it after the smoke.
+
 **Nexus Mod downloads (2026-11-24).** The stock Nexus MCP can now save files
 whose GraphQL `uri` is an opaque storage path. A public Phantom Blade Zero
 file (Mod 266, file 623) supplied the regression example. The bundled provider

@@ -104,15 +104,22 @@ export async function startWebView2(application, scratch) {
   assert.equal(process.platform, 'win32');
   const shell = process.env.AMM_WINDOWS_SMOKE_POWERSHELL;
   assert.ok(shell && isAbsolute(shell), 'The installer smoke must supply the absolute PowerShell path');
+  const fixturePort = process.env.AMM_WINDOWS_SMOKE_CDP_PORT;
+  if (fixturePort !== undefined) {
+    assert.ok(/^[1-9][0-9]{0,4}$/.test(fixturePort) && Number(fixturePort) <= 65535,
+      'Expected a valid WebView2 CDP port from the installer smoke');
+  }
   const { chromium } = await import('@playwright/test');
-  const port = await loopbackPort();
-  // Set test-only flags on this child. Do not enable debugging in shipped settings.
+  const port = fixturePort === undefined ? await loopbackPort() : Number(fixturePort);
   const env = Object.fromEntries(Object.entries(process.env).filter(([name]) =>
     !/^(AMM_|WEBVIEW2_)/i.test(name)));
   // Keep unrelated AMM_ variables isolated while explicitly disabling analytics in the app.
   env.AMM_DISABLE_ANALYTICS = '1';
-  env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = `--remote-debugging-address=${loopback} --remote-debugging-port=${port}`;
-  env.WEBVIEW2_USER_DATA_FOLDER = await mkdtemp(join(scratch, 'webview2-'));
+  // The elevated fixture supplies the port via temporary HKLM policy; only non-elevated hosts use these flags.
+  if (fixturePort === undefined) {
+    env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = `--remote-debugging-address=${loopback} --remote-debugging-port=${port}`;
+    env.WEBVIEW2_USER_DATA_FOLDER = await mkdtemp(join(scratch, 'webview2-'));
+  }
   const app = spawn(application, [], { cwd: scratch, env, stdio: ['ignore', 'inherit', 'inherit'] });
   const exited = new Promise(resolve => {
     app.once('error', resolve);
