@@ -40,11 +40,20 @@ downloads. `download_mod` does not accept uncataloged links.
 
 The Agent checks the selected file against the connected source MCP first. The native catalog is independent of the connected services. On Mod 客栈, `list_works` and `list_work_files` identify the exact attachment. The official MCP's `get_work_file_download` issues a short-lived link and counts the download. The desktop adapter requests the signed link and transfers the selected attachment in one operation (reviewed unless the Agent uses Full Trust), returning the local archive receipt for later review. Signed URLs stay out of the conversation and the database.
 
-When the source cannot deliver the attachment, the Agent uses the connected Playwright MCP to download the same file through the official page and checks the saved file. A denied approval stops the operation. The stock browser reports absolute file paths and writes to `downloads/Playwright` under the active manager storage directory. The stock mod.io, CurseForge, GameBanana and Nexus Mods launchers set their child process’s download directory to `downloads/incoming` under the same root. For new library downloads, `list_mod_receipt_folders` returns the managed incoming folder and the stock Playwright download folder. `file_received_mod` files the verified download under its game in `Mods`. A file saved elsewhere goes through the desktop picker and reviewed import. The Agent installs from the resulting library artifact ID.
+When the source cannot deliver the attachment, the Agent uses the connected Playwright MCP to download the same file through the official page and checks the saved file. A denied approval stops the operation. The stock browser reports absolute file paths and writes to `downloads/Playwright` under the active manager storage directory. The stock mod.io, CurseForge, GameBanana, Nexus Mods and Thunderstore launchers set their child process’s download directory to `downloads/incoming` under the same root. For new library downloads, `list_mod_receipt_folders` returns the managed incoming folder and the stock Playwright download folder. `file_received_mod` files the verified download under its game in `Mods`. A file saved elsewhere goes through the desktop picker and reviewed import. The Agent installs from the resulting library artifact ID.
 
 ### Downloads with proxy DNS
 
 The downloader validates and pins the IPs for each HTTPS hop. If the OS resolver returns only benchmark addresses in `198.18.0.0/15` or `2001:2::/48` for a public hostname, it queries Cloudflare over HTTPS for A and AAAA records. The resolver receives only the hostname and record type. Its connection uses fixed public bootstrap addresses and normal TLS certificate verification. The download uses the verified addresses with the original HTTPS hostname. Private or mixed DNS answers still fail closed. If no public address can be obtained after signing, use the official work page in the connected Playwright MCP without issuing a second ticket.
+
+### Thunderstore MCP
+
+Enable **Thunderstore MCP** in **Settings → 工具**. It uses the bundled uvx
+launcher, needs no API key, and is separate from the native Thunderstore
+catalog below. For a source-MCP download, first confirm the community, author,
+package and exact version. The `download_version` tool returns the local ZIP
+path, byte count and SHA-256. File the completed archive through the normal
+`file_received_mod` flow; downloading does not install it.
 
 ## Reviewed public archive links
 

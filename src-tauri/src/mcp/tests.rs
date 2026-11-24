@@ -220,7 +220,7 @@ fn sqlite_crud_presets_markitdown_inherits_uvx_default_and_secret_references() {
     servers.seed_presets().unwrap();
     servers.seed_presets().unwrap();
     let presets = servers.list().unwrap();
-    assert_eq!(presets.len(), 8);
+    assert_eq!(presets.len(), 9);
     assert!(presets
         .iter()
         .all(|server| !server.enabled && server.builtin));
@@ -319,6 +319,14 @@ fn mod_source_presets_bind_their_published_stdio_commands_and_credentials() {
         ("curseforge", vec!["curseforge-mcp@latest"]),
         ("gamebanana", vec!["gamebanana-mcp@latest"]),
         (
+            "thunderstore",
+            vec![
+                "--default-index",
+                "https://pypi.org/simple",
+                "thunderstore-mcp@latest",
+            ],
+        ),
+        (
             "nexusmods",
             vec![
                 "--upgrade",
@@ -334,6 +342,11 @@ fn mod_source_presets_bind_their_published_stdio_commands_and_credentials() {
         assert_eq!(config.args, args);
         config.validate().unwrap();
     }
+    let thunderstore = servers.get("thunderstore").unwrap();
+    assert_eq!(thunderstore.name, "Thunderstore MCP");
+    assert!(thunderstore.env_secret_refs.is_empty());
+    assert!(thunderstore.credential_url.is_none());
+    assert!(thunderstore.bearer_secret_ref.is_none());
     let modio = servers.get("modio").unwrap();
     assert_eq!(
         modio.env_secret_refs["MODIO_API_BASE_URL"],
@@ -367,6 +380,60 @@ fn mod_source_presets_bind_their_published_stdio_commands_and_credentials() {
             .as_deref(),
         Some("sample-key")
     );
+}
+
+#[test]
+fn thunderstore_preset_does_not_replace_an_existing_manual_connection() {
+    let (_dir, servers, _, _) = fixture();
+    let existing = ServerConfig::stdio(
+        "thunderstore",
+        "My Thunderstore",
+        "custom-wrapper",
+        vec!["my-args".into()],
+    );
+    servers.create(&existing).unwrap();
+    servers.seed_presets().unwrap();
+    assert_eq!(servers.get("thunderstore").unwrap(), existing);
+    assert!(servers.startup_requests().unwrap().is_empty());
+}
+
+#[test]
+fn v24_upgrade_unpins_only_stock_thunderstore_and_revokes_its_old_consent() {
+    for (builtin, package, migrates) in [
+        (true, "thunderstore-mcp==0.1.0", true),
+        (true, "thunderstore-mcp==0.1.1", false),
+        (false, "thunderstore-mcp==0.1.0", false),
+    ] {
+        let (_dir, servers, _, context) = fixture();
+        servers.seed_presets().unwrap();
+        let mut expected = servers.get("thunderstore").unwrap();
+        expected.enabled = true;
+        expected.builtin = builtin;
+        expected.description = Some("Custom display text".into());
+        let mut old = expected.clone();
+        *old.args.last_mut().unwrap() = package.into();
+        if builtin {
+            servers.update(&old).unwrap();
+        } else {
+            servers.remove(&old.id).unwrap();
+            servers.create(&old).unwrap();
+        }
+        servers.remember_start(&old).unwrap();
+        servers
+            .db
+            .conn()
+            .pragma_update(None, "user_version", 24)
+            .unwrap();
+        let upgraded = McpServers::new(Db::open(&context.engine.paths.db_file()).unwrap());
+        upgraded.seed_presets().unwrap();
+        if migrates {
+            assert_eq!(upgraded.get(&old.id).unwrap(), expected);
+            assert!(upgraded.startup_digest(&old.id).unwrap().is_none());
+        } else {
+            assert_eq!(upgraded.get(&old.id).unwrap(), old);
+            assert!(ConnectionConsent::from_remembered(&upgraded, &old).is_ok());
+        }
+    }
 }
 
 #[test]
@@ -2551,6 +2618,52 @@ async fn live_markitdown_preset_initializes_and_lists_conversion_tool() {
         .unwrap()
         .iter()
         .any(|tool| tool.remote_name == "convert_to_markdown"));
+}
+
+/// Exercise the exact desktop preset with the bundled launcher and an empty SecretStore.
+#[tokio::test]
+#[ignore = "requires the prepared MCP runtime and Thunderstore dependencies (or network access)"]
+async fn live_thunderstore_preset_registers_tools_and_prepares_managed_inbox() {
+    use crate::mcp_connections::McpConnections;
+
+    let (dir, servers, settings, context) = fixture();
+    servers.seed_presets().unwrap();
+    servers.set_enabled("thunderstore", true).unwrap();
+    let config = servers.get("thunderstore").unwrap();
+    let inbox = crate::storage::incoming_downloads(&context.engine.paths.root);
+    std::fs::remove_dir(&inbox).unwrap(); // AppPaths::new created it for the fixture.
+    let registry = ToolRegistry::default();
+    let connections = McpConnections::with_runtime(McpRuntime::bundled(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/mcp-runtime/runtime.zip"),
+        dir.path().canonicalize().unwrap().join("runtime-cache"),
+    ));
+    let info = connections
+        .connect(settings, &registry, config, true)
+        .await
+        .expect("failed to initialize the Thunderstore preset with bundled uvx");
+    println!("Thunderstore MCP discovered {} tools", info.tools.len());
+    for remote_name in [
+        "list_communities",
+        "search_packages",
+        "get_version",
+        "list_dependencies",
+        "download_version",
+    ] {
+        let name = client::namespaced_tool_name("thunderstore", remote_name);
+        assert!(
+            info.tools.contains(&name),
+            "tool not registered: {remote_name}"
+        );
+        assert_eq!(
+            registry.get(&name).unwrap().definition().effect,
+            Effect::ExternalWrite
+        );
+    }
+    assert!(inbox.is_dir());
+    connections
+        .disconnect(&registry, &servers, &info.server_id)
+        .await
+        .unwrap();
 }
 
 /// Opt-in native HTTP smoke using a disposable DB and no credentials.

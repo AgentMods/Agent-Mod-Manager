@@ -64,8 +64,9 @@ The presets below appear in Settings → 工具.
 | CurseForge | `curseforge-mcp@latest` | `CURSEFORGE_API_KEY` from CurseForge for Studios |
 | GameBanana | `gamebanana-mcp@latest` | Anonymous |
 | Nexus Mods | `--upgrade --from glossmod-nexusmods-mcp nexusmods-mcp` | Anonymous public lookup, optional `NEXUSMODS_API_KEY` for account-authorized operations |
+| [Thunderstore](https://pypi.org/project/thunderstore-mcp/) | `--default-index https://pypi.org/simple thunderstore-mcp@latest` | Anonymous |
 
-The four stock uvx launchers above pass their provider-specific `*_DOWNLOAD_DIR`
+The five stock uvx launchers above pass their provider-specific `*_DOWNLOAD_DIR`
 to the child process, set to `downloads/incoming` in the active storage directory.
 Custom launch commands and arguments do not receive this override.
 
@@ -108,6 +109,10 @@ Click Start on a service in Settings to connect immediately. A stdio command run
 application-owned launchers. Their child environments select npmmirror
 (`npm_config_registry`) or the Tsinghua PyPI mirror (`UV_DEFAULT_INDEX`).
 Explicit CLI registry options take precedence. MarkItDown inherits the bundled uvx default.
+Thunderstore resolves `@latest` on official PyPI because the bundled mirror did
+not serve the package when the preset was added. Schema v25 updates the stock
+preview command pinned to 0.1.0 and expires its auto-start consent; use Start to
+approve the new command. Custom launch configurations are preserved.
 Other commands, including absolute paths, keep their own executable and package configuration.
 Package-backed MCPs and their Python interpreters are fetched by their launchers.
 Schema v4 revokes old auto-start consent for affected bare aliases, including custom connections,

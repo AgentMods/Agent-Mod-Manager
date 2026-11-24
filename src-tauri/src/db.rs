@@ -204,6 +204,9 @@ impl Db {
                     tx.execute("ALTER TABLE messages ADD COLUMN origin_json TEXT", [])?;
                 }
             }
+            if version < 25 {
+                crate::mcp::config::migrate_thunderstore_to_latest(&tx)?;
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
@@ -217,7 +220,7 @@ impl Db {
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 24;
+pub const SCHEMA_VERSION: i64 = 25;
 
 // SQLite appends rowid to the index key: these indexes bound scans to the
 // conversation's insertion-order suffix and the most recent retained user.

@@ -589,6 +589,7 @@ fn stock_source_download_dirs_use_each_active_storage_root_without_touching_user
             ("curseforge", "CURSEFORGE_DOWNLOAD_DIR"),
             ("gamebanana", "GAMEBANANA_DOWNLOAD_DIR"),
             ("nexusmods", "NEXUSMODS_DOWNLOAD_DIR"),
+            ("thunderstore", "THUNDERSTORE_DOWNLOAD_DIR"),
         ] {
             let stock = servers.get(id).unwrap();
             let mut command = Command::new("uvx");

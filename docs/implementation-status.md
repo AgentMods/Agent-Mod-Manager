@@ -1,7 +1,7 @@
 # Agent Mod Manager implementation status
 
-Updated: 2026-11-24. The desktop release target is `1.0.1`. See the
-[Chinese release notes](releases/1.0.1.md) for user-facing features and
+Updated: 2026-11-25. The desktop release target is `1.0.2`. See the
+[Chinese release notes](releases/1.0.2.md) for user-facing features and
 installation limitations. This page records implementation and verification
 evidence; it does not establish that the release workflow or CI has passed.
 The broader project scope remains active.
@@ -1016,10 +1016,21 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   encrypted-Store secret references, explicit exact-config connection confirmation,
   namespaced tools, bounded results/cancellation, stale-config revocation and
   atomic registry registration. All external tool annotations remain untrusted.
-  The eight opt-in presets are Mod 客栈, Playwright, MarkItDown, mod.io,
-  CurseForge, GameBanana, 3DM and Nexus Mods. `system-mod-download` uses the
-  connected source MCPs for project and file discovery and download, including
-  Mod 客栈. The official Mod 客栈 attachment tool requests a signed link and transfers a selected
+  The nine opt-in presets are Mod 客栈, Playwright, MarkItDown, mod.io,
+  CurseForge, GameBanana, 3DM, Nexus Mods and Thunderstore. Insert-only seeding
+  adds the Thunderstore preset on startup without overwriting an existing
+  connection with that ID. The preset resolves `thunderstore-mcp@latest` through
+  the bundled uvx using official PyPI, needs no credentials, and sets
+  `THUNDERSTORE_DOWNLOAD_DIR` for the stock process to the active
+  `downloads/incoming` folder. Mod downloads continue through the normal
+  approval and receipt flow; the native Thunderstore catalog is unchanged.
+  Schema v25 updates the stock preview command from the 0.1.0 pin to `@latest`
+  and revokes the old startup consent without editing custom connections.
+  A Windows smoke test with the bundled launcher registered all 16 Thunderstore
+  tools and prepared the managed inbox; a separate public community lookup
+  succeeded. No live archive was downloaded in these tests.
+  `system-mod-download` uses connected source MCPs for project and file discovery
+  and download. The official Mod 客栈 attachment tool requests a signed link and transfers a selected
   file into managed downloads as one operation under the same approval policy. When a source cannot
   deliver the file, the Agent uses the connected Playwright MCP to download it
   from the official page. Schema v12 gives the stock Playwright browser a

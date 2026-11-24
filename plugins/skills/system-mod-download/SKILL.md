@@ -19,9 +19,10 @@ description: "优先通过对应来源 MCP 查找并下载指定 Mod，仅在来
 | CurseForge · `curseforge` | `list_games` → `search_mods` → `get_mod`；按加载器筛选时同时传游戏版本。用 `list_mod_files` / `get_mod_file` 选文件、`get_file_dependencies` 查前置。优先用可保存文件的 `download_file`；`get_file_download_url` 只提供链接，不表示已保存。 |
 | GameBanana · `gamebanana` | `search_games` → `search_mods` → `get_mod`；用 `list_files` / `get_file` 选文件、`get_requirements` 查前置，再用 `download_file` 下载选定文件。 |
 | Nexus Mods · `nexusmods` | `find_games` 取得 `domainName`，再用 `find_mods` / `get_mod`；用 `list_files` / `get_file` 选文件、`get_file_requirements` 查前置，再按账户权限用 `download_file`。 |
+| Thunderstore · `thunderstore` | 用 `list_communities` 核对社区 `identifier`，再用 `search_packages` 搜索；用 `get_package` 或 `list_versions` 核对 `namespace`、`name` 和精确 `version`，用 `get_version` / `list_dependencies` 核对文件和前置。调用 `download_version` 下载选定版本；用返回的 `path`、`bytes_written` 和 `sha256` 核对已保存的 ZIP，再用精确文件名入库。 |
 
 - 官方 Mod 客栈的 `get_work_file_download` 每次成功签发都会计一次下载，链接有效 5 分钟。管理器客户端负责消费链接并保存归档，收到工具成功响应立即检查**受管归档回执**，不要重复签发。已完成就结束下载，不把文件再交浏览器；超时或结果不明时先查是否已落盘，不盲目重试。若运行时只返回链接，就不能算已下载；不要把签名地址、密钥或 `nxm://` 授权信息写进回复或转交浏览器。
-- 其他来源下载前，用 `list_mod_receipt_folders` 核对当前 `incoming` 目录。内置 mod.io、CurseForge、GameBanana 和 Nexus Mods 预设在启动时已设为该目录，按实际 schema 调用，不编造路径参数。其他工具若支持选择本机保存位置，显式选 `incoming`；不要默认写入系统 Downloads 或游戏目录。不能确认受管保存位置时，使用下述原厂 Playwright 流程，仍须遵守审批。确认已完成、取得本机可读的绝对路径，核对文件名及可用的大小、校验值。仅有链接、远端服务路径或未完成的传输都不是本机文件。区分未连接、查询失败、权限不足与零结果。来源凭据缺失时，先尝试官方页面允许的下载方式；确实需要用户授权时，再说明缺少哪项权限。
+- 其他来源下载前，用 `list_mod_receipt_folders` 核对当前 `incoming` 目录。内置 mod.io、CurseForge、GameBanana、Nexus Mods 和 Thunderstore 预设在启动时已设为该目录，按实际 schema 调用，不编造路径参数。其他工具若支持选择本机保存位置，显式选 `incoming`；不要默认写入系统 Downloads 或游戏目录。不能确认受管保存位置时，使用下述原厂 Playwright 流程，仍须遵守审批。确认已完成、取得本机可读的绝对路径，核对文件名及可用的大小、校验值。仅有链接、远端服务路径或未完成的传输都不是本机文件。区分未连接、查询失败、权限不足与零结果。来源凭据缺失时，先尝试官方页面允许的下载方式；确实需要用户授权时，再说明缺少哪项权限。
 
 ## 仅在来源无法取得文件时用 Playwright MCP
 

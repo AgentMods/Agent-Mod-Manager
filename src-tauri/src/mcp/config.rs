@@ -276,6 +276,13 @@ const GLOSSMOD_3DM_CREDENTIAL_URL: &str = "https://mod.3dmgame.com/Workshop/Api"
 
 const MODIO_ID: &str = "modio";
 pub(super) const NEXUSMODS_ID: &str = "nexusmods";
+const THUNDERSTORE_ID: &str = "thunderstore";
+// Use official PyPI; the bundled mirror did not serve this package.
+const THUNDERSTORE_ARGS: &[&str] = &[
+    "--default-index",
+    "https://pypi.org/simple",
+    "thunderstore-mcp@latest",
+];
 
 struct ModSourcePreset {
     id: &'static str,
@@ -289,6 +296,15 @@ struct ModSourcePreset {
 }
 
 const MOD_SOURCE_PRESETS: &[ModSourcePreset] = &[
+    ModSourcePreset {
+        id: THUNDERSTORE_ID,
+        name: "Thunderstore MCP",
+        description: "搜索 Thunderstore 社区与模组，查看版本、文档和依赖，并下载指定版本。",
+        download_dir_env: "THUNDERSTORE_DOWNLOAD_DIR",
+        args: THUNDERSTORE_ARGS,
+        credential_url: None,
+        bindings: &[],
+    },
     ModSourcePreset {
         id: MODIO_ID,
         name: "mod.io MCP",
@@ -388,6 +404,7 @@ fn v11_builtin_presets() -> impl Iterator<Item = ServerConfig> {
         playwright_v11_args(),
         LEGACY_PLAYWRIGHT_DESCRIPTION,
     )
+    .filter(|preset| preset.id != THUNDERSTORE_ID)
 }
 
 /// Schema v11: replace only the last shipped package commands. A changed command
@@ -435,6 +452,27 @@ pub(crate) fn migrate_descriptions(conn: &Connection) -> AppResult<()> {
             params![config.id, config.description],
         )?;
     }
+    Ok(())
+}
+
+/// Schema v25: upgrade only the launch config seeded by the pinned preview.
+pub(crate) fn migrate_thunderstore_to_latest(conn: &Connection) -> AppResult<()> {
+    let previous = [
+        "--default-index",
+        "https://pypi.org/simple",
+        "thunderstore-mcp==0.1.0",
+    ];
+    conn.execute(
+        "UPDATE mcp_servers SET args_json=?1, startup_digest=NULL
+         WHERE id=?2 AND builtin=1 AND plugin_slug IS NULL AND name='Thunderstore MCP'
+           AND transport='stdio' AND command='uvx' AND args_json=?3
+           AND url IS NULL AND credential_url IS NULL AND env_json='{}' AND secret_ref IS NULL",
+        params![
+            serde_json::to_string(THUNDERSTORE_ARGS)?,
+            THUNDERSTORE_ID,
+            serde_json::to_string(&previous)?
+        ],
+    )?;
     Ok(())
 }
 

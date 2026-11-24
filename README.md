@@ -16,6 +16,10 @@ Agent Mod Manager（AMM）是一款由 AI Agent 驱动的智能游戏 Mod 管理
 - 无毒无捆绑
 - 功能全部免费开放
 
+### Thunderstore MCP
+
+在「设置 → 工具」启动 **Thunderstore MCP** 后，Agent 可按游戏社区查找模组、查看版本和依赖，并下载指定版本。无需 API Key；首次启动需要联网准备依赖。下载的 ZIP 进入管理器收件目录，不会自动安装。
+
 ### [支持的游戏](https://www.glossmod.com/manager-plugins)
 
 ### 支持的语言
