@@ -60,6 +60,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 rand = "0.9"
+ring = "0.17.14"
 url = "2"
 percent-encoding = "2.3"
 regex = "1"

@@ -2582,24 +2582,20 @@ async fn live_3dm_public_http_initializes_and_registers_tools() {
         .unwrap();
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn confirmed_stdio_mock_receives_keychain_secret_without_ambient_credentials() {
+    const FIRST_FIXTURE_VALUE: &str = "mock-secret-value";
+    const SECOND_FIXTURE_VALUE: &str = "mock-\"quoted\\env";
+
     let (_dir, servers, settings, context) = fixture();
-    let python = if std::path::Path::new("/usr/bin/python3").exists() {
+    let python = if cfg!(windows) {
+        "py"
+    } else if std::path::Path::new("/usr/bin/python3").exists() {
         "/usr/bin/python3"
     } else {
         "python3"
     };
-    let script = std::path::Path::new(file!())
-        .parent()
-        .unwrap()
-        .join("mock_stdio.py");
-    let script = if script.is_absolute() {
-        script
-    } else {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(script)
-    };
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/mock_stdio.py");
     let mut config = ServerConfig::stdio(
         "stdio_mock",
         "Mock",
@@ -2614,10 +2610,10 @@ async fn confirmed_stdio_mock_receives_keychain_secret_without_ambient_credentia
         .env_secret_refs
         .insert("SECOND_API_KEY".into(), "mcp.stdio.second_key".into());
     servers
-        .write_secret(&settings, "mcp.stdio.key", "mock-secret-value")
+        .write_secret(&settings, "mcp.stdio.key", FIRST_FIXTURE_VALUE)
         .unwrap();
     servers
-        .write_secret(&settings, "mcp.stdio.second_key", "mock-\"quoted\\env")
+        .write_secret(&settings, "mcp.stdio.second_key", SECOND_FIXTURE_VALUE)
         .unwrap();
     servers.create(&config).unwrap();
     let consent = ConnectionConsent::after_user_confirmation(&config, true).unwrap();
@@ -2637,14 +2633,20 @@ async fn confirmed_stdio_mock_receives_keychain_secret_without_ambient_credentia
         .await
         .unwrap();
     let text: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(text["secretPresent"], true);
+    assert_eq!(text["firstCredentialMatches"], true);
+    assert_eq!(text["secondCredentialMatches"], true);
     assert_eq!(text["ambientSecretPresent"], false);
-    assert_eq!(text["echoedCredential"], "[REDACTED]");
-    assert_eq!(text["secondCredential"], "[REDACTED]");
+    // The fixture sends the fixed samples even when env injection fails; only
+    // production MCP result redaction can turn them into these markers.
+    assert_eq!(text["firstFixtureValue"], "[REDACTED]");
+    assert_eq!(text["secondFixtureValue"], "[REDACTED]");
+    assert_eq!(text["arguments"], json!({"test":true}));
     assert!(!serde_json::to_string(&result)
         .unwrap()
-        .contains("mock-secret-value"));
+        .contains(FIRST_FIXTURE_VALUE));
+    #[cfg(unix)]
     let pid = text["pid"].as_u64().unwrap();
+    #[cfg(unix)]
     assert!(std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()
@@ -2653,6 +2655,7 @@ async fn confirmed_stdio_mock_receives_keychain_secret_without_ambient_credentia
     servers.remove(&config.id).unwrap();
     assert!(client.list_tools(&context.cancel).await.is_err());
     client.disconnect_and_wait().await.unwrap();
+    #[cfg(unix)]
     assert!(!std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stderr(std::process::Stdio::null())

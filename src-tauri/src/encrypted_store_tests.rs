@@ -2,17 +2,19 @@ use super::*;
 
 #[test]
 fn authenticated_roundtrip_random_nonce_and_record_binding() {
-    let key = [42; 32];
+    let key = Zeroizing::new(random::<32>().unwrap());
+    let other_key = Zeroizing::new(random::<32>().unwrap());
     let secret = "sk-test-not-a-real-credential";
     let first = encrypt(&key, "model.api_key", secret).unwrap();
     let second = encrypt(&key, "model.api_key", secret).unwrap();
-    assert_ne!(first, second);
+    assert_ne!(first["nonce"], second["nonce"]);
+    assert_ne!(first["ciphertext"], second["ciphertext"]);
     assert!(!first.to_string().contains(secret));
     assert_eq!(
         decrypt(&key, "model.api_key", first.clone()).unwrap(),
         secret
     );
-    assert!(decrypt(&[43; 32], "model.api_key", first.clone()).is_err());
+    assert!(decrypt(&other_key, "model.api_key", first.clone()).is_err());
     assert!(decrypt(&key, "sources.nexus", first.clone()).is_err());
     let mut corrupted = first;
     let bytes = corrupted["ciphertext"].as_str().unwrap().to_owned();
@@ -26,7 +28,7 @@ fn authenticated_roundtrip_random_nonce_and_record_binding() {
 
 #[test]
 fn malformed_envelopes_and_oversized_plaintext_fail_without_echoing_secrets() {
-    let key = [17; 32];
+    let key = Zeroizing::new(random::<32>().unwrap());
     assert!(encrypt(&key, "bad/key", "secret").is_err());
     assert!(encrypt(&key, "model.api_key", &"x".repeat(MAX_SECRET + 1)).is_err());
     for value in [
@@ -104,13 +106,10 @@ fn actual_tauri_store_persists_ciphertext_and_reopens_without_keychain() {
         reopened.read("model.api_key").unwrap().as_deref(),
         Some(secret)
     );
-    create_private(
-        &root.join("wrong.env"),
-        format!("{KEY_VARIABLE}={}\n", "ff".repeat(32)).as_bytes(),
-    )
-    .unwrap();
+    let wrong_env = root.join("wrong.env");
+    master_key(&wrong_env, false, true).unwrap();
     let before = fs::read(&path).unwrap();
-    assert!(open_at(app.handle(), &path, &root.join("wrong.env"), false).is_err());
+    assert!(open_at(app.handle(), &path, &wrong_env, false).is_err());
     assert_eq!(fs::read(&path).unwrap(), before);
 }
 

@@ -6,6 +6,30 @@ installation limitations. This page records implementation and verification
 evidence; it does not establish that the release workflow or CI has passed.
 The broader project scope remains active.
 
+**GitHub Security follow-up (2026-11-24).** Reviewed seven open CodeQL
+alerts and one Dependabot alert; Secret Scanning reported no open alerts.
+Model metadata caches use process-local random-key HMAC tags to keep provider
+credentials separated. Authenticated results are not shared when OS randomness
+is unavailable. The encrypted store uses a fallible OS-random generator for
+keys and nonces without changing the AES-GCM envelope. Test fixtures no longer
+emit inherited credential values, and the publication mock checks request
+headers, size, and JSON-RPC structure without panicking on invalid input.
+
+Dependabot #1 (`GHSA-wrw7-89jp-8q8g` / `RUSTSEC-2024-0429`) still sees the
+`glib 0.18.5` version. The locked Linux dependency already has the upstream
+fix (`gtk-rs/gtk-rs-core` commit `b5a4071`) at the pinned backport revision
+`7e91f1a9`. Verify And Package now rejects any affected `glib` version from
+an unverified source. Keep this guard and pin until the Linux desktop stack
+can resolve only unaffected registry versions. GitHub alert state is separate
+from local verification.
+
+Local CodeQL 2.27.5 default suites for Rust, Python and Actions returned no
+security findings. All changed Rust files were extracted. On Windows, 22
+focused regressions passed, as did Rust formatting and all-target Clippy.
+The full Windows Rust library suite passed 1,167 tests with 15 ignored.
+The Linux-target Cargo tree resolved the patched revision, and the guard
+rejected fixtures with the registry source and an unverified Git revision.
+
 **macOS package verification (2026-11-24).** CI copies the app from the DMG,
 detaches the image and launches the installed copy from a canonical path. Tauri
 rejects executable paths containing symlinked components, including `/var` in

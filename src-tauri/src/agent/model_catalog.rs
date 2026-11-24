@@ -3,9 +3,9 @@ use crate::{
     settings::{parse_model_base_url, valid_model_id, ReasoningEffort},
 };
 use reqwest::RequestBuilder;
+use ring::{hmac, rand::SystemRandom};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
@@ -230,14 +230,24 @@ fn known_window(base: &Url, id: &str) -> Option<usize> {
 }
 
 type NativeWindows = BTreeMap<String, Option<usize>>;
-type ServiceKey = (String, Option<[u8; 32]>);
+type ServiceKey = (String, Option<hmac::Tag>);
 type Cache<T> = Mutex<Option<(Instant, Option<Arc<T>>)>>;
 type ServiceCaches = VecDeque<(ServiceKey, Arc<Cache<NativeWindows>>)>;
 
-#[derive(Default)]
 struct WindowResolver {
+    credential_cache_key: Option<hmac::Key>,
     services: Mutex<ServiceCaches>,
     catalog: Cache<Catalog>,
+}
+
+impl Default for WindowResolver {
+    fn default() -> Self {
+        Self {
+            credential_cache_key: hmac::Key::generate(hmac::HMAC_SHA256, &SystemRandom::new()).ok(),
+            services: Mutex::default(),
+            catalog: Mutex::default(),
+        }
+    }
 }
 
 async fn cached<T>(cache: &Cache<T>, load: impl Future<Output = Option<T>>) -> Option<Arc<T>> {
@@ -259,6 +269,32 @@ async fn cached<T>(cache: &Cache<T>, load: impl Future<Output = Option<T>>) -> O
 }
 
 impl WindowResolver {
+    async fn service_cache(&self, base: &Url, api_key: Option<&str>) -> Arc<Cache<NativeWindows>> {
+        // Entitlements may differ across credentials. A per-process HMAC key keeps cache
+        // tags from becoming reusable credential fingerprints. Never persist these tags.
+        let tag = match (api_key, self.credential_cache_key.as_ref()) {
+            (Some(key), Some(cache_key)) => Some(hmac::sign(cache_key, key.as_bytes())),
+            (Some(_), None) => return Arc::default(), // No entropy: do not share authenticated results.
+            (None, _) => None,
+        };
+        let base = normalized_base(base);
+        let mut services = self.services.lock().await;
+        let cache = services
+            .iter()
+            .position(|((cached_base, cached_tag), _)| {
+                cached_base == base
+                    && cached_tag.as_ref().map(AsRef::as_ref) == tag.as_ref().map(AsRef::as_ref)
+            })
+            .and_then(|index| services.remove(index))
+            .map(|(_, cache)| cache)
+            .unwrap_or_default();
+        if services.len() == MAX_CACHED_SERVICES {
+            services.pop_front();
+        }
+        services.push_back(((base.to_owned(), tag), Arc::clone(&cache)));
+        cache
+    }
+
     async fn resolve(
         &self,
         base: &Url,
@@ -269,25 +305,7 @@ impl WindowResolver {
         if !valid_model_id(id) {
             return None;
         }
-        // Entitlements may differ across credentials. Cache by digest, never by the key itself.
-        let service_key = (
-            normalized_base(base).to_owned(),
-            api_key.map(|key| Sha256::digest(key).into()),
-        );
-        let service = {
-            let mut services = self.services.lock().await;
-            let cache = services
-                .iter()
-                .position(|(key, _)| *key == service_key)
-                .and_then(|index| services.remove(index))
-                .map(|(_, cache)| cache)
-                .unwrap_or_default();
-            if services.len() == MAX_CACHED_SERVICES {
-                services.pop_front();
-            }
-            services.push_back((service_key, Arc::clone(&cache)));
-            cache
-        };
+        let service = self.service_cache(base, api_key).await;
         let models = cached(&service, async {
             let response = service_models(base, api_key, RUNTIME_LOOKUP_TIMEOUT)
                 .await
@@ -487,6 +505,48 @@ mod tests {
             .iter()
             .all(|row| row.reasoning_levels == [ReasoningEffort::Medium]));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn native_caches_are_isolated_by_endpoint_and_credential() {
+        let resolver = WindowResolver::default();
+        let base = Url::parse("https://example.test/v1").unwrap();
+        let other_base = Url::parse("https://other.test/v1").unwrap();
+        let first = resolver.service_cache(&base, Some("test-key-a")).await;
+        assert!(Arc::ptr_eq(
+            &first,
+            &resolver.service_cache(&base, Some("test-key-a")).await,
+        ));
+        for (endpoint, credential) in [
+            (&base, Some("test-key-b")),
+            (&base, None),
+            (&other_base, Some("test-key-a")),
+        ] {
+            assert!(!Arc::ptr_eq(
+                &first,
+                &resolver.service_cache(endpoint, credential).await,
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_caches_are_not_reused_without_a_random_key() {
+        let resolver = WindowResolver {
+            credential_cache_key: None,
+            services: Mutex::default(),
+            catalog: Mutex::default(),
+        };
+        let base = Url::parse("https://example.test/v1").unwrap();
+        let anonymous = resolver.service_cache(&base, None).await;
+        let first = resolver.service_cache(&base, Some("test-key")).await;
+        let second = resolver.service_cache(&base, Some("test-key")).await;
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &anonymous));
+        assert!(Arc::ptr_eq(
+            &anonymous,
+            &resolver.service_cache(&base, None).await,
+        ));
+        assert_eq!(resolver.services.lock().await.len(), 1);
     }
 
     #[tokio::test]

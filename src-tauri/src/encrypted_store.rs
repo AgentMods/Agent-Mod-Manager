@@ -9,7 +9,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
-use rand::TryRngCore;
+use ring::rand::{generate, SystemRandom};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -33,11 +33,9 @@ fn failure(message: &str) -> AppError {
     AppError::Other(message.into())
 }
 fn random<const N: usize>() -> AppResult<[u8; N]> {
-    let mut bytes = [0; N];
-    rand::rngs::OsRng
-        .try_fill_bytes(&mut bytes)
-        .map_err(|_| failure("无法取得系统安全随机数"))?;
-    Ok(bytes)
+    generate::<[u8; N]>(&SystemRandom::new())
+        .map(|bytes| bytes.expose())
+        .map_err(|_| failure("无法取得系统安全随机数"))
 }
 
 #[derive(Serialize, Deserialize)]

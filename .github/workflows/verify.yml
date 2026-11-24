@@ -77,6 +77,8 @@ jobs:
       - run: yarn install --frozen-lockfile
       - run: yarn build
       - run: yarn prepare:seven-zip
+      - name: Verify Rust security backports
+        run: python scripts/check-rustsec-backports.py
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
       - name: Build Unsigned Installers

@@ -9,10 +9,12 @@ use axum::{
     routing::post,
     Router,
 };
+use rmcp::model::{JsonRpcVersion2_0, RequestId};
 use std::sync::{Arc, Mutex};
 
 const SLUG: &str = "manager-publication-test";
 const KEY: &str = "fake-key-for-offline-test";
+const MAX_LOOPBACK_REQUEST_BYTES: usize = 5 * 1024 * 1024;
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -79,23 +81,86 @@ fn receipt(id: i64, release_id: i64, hidden: bool) -> Value {
         "hidden":hidden,"name":"Fixture","reason":if hidden { "moderated" } else { "" },"extraProviderMetadata":true})
 }
 
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+enum LoopbackMethod {
+    #[serde(rename = "initialize")]
+    Initialize,
+    #[serde(rename = "notifications/initialized")]
+    Initialized,
+    #[serde(rename = "tools/call")]
+    CallTool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoopbackRequest {
+    #[serde(rename = "jsonrpc")]
+    _version: JsonRpcVersion2_0,
+    id: Option<RequestId>,
+    method: LoopbackMethod,
+    params: Option<serde_json::Map<String, Value>>,
+}
+
 #[derive(Clone)]
 struct Loopback {
-    calls: Arc<Mutex<Vec<(Value, usize)>>>,
+    calls: Arc<Mutex<Vec<(LoopbackRequest, usize)>>>,
     reply: Value,
     status: StatusCode,
 }
 
 async fn post_mcp(State(state): State<Loopback>, headers: HeaderMap, bytes: Bytes) -> Response {
-    assert_eq!(headers[header::AUTHORIZATION], format!("Bearer {KEY}"));
-    let accept = headers[header::ACCEPT].to_str().unwrap();
-    assert!(accept.contains("application/json") && accept.contains("text/event-stream"));
-    let rpc: Value = serde_json::from_slice(&bytes).unwrap();
-    state.calls.lock().unwrap().push((rpc.clone(), bytes.len()));
-    match rpc["method"].as_str().unwrap() {
-        "initialize" => {
-            assert!(rpc["params"]["protocolVersion"].is_string());
-            let reply = json!({"jsonrpc":"2.0","id":rpc["id"],"result":{
+    if !headers
+        .get(header::AUTHORIZATION)
+        .is_some_and(|value| value == format!("Bearer {KEY}").as_str())
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.contains("application/json") && value.contains("text/event-stream")
+        })
+    {
+        return StatusCode::NOT_ACCEPTABLE.into_response();
+    }
+    if !headers
+        .get(header::CONTENT_TYPE)
+        .is_some_and(|value| value == "application/json")
+    {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    if bytes.len() > MAX_LOOPBACK_REQUEST_BYTES {
+        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    }
+    if !bytes.trim_ascii_start().starts_with(b"{") {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    // Decode only this mock's JSON-RPC envelope, retaining the opaque params
+    // for exact equality assertions. Keep serde_json's default recursion limit.
+    let mut decoder = serde_json::Deserializer::from_slice(&bytes);
+    let Ok(rpc) = LoopbackRequest::deserialize(&mut decoder) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if decoder.end().is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if rpc.method != LoopbackMethod::Initialize
+        && (!headers
+            .get("mcp-protocol-version")
+            .is_some_and(|value| value == "2025-03-26")
+            || !headers
+                .get("mcp-session-id")
+                .is_some_and(|value| value == "loopback-session"))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let param = |key| rpc.params.as_ref().and_then(|params| params.get(key));
+    let response = match (rpc.method, rpc.id.as_ref()) {
+        (LoopbackMethod::Initialize, Some(id))
+            if param("protocolVersion").is_some_and(Value::is_string) =>
+        {
+            let reply = json!({"jsonrpc":"2.0","id":id,"result":{
                 "capabilities":{"tools":{}},"protocolVersion":"2025-03-26",
                 "serverInfo":{"name":"loopback","version":"1"}
             }});
@@ -111,23 +176,27 @@ async fn post_mcp(State(state): State<Loopback>, headers: HeaderMap, bytes: Byte
             )
                 .into_response()
         }
-        method => {
-            assert_eq!(headers["mcp-protocol-version"], "2025-03-26");
-            assert_eq!(headers["mcp-session-id"], "loopback-session");
-            match method {
-                "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
-                "tools/call" if state.status == StatusCode::OK => {
-                    let response = json!({"jsonrpc":"2.0","id":rpc["id"],"result":state.reply});
-                    Response::builder()
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(response.to_string()))
-                        .unwrap()
-                }
-                "tools/call" => state.status.into_response(),
-                other => panic!("Unexpected procedure: {other}"),
+        (LoopbackMethod::Initialized, None) if rpc.params.is_none() => {
+            StatusCode::ACCEPTED.into_response()
+        }
+        (LoopbackMethod::CallTool, Some(id))
+            if param("name").is_some_and(Value::is_string)
+                && param("arguments").is_some_and(Value::is_object) =>
+        {
+            if state.status == StatusCode::OK {
+                let response = json!({"jsonrpc":"2.0","id":id,"result":state.reply});
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(response.to_string()))
+                    .unwrap()
+            } else {
+                state.status.into_response()
             }
         }
-    }
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    state.calls.lock().unwrap().push((rpc, bytes.len()));
+    response
 }
 
 async fn local_transport(
@@ -143,7 +212,7 @@ async fn local_transport(
     };
     let app = Router::new()
         .route("/api/v1/mcp", post(post_mcp))
-        .layer(DefaultBodyLimit::max(5 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_LOOPBACK_REQUEST_BYTES))
         .with_state(mock.clone());
     let handle = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
     let transport = remote::Transport::connect_to(&url, KEY.into(), &CancellationToken::new())
@@ -209,9 +278,10 @@ async fn real_mcp_first_publish_consumes_agent_draft_and_preserves_large_approve
     let calls = mock.calls.lock().unwrap();
     assert_eq!(calls.len(), 3);
     let (rpc, size) = &calls[2];
-    assert_eq!(rpc["params"]["name"], "publish_manager_plugin");
+    let params = rpc.params.as_ref().unwrap();
+    assert_eq!(params["name"], "publish_manager_plugin");
     assert!(
-        rpc["params"]["arguments"]
+        params["arguments"]
             == json!({
                 "adapter":f.adapter,"skill":f.skill,"tags":["中文标签","other"]
             }),
@@ -268,7 +338,7 @@ async fn real_mcp_release_binding_and_hidden_receipt_and_installed_provenance() 
     assert!(done.remote.unwrap().hidden);
     let calls = mock.calls.lock().unwrap();
     assert_eq!(calls.len(), 3);
-    let params = &calls[2].0["params"];
+    let params = calls[2].0.params.as_ref().unwrap();
     assert_eq!(params["name"], "publish_manager_plugin_release");
     assert!(
         params["arguments"]
