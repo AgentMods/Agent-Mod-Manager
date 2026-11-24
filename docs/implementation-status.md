@@ -1,7 +1,22 @@
 # Agent Mod Manager implementation status
 
-Updated: 2026-11-24. The full project goal remains active. This is an
-implementation and verification snapshot, not a release-completion claim.
+Updated: 2026-11-24. The desktop release target is `1.0.0`. See the
+[Chinese release notes](releases/1.0.0.md) for user-facing features and
+installation limitations. This page records implementation and verification
+evidence; it does not establish that the release workflow or CI has passed.
+The broader project scope remains active.
+
+**Nexus Mod downloads (2026-11-24).** The stock Nexus MCP can now save files
+whose GraphQL `uri` is an opaque storage path. A public Phantom Blade Zero
+file (Mod 266, file 623) supplied the regression example. The bundled provider
+uses a safe original archive name when available and otherwise combines the
+file identity with its detected archive extension. Nine offline provider tests
+cover filename selection and the stdio download flow, including account
+authorization, mirror renewal, checksum verification and duplicate destinations.
+The Windows x64 NSIS package passed its archive test, and its extracted
+runtime resolved the patched wheel offline. The desktop MCP and incoming
+archive tests passed on Windows. Live testing used public file metadata. The
+archive transfer test used a fixture mirror.
 
 **Desktop languages (2026-11-24).** Settings → Appearance and storage has one
 Language selector for the interface and newly queued Mod organization jobs.
@@ -1480,11 +1495,11 @@ distribution acceptance, and it does not repeat the earlier game workflow.
   testing and a guided recovery path for legacy journals without identity
   evidence. Stronger cross-platform containment for external stdio MCP processes
   remains open.
-- Complete macOS release acceptance: CI now covers isolated packaged-app launch
-  and fresh SQLite/plugin initialization, while a temporary copy from the DMG
-  booted locally. The ad hoc build was rejected by Gatekeeper, so acceptance
-  via normal Finder install/launch remains pending. The fixture smoke does not
-  cover crash/disk-full testing or general production archives.
+- Complete macOS release acceptance: the verification workflow defines an isolated
+  packaged-app launch smoke test for fresh SQLite/plugin initialization. A
+  temporary copy from the DMG booted locally. Gatekeeper rejected the ad hoc
+  build, so normal Finder install/launch remains pending. The fixture smoke does
+  not cover crash/disk-full testing or general production archives.
 - Run the Windows installer jobs and verify on a clean Windows 11 desktop.
   Linux ARM64 `.deb`
   and extraction-mode AppImage passed the isolated WebView smoke above; native

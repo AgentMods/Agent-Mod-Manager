@@ -27,7 +27,7 @@ def bundle(directory, suffix):
 
 def main():
     repo = os.environ["RELEASE_REPOSITORY"]
-    tag = os.environ["GITHUB_REF_NAME"]
+    tag = os.environ.get("RELEASE_TAG") or os.environ["GITHUB_REF_NAME"]
     version = json.loads(Path("src-tauri/tauri.conf.json").read_text())["version"]
     if tag != f"v{version}":
         raise ValueError(f"Release tag {tag} does not match version {version}")

@@ -1,6 +1,8 @@
 # Agent Mod Manager
 
-一款由AI Agents 驱动的智能 Mod 管理器
+一款由 AI Agent 驱动的桌面 Mod 管理器。
+
+**[1.0.0 中文发行说明](docs/releases/1.0.0.md)**：查看版本亮点、安装包选择和已知限制。
 
 ## 切换 Agent 工作区
 
@@ -16,14 +18,14 @@
 
 ## 更新桌面应用
 
-签名发行版会在启动时检查 GitHub Releases，发现新版本后在后台下载。也可以打开 **设置 → 外观与存储 → 应用更新**，点击 **检查更新**。显示「已下载」后，正常退出程序即可安装，下次打开时使用新版本。下载过程中退出，下次启动会重新检查。系统安装器可能要求管理员授权。
+启用 Tauri 更新签名的发行版会在启动时检查 GitHub Releases，发现新版本后在后台下载。也可以打开 **设置 → 外观与存储 → 应用更新**，点击 **检查更新**。显示「已下载」后，正常退出程序即可安装，下次打开时使用新版本。下载过程中退出，下次启动会重新检查。系统安装器可能要求管理员授权。更新签名用于校验更新文件，不等同于操作系统的代码签名或公证。
 
 ### 维护者发布流程
 
 1. 首次配置时，运行 `yarn tauri signer generate -w <仓库外的私钥文件路径>` 并备份密钥。把 `.pub` 文件内容存入 GitHub Actions 仓库变量 `TAURI_UPDATER_PUBLIC_KEY`，私钥文件内容和密码分别存入 Secrets `TAURI_SIGNING_PRIVATE_KEY`、`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。后续发行沿用同一对密钥。
 2. 默认更新源是当前仓库的公开 Releases。如果源码仓库为私有，将变量 `AMM_RELEASE_REPOSITORY` 设为公开分发仓库的 `owner/repo`，并设置对该仓库有 Contents 写权限的 Secret `AMM_RELEASE_TOKEN`。客户端可匿名下载。
-3. 同步 `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`package.json` 及 Cargo 锁文件中的应用版本，推送对应的稳定标签（例如版本 `1.2.3` 对应 `v1.2.3`）。**Build signed desktop release** 会构建 Windows x64（NSIS、MSI）、Linux x64（AppImage、Debian）、macOS（Apple Silicon、Intel）安装包，校验签名并创建带 `latest.json` 的 Release 草稿。
-4. 审核安装包后在 GitHub 发布草稿，并将其设为 **Latest**。更新器读取 `/releases/latest/download/latest.json`。此前未集成更新器的用户需要手动安装一次签名发行版。
+3. 同步 `src-tauri/tauri.conf.json`、`src-tauri/Cargo.toml`、`package.json` 及 Cargo 锁文件中的应用版本，在 Actions 手动运行 **Build signed desktop release**，选择 `main` 并填写对应标签（例如 `v1.2.3`）。也可以直接推送匹配的稳定标签触发构建。**Build signed desktop release** 会构建 Windows x64（NSIS、MSI）、Linux x64（AppImage、Debian）、macOS（Apple Silicon、Intel）安装包，校验签名并创建带 `latest.json` 的 Release 草稿。
+4. 审核安装包及草稿正文。工作流会读取 `docs/releases/<版本>.md` 作为发行说明。在 GitHub 发布草稿并将其设为 **Latest**。更新器读取 `/releases/latest/download/latest.json`。此前未集成更新器的用户需要手动安装一次启用了更新签名的发行版。
 
 ## 安装、更新和移除插件
 

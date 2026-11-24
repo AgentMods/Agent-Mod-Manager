@@ -2,7 +2,7 @@ use super::config::{McpServers, McpTransport, ServerConfig, PLAYWRIGHT_COMMAND};
 use super::redaction::ConnectionSecrets;
 use super::McpRuntime;
 use crate::{
-    agent::sse::available_memory,
+    agent::sse::{available_memory, update_memory_reservation},
     error::{AppError, AppResult},
     settings::Settings,
 };
@@ -370,6 +370,10 @@ impl McpClient {
                         ensure_chromium(install, cancel).await?;
                     }
                     server
+                } else if config.id == super::config::NEXUSMODS_ID
+                    && config.source_download_dir_env().is_some()
+                {
+                    runtime.nexus_command(cancel).await?
                 } else {
                     runtime.command(executable, cancel).await?
                 };
@@ -1127,13 +1131,12 @@ impl<'a> McpMemory<'a> {
     }
 
     fn charge(&mut self, bytes: usize) -> AppResult<()> {
-        self.pool
-            .fetch_update(Relaxed, Relaxed, |reserved| {
-                reserved
-                    .checked_add(bytes)
-                    .filter(|&total| total <= self.limit)
-            })
-            .map_err(|_| memory_error())?;
+        update_memory_reservation(self.pool, |reserved| {
+            reserved
+                .checked_add(bytes)
+                .filter(|&total| total <= self.limit)
+        })
+        .map_err(|_| memory_error())?;
         self.held += bytes;
         Ok(())
     }
@@ -1145,14 +1148,13 @@ impl<'a> McpMemory<'a> {
         // fixed application frame allowance. Future connections share the pool.
         let mut frame = 0;
         let copies = slots * 2;
-        self.pool
-            .fetch_update(Relaxed, Relaxed, |reserved| {
-                frame = (self.limit.saturating_sub(reserved) / 2 / copies).min(sdk_default);
-                // Below one typical I/O buffer, fail before launching a server that
-                // is unlikely to deliver even its initialization/tool schema.
-                (frame >= 8192).then(|| reserved + frame * copies)
-            })
-            .map_err(|_| memory_error())?;
+        update_memory_reservation(self.pool, |reserved| {
+            frame = (self.limit.saturating_sub(reserved) / 2 / copies).min(sdk_default);
+            // Below one typical I/O buffer, fail before launching a server that
+            // is unlikely to deliver even its initialization/tool schema.
+            (frame >= 8192).then(|| reserved + frame * copies)
+        })
+        .map_err(|_| memory_error())?;
         self.held += frame * copies;
         Ok(frame)
     }

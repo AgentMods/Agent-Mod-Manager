@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 const PYPI_INDEX: &str = "https://pypi.tuna.tsinghua.edu.cn/simple";
 const NPM_REGISTRY: &str = "https://registry.npmmirror.com";
 const NPX_CLI: &str = "npm/bin/npx-cli.js";
+const NEXUS_WHEEL: &str = "nexus/glossmod_nexusmods_mcp-1.0.0+amm.1-py3-none-any.whl";
 const BING_HELPER: &str = "bin/bing-search.cjs";
 const PLAYWRIGHT_PACKAGE: &str = "bin/node_modules/playwright-core/package.json";
 const PLAYWRIGHT_CLI: &str = "bin/node_modules/playwright-core/cli.js";
@@ -67,6 +68,15 @@ impl McpRuntime {
         };
         let root = self.prepare_root(cancel, Bundle::root).await?;
         bundled_command(launcher, &root, path)
+    }
+
+    pub(super) async fn nexus_command(&self, cancel: &CancellationToken) -> AppResult<Command> {
+        let root = self.prepare_root(cancel, Bundle::root).await?;
+        verify_files([root.join(NEXUS_WHEEL)])?;
+        let mut cmd = bundled_command(Launcher::Uvx, &root, std::env::var_os("PATH"))?;
+        cmd.args(["--isolated", "--find-links"])
+            .arg(dunce::simplified(&root).join("nexus"));
+        Ok(cmd)
     }
 
     pub(crate) async fn bing_search_command(
@@ -445,6 +455,38 @@ mod tests {
         let reopened = McpRuntime::bundled(dir.join("fixture.zip"), dir.join("cache"));
         reopened.command("uvx", &cancel).await.unwrap();
         assert_eq!(dir.join("cache").read_dir().unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn nexus_launcher_adds_the_packaged_wheel_directory_as_one_argument() {
+        let tmp = tempfile::Builder::new()
+            .prefix("nexus runtime ")
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let cancel = CancellationToken::new();
+        let runtime = archive(&dir, &[NEXUS_WHEEL]);
+        let cmd = runtime.nexus_command(&cancel).await.unwrap();
+        let cmd = cmd.as_std();
+        let args: Vec<_> = cmd.get_args().collect();
+        assert!(cmd.get_program().to_string_lossy().ends_with(UVX));
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], "--isolated");
+        assert_eq!(args[1], "--find-links");
+        let wheel = Path::new(args[2]).join(Path::new(NEXUS_WHEEL).file_name().unwrap());
+        assert!(wheel.is_file());
+        fs::remove_file(wheel).unwrap();
+        assert!(runtime.nexus_command(&cancel).await.is_err());
+        assert_eq!(
+            runtime
+                .command("uvx", &cancel)
+                .await
+                .unwrap()
+                .as_std()
+                .get_args()
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]

@@ -215,6 +215,11 @@ def prepare(target):
             runtime.copy_distribution(uv_archive, select_uv)
             with helper.open('rb') as stream:
                 runtime.add(BING_HELPER, stream, os.fstat(stream.fileno()).st_size)
+            wheel = ROOT / 'scripts/vendor' / lock['nexus']['filename']
+            if hash_file(wheel) != lock['nexus']['sha256']:
+                raise ValueError('Bundled Nexus MCP wheel does not match the runtime lock')
+            with wheel.open('rb') as stream:
+                runtime.add(f'nexus/{wheel.name}', stream, wheel.stat().st_size)
             runtime.copy_distribution(playwright_archive, select_playwright)
             for name, sha256 in uv['licenses'].items():
                 license_path = download(f'https://raw.githubusercontent.com/astral-sh/uv/{uv["commit"]}/{name}', sha256)

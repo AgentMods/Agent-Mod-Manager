@@ -117,6 +117,12 @@ console.log('bing-helper-playwright-ok');
     cli.write_text('#!/usr/bin/env node\nconsole.log(require("node:fs").realpathSync(process.execPath));\n', encoding='utf-8', newline='\n')
     cli.chmod(0o755)
     run([node, npx, '--yes', '--offline', '--package=file:./npm-fixture', '--', 'amm-fixture'], str(node.resolve()))
+    # Resolve the stock Nexus package from the installed runtime, without fetching dependencies.
+    requirement = work / 'nexus-requirements.in'
+    requirement.write_text('glossmod-nexusmods-mcp\n', encoding='utf-8')
+    run([bin_dir / f'uv{exe}', 'pip', 'compile', '--no-index', '--find-links', runtime / 'nexus',
+         '--no-deps', '--no-header', '--python', sys.executable, requirement],
+        'glossmod-nexusmods-mcp==1.0.0+amm.1')
     wheel = python_fixture(work)
     run([uvx, '--offline', '--python', sys.executable, '--from', str(wheel), 'amm-fixture'], 'python-fixture-ok')
 

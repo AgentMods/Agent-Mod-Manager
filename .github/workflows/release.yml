@@ -3,15 +3,22 @@ name: Build signed desktop release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Stable release tag matching the application version (vX.Y.Z)
+        type: string
+        required: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: desktop-release-${{ github.ref }}
+  group: desktop-release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   RELEASE_REPOSITORY: ${{ vars.AMM_RELEASE_REPOSITORY || github.repository }}
   UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
 
@@ -51,7 +58,7 @@ jobs:
         run: |
           import json, os, pathlib, re
           version = json.loads(pathlib.Path('src-tauri/tauri.conf.json').read_text())['version']
-          if os.environ['GITHUB_REF_NAME'] != f'v{version}' or not re.fullmatch(r'\d+\.\d+\.\d+', version):
+          if os.environ['RELEASE_TAG'] != f'v{version}' or not re.fullmatch(r'\d+\.\d+\.\d+', version):
               raise SystemExit('Use a stable vX.Y.Z tag matching tauri.conf.json')
           key = os.environ['UPDATER_PUBLIC_KEY'].strip()
           if not key:
@@ -116,9 +123,22 @@ jobs:
           GH_TOKEN: ${{ secrets.AMM_RELEASE_TOKEN || github.token }}
         run: |
           test "$(gh api "repos/$RELEASE_REPOSITORY" --jq .visibility)" = public || { echo 'The updater needs a public release repository'; exit 1; }
-          if gh release view "$GITHUB_REF_NAME" --repo "$RELEASE_REPOSITORY" --json isDraft > release-state.json; then
+          target=()
+          if [[ "$RELEASE_REPOSITORY" == "$GITHUB_REPOSITORY" ]]; then
+            target=(--target "$GITHUB_SHA")
+            remote_tag=$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG")
+            if [[ -n "$remote_tag" ]]; then
+              git fetch --depth=1 origin "refs/tags/$RELEASE_TAG"
+              test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$GITHUB_SHA" || { echo 'Existing tag points to a different commit'; exit 1; }
+            fi
+          fi
+          notes=(--notes "Agent Mod Manager $RELEASE_TAG")
+          notes_file="docs/releases/${RELEASE_TAG#v}.md"
+          if [[ -f "$notes_file" ]]; then notes=(--notes-file "$notes_file"); fi
+          if gh release view "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --json isDraft > release-state.json; then
             jq -e .isDraft release-state.json >/dev/null
-            gh release upload "$GITHUB_REF_NAME" release/* --repo "$RELEASE_REPOSITORY" --clobber
+            gh release upload "$RELEASE_TAG" release/* --repo "$RELEASE_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" "${target[@]}" "${notes[@]}"
           else
-            gh release create "$GITHUB_REF_NAME" release/* --repo "$RELEASE_REPOSITORY" --draft --title "Agent Mod Manager $GITHUB_REF_NAME" --notes "Agent Mod Manager $GITHUB_REF_NAME"
+            gh release create "$RELEASE_TAG" release/* --repo "$RELEASE_REPOSITORY" --draft "${target[@]}" --title "Agent Mod Manager $RELEASE_TAG" "${notes[@]}"
           fi

@@ -1,3 +1,4 @@
+import { version } from "../package.json";
 import { tr, useLocale } from "@/lib/i18n";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { Gamepad2Icon, HeartIcon, HistoryIcon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
@@ -42,7 +43,7 @@ const navigation = [
 ] as const;
 const settingsItem = { id: "settings", get label() { return tr("设置"); }, icon: SettingsIcon } as const;
 const SPONSOR_URL = "https://sponsor.aoe.top/";
-const APP_VERSION = "v0.1.0";
+const APP_VERSION = `v${version}`;
 const pages = { library: LibraryPage, detail: GameDetailPage, agent: AgentPage, plugins: PluginsPage, trash: TrashPage, history: HistoryPage, settings: SettingsPage };
 
 /** The navigation rail collapses to icons below this width so content keeps its room. */
