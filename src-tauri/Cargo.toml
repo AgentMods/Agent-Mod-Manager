@@ -1,6 +1,6 @@
 [package]
 name = "agent-mod-manager"
-version = "1.0.2"
+version = "1.0.3"
 description = "Agent-driven cross-platform game mod manager"
 authors = ["Agent Mod Manager"]
 edition = "2021"
