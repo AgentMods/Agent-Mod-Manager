@@ -1,7 +1,139 @@
 # Agent Mod Manager implementation status
 
-Updated: 2026-11-23. The full project goal remains active. This is an
-implementation and verification snapshot, not a release-completion claim.
+Updated: 2026-11-24. The desktop release target is `1.0.0`. See the
+[Chinese release notes](releases/1.0.0.md) for user-facing features and
+installation limitations. This page records implementation and verification
+evidence; it does not establish that the release workflow or CI has passed.
+The broader project scope remains active.
+
+**macOS package verification (2026-11-24).** CI copies the app from the DMG,
+detaches the image and launches the installed copy from a canonical path. Tauri
+rejects executable paths containing symlinked components, including `/var` in
+the runner’s temporary directory. The smoke checks SQLite initialization in a
+fresh home directory.
+
+**Windows package verification (2026-11-24).** Both installer formats installed
+successfully on the disposable Windows runner. Elevated WebView2 hosts ignore
+the environment flag the smoke used to enable debugging. The elevated test
+now scopes a temporary loopback debugging policy to the installed executable
+and removes it after the smoke.
+
+**Nexus Mod downloads (2026-11-24).** The stock Nexus MCP can now save files
+whose GraphQL `uri` is an opaque storage path. A public Phantom Blade Zero
+file (Mod 266, file 623) supplied the regression example. The bundled provider
+uses a safe original archive name when available and otherwise combines the
+file identity with its detected archive extension. Nine offline provider tests
+cover filename selection and the stdio download flow, including account
+authorization, mirror renewal, checksum verification and duplicate destinations.
+The Windows x64 NSIS package passed its archive test, and its extracted
+runtime resolved the patched wheel offline. The desktop MCP and incoming
+archive tests passed on Windows. Live testing used public file metadata. The
+archive transfer test used a fixture mirror.
+
+**Desktop languages (2026-11-24).** Settings → Appearance and storage has one
+Language selector for the interface and newly queued Mod organization jobs.
+It follows system preferences by default, falls back to English, and persists a
+manual choice across restarts. Supported languages are Simplified Chinese,
+English, Japanese, Korean, German, French, Spanish, Brazilian Portuguese,
+Russian and Italian. The SQLite migration carries forward a supported legacy
+Mod language preference. Previously queued jobs keep their recorded language.
+
+Chat honors an explicit language request, then the language of the user's own
+current message. For attachment-only or ambiguous input it consults previous
+authored messages and falls back to the effective app language. This also
+applies to questionnaires and resumed turns. The UI can switch language while
+a chat draft or a dialog is open. Dates, counts, app-authored scan warnings and
+known native errors use the effective locale. User content and diagnostic
+paths retain their original text. The Windows NSIS wizard selects from the same
+ten languages using the Windows display language.
+
+The production build validated 1,238 UI messages and 711 native error details.
+Twelve focused checks exercised plural forms, confirmation text and native
+error rendering. On Windows the full Rust library suite passed 1,163 tests
+with 15 ignored. All-target Clippy and Rust formatting also passed.
+Playwright passed 1,022 checks with four skipped, covering all ten choices,
+reload persistence, fallback, drafts, open dialogs and narrow layouts. The
+final x64 NSIS package passed its archive test. All ten installer language
+resources passed their compiler checks, and the wizard opened in Simplified
+Chinese on the test host. Desktop WebView relaunch with a disposable Windows
+profile and live model response-language checks remain unverified.
+
+**Windows installer welcome page (2026-11-24).** The NSIS setup wizard now uses
+GA artwork, native English and Simplified Chinese text, and the Windows app
+color preference. Open wizard pages refresh on a system theme change. A native
+NSIS fixture switched both languages between light and dark using a private
+registry subtree and navigated through directory selection and completion.
+The packaged x64 installer was opened on Windows and exercised through Next,
+Back and Cancel. The package smoke job covers installation on a disposable host.
+
+**Archive and Linux dependency security fixes (2026-11-24).** The Rust lockfile
+selects `zip 9.8.2` for archive handling. ZIP preflight propagates filename
+decoding errors and rejects entries without a validated data offset. The Linux
+GTK 3 stack uses `glib 0.18.5` with the two-line `VariantStrIter` fix from
+`gtk-rs/gtk-rs-core#1343`, pinned to commit `7e91f1a9`. Remove the Cargo
+patch once GTK's dependency constraints accept a fixed registry release.
+On Windows, 1,146 Rust library tests passed and 15 were ignored. The old and new
+ZIP writers produced byte-identical plugin packages for the comparison fixture,
+preserving its preview hash. A Linux release-mode smoke test exercised both
+directions of `VariantStrIter` against the pinned patch.
+
+**Desktop application updates (2026-11-24).** Signed desktop builds check the
+GitHub Releases manifest on launch. Settings offers a manual check and shows
+progress and errors. A verified update waits in a temporary file until normal
+process exit, when installation waits for active file transactions. The installer
+leaves the app closed. The tag workflow assembles a draft release with separate
+signed payloads for NSIS, MSI, AppImage, Debian, and both macOS architectures.
+Windows verification produced MSI and NSIS updater signatures with the Tauri CLI.
+Ten Rust updater tests passed, including signature rejection, staging errors,
+and shutdown races. Fifteen Playwright checks passed across three viewport sizes. A release assembly
+test verified all six manifest entries and rejected a modified payload. A live
+upgrade between two published versions still needs a public signed release
+channel. See the [release setup](../README.md#维护者发布流程).
+
+**Windows MCP startup windows (2026-11-23).** Restoring saved stdio connections
+could open a terminal for each bundled uvx or npx launcher. Bundled and custom
+MCP commands now use the same Windows no-console creation flag as the browser
+helpers. The desktop still restores the selected connections through stdio.
+The packaged npx launcher completed an offline MCP handshake
+and listed a fixture tool. A local wheel started by the packaged uvx launcher
+echoed piped input and reported no console window handle.
+
+**Agent and MCP game-library controls (2026-11-23).** Desktop conversations and
+clients of the authenticated local MCP server can list registrations, add a local
+game directory, edit the display name or launch program, remove a registration,
+launch a game, and bind an installed adapter. Listing supports pagination and
+respects the desktop conversation's workspace. External calls identify existing
+games by ID. Updates, removals, registrations, bindings and launches recheck the
+reviewed target at execution. The regular approval matrix applies to manager
+changes and game launches. Removal preserves files and checks active installs,
+file recovery and pending reviews. Successful changes refresh the desktop library.
+Windows verification passed 1,135 Rust library tests with 15 ignored, all-target
+Clippy, Rust formatting and the frontend production build. A loopback model test
+removed two selected registrations in one turn while keeping their save files
+and a third registration. Authenticated MCP tests exercised all five operations
+under each permission mode using a temporary library and a fixture executable.
+Thirty Playwright checks across three viewport sizes covered game and adapter
+cache refresh, including delivery through the persisted Agent event log.
+
+**Chat links and app logo (2026-11-23, Windows).** Pasted URLs and Markdown
+links wrap within chat bubbles and stay underlined in both themes. User links
+inherit the bubble text color. Assistant links use the theme accent foreground.
+The sidebar and onboarding header use the dark GA mark on light surfaces and
+the white mark on dark surfaces. The frontend build and 39 Playwright checks
+for message actions, theme switching, motion and sidebar state passed across
+three viewport sizes, including link contrast checks in both themes.
+
+**Desktop usage counts (2026-11-23).** Release builds send fixed startup and
+feature events to the self-hosted Aptabase instance at `analytics.gloscai.com`
+with OS and application versions. Desktop setup
+counts a successful start once. Managed Mod installs count after the transaction
+commits across desktop and Agent paths. Other feature events count accepted
+desktop actions. Each process keeps its daily session ID and outbound queue in
+memory. Debug builds, stdio proxies and package smoke runs skip collection.
+See the event names, counting rules and opt-out in [the README](../README.md#匿名使用统计).
+The Windows release binary built successfully. The Rust library suite passed
+1,124 tests with 15 ignored, including local HTTP payload checks. All-target
+Clippy and Rust formatting checks passed.
 
 **Removing Mods with overlapping legacy installations (2026-11-23, Windows).**
 Installation inspection can identify the last writer of a shared path by matching
@@ -41,8 +173,12 @@ The worker uses recorded source titles and meaningful relative component names
 when download filenames are opaque. It preserves manual tag assignments and
 leaves names alone when the available evidence is insufficient. Transient
 failures retry with backoff. Disabling the skill pauses pending work, and a
-completed record stays complete across restarts. The target language defaults
-to the system language and can be set in Settings → Appearance and storage.
+completed record stays complete across restarts. The shared Language setting
+(under Settings → Appearance and storage) controls the interface and the
+language of newly queued Mod organization jobs. It defaults to the first
+supported system language, or English. Earlier supported Mod language
+overrides migrate to this setting; changing it does not alter queued or completed
+jobs. Agent chat still follows the current prompt.
 Game Details shows customizable color tags before the Mod name and supports
 filtering by tag. Organization updates manager metadata only.
 A local model fixture exercised both a new approved installation and startup
@@ -512,7 +648,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   picker and migration confirmation. After a migration restart, the guide opens
   at model configuration when the active root has changed, or returns to the
   storage step to show a migration error. Model setup, tool activation and game
-  scanning can be deferred. Adding a discovered game requires explicit selection.
+  scanning can be deferred. Clicking “添加” on a scan result adds that game directly.
   The completion screen shows the current directory, default model, running tool
   services and library count. The guide supports light and dark themes, a compact
   progress indicator on narrow screens, and reopening from Settings.
@@ -905,7 +1041,10 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   include Chinese descriptions, custom connections can be edited in Settings,
   and adapters can supply a `description` per service in `mcpServers`.
   The per-service credentials dialog handles Bearer and stdio environment secrets.
-  Its footer has 返回 and 保存.
+  Each password field shows whether a nonblank value is saved locally, or whether
+  its status could not be read. The desktop status command returns booleans for
+  the selected connection's references only; it never returns credential values
+  or validates them with the provider. Its footer has 返回 and 保存.
   保存 submits the nonblank fields together. Each connection can store an
   optional `credential_url`. The 获取 Key link opens that page in the system
   browser. The credential-backed Mod service presets include their key-management pages.
@@ -945,6 +1084,36 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   cross-platform or release acceptance.
 
 ## Verification
+
+**Windows release smoke, 2026-11-24.** The production desktop was opened with
+its existing data to inspect the library, plugin catalog, history, settings and
+themes. Write scenarios used a separate release build of the same source with an
+isolated application identifier and temporary game files. The sidebar now exposes
+archived conversations, Settings names the install and uninstall Skills in Chinese,
+and the file approval preview shows the import description, operation and impact
+in Chinese. Steam discovery excludes the manifest IDs for Steamworks Common
+Redistributables and Ubisoft Connect Services, including directory-scan fallback.
+
+The native WebView2 flow covered first launch, adapter creation and deployment,
+Minecraft registration and Fabric diagnostics. Windows selected a local JAR,
+approval installed it, and the installed bytes matched the reviewed archive.
+A loopback model exercised streamed tool calls, cancellation and archival. After
+relaunch the archived conversation was read-only and the recycled test file was
+restored byte-for-byte. SQLite integrity and the six committed file transactions
+were checked. The local Fabric 1.21.1 bootstrap also produced real English and
+Chinese missing-dependency and version-mismatch logs, plus a successful test Mod
+entrypoint before the EULA prompt. The native diagnostic parser replayed all five.
+Anonymous live checks downloaded a pinned Modrinth JAR and resolved and downloaded
+a Thunderstore release. The integrity checks used the downloaded bytes.
+The final native scan of the workstation returned seven candidates from 63 entries,
+retaining the games and omitting both platform services. Across three viewport
+sizes, Playwright passed 995 cases with four viewport-specific skips. The Rust
+library suite passed 1,151 cases with 15 opt-in or helper cases ignored. After
+the import wording change, all 14 import tests passed. Rust formatting, all-target
+Clippy, the frontend production build, and 19 browser-search tests passed.
+The final Windows x64 ZIP was unpacked and all seven files matched the release
+build. Installer lifecycle, a signed live upgrade, external publication and paid
+model credentials were outside this workstation smoke run.
 
 On Windows with the Mihomo tunnel active, system DNS returned both IPv4 and IPv6
 benchmark addresses for Mod Inn and Modrinth. The native downloader recovered the
@@ -1339,11 +1508,11 @@ distribution acceptance, and it does not repeat the earlier game workflow.
   testing and a guided recovery path for legacy journals without identity
   evidence. Stronger cross-platform containment for external stdio MCP processes
   remains open.
-- Complete macOS release acceptance: CI now covers isolated packaged-app launch
-  and fresh SQLite/plugin initialization, while a temporary copy from the DMG
-  booted locally. The ad hoc build was rejected by Gatekeeper, so acceptance
-  via normal Finder install/launch remains pending. The fixture smoke does not
-  cover crash/disk-full testing or general production archives.
+- Complete macOS release acceptance: the verification workflow defines an isolated
+  packaged-app launch smoke test for fresh SQLite/plugin initialization. A
+  temporary copy from the DMG booted locally. Gatekeeper rejected the ad hoc
+  build, so normal Finder install/launch remains pending. The fixture smoke does
+  not cover crash/disk-full testing or general production archives.
 - Run the Windows installer jobs and verify on a clean Windows 11 desktop.
   Linux ARM64 `.deb`
   and extraction-mode AppImage passed the isolated WebView smoke above; native
@@ -1355,8 +1524,9 @@ All requirements in the original approved plan remain in scope.
 ## Desktop game card actions (2026-11-19)
 
 - Implemented desktop IPC commands `update_game`, `remove_game`,
-  `open_game_location`, and `launch_game`. The Agent and inbound MCP registries
-  exclude these commands. The existing opener capability is sufficient.
+  `open_game_location`, and `launch_game`. These originally shipped as desktop
+  card actions. The November 23 game-library tools also expose edit, remove and
+  launch through the Agent and inbound MCP.
 - Editing preserves game identity and unrelated metadata. A custom launch path
   is checked on save and launch. The macOS `.app` path resolves its declared
   bundle executable. A valid custom executable takes priority over the numeric

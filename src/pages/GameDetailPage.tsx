@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { displayPath, pathBasename } from "@/lib/paths";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
@@ -34,8 +35,8 @@ type ReplacementRollback = { installId: string; name: string; version: string | 
 type Snapshot = { id: string; label: string; file_count: number; total_size: number; created_at: string };
 const legacyLogEncodings = ['windows-1252', 'windows-1251', 'gbk', 'big5', 'shift_jis'] as const;
 const readStatusLabels = {
-  read: '已读取', missing: '文件缺失', denied: '拒绝读取', binary: '二进制内容',
-  unknown_encoding: '编码未知', io_error: '读取失败', limit_reached: '达到读取上限',
+  get read() { return tr("已读取"); }, get missing() { return tr("文件缺失"); }, get denied() { return tr("拒绝读取"); }, get binary() { return tr("二进制内容"); },
+  get unknown_encoding() { return tr("编码未知"); }, get io_error() { return tr("读取失败"); }, get limit_reached() { return tr("达到读取上限"); },
 };
 type DiagnosticFile = {
   file: string; kind: 'log' | 'load_order'; status: keyof typeof readStatusLabels;
@@ -57,14 +58,14 @@ function clipSourceText(text: string, limit: number) {
 function DiagnosticSources({ files }: { files: DiagnosticFile[] }) {
   if (!files.length) return null;
   return <details className="min-w-0 rounded-md border p-3">
-    <summary className="cursor-pointer rounded-sm text-sm font-medium focus-visible:outline-2 focus-visible:outline-ring">文件读取状态（{files.length}）</summary>
+    <summary className="cursor-pointer rounded-sm text-sm font-medium focus-visible:outline-2 focus-visible:outline-ring">{tr("文件读取状态（{length}）", { length: files.length })}</summary>
     <ItemGroup className="mt-3 gap-2">
       {files.map(({ file, kind, status, encoding, truncated, notes, continued, continues }, i) => <Item role="listitem" size="sm" variant="muted" key={i}>
         <ItemContent className="min-w-0 wrap-anywhere">
-          <PathText>{clipSourceText(pathBasename(file) || '未命名文件', 120)}</PathText>
-          <p>{kind === 'log' ? '日志' : '加载顺序'} · {readStatusLabels[status] ?? '读取状态未知'}
-            {encoding && ` · ${clipSourceText(encoding, 32)}`}{truncated && ' · 已截断'}{continued && ' · 续读'}{continues && ' · 未读完'}</p>
-          {notes.map((note, index) => <p key={index}>{clipSourceText(note, 256)}</p>)}
+          <PathText>{clipSourceText(pathBasename(file) || tr("未命名文件"), 120)}</PathText>
+          <p>{kind === 'log' ? tr("日志") : tr("加载顺序")} · {readStatusLabels[status] ?? tr("读取状态未知")}
+            {encoding && ` · ${clipSourceText(encoding, 32)}`}{truncated && tr(" · 已截断")}{continued && tr(" · 续读")}{continues && tr(" · 未读完")}</p>
+          {notes.map((note, index) => <p key={index}>{clipSourceText(tr(note), 256)}</p>)}
         </ItemContent>
       </Item>)}
     </ItemGroup>
@@ -73,24 +74,24 @@ function DiagnosticSources({ files }: { files: DiagnosticFile[] }) {
 
 function ReplacementEffects({ plan }: { plan: FilePlan }) {
   return <div className="plan-preview flex min-w-0 flex-col gap-3">
-    <p className="wrap-anywhere">原替换事务：{plan.summary}</p>
-    <Table aria-label="回滚文件影响" className="table-fixed">
+    <p className="wrap-anywhere">{tr("原替换事务：{summary}", { summary: plan.summary })}</p>
+    <Table aria-label={tr("回滚文件影响")} className="table-fixed">
       <colgroup><col className="w-[36%]" /><col /></colgroup>
-      <TableHeader><TableRow><TableHead scope="col">撤销效果</TableHead><TableHead scope="col">文件路径</TableHead></TableRow></TableHeader>
+      <TableHeader><TableRow><TableHead scope="col">{tr("撤销效果")}</TableHead><TableHead scope="col">{tr("文件路径")}</TableHead></TableRow></TableHeader>
       <TableBody>{[...plan.entries].reverse().map(({ operation, before }, index) => {
-        const effect = operation.op === 'move' ? (before ? '移回原位置并还原覆盖' : '移回原位置')
-          : operation.op === 'copy' ? (before ? '还原覆盖前文件' : '移出新增文件')
-            : operation.op === 'mkdir' ? '移除本次创建的空目录' : '撤销原操作';
+        const effect = operation.op === 'move' ? (before ? tr("移回原位置并还原覆盖") : tr("移回原位置"))
+          : operation.op === 'copy' ? (before ? tr("还原覆盖前文件") : tr("移出新增文件"))
+            : operation.op === 'mkdir' ? tr("移除本次创建的空目录") : tr("撤销原操作");
         return <TableRow key={index}>
           <TableCell className="align-top whitespace-normal">{effect}</TableCell>
           <TableCell className="whitespace-normal">
             <PathText className="block">{displayPath(operation.dst)}</PathText>
-            {operation.op === 'move' && operation.src && <><small className="text-muted-foreground">原位置</small><PathText className="block">{displayPath(operation.src)}</PathText></>}
+            {operation.op === 'move' && operation.src && <><small className="text-muted-foreground">{tr("原位置")}</small><PathText className="block">{displayPath(operation.src)}</PathText></>}
           </TableCell>
         </TableRow>;
       })}</TableBody>
     </Table>
-    <PathText>事务 {plan.id}</PathText>
+    <PathText>{tr("事务 {id}", { id: plan.id })}</PathText>
   </div>;
 }
 
@@ -107,7 +108,7 @@ function DetailEmptyState({ title, action, loading = false }: { title: string; a
 export default function GameDetailPage() {
   const gameId = useUI(s => s.gameId);
   const navigate = useUI(s => s.navigate);
-  if (!gameId) return <Page><PageHeader title="游戏详情" /><DetailEmptyState title="尚未选择游戏" action={<Button onClick={() => navigate('library')}><ArrowLeftIcon data-icon="inline-start" />返回游戏库</Button>} /></Page>;
+  if (!gameId) return <Page><PageHeader title={tr("游戏详情")} /><DetailEmptyState title={tr("尚未选择游戏")} action={<Button onClick={() => navigate('library')}><ArrowLeftIcon data-icon="inline-start" />{tr("返回游戏库")}</Button>} /></Page>;
   return <GameDetails key={gameId} gameId={gameId} />;
 }
 
@@ -206,7 +207,7 @@ function GameDetails({ gameId }: { gameId: string }) {
     if (!writable || busy || installs.isFetching || !transactionId) return;
     await run(async () => {
       const plan = await api<FilePlan>('get_file_plan', { planId: transactionId });
-      if (plan.id !== transactionId) throw new Error('无法读取对应的替换事务。');
+      if (plan.id !== transactionId) throw new Error(tr("无法读取对应的替换事务。"));
       setRollbackError(null);
       setRollback({ installId: mod.id, name: mod.name, version: mod.version, plan });
     });
@@ -218,13 +219,13 @@ function GameDetails({ gameId }: { gameId: string }) {
       try {
         const { data } = await installs.refetch({ throwOnError: true });
         if (replacementTransaction(data?.find(mod => mod.id === rollback.installId)) !== rollback.plan.id) {
-          throw new Error('安装记录已变化，不能继续回滚此替换。');
+          throw new Error(tr("安装记录已变化，不能继续回滚此替换。"));
         }
       } catch (e) { setRollbackError(e); return; }
       try {
         await api('rollback_transaction', { transactionId: rollback.plan.id });
         setRollback(null);
-        notify('版本替换已回滚');
+        notify(tr("版本替换已回滚"));
       } catch (e) { setRollbackError(e); }
       finally {
         await client.invalidateQueries();
@@ -261,7 +262,7 @@ function GameDetails({ gameId }: { gameId: string }) {
       const library = client.getQueryState<LibraryMod[]>(['mod-library', gameId]);
       if (!backendAvailable || client.getQueryData<{ recoveryError: string | null }>(['bootstrap'])?.recoveryError !== null ||
           installs?.status !== 'success' || !installs.data || library?.status !== 'success' || !library.data) {
-        throw new Error('当前不能写入，请刷新 Mod 列表后重试。');
+        throw new Error(tr("当前不能写入，请刷新 Mod 列表后重试。"));
       }
       if (!index || index.installs !== installs.data || index.library !== library.data) {
         const rows = buildModRows(gameId, installs.data, library.data);
@@ -318,7 +319,7 @@ function GameDetails({ gameId }: { gameId: string }) {
         await api('remove_managed_mod', { gameId, target: { kind, id } });
         setRemoval(null);
         await Promise.all([installs.refetch(), library.refetch(), game.refetch()]);
-        notify(kind === 'plan' ? '安装计划已取消，记录已移除' : '已从管理列表删除');
+        notify(kind === 'plan' ? tr("安装计划已取消，记录已移除") : tr("已从管理列表删除"));
       } catch (error) { setRemovalError(error); }
     });
   }
@@ -328,26 +329,26 @@ function GameDetails({ gameId }: { gameId: string }) {
       await api<LibraryMod>('register_imported_mod', { gameId, transactionId });
       setUnindexedImport(null);
       void client.invalidateQueries({ queryKey: ['mod-library', gameId] });
-      notify('归档已导入，可在 Mod 管理列表中安装');
+      notify(tr("归档已导入，可在 Mod 管理列表中安装"));
     });
   }
   async function importArchive() {
     if (!writable || busy || unindexedImport) return;
     await run(async () => {
-      const selected = await open({ multiple: false, directory: false, title: '选择本地 Mod 归档', filters: [{ name: 'Mod 归档', extensions: ['zip', 'jar', 'mrpack', '7z', 'rar', 'gz', 'tgz'] }] });
+      const selected = await open({ multiple: false, directory: false, title: tr("选择本地 Mod 归档"), filters: [{ name: tr("Mod 归档"), extensions: ['zip', 'jar', 'mrpack', '7z', 'rar', 'gz', 'tgz'] }] });
       if (typeof selected !== 'string') return;
       const { plan } = await api<{ plan: FilePlan }>('plan_import_archive', { path: selected });
       reviewPlan(plan, () => { void indexImport(plan.id); });
     });
   }
-  const fileRoots = [{ name: '游戏目录', path: game.data?.rootPath ?? '' },
+  const fileRoots = [{ name: tr("游戏目录"), path: game.data?.rootPath ?? '' },
   ...Object.entries(roots.data ?? {}).map(([name, path]) => ({ name, path }))];
   const fileRoot = fileRoots.find(root => root.path === fileRootPath) ?? fileRoots[0];
 
   return <Page className="min-w-0" data-testid="game-detail-page">
     <div className="flex items-center gap-2 text-sm text-muted-foreground">
-      <IconButton title="返回游戏库" onClick={() => navigate('library')}><ArrowLeftIcon data-icon="inline-start" /></IconButton>
-      <span>游戏库 / 游戏详情</span>
+      <IconButton title={tr("返回游戏库")} onClick={() => navigate('library')}><ArrowLeftIcon data-icon="inline-start" /></IconButton>
+      <span>{tr("游戏库 / 游戏详情")}</span>
     </div>
     <ErrorState error={game.error} />
     <ErrorState error={error} />
@@ -358,27 +359,27 @@ function GameDetails({ gameId }: { gameId: string }) {
             <Gamepad2Icon className="size-6" aria-hidden="true" />
           </div>
           <div className="flex min-w-0 flex-col gap-1 wrap-anywhere">
-            <PageHeader title={game.data?.name ?? '正在读取游戏…'} />
+            <PageHeader title={game.data?.name ?? tr("正在读取游戏…")} />
             <CardDescription>
-              <p>{game.data?.platform ?? '—'} · <span className="whitespace-nowrap">已安装 {game.data?.installedModCount ?? 0} 个 Mod</span></p>
+              <p>{game.data?.platform ?? '—'} · <span className="whitespace-nowrap">{tr("已安装 {value1} 个 Mod", { value1: game.data?.installedModCount ?? 0 })}</span></p>
             </CardDescription>
           </div>
         </div>
-        <Button disabled={!writable || busy || batchBusy || !!unindexedImport} onClick={() => { void importArchive(); }}><FolderOpenIcon data-icon="inline-start" />导入本地归档</Button>
+        <Button disabled={!writable || busy || batchBusy || !!unindexedImport} onClick={() => { void importArchive(); }}><FolderOpenIcon data-icon="inline-start" />{tr("导入本地归档")}</Button>
       </CardHeader>
     </Card>
 
     <Tabs className="min-w-0 gap-4" value={tab} onValueChange={value => { setTab(value); if (!batchBusy) setBatchMode(false); }}>
       <div className="flex flex-wrap items-center justify-between gap-2">
         <TabsList className="w-full sm:w-fit">
-          <TabsTrigger value="mods">Mod 管理</TabsTrigger>
-          <TabsTrigger value="files">文件</TabsTrigger>
-          <TabsTrigger value="snapshots">快照</TabsTrigger>
-          <TabsTrigger value="diagnostics">诊断</TabsTrigger>
+          <TabsTrigger value="mods">{tr("Mod 管理")}</TabsTrigger>
+          <TabsTrigger value="files">{tr("文件")}</TabsTrigger>
+          <TabsTrigger value="snapshots">{tr("快照")}</TabsTrigger>
+          <TabsTrigger value="diagnostics">{tr("诊断")}</TabsTrigger>
         </TabsList>
         {tab === 'mods' && <div className="ml-auto flex items-center gap-2">
-          <Switch id="mod-batch-mode" aria-label="批量操作" checked={batchMode} disabled={batchBusy} onCheckedChange={setBatchMode} />
-          <Label htmlFor="mod-batch-mode">批量操作</Label>
+          <Switch id="mod-batch-mode" aria-label={tr("批量操作")} checked={batchMode} disabled={batchBusy} onCheckedChange={setBatchMode} />
+          <Label htmlFor="mod-batch-mode">{tr("批量操作")}</Label>
         </div>}
       </div>
 
@@ -386,21 +387,21 @@ function GameDetails({ gameId }: { gameId: string }) {
         <ErrorState error={roots.error} />
         {fileRoot.path ? <GameFileBrowser key={fileRoot.path} root={fileRoot} roots={fileRoots} onRootChange={setFileRootPath}
           active={tab === 'files'} busy={busy} writable={writable}
-          onTrash={path => preview('trash_paths', { request: { paths: [path], game_id: gameId, reason: '用户从文件浏览器移除' } })} />
-          : game.isLoading && <DetailEmptyState loading title="正在读取游戏目录…" />}
+          onTrash={path => preview('trash_paths', { request: { paths: [path], game_id: gameId, reason: tr("用户从文件浏览器移除") } })} />
+          : game.isLoading && <DetailEmptyState loading title={tr("正在读取游戏目录…")} />}
       </TabsContent>
 
       <TabsContent value="mods" className="flex min-w-0 flex-col gap-3">
         <ErrorState error={installs.error} />
         <ErrorState error={library.error} />
         {(installs.isError || library.isError) && !gameSwitches.some(entry => entry.status === 'readback_failed') &&
-          <Button variant="outline" size="sm" className="self-start" onClick={() => { void installs.refetch(); void library.refetch(); }}>刷新 Mod 列表</Button>}
-        {unindexedImport && <Button className="self-start" variant="outline" disabled={!writable || busy} onClick={() => { void indexImport(unindexedImport); }}>重试添加到 Mod 库</Button>}
+          <Button variant="outline" size="sm" className="self-start" onClick={() => { void installs.refetch(); void library.refetch(); }}>{tr("刷新 Mod 列表")}</Button>}
+        {unindexedImport && <Button className="self-start" variant="outline" disabled={!writable || busy} onClick={() => { void indexImport(unindexedImport); }}>{tr("重试添加到 Mod 库")}</Button>}
         <ModManagementTable key={gameId} gameId={gameId} rows={modRows} batchMode={batchMode} disabled={modWritesDisabled || batchBusy} fetching={installs.isFetching || library.isFetching}
           onStart={startModAction} onRemove={askRemoval} onRollback={previewReplacementRollback} onBatch={runModBatch}
           onBatchBusy={setBatchBusy} refreshRemovals={refreshBatchRemovals} />
         {modActionError && <div ref={modActionErrorRef}><ErrorState error={modActionError} /></div>}
-        {!modRows.length && !installs.error && !library.error && <DetailEmptyState loading={modsLoading} title={modsLoading ? '正在读取 Mod…' : '暂无 Mod'} />}
+        {!modRows.length && !installs.error && !library.error && <DetailEmptyState loading={modsLoading} title={modsLoading ? tr("正在读取 Mod…") : tr("暂无 Mod")} />}
       </TabsContent>
 
       <TabsContent value="snapshots" className="flex min-w-0 flex-col gap-3">
@@ -408,26 +409,26 @@ function GameDetails({ gameId }: { gameId: string }) {
           <CardHeader>
             <div className="flex flex-wrap items-center gap-2">
               <Field className="min-w-0 flex-1 basis-40">
-                <FieldLabel htmlFor="snapshot-label" className="sr-only">快照名称</FieldLabel>
-                <Input id="snapshot-label" placeholder="快照名称" value={snapshotLabel} onChange={e => setSnapshotLabel(e.target.value)} />
+                <FieldLabel htmlFor="snapshot-label" className="sr-only">{tr("快照名称")}</FieldLabel>
+                <Input id="snapshot-label" placeholder={tr("快照名称")} value={snapshotLabel} onChange={e => setSnapshotLabel(e.target.value)} />
               </Field>
               <Button variant="outline" disabled={!writable || busy || !snapshotLabel.trim()} onClick={() => run(async () => {
                 const [, plan] = await api<[Snapshot, FilePlan]>('snapshot_create', { gameId, label: snapshotLabel });
                 reviewPlan(plan, () => { void snapshots.refetch(); });
-              })}><CameraIcon data-icon="inline-start" />预览创建快照</Button>
+              })}><CameraIcon data-icon="inline-start" />{tr("预览创建快照")}</Button>
             </div>
           </CardHeader>
           <CardContent className="flex min-w-0 flex-col gap-3">
             <ErrorState error={snapshots.error} />
             <Table aria-busy={snapshots.isFetching}>
-              <TableHeader><TableRow><TableHead>名称</TableHead><TableHead>文件</TableHead><TableHead>大小</TableHead><TableHead>创建时间</TableHead><TableHead /></TableRow></TableHeader>
+              <TableHeader><TableRow><TableHead>{tr("名称")}</TableHead><TableHead>{tr("文件")}</TableHead><TableHead>{tr("大小")}</TableHead><TableHead>{tr("创建时间")}</TableHead><TableHead /></TableRow></TableHeader>
               <TableBody>{(snapshots.data ?? []).map(item => <TableRow key={item.id}>
                 <TableCell className="min-w-24 wrap-anywhere whitespace-normal">{item.label}</TableCell><TableCell>{item.file_count}</TableCell>
                 <TableCell>{bytes(item.total_size)}</TableCell><TableCell>{date(item.created_at)}</TableCell>
-                <TableCell><Button variant="outline" disabled={!writable || busy} onClick={() => preview('restore_snapshot', { gameId, snapshotId: item.id })}><Undo2Icon data-icon="inline-start" />恢复预览</Button></TableCell>
+                <TableCell><Button variant="outline" disabled={!writable || busy} onClick={() => preview('restore_snapshot', { gameId, snapshotId: item.id })}><Undo2Icon data-icon="inline-start" />{tr("恢复预览")}</Button></TableCell>
               </TableRow>)}</TableBody>
             </Table>
-            {!snapshots.data?.length && <DetailEmptyState title="尚无快照" />}
+            {!snapshots.data?.length && <DetailEmptyState title={tr("尚无快照")} />}
           </CardContent>
         </Card>
       </TabsContent>
@@ -436,28 +437,28 @@ function GameDetails({ gameId }: { gameId: string }) {
         <Card className="min-w-0">
           <CardHeader className="flex flex-wrap items-end justify-between gap-4">
             <div className="flex min-w-0 flex-col gap-1">
-              <CardTitle>游戏诊断</CardTitle>
-              <CardDescription>仅分析管理中的目录与日志</CardDescription>
+              <CardTitle>{tr("游戏诊断")}</CardTitle>
+              <CardDescription>{tr("仅分析管理中的目录与日志")}</CardDescription>
             </div>
             <div className="flex min-w-0 flex-wrap items-end gap-2">
               <Field className="w-auto gap-1">
-                <FieldLabel htmlFor="diagnostic-log-encoding">日志编码</FieldLabel>
+                <FieldLabel htmlFor="diagnostic-log-encoding">{tr("日志编码")}</FieldLabel>
                 <NativeSelect id="diagnostic-log-encoding" value={legacyLogEncoding ?? ''} disabled={!backendAvailable || busy} onChange={event => {
                   const value = event.currentTarget.value;
                   stopDiagnosis();
                   setLegacyLogEncoding(legacyLogEncodings.find(encoding => encoding === value) ?? null);
                   setDiagnosis(null);
                 }}>
-                  <NativeSelectOption value="">默认（不回退）</NativeSelectOption>
-                  {legacyLogEncodings.map(encoding => <NativeSelectOption value={encoding} key={encoding}>回退：{encoding}</NativeSelectOption>)}
+                  <NativeSelectOption value="">{tr("默认（不回退）")}</NativeSelectOption>
+                  {legacyLogEncodings.map(encoding => <NativeSelectOption value={encoding} key={encoding}>{tr("回退：{encoding}", { encoding })}</NativeSelectOption>)}
                 </NativeSelect>
               </Field>
               <Button variant="outline" disabled={!backendAvailable || busy} onClick={() => void runDiagnosis()}>
                 {busy ? <Spinner data-icon="inline-start" /> : <ShieldCheckIcon data-icon="inline-start" />}
-                {diagnosing ? '正在诊断…' : '开始诊断'}
+                {diagnosing ? tr("正在诊断…") : tr("开始诊断")}
               </Button>
-              {diagnosis?.logs?.nextCursor && <Button variant="outline" disabled={busy} onClick={() => void runDiagnosis(diagnosis.logs!.nextCursor!)}>下一批诊断</Button>}
-              {(diagnosing || diagnosis?.logs?.nextCursor) && <Button variant="ghost" onClick={stopDiagnosis}>停止诊断</Button>}
+              {diagnosis?.logs?.nextCursor && <Button variant="outline" disabled={busy} onClick={() => void runDiagnosis(diagnosis.logs!.nextCursor!)}>{tr("下一批诊断")}</Button>}
+              {(diagnosing || diagnosis?.logs?.nextCursor) && <Button variant="ghost" onClick={stopDiagnosis}>{tr("停止诊断")}</Button>}
             </div>
           </CardHeader>
         </Card>
@@ -468,23 +469,23 @@ function GameDetails({ gameId }: { gameId: string }) {
             {diagnosis.bethesdaPlugins && <BethesdaPluginEvidence report={diagnosis.bethesdaPlugins} />}
             <Card className="min-w-0">
               <CardContent className="flex min-w-0 flex-col items-start gap-3">
-                <Badge>{diagnosis.status === 'findings' ? '已发现诊断线索' : '未确认故障原因'}</Badge>
+                <Badge>{diagnosis.status === 'findings' ? tr("已发现诊断线索") : tr("未确认故障原因")}</Badge>
                 {diagnosis.causes.length > 0 && <ItemGroup className="w-full min-w-0 gap-2">
                   {diagnosis.causes.map((cause, i) => <Item role="listitem" variant="outline" size="sm" key={i}>
                     <ItemContent className="min-w-0 wrap-anywhere">
-                      <h3 className="font-medium">{cause.summary}</h3>
+                      <h3 className="font-medium">{tr(cause.summary)}</h3>
                       <ItemDescription className="line-clamp-none">{cause.basis}</ItemDescription>
                     </ItemContent>
                   </Item>)}
                 </ItemGroup>}
                 {diagnosis.unknowns.map((text, i) => <Alert role="note" variant="warning" key={i}>
-                  <TriangleAlertIcon /><AlertDescription className="wrap-anywhere">{text}</AlertDescription>
+                  <TriangleAlertIcon /><AlertDescription className="wrap-anywhere">{tr(text)}</AlertDescription>
                 </Alert>)}
                 {diagnosis.repairSuggestions.length > 0 && <ItemGroup className="w-full min-w-0 gap-2">
                   {diagnosis.repairSuggestions.map((suggestion, i) => <Item role="listitem" variant="outline" size="sm" key={i}>
-                    <ItemContent className="min-w-0 basis-48 wrap-anywhere"><p>{suggestion.description}</p></ItemContent>
+                    <ItemContent className="min-w-0 basis-48 wrap-anywhere"><p>{tr(suggestion.description)}</p></ItemContent>
                     {suggestion.fileOpsInput && <ItemActions>
-                      <Button variant="outline" disabled={!writable || busy} onClick={() => preview('plan_file_ops', { operations: suggestion.fileOpsInput?.ops, summary: suggestion.fileOpsInput?.summary })}>预览修复</Button>
+                      <Button variant="outline" disabled={!writable || busy} onClick={() => preview('plan_file_ops', { operations: suggestion.fileOpsInput?.ops, summary: suggestion.fileOpsInput?.summary })}>{tr("预览修复")}</Button>
                     </ItemActions>}
                   </Item>)}
                 </ItemGroup>}
@@ -493,7 +494,7 @@ function GameDetails({ gameId }: { gameId: string }) {
           </section>
           <aside className="min-w-0">
             <Card>
-              <CardHeader><CardTitle>诊断证据</CardTitle></CardHeader>
+              <CardHeader><CardTitle>{tr("诊断证据")}</CardTitle></CardHeader>
               <CardContent className="flex min-w-0 flex-col gap-3">
                 <DiagnosticSources files={diagnosis.logs?.files ?? []} />
                 {diagnosis.evidence.length > 0 && <ItemGroup className="gap-2">
@@ -504,9 +505,9 @@ function GameDetails({ gameId }: { gameId: string }) {
               </CardContent>
             </Card>
           </aside>
-        </div> : <DetailEmptyState title="尚未运行诊断" />}
+        </div> : <DetailEmptyState title={tr("尚未运行诊断")} />}
         <Card className="min-w-0">
-          <CardHeader><CardTitle>用户管理目录</CardTitle></CardHeader>
+          <CardHeader><CardTitle>{tr("用户管理目录")}</CardTitle></CardHeader>
           <CardContent className="flex min-w-0 flex-col gap-3">
             <ErrorState error={roots.error} />
             {Object.keys(roots.data ?? {}).length > 0 && <ItemGroup className="gap-2">
@@ -516,18 +517,18 @@ function GameDetails({ gameId }: { gameId: string }) {
             </ItemGroup>}
             <FieldGroup className="flex-row flex-wrap items-end gap-2">
               <Field className="min-w-0 flex-1 basis-36">
-                <FieldLabel htmlFor="managed-root-id" className="sr-only">适配包目录 ID</FieldLabel>
-                <Input id="managed-root-id" placeholder="适配包目录 ID" value={rootId} onChange={e => setRootId(e.target.value)} />
+                <FieldLabel htmlFor="managed-root-id" className="sr-only">{tr("适配包目录 ID")}</FieldLabel>
+                <Input id="managed-root-id" placeholder={tr("适配包目录 ID")} value={rootId} onChange={e => setRootId(e.target.value)} />
               </Field>
               <Field className="min-w-0 flex-1 basis-52">
-                <FieldLabel htmlFor="managed-root-path" className="sr-only">本机目录完整路径</FieldLabel>
-                <Input id="managed-root-path" placeholder="本机目录完整路径" value={rootPath} onChange={e => setRootPath(e.target.value)} />
+                <FieldLabel htmlFor="managed-root-path" className="sr-only">{tr("本机目录完整路径")}</FieldLabel>
+                <Input id="managed-root-path" placeholder={tr("本机目录完整路径")} value={rootPath} onChange={e => setRootPath(e.target.value)} />
               </Field>
               <Button variant="outline" disabled={!writable || busy || !rootId || !rootPath} onClick={() => run(async () => {
                 await api('register_user_root', { gameId, rootId, directory: rootPath });
                 await roots.refetch();
-                notify('用户目录已添加');
-              })}>添加目录</Button>
+                notify(tr("用户目录已添加"));
+              })}>{tr("添加目录")}</Button>
             </FieldGroup>
           </CardContent>
         </Card>
@@ -535,32 +536,32 @@ function GameDetails({ gameId }: { gameId: string }) {
     </Tabs>
 
     {Array.from(reviews, ([key, review]) => <ModActionReview key={key} operationId={review.id}
-      name={review.count === 1 ? review.name : `${batchLabels[review.kind]} ${review.count} 个 Mod`}
+      name={review.count === 1 ? review.name : tr("{value1} {count} 个 Mod", { value1: batchLabels[review.kind], count: review.count })}
       conversationId={review.conversationId} turnId={review.turnId} />)}
     {gameSwitches.map(entry => entry.status === 'readback_failed' ? <div className="flex flex-col items-start gap-2" key={entry.id}>
-          <ErrorState error={entry.error} /><Button size="sm" variant="outline" onClick={() => retryModSwitchReadback(entry.id)}>重新读取状态</Button>
+          <ErrorState error={entry.error} /><Button size="sm" variant="outline" onClick={() => retryModSwitchReadback(entry.id)}>{tr("重新读取状态")}</Button>
         </div> : null)}
 
-    {removal && <Modal title={removal.kind === 'plan' ? '取消安装计划' : '从管理列表删除'} onClose={() => { if (!busy) setRemoval(null); }} actions={<>
-      <Button variant="outline" disabled={busy} onClick={() => setRemoval(null)}>返回</Button>
-      <Button variant="destructive" disabled={!writable || busy} onClick={() => { void confirmRemoval(); }}>{removal.kind === 'installed' ? '使用 Agent 删除' : removal.kind === 'plan' ? '确认取消计划' : '确认删除'}</Button>
+    {removal && <Modal title={removal.kind === 'plan' ? tr("取消安装计划") : tr("从管理列表删除")} onClose={() => { if (!busy) setRemoval(null); }} actions={<>
+      <Button variant="outline" disabled={busy} onClick={() => setRemoval(null)}>{tr("返回")}</Button>
+      <Button variant="destructive" disabled={!writable || busy} onClick={() => { void confirmRemoval(); }}>{removal.kind === 'installed' ? tr("使用 Agent 删除") : removal.kind === 'plan' ? tr("确认取消计划") : tr("确认删除")}</Button>
     </>}>
-      <p className="wrap-anywhere">{removal.kind === 'plan' ? `取消「${removal.name}」的这次安装计划？同名的其他安装记录会保留。` : removal.kind === 'installed' ? `Agent 会先检查「${removal.name}」。若清单文件全部缺失，且无覆盖、共享或替换关系，只移除管理记录；若可安全卸载或回滚，成功后才移除记录。其他异常需先审核。` : `从此游戏的管理列表移除「${removal.name}」？磁盘上的原包和事务历史会保留。`}</p>
+      <p className="wrap-anywhere">{removal.kind === 'plan' ? tr("取消「{name}」的这次安装计划？同名的其他安装记录会保留。", { name: removal.name }) : removal.kind === 'installed' ? tr("Agent 会先检查「{name}」。若清单文件全部缺失，且无覆盖、共享或替换关系，只移除管理记录；若可安全卸载或回滚，成功后才移除记录。其他异常需先审核。", { name: removal.name }) : tr("从此游戏的管理列表移除「{name}」？磁盘上的原包和事务历史会保留。", { name: removal.name })}</p>
       <ErrorState error={removalError} />
     </Modal>}
-    {rollback && <Modal title="回滚版本替换" onClose={() => { if (!busy) setRollback(null); }} actions={<>
-      <Button variant="outline" disabled={busy} onClick={() => setRollback(null)}>取消</Button>
+    {rollback && <Modal title={tr("回滚版本替换")} onClose={() => { if (!busy) setRollback(null); }} actions={<>
+      <Button variant="outline" disabled={busy} onClick={() => setRollback(null)}>{tr("取消")}</Button>
       <Button disabled={!writable || busy || installs.isFetching || !rollbackCurrent} onClick={() => { void confirmReplacementRollback(); }}>
         {busy ? <Spinner data-icon="inline-start" /> : <Undo2Icon data-icon="inline-start" />}
-        {busy ? '正在回滚…' : '确认回滚'}
+        {busy ? tr("正在回滚…") : tr("确认回滚")}
       </Button>
     </>}>
       <Alert role="note" variant="warning">
         <TriangleAlertIcon />
-        <AlertDescription className="wrap-anywhere">将撤销 {rollback.name}{rollback.version ? ` · ${rollback.version}` : ''} 的版本替换，以下为要撤销的文件影响。</AlertDescription>
+        <AlertDescription className="wrap-anywhere">{tr("将撤销 {name}{value2} 的版本替换，以下为要撤销的文件影响。", { name: rollback.name, value2: rollback.version ? ` · ${rollback.version}` : '' })}</AlertDescription>
       </Alert>
       <ReplacementEffects plan={rollback.plan} />
-      <ErrorState error={rollbackError || (!rollbackCurrent && '安装记录已变化，不能继续回滚此替换。')} />
+      <ErrorState error={rollbackError || (!rollbackCurrent && tr("安装记录已变化，不能继续回滚此替换。"))} />
     </Modal>}
   </Page>;
 }

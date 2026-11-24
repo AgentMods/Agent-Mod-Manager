@@ -86,6 +86,9 @@ fn preview_is_inert_camel_case_and_native_apply_enables_separate_install() {
     assert!(engine.get_plan(&preview.plan.id).unwrap().requires_review);
     assert!(!preview.warnings.is_empty());
     let json = serde_json::to_value(&preview).unwrap();
+    assert_eq!(json["plan"]["summary"], "导入本地归档到管理器：Example.jar");
+    assert_eq!(json["plan"]["entries"][0]["impact"], "add");
+    assert_eq!(json["plan"]["entries"][0]["operation"]["op"], "copy");
     let returned_path = PathBuf::from(json["artifactPath"].as_str().unwrap());
     assert_eq!(
         json["artifactPath"],
@@ -721,7 +724,7 @@ fn only_a_committed_picker_import_can_be_published_to_the_game_library() {
                 src: import.artifact_path,
                 dst: engine.paths.staging().join("unrelated.jar"),
             }],
-            "Import local archive Example.jar".into(),
+            import.plan.summary.clone(),
         )
         .unwrap();
     engine.approve_plan(&unrelated.id).unwrap();

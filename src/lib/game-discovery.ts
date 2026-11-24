@@ -1,3 +1,4 @@
+import { formatNativeError } from "./native-error";
 import type { Game, GameCandidate } from "./types";
 import { gameDirectoryKey } from "./paths";
 
@@ -20,4 +21,10 @@ export function reconcileCandidates(candidates: GameCandidate[], games: Game[] =
     };
     return candidate;
   });
+}
+
+/** Old scan results carry only text, while new results include the original text and a translation key. */
+export function candidateWarnings(candidate: GameCandidate) {
+  const details = new Map(candidate.warningDetails?.map(item => [item.message, item]));
+  return candidate.warnings.map(message => formatNativeError(details.get(message) ?? message));
 }

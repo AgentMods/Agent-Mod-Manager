@@ -1,10 +1,15 @@
+import { tr } from "@/lib/i18n";
 import type { Conversation, ConversationCategory } from "./types";
 
+export function conversationTitle(conversation: Conversation) {
+  return conversation.auto_title_pending ? tr("新对话") : conversation.title || tr("未命名对话");
+}
+
 export const conversationCategoryLabels = {
-  install: "安装 Mod",
-  uninstall: "卸载 Mod",
-  remove: "删除 Mod",
-  adapter: "适配包",
+  get install() { return tr("安装 Mod"); },
+  get uninstall() { return tr("卸载 Mod"); },
+  get remove() { return tr("删除 Mod"); },
+  get adapter() { return tr("适配包"); },
 } satisfies Record<ConversationCategory, string>;
 
 export interface ConversationGroup {

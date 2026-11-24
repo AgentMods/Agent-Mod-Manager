@@ -1,3 +1,6 @@
+import type { NativeMessage } from "./native-error";
+import type { ModRequestOrigin } from './mod-request';
+
 export type PageName = "library" | "detail" | "agent" | "plugins" | "trash" | "history" | "settings" | "onboarding";
 export type PermissionMode = "request_approval" | "auto_approve" | "full_trust";
 export interface Game {
@@ -10,6 +13,7 @@ export type ConversationCategory = "install" | "uninstall" | "remove" | "adapter
 /** null follows all registered games; an empty list deliberately selects none. */
 export type GameWorkspace = string[] | null;
 export interface Conversation {
+  auto_title_pending?: boolean;
   workspace_game_ids?: GameWorkspace;
   category: ConversationCategory | null;
   id: string; title: string; game_id: string | null; task_summary: string | null;
@@ -26,7 +30,12 @@ export interface Conversation {
 export type AgentAttachment =
   | { kind: "image"; name: string; dataUrl: string }
   | { kind: "document"; name: string; markdown: string };
+/** Local presentation provenance, never a source of authorization. */
+export type PromptOrigin = ModRequestOrigin | { kind: 'adapter_prompt' | 'game_rename' | 'questionnaire_answer' };
+export type MessageOrigin = (ModRequestOrigin & { originalContent: string })
+  | Exclude<PromptOrigin, ModRequestOrigin> | { kind: 'user' | 'edited' };
 export interface Message {
+  origin?: MessageOrigin | null;
   id: string; role: string; content: string; reasoning: string | null;
   attachments?: AgentAttachment[];
   tool_calls: unknown; tool_call_id: string | null; token_count?: number; created_at?: string;
@@ -88,10 +97,10 @@ export interface CatalogSearch { totalGames: number; skippedEntries: number; gam
 export interface GameCandidate {
   sources?: { kind: string; steamAppId?: string | null; completeInstall?: boolean | null }[];
   status: "high_confidence" | "candidate" | "unidentified";
-  rootPath: string; name: string; confidence: number; suggestedAdapterSlug: string | null; registeredGameId: string | null; platform: string; warnings: string[];
+  rootPath: string; name: string; confidence: number; suggestedAdapterSlug: string | null; registeredGameId: string | null; platform: string; warnings: string[]; warningDetails?: NativeMessage[];
 }
 export interface ScanReport {
-  candidates: GameCandidate[]; warnings: {path: string; message: string}[]; directoriesChecked: number; entriesChecked: number; truncated: boolean; nextCursor?: string | null;
+  candidates: GameCandidate[]; warnings: {path: string; message: string; key?: string; args?: NativeMessage["args"]}[]; directoriesChecked: number; entriesChecked: number; truncated: boolean; nextCursor?: string | null;
 }
 export interface Plugin {
   updatedAt: string | null;

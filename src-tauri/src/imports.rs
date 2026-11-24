@@ -462,7 +462,7 @@ fn plan_import(engine: &FileEngine, path: &Path, _hooks: &mut Hooks) -> AppResul
             src: scratch.clone(),
             dst: artifact.clone(),
         }],
-        format!("Import local archive {filename}"),
+        format!("导入本地归档到管理器：{filename}"),
     )?;
     let plan = engine.require_review(&plan.id)?;
     let expected = Fingerprint {

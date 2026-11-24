@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useEffect, useId, useRef, useState } from "react";
 import { CheckIcon, ChevronLeftIcon, ChevronRightIcon, CircleHelpIcon, ClipboardListIcon, RotateCcwIcon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -46,7 +47,7 @@ function readQuestion(value: unknown): Question | null {
 function questionOutcome(request: AgentEvent, events: AgentEvent[], submitted?: Answer[]): QuestionOutcome | null {
   const resolution = events.find((event) => event.kind === "approval-resolved" && event.payload.approvalId === request.payload.approvalId);
   const status = resolution?.payload.status;
-  if (status === "cancelled") return { kind: "closed", label: "已取消或过期" };
+  if (status === "cancelled") return { kind: "closed", label: tr("已取消或过期") };
   if (status === "rejected") return { kind: "skipped" };
 
   const result = events.find((event) => event.kind === "tool-result" && event.turnId === request.turnId &&
@@ -64,7 +65,7 @@ function questionOutcome(request: AgentEvent, events: AgentEvent[], submitted?: 
 
   const done = events.find((event) => event.kind === "done" && event.turnId === request.turnId && event.seq > request.seq);
   if (status === "approved" || submitted) return { kind: "answered", answers: submitted, syncing: !result && !done };
-  if (done) return { kind: "closed", label: done.payload.status === "cancelled" ? "已取消" : "已结束" };
+  if (done) return { kind: "closed", label: done.payload.status === "cancelled" ? tr("已取消") : tr("已结束") };
   return null;
 }
 
@@ -72,8 +73,8 @@ export function describeQuestionnaire(request: AgentEvent, events: AgentEvent[],
   const preview = request.payload.preview as Record<string, unknown> | undefined;
   const structured = Array.isArray(preview?.questions);
   const questions = structured ? (preview?.questions as unknown[]).map(readQuestion) : [readQuestion(preview)];
-  const title = typeof preview?.title === "string" && preview.title.trim() ? preview.title : "Agent 等待你的回答";
-  const outcome = questionOutcome(request, events, submitted) ?? (archived ? { kind: "closed" as const, label: "对话已归档" } : null);
+  const title = typeof preview?.title === "string" && preview.title.trim() ? preview.title : tr("Agent 等待你的回答");
+  const outcome = questionOutcome(request, events, submitted) ?? (archived ? { kind: "closed" as const, label: tr("对话已归档") } : null);
   const valid = questions.length > 0 && questions.every(Boolean);
   const skippedAll = outcome?.kind === "answered" && outcome.answers?.length === questions.length && outcome.answers.every((answer) => answer === null);
   const canReanswer = valid && !archived && (outcome?.kind === "closed" || outcome?.kind === "skipped" || skippedAll);
@@ -101,13 +102,13 @@ export function QuestionnaireTrace({ questionnaire, onReanswer, disabled }: {
       <TraceCollapsibleTrigger className="w-fit gap-2 px-1.5">
         <TraceLine>
           <TraceIcon><CircleHelpIcon /></TraceIcon>
-          <TraceTitle>已询问 {count} 个问题</TraceTitle>
+          <TraceTitle>{tr("已询问 {count} 个问题", { count })}</TraceTitle>
           {outcome.kind === "closed" && <TraceDescription>{outcome.label}</TraceDescription>}
         </TraceLine>
       </TraceCollapsibleTrigger>
       {canReanswer && onReanswer && <Button type="button" variant="outline" size="lg" disabled={disabled}
-        title="在当前对话中补充回答" onClick={onReanswer}>
-        <RotateCcwIcon data-icon="inline-start" />重新回答
+        title={tr("在当前对话中补充回答")} onClick={onReanswer}>
+        <RotateCcwIcon data-icon="inline-start" />{tr("重新回答")}
       </Button>}
     </div>
     <TraceCollapsibleContent>
@@ -124,9 +125,9 @@ function QuestionnaireAnswers({ questions, outcome }: {questions: Questionnaire[
       if (!item) return null;
       const answer = answers?.[index];
       let reply = answer;
-      if (outcome.kind === "closed") reply = "未回答";
-      else if (outcome.kind === "skipped" || answer === null) reply = "已跳过";
-      else if (answer === undefined) reply = outcome.kind === "answered" && outcome.syncing ? "正在同步回答…" : "无可用回答记录";
+      if (outcome.kind === "closed") reply = tr("未回答");
+      else if (outcome.kind === "skipped" || answer === null) reply = tr("已跳过");
+      else if (answer === undefined) reply = outcome.kind === "answered" && outcome.syncing ? tr("正在同步回答…") : tr("无可用回答记录");
       return <div key={index} className="flex min-w-0 flex-col gap-1">
         <dt className="font-medium text-foreground/85">{item.question}</dt>
         <dd>{Array.isArray(reply) ? <ul className="list-disc space-y-1 ps-5">
@@ -213,7 +214,7 @@ export function AgentQuestionnaire({ questionnaire, disabled, onSubmit, onCancel
   }
 
   if (!question) return null;
-  const options = [...visibleOptions.map((label, index) => ({ value: optionStart + index, label })), { value: CUSTOM, label: "自己填写" } as const];
+  const options = [...visibleOptions.map((label, index) => ({ value: optionStart + index, label })), { value: CUSTOM, label: tr("自己填写") } as const];
   const optionRows = options.map(({ value, label }) => {
     const itemId = `${id}-${step}-${value}`;
     return <Label key={value} htmlFor={itemId}
@@ -232,7 +233,7 @@ export function AgentQuestionnaire({ questionnaire, disabled, onSubmit, onCancel
           <ClipboardListIcon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
           <span className="min-w-0 wrap-anywhere">{title}</span>
         </CardTitle>
-        {reanswering && <CardDescription>回答将作为新消息发送到当前对话。</CardDescription>}
+        {reanswering && <CardDescription>{tr("回答将作为新消息发送到当前对话。")}</CardDescription>}
       </CardHeader>
       <Separator />
       <CardContent className="flex flex-col gap-3 px-4 py-4 sm:px-5">
@@ -240,16 +241,16 @@ export function AgentQuestionnaire({ questionnaire, disabled, onSubmit, onCancel
           <h3 id={`${id}-question`} ref={heading} tabIndex={-1} className="min-w-0 font-medium leading-relaxed wrap-anywhere whitespace-pre-line outline-none">
             {question.question}
           </h3>
-          <span className="shrink-0 pt-0.5 text-xs text-muted-foreground tabular-nums" aria-label={`第 ${step + 1} 题，共 ${questions.length} 题`}>{step + 1} / {questions.length}</span>
+          <span className="shrink-0 pt-0.5 text-xs text-muted-foreground tabular-nums" aria-label={tr("第 {value1} 题，共 {length} 题", { value1: step + 1, length: questions.length })}>{step + 1} / {questions.length}</span>
         </div>
         {optionPages > 1 && <div className="flex flex-wrap items-center gap-2">
-          <Button type="button" size="sm" variant="outline" disabled={busy || optionPage === 0} onClick={() => setOptionPage(optionPage - 1)}>上一页选项</Button>
-          <span role="status" className="text-xs text-muted-foreground tabular-nums">第 {optionPage + 1} / {optionPages} 页，共 {question.options.length} 个选项</span>
-          <Button type="button" size="sm" variant="outline" disabled={busy || optionPage + 1 === optionPages} onClick={() => setOptionPage(optionPage + 1)}>下一页选项</Button>
+          <Button type="button" size="sm" variant="outline" disabled={busy || optionPage === 0} onClick={() => setOptionPage(optionPage - 1)}>{tr("上一页选项")}</Button>
+          <span role="status" className="text-xs text-muted-foreground tabular-nums">{tr("第 {value1} / {optionPages} 页，共 {length} 个选项", { value1: optionPage + 1, optionPages, length: question.options.length })}</span>
+          <Button type="button" size="sm" variant="outline" disabled={busy || optionPage + 1 === optionPages} onClick={() => setOptionPage(optionPage + 1)}>{tr("下一页选项")}</Button>
         </div>}
         {question.options.length > 0 && (question.multiSelect
           ? <FieldSet key={step} aria-labelledby={`${id}-question`} className="min-w-0 gap-1.5">
-              <span className="text-xs text-muted-foreground" role="status">可多选 · 已选 {chosenValues.length} 项</span>
+              <span className="text-xs text-muted-foreground" role="status">{tr("可多选 · 已选 {length} 项", { length: chosenValues.length })}</span>
               {optionRows}
             </FieldSet>
           : <RadioGroup key={step} aria-labelledby={`${id}-question`} className="gap-1.5"
@@ -258,9 +259,9 @@ export function AgentQuestionnaire({ questionnaire, disabled, onSubmit, onCancel
               {optionRows}
             </RadioGroup>)}
         {(!question.options.length || chosenValues.includes(CUSTOM)) && <Field>
-          <FieldLabel htmlFor={`${id}-answer`}>填写回答</FieldLabel>
+          <FieldLabel htmlFor={`${id}-answer`}>{tr("填写回答")}</FieldLabel>
           <Textarea id={`${id}-answer`} rows={3} value={customText} disabled={busy}
-            placeholder="输入你的回答…" onChange={(event) => updateChoice(question.options.length ? chosenValues : [CUSTOM], event.target.value)}/>
+            placeholder={tr("输入你的回答…")} onChange={(event) => updateChoice(question.options.length ? chosenValues : [CUSTOM], event.target.value)}/>
         </Field>}
         <ErrorState error={error} />
       </CardContent>
@@ -270,16 +271,16 @@ export function AgentQuestionnaire({ questionnaire, disabled, onSubmit, onCancel
       <div className="flex flex-wrap items-center gap-1">
         <Button type="button" size="sm" variant="ghost" disabled={submitting} onClick={onCancel}>
           {!reanswering && <SquareIcon data-icon="inline-start" />}
-          {reanswering ? "取消重新回答" : "停止生成"}
+          {reanswering ? tr("取消重新回答") : tr("停止生成")}
         </Button>
         {step > 0 && <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => goToStep(step - 1)}>
-          <ChevronLeftIcon data-icon="inline-start" />上一步
+          <ChevronLeftIcon data-icon="inline-start" />{tr("上一步")}
         </Button>}
-        <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => { void next(true); }}>跳过</Button>
+        <Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => { void next(true); }}>{tr("跳过")}</Button>
       </div>
       <Button type="button" size="sm" disabled={busy || !currentAnswer} onClick={() => { void next(false); }}>
         {busy ? <Spinner data-icon="inline-start" /> : finalStep && <CheckIcon data-icon="inline-start" />}
-        {finalStep ? "提交回答" : "下一步"}
+        {finalStep ? tr("提交回答") : tr("下一步")}
         {!finalStep && <ChevronRightIcon data-icon="inline-end" />}
       </Button>
     </CardFooter>

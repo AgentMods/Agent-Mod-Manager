@@ -13,6 +13,7 @@ export default defineConfig({
   outputDir: `output/playwright/results${suffix}`,
   use: {
     baseURL: `http://127.0.0.1:${port}`,
+    locale: "zh-CN",
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
   },
@@ -25,7 +26,10 @@ export default defineConfig({
     command: `yarn dev --host 127.0.0.1 --port ${port}`,
     url: `http://127.0.0.1:${port}`,
     reuseExistingServer: false,
-    env: { VITE_CACHE_DIR: `node_modules/.vite-pw-${port}` },
+    env: {
+      VITE_CACHE_DIR: `node_modules/.vite-pw-${port}`,
+      AMM_PLAYWRIGHT_STABLE_SERVER: "1",
+    },
     timeout: 30_000,
   },
 });

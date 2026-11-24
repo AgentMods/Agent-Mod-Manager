@@ -5,7 +5,6 @@ use super::{
 use crate::{
     error::{AppError, AppResult},
     game_actions,
-    sources::resolutions::ResolutionScope,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -40,23 +39,27 @@ impl AgentTool for SetGameAdapter {
         }
     }
 
+    fn inbound_definition(&self) -> ToolDefinition {
+        let mut definition = self.definition();
+        definition.description =
+            "为指定登记游戏绑定已安装且启用的适配包；game_name 可同时更新游戏库显示名称。".into();
+        definition.parameters["properties"]["game_id"]["description"] = json!("已登记游戏的 ID");
+        definition.parameters["required"] = json!(["slug", "game_id"]);
+        definition
+    }
+
     async fn prepare(&self, context: &ToolContext, args: &Value) -> AppResult<PreparedTool> {
         if context.cancel.is_cancelled() {
             return Err(AppError::Cancelled);
         }
-        let ResolutionScope::Agent(conversation) = &context.resolution_scope else {
-            return Err(AppError::Denied("适配包绑定仅供桌面 Agent 对话使用".into()));
-        };
         let args: BindingArgs = serde_json::from_value(args.clone()).map_err(|_| {
             AppError::Invalid("绑定适配包需要 slug，可选 game_id、game_name".into())
         })?;
-        let conversation = conversation.clone();
-        let engine = context.engine.clone();
+        let context = context.clone();
         let binding = tokio::task::spawn_blocking(move || {
-            let selected = super::workspace::selection(&engine.db, &conversation)?;
-            let id = super::workspace::resolve(selected.as_deref(), args.game_id.as_deref())?;
+            let id = super::workspace::tool_target(&context, args.game_id.as_deref())?;
             game_actions::prepare_game_adapter_binding(
-                &engine,
+                &context.engine,
                 &id,
                 &args.slug,
                 args.game_name.as_deref(),
@@ -100,7 +103,9 @@ impl AgentTool for SetGameAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{history::History, transaction::tests::setup};
+    use crate::{
+        history::History, sources::resolutions::ResolutionScope, transaction::tests::setup,
+    };
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test]

@@ -10,9 +10,20 @@ const priorReply = "上一轮 Agent 回复";
 const laterUser = "后续轮次请求";
 const laterReply = "后续轮次回复";
 
-async function openConversation(page: Page) {
+type FixtureMessage = {id: string; role: "user" | "assistant"; content: string};
+
+const defaultMessages: FixtureMessage[] = [
+  {id: "user-prior", role: "user", content: priorUser},
+  {id: "assistant-prior", role: "assistant", content: priorReply},
+  {id: "user-target", role: "user", content: original},
+  {id: "assistant-target", role: "assistant", content: reply},
+  {id: "user-later", role: "user", content: laterUser},
+  {id: "assistant-later", role: "assistant", content: laterReply},
+];
+
+async function openConversation(page: Page, initialMessages = defaultMessages) {
   await installMockTauri(page);
-  await page.addInitScript(({ original, reply, priorUser, priorReply, laterUser, laterReply, regeneratedReply }) => {
+  await page.addInitScript(({ initialMessages, regeneratedReply }) => {
     window.addEventListener("DOMContentLoaded", () => {
       const fixture = (window as any).__AMM_TEST__;
       const tauri = (window as any).__TAURI_INTERNALS__;
@@ -20,14 +31,7 @@ async function openConversation(page: Page) {
       const message = (id: string, role: string, content: string) => ({
         id, role, content, reasoning: null, tool_calls: null, tool_call_id: null,
       });
-      let messages = [
-        message("user-prior", "user", priorUser),
-        message("assistant-prior", "assistant", priorReply),
-        message("user-target", "user", original),
-        message("assistant-target", "assistant", reply),
-        message("user-later", "user", laterUser),
-        message("assistant-later", "assistant", laterReply),
-      ];
+      let messages = initialMessages.map(({id, role, content}: {id: string; role: string; content: string}) => message(id, role, content));
 
       Object.defineProperty(navigator.clipboard, "writeText", {
         value: async (text: string) => { fixture.clipboardText = text; },
@@ -57,7 +61,7 @@ async function openConversation(page: Page) {
         return invoke(command, args);
       };
     }, { once: true });
-  }, { original, reply, priorUser, priorReply, laterUser, laterReply, regeneratedReply });
+  }, { initialMessages, regeneratedReply });
   await page.goto("/");
   await page.getByRole("button", { name: /^Agent( 对话)?$/ }).click();
   await page.getByRole("button", { name: "检查 Minecraft 模组", exact: true }).click();
@@ -127,4 +131,58 @@ test("editing replaces the selected turn in place and cancelling restores the co
     messageId: "user-target", edit: true, request: { conversationId, content: "请只检查已启用的模组" },
   });
   await expectConversationUnchangedInSidebar(page);
+});
+
+test("pasted and Markdown links stay readable and retain long URLs in both themes", async ({page}) => {
+  await page.emulateMedia({colorScheme: "light"});
+  const userUrl = `https://links.example.org/user/${"long-segment-".repeat(12)}?source=chat&mode=fixture`;
+  const assistantUrl = `https://links.example.org/assistant/${"long-segment-".repeat(12)}?source=chat&mode=fixture`;
+  await openConversation(page, [
+    {id: "user-link", role: "user", content: userUrl},
+    {id: "assistant-link", role: "assistant", content: `[${assistantUrl}](${assistantUrl})`},
+  ]);
+
+  const html = page.locator("html");
+  await expect(html).toHaveAttribute("data-theme", "light");
+  for (const [theme, nextTheme] of [["light", "dark"], ["dark", "light"]] as const) {
+    await expect(html).toHaveAttribute("data-theme", theme);
+    for (const [messageId, url] of [["user-link", userUrl], ["assistant-link", assistantUrl]] as const) {
+      const message = page.locator(`[data-message-id="${messageId}"]`);
+      const link = message.getByRole("link");
+      await expect(link).toBeVisible();
+      await expect(link).toHaveAttribute("href", url);
+      await expect(link).toHaveText(url);
+      expect(await link.evaluate((element) => getComputedStyle(element).textDecorationLine)).toContain("underline");
+
+      const contrast = await link.evaluate((element) => {
+        const canvas = document.createElement("canvas");
+        canvas.width = canvas.height = 1;
+        const context = canvas.getContext("2d", {colorSpace: "srgb"});
+        if (!context) throw new Error("2D canvas is unavailable");
+        context.fillStyle = "white";
+        context.fillRect(0, 0, 1, 1);
+        const ancestors: HTMLElement[] = [];
+        for (let node: HTMLElement | null = element as HTMLElement; node; node = node.parentElement) ancestors.push(node);
+        for (const node of ancestors.reverse()) {
+          context.fillStyle = getComputedStyle(node).backgroundColor;
+          context.fillRect(0, 0, 1, 1);
+        }
+        const background = Array.from(context.getImageData(0, 0, 1, 1).data.slice(0, 3));
+        context.fillStyle = getComputedStyle(element).color;
+        context.fillRect(0, 0, 1, 1);
+        const foreground = Array.from(context.getImageData(0, 0, 1, 1).data.slice(0, 3));
+        const luminance = (rgb: readonly number[]) => rgb.map((channel) => {
+          const value = channel / 255;
+          return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+        }).reduce((sum, value, index) => sum + value * [0.2126, 0.7152, 0.0722][index], 0);
+        const values = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
+        return (values[0] + 0.05) / (values[1] + 0.05);
+      });
+      expect(contrast, `${messageId} link contrast in ${theme} theme`).toBeGreaterThanOrEqual(4.5);
+      await expect.poll(() => message.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+    }
+
+    await page.getByRole("button", {name: `切换${nextTheme === "dark" ? "暗色" : "亮色"}主题`, exact: true}).click();
+    await expect(html).toHaveAttribute("data-theme", nextTheme);
+  }
 });

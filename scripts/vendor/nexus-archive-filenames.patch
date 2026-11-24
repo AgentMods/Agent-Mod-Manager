@@ -1,0 +1,437 @@
+diff --git a/src/nexusmods_mcp/download.py b/src/nexusmods_mcp/download.py
+index 09b5d86..11b5c0d 100644
+--- a/src/nexusmods_mcp/download.py
++++ b/src/nexusmods_mcp/download.py
+@@ -1,6 +1,7 @@
+ """Stream a selected archive into a new local file and verify upstream metadata."""
+ 
+ import hashlib
++import ntpath
+ import os
+ import re
+ import tempfile
+@@ -11,19 +12,107 @@ import httpx
+ 
+ from .api import NexusError
+ 
++# Recognize archive suffixes in upstream names as well as in the detected format.
++_ARCHIVE_EXTENSIONS = {
++    "zip",
++    "7z",
++    "rar",
++    "tar",
++    "gz",
++    "tgz",
++    "bz2",
++    "tbz",
++    "tbz2",
++    "xz",
++    "txz",
++    "zst",
++    "tzst",
++    "lz",
++    "lzma",
++    "tar.gz",
++    "tar.bz2",
++    "tar.xz",
++    "tar.zst",
++    "tar.lz",
++    "tar.lzma",
++    "fomod",
++    "omod",
++    "bsa",
++    "ba2",
++    "pak",
++    "jar",
++    "mrpack",
++}
+ 
+-def archive_name(value: str) -> str:
++
++def _reserved_filename(name: str) -> bool:
++    if hasattr(ntpath, "isreserved"):
++        return ntpath.isreserved(name)
++    return PureWindowsPath(name).is_reserved()  # Python 3.11 and 3.12
++
++
++def archive_name(value: object) -> str:
+     if (
+-        not value
+-        or value in {".", ".."}
+-        or re.search(r'[<>:"/\\|?*\x00-\x1f]', value)
++        not isinstance(value, str)
++        or not value
++        or value.startswith(".")
++        or re.search(r'[<>:"/\\|?*\x00-\x1f\x7f-\x9f\ud800-\udfff]', value)
+         or value != value.rstrip(" .")
+-        or PureWindowsPath(value).is_reserved()
++        or len(value.encode("utf-8")) > 255
++        or _reserved_filename(value)
+     ):
+         raise ValueError("Nexus supplied an invalid archive filename.")
+     return value
+ 
+ 
++def _named_archive(value: object, *, require_known_suffix: bool) -> str | None:
++    try:
++        name = archive_name(value)
++    except ValueError:
++        return None
++    suffix = PureWindowsPath(name).suffix
++    if not suffix or (
++        require_known_suffix and suffix[1:].lower() not in _ARCHIVE_EXTENSIONS
++    ):
++        return None
++    return name
++
++
++def _download_name(metadata: dict) -> str:
++    row = metadata["modFile"]
++    detected = row.get("detectedFileExtension")
++    extension = detected.lower().removeprefix(".") if isinstance(detected, str) else ""
++    known_type = extension in _ARCHIVE_EXTENSIONS
++
++    # With a detected archive type, do not misread a display version like "1.2"
++    # as a file extension. Without one, preserve safe legacy filenames.
++    v1 = metadata.get("v1")
++    if isinstance(v1, dict) and (
++        name := _named_archive(v1.get("file_name"), require_known_suffix=known_type)
++    ):
++        return name
++    # A URI containing a path is an object key, not a source of local path parts.
++    if name := _named_archive(row.get("uri"), require_known_suffix=known_type):
++        return name
++
++    if not known_type:
++        raise ValueError("Nexus did not supply a supported archive extension.")
++
++    # The GraphQL UID identifies the release across games; names and file IDs alone do not.
++    uid = row.get("uid")
++    if type(uid) is int and 0 < uid < 10**20:
++        uid = str(uid)
++    if not isinstance(uid, str) or not re.fullmatch(r"[1-9][0-9]{0,19}", uid):
++        raise ValueError(
++            "Nexus did not supply a valid file UID for the archive filename."
++        )
++
++    title = row.get("name")
++    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", title) if isinstance(title, str) else ""
++    slug = slug.strip("._-")[:80].rstrip("._-") or "file"
++    return f"nexus-{slug}-{uid}.{extension}"
++
++
+ def checksums(metadata: dict) -> dict[str, str]:
+     expected = {}
+     for source in (
+@@ -46,7 +135,7 @@ def checksums(metadata: dict) -> dict[str, str]:
+ 
+ 
+ def download_path(directory: Path, metadata: dict) -> Path:
+-    name = archive_name(metadata["modFile"]["uri"])
++    name = _download_name(metadata)
+     destination = directory.expanduser().resolve() / name
+     if os.path.lexists(destination):
+         raise FileExistsError(f"A file already exists at {destination}.")
+diff --git a/tests/test_nexus.py b/tests/test_nexus.py
+index db538db..5de2e4e 100644
+--- a/tests/test_nexus.py
++++ b/tests/test_nexus.py
+@@ -2,7 +2,6 @@
+ 
+ import hashlib
+ import json
+-import os
+ import sys
+ import tempfile
+ import time
+@@ -14,7 +13,7 @@ from mcp import ClientSession, StdioServerParameters
+ from mcp.client.stdio import stdio_client
+ 
+ from nexusmods_mcp.api import NexusError, nxm_parameters
+-from nexusmods_mcp.download import archive_name, save_archive
++from nexusmods_mcp.download import archive_name, download_path, save_archive
+ 
+ BODY = b"archive"
+ HASH = hashlib.sha256(BODY).hexdigest()
+@@ -28,16 +27,23 @@ FILE = {
+     "version": "2.1",
+     "name": "Test",
+ }
++OPAQUE_FILE = {
++    **FILE,
++    "uri": "c9/1a/17/c91a1795-5e31-479b-86a4-b5b9d9f481ba",
++    "name": "FangYao V0.9",
++    "fileId": 623,
++    "uid": "45586782880367",
++    "detectedFileExtension": "zip",
++}
+ MOD = {"modId": 7, "name": "Test Mod", "game": {"domainName": "testgame"}}
+ 
+ 
+ def start_fixture():
+     from nexusmods_mcp.server import build_server
+ 
+-    calls = 0
++    calls = {8: 0, 623: 0}
+ 
+     def handle(request):
+-        nonlocal calls
+         path = request.url.path
+         if request.url.host == "mirror.example":
+             assert (
+@@ -46,6 +52,7 @@ def start_fixture():
+             )
+             if path == "/stale":
+                 return httpx.Response(403)
++            assert path == "/usable"
+             return httpx.Response(200, content=BODY)
+         assert (
+             request.url.host == "api.nexusmods.com"
+@@ -74,7 +81,7 @@ def start_fixture():
+             elif "query ModDetails(" in q:
+                 data = {"mod": MOD}
+             elif "query Files(" in q:
+-                data = {"modFiles": [FILE]}
++                data = {"modFiles": [FILE, OPAQUE_FILE]}
+             elif "query Requirements(" in q:
+                 assert (v["offset"], v["reverseOffset"]) == (1, 3)
+                 data = {
+@@ -98,8 +105,10 @@ def start_fixture():
+                 200, json={"data": {"gallery_images": [], "future_field": 42}}
+             )
+         if path.endswith("download-link"):
+-            calls += 1
+-            endpoint = "stale" if calls == 1 else "usable"
++            file_id = int(path.split("/")[-2])
++            calls[file_id] += 1
++            assert calls[file_id] <= 2, "duplicate download requested a signed link"
++            endpoint = "stale" if calls[file_id] == 1 else "usable"
+             return httpx.Response(
+                 200,
+                 json={
+@@ -110,8 +119,21 @@ def start_fixture():
+             return httpx.Response(403)
+         if path.endswith("/99"):
+             return httpx.Response(200, json={"data": {"size_in_bytes": 7}})
++        if path.endswith("/45586782880367"):
++            return httpx.Response(
++                200, json={"data": {"size_in_bytes": len(BODY), "sha256": HASH}}
++            )
+         if path.endswith("/8.json"):
+-            return httpx.Response(200, json={"sha256": HASH, "file_id": 8})
++            return httpx.Response(
++                200,
++                json={
++                    "sha256": HASH,
++                    "file_id": 8,
++                    "file_name": "Original Test.TAR.GZ",
++                },
++            )
++        if path.endswith("/623.json"):
++            return httpx.Response(403)
+         raise AssertionError(path)
+ 
+     build_server(lambda: httpx.AsyncClient(transport=httpx.MockTransport(handle))).run()
+@@ -121,9 +143,10 @@ class StdioWorkflow(unittest.IsolatedAsyncioTestCase):
+     async def test_search_details_requirements_file_and_download(self):
+         with tempfile.TemporaryDirectory() as root:
+             env = {
+-                **os.environ,
+                 "NEXUSMODS_DOWNLOAD_DIR": root,
+                 "NEXUSMODS_API_KEY": "fixture",
++                "NEXUSMODS_ACCESS_TOKEN": "",
++                "PYTHONDONTWRITEBYTECODE": "1",
+             }
+             fixture_script = str(Path(__file__).resolve())
+             params = StdioServerParameters(
+@@ -179,18 +202,184 @@ class StdioWorkflow(unittest.IsolatedAsyncioTestCase):
+                 )
+                 self.assertEqual(expired["httpStatus"], 410)
+                 self.assertIn("file_id=8", expired["filePage"])
+-                saved = await call("download_file", selected)
+-                self.assertEqual(Path(saved["path"]).read_bytes(), BODY)
+-                self.assertEqual(saved["verifiedUpstreamHashes"], {"sha256": HASH})
+-                self.assertTrue(
+-                    (await session.call_tool("download_file", selected)).isError
++                opaque = dict(ids, file_id=files["files"][1]["fileId"])
++                metadata = await call("get_file", opaque)
++                self.assertEqual(metadata["modFile"], OPAQUE_FILE)
++                self.assertIn("v1", metadata["unavailable"])
++                blocked = await call(
++                    "download_file",
++                    dict(
++                        opaque,
++                        nxm_url="nxm://testgame/mods/7/files/623?key=k&expires=1",
++                    ),
+                 )
++                self.assertEqual(blocked["status"], "web_authorization_required")
++                self.assertEqual(blocked["httpStatus"], 410)
++                self.assertIn("file_id=623", blocked["filePage"])
++                self.assertEqual(list(Path(root).iterdir()), [])
++                expected = {
++                    8: "Original Test.TAR.GZ",
++                    623: "nexus-FangYao-V0.9-45586782880367.zip",
++                }
++                for selection in (selected, opaque):
++                    saved = await call("download_file", selection)
++                    destination = Path(root).resolve() / expected[selection["file_id"]]
++                    self.assertEqual(Path(saved["path"]), destination)
++                    self.assertEqual(saved["bytes"], len(BODY))
++                    self.assertEqual(saved["verifiedUpstreamHashes"], {"sha256": HASH})
++                    duplicate = await session.call_tool("download_file", selection)
++                    self.assertTrue(duplicate.isError)
++                    self.assertIn("A file already exists", duplicate.content[0].text)
++                    self.assertEqual(destination.read_bytes(), BODY)
+                 self.assertTrue(
+                     (
+                         await session.call_tool("get_file", dict(ids, file_id=100))
+                     ).isError
+                 )
+-                self.assertEqual([p.name for p in Path(root).iterdir()], ["test.zip"])
++                self.assertCountEqual(
++                    [p.name for p in Path(root).iterdir()], expected.values()
++                )
++
++
++class DownloadPathTests(unittest.TestCase):
++    def setUp(self):
++        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
++
++    def test_preserves_safe_original_archive_and_legacy_names(self):
++        for name, detected in (
++            ("Bundle.TAR.GZ", "zip"),
++            ("\u6a21\u7ec4.v1.7Z", "zip"),
++            ("Mod.jar", "zip"),
++            ("Modpack.mrpack", "zip"),
++            ("A mod's file.modpack", "modpack"),
++            ("Legacy.esm", None),
++            ("Split.7z.001", None),
++        ):
++            with self.subTest(name=name, detected=detected):
++                row = dict(FILE, detectedFileExtension=detected)
++                self.assertEqual(
++                    download_path(self.root, {"modFile": dict(row, uri=name)}).name,
++                    name,
++                )
++                self.assertEqual(
++                    download_path(
++                        self.root, {"modFile": row, "v1": {"file_name": name}}
++                    ).name,
++                    name,
++                )
++
++    def test_display_suffix_does_not_override_detected_archive_type(self):
++        label = "ZXuKongSwap 1.2"
++        row = dict(OPAQUE_FILE, name=label)
++        for metadata in (
++            {"modFile": dict(row, uri=label)},
++            {"modFile": row, "v1": {"file_name": label}},
++            {"modFile": dict(row, uri=label), "v1": {"file_name": "Label.data"}},
++        ):
++            with self.subTest(metadata=metadata):
++                self.assertEqual(
++                    download_path(self.root, metadata).name,
++                    "nexus-ZXuKongSwap-1.2-45586782880367.zip",
++                )
++        for rejected in ("../bad.zip", label, "Label.data", "archive.zip.exe"):
++            with self.subTest(rejected=rejected):
++                metadata = {
++                    "modFile": dict(FILE, detectedFileExtension="zip"),
++                    "v1": {"file_name": rejected},
++                }
++                self.assertEqual(download_path(self.root, metadata).name, FILE["uri"])
++
++    def test_opaque_uri_uses_detected_format_and_distinct_stable_uid(self):
++        first = download_path(self.root, {"modFile": OPAQUE_FILE})
++        self.assertEqual(first, self.root / "nexus-FangYao-V0.9-45586782880367.zip")
++        self.assertEqual(
++            download_path(
++                self.root, {"modFile": dict(OPAQUE_FILE, uid=45586782880367)}
++            ),
++            first,
++        )
++        second = dict(OPAQUE_FILE, fileId=624, uid="45586782880368")
++        self.assertNotEqual(download_path(self.root, {"modFile": second}), first)
++        for detected, extension in (
++            (".RAR", "rar"),
++            ("7z", "7z"),
++            ("tar", "tar"),
++            (".TAR.GZ", "tar.gz"),
++            ("tar.zst", "tar.zst"),
++            ("fomod", "fomod"),
++            ("jar", "jar"),
++            (".MRPACK", "mrpack"),
++        ):
++            with self.subTest(detected=detected):
++                row = dict(OPAQUE_FILE, detectedFileExtension=detected)
++                self.assertEqual(
++                    download_path(self.root, {"modFile": row}).name,
++                    f"nexus-FangYao-V0.9-45586782880367.{extension}",
++                )
++
++    def test_path_like_or_unusable_original_name_is_never_used_as_a_filename(self):
++        for uri in (
++            None,
++            42,
++            "",
++            "opaque",
++            ".zip",
++            ".hidden.zip",
++            "release.",
++            "../escape.zip",
++            "folder/archive.zip",
++            "folder\\archive.zip",
++            "C:alternate.zip",
++            "\\\\share\\archive.zip",
++            "https://host/archive.zip",
++            "CON.zip",
++            "LPT\u00b9.tar.gz",
++            "archive.zip ",
++            "bad\x00.zip",
++            "bad\x7f.zip",
++            "bad\x85.zip",
++            "bad\ud800.zip",
++            "a" * 252 + ".zip",
++        ):
++            with self.subTest(uri=uri):
++                row = dict(OPAQUE_FILE, uri=uri, name="CON.v1/../folder\\bad:name")
++                metadata = {"modFile": row, "v1": {"file_name": uri}}
++                destination = download_path(self.root, metadata)
++                self.assertEqual(
++                    destination,
++                    self.root / "nexus-CON.v1-..-folder-bad-name-45586782880367.zip",
++                )
++                self.assertEqual(archive_name(destination.name), destination.name)
++        long_title = dict(OPAQUE_FILE, name="a" * 2000)
++        self.assertEqual(
++            download_path(self.root, {"modFile": long_title}).name,
++            f"nexus-{'a' * 80}-45586782880367.zip",
++        )
++
++    def test_fallback_rejects_unrecognized_extension_or_invalid_uid(self):
++        for extension in (
++            None,
++            "",
++            "exe",
++            "/zip",
++            "zip/../rar",
++            "zip.exe",
++            "..zip",
++            7,
++        ):
++            with self.subTest(extension=extension):
++                row = dict(
++                    OPAQUE_FILE,
++                    uri="nested/archive.zip",
++                    detectedFileExtension=extension,
++                )
++                with self.assertRaisesRegex(ValueError, "archive extension"):
++                    download_path(self.root, {"modFile": row})
++        for uid in (None, True, 0, -1, 3.5, "0", "../123", "9" * 21, "\u0661"):
++            with self.subTest(uid=uid):
++                row = dict(OPAQUE_FILE, uid=uid)
++                with self.assertRaisesRegex(ValueError, "file UID"):
++                    download_path(self.root, {"modFile": row})
+ 
+ 
+ class DownloaderTests(unittest.IsolatedAsyncioTestCase):

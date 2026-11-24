@@ -6,6 +6,7 @@ async function openModelSettings(page: Page, options?: Parameters<typeof install
   await installMockTauri(page, options);
   await page.goto("/");
   await page.getByRole("button", {name: "设置", exact: true}).click();
+  await page.getByRole("tab", {name: "AI 与模型", exact: true}).click();
   const section = page.getByRole("region", {name: "模型列表", exact: true});
   const table = section.getByRole("table", {name: "模型列表", exact: true});
   await expect(table).toBeVisible();

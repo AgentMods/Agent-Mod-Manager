@@ -86,6 +86,8 @@ pub struct Conversation {
     pub id: String,
     pub title: String,
     #[serde(default)]
+    pub auto_title_pending: bool,
+    #[serde(default)]
     pub category: Option<String>,
     /// Compatibility projection for callers that require exactly one game.
     pub game_id: Option<String>,
@@ -125,6 +127,9 @@ pub struct Message {
     pub id: String,
     pub role: String,
     pub content: String,
+    /// Presentation provenance; absent on old history rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<Attachment>,
     pub reasoning: Option<String>,
@@ -283,7 +288,7 @@ impl History {
              SELECT c.id,c.title,c.game_id,c.task_summary,c.archived,c.pinned,c.message_count,c.created_at,c.updated_at,
                     t.id AS turn_id,t.status AS turn_status,
                     COALESCE((SELECT MAX(seq) FROM agent_events WHERE conversation_id=c.id),0) AS event_seq,
-                    c.category,c.workspace_game_ids_json
+                    c.category,c.workspace_game_ids_json,c.auto_title_pending
              FROM conversations c
              LEFT JOIN latest_turns lt ON lt.conversation_id=c.id
              LEFT JOIN agent_turns t ON t.rowid=lt.turn_row
@@ -389,8 +394,8 @@ impl History {
                 .then(|| serde_json::to_string(&attachments))
                 .transpose()?;
             tx.execute(
-                "UPDATE messages SET content=?1,attachments_json=?2,token_count=0 WHERE id=?3",
-                params![text, encoded, user_id],
+                "UPDATE messages SET content=?1,attachments_json=?2,origin_json=?3,token_count=0 WHERE id=?4",
+                params![text, encoded, json!({"kind":"edited"}).to_string(), user_id],
             )?;
         } else {
             crate::agent::attachments::validate_user_input(&content, &attachments)?;
@@ -618,6 +623,7 @@ impl History {
             id: new_id("msg"),
             role: role.into(),
             content: content.into(),
+            origin: None,
             attachments,
             reasoning: None,
             tool_calls,
@@ -873,6 +879,7 @@ fn conversation_from_row(row: &Row<'_>) -> rusqlite::Result<Conversation> {
     Ok(Conversation {
         id: row.get(0)?,
         title: row.get(1)?,
+        auto_title_pending: row.get("auto_title_pending")?,
         category: row.get("category")?,
         game_id: row.get(2)?,
         workspace_game_ids: workspace::from_row(row)?,
@@ -889,7 +896,7 @@ fn conversation_from_row(row: &Row<'_>) -> rusqlite::Result<Conversation> {
 
 fn read_conversation(conn: &Connection, id: &str) -> AppResult<Conversation> {
     let mut conversation = conn.query_row(
-        "SELECT id,title,game_id,task_summary,archived,pinned,message_count,created_at,updated_at,category,workspace_game_ids_json
+        "SELECT id,title,game_id,task_summary,archived,pinned,message_count,created_at,updated_at,category,workspace_game_ids_json,auto_title_pending
          FROM conversations WHERE id=?1",
         [id], conversation_from_row,
     ).optional()?.ok_or_else(|| AppError::NotFound("会话".into()))?;
@@ -916,7 +923,7 @@ fn read_permission_mode(conn: &Connection, id: &str) -> AppResult<Option<String>
 
 fn read_messages(conn: &Connection, id: &str) -> AppResult<Vec<Message>> {
     // created_at has millisecond precision; UUIDs are random. Neither is sequence.
-    let mut stmt = conn.prepare("SELECT id,role,content,reasoning,tool_calls_json,tool_call_id,attachments_json FROM messages WHERE conversation_id=?1 ORDER BY rowid")?;
+    let mut stmt = conn.prepare("SELECT id,role,content,reasoning,tool_calls_json,tool_call_id,attachments_json,origin_json FROM messages WHERE conversation_id=?1 ORDER BY rowid")?;
     let result = stmt
         .query_map([id], message_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
@@ -925,7 +932,7 @@ fn read_messages(conn: &Connection, id: &str) -> AppResult<Vec<Message>> {
 
 // Do not read the stored reasoning when preparing requests to the model.
 const AGENT_MESSAGE_COLUMNS: &str =
-    "id,role,content,NULL,tool_calls_json,tool_call_id,attachments_json";
+    "id,role,content,NULL,tool_calls_json,tool_call_id,attachments_json,NULL";
 
 fn read_agent_messages(
     conn: &Connection,
@@ -958,6 +965,7 @@ fn message_from_row(row: &Row<'_>) -> rusqlite::Result<Message> {
         tool_calls: json_column(row, 4)?,
         tool_call_id: row.get(5)?,
         attachments: serde_column(row, 6)?.unwrap_or_default(),
+        origin: json_column(row, 7)?,
     })
 }
 
@@ -1115,6 +1123,26 @@ mod tests {
             )
             .unwrap();
         (dir, history)
+    }
+
+    #[test]
+    fn migrating_message_origins_keeps_legacy_history_unmarked() {
+        let (dir, history) = fixture();
+        let conv = history.create_conversation("Legacy", None).unwrap();
+        let original = history
+            .append_message(&conv.id, "user", "Old prompt", None, None)
+            .unwrap();
+        history
+            .db
+            .conn()
+            .execute_batch("ALTER TABLE messages DROP COLUMN origin_json; PRAGMA user_version=23;")
+            .unwrap();
+        drop(history);
+        let reopened = History::new(Db::open(&dir.path().join("history.sqlite")).unwrap());
+        assert_eq!(
+            reopened.get_conversation(&conv.id).unwrap().messages,
+            vec![original]
+        );
     }
 
     fn call() -> ToolCall {
@@ -1421,6 +1449,7 @@ mod tests {
         let detail = history.get_conversation(&source.id).unwrap();
         assert_eq!(detail.messages, [first, earlier, question]);
         assert_eq!(detail.conversation.message_count, 3);
+        assert!(!detail.conversation.auto_title_pending);
         assert_eq!(detail.conversation.task_summary, None);
         assert!(detail.conversation.pinned);
         assert_eq!(detail.conversation.game_id, source.game_id);
@@ -1499,6 +1528,7 @@ mod tests {
         let (dir, history) = fixture();
         let conversation = history.create_conversation("", None).unwrap();
         assert_eq!(conversation.title, "新对话");
+        assert!(conversation.auto_title_pending);
         let user = history
             .append_message(&conversation.id, "user", "List games", None, None)
             .unwrap();

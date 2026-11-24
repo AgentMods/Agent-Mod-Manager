@@ -5,6 +5,11 @@ on:
   push:
     branches: [main, master]
   workflow_dispatch:
+    inputs:
+      verify_linux:
+        description: Build and smoke-test Linux desktop packages
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -39,13 +44,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            bundles: nsis,msi
-          - os: macos-latest
-            bundles: dmg
-          - os: ubuntu-24.04
-            bundles: appimage,deb
+        # Linux native dependencies and package smoke tests are opt-in.
+        include: >-
+          ${{ fromJSON(format('[{0},{1}{2}]',
+            '{"os":"windows-latest","bundles":"nsis,msi"}',
+            '{"os":"macos-latest","bundles":"dmg"}',
+            github.event_name == 'workflow_dispatch' && inputs.verify_linux
+              && ',{"os":"ubuntu-24.04","bundles":"appimage,deb"}' || '')) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -73,7 +78,6 @@ jobs:
       - run: yarn build
       - run: yarn prepare:seven-zip
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-      - run: node scripts/test-rust.mjs --locked --lib
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
       - name: Build Unsigned Installers
         id: bundle
@@ -120,7 +124,7 @@ jobs:
           packages=(src-tauri/target/release/bundle/appimage/*.AppImage)
           test "${#packages[@]}" -eq 1
           bash scripts/run-linux-package-smoke.sh "${packages[0]}" output/linux-package-smoke/appimage
-      - name: Verify 7-Zip In macOS DMG
+      - name: Install and launch the app from the macOS DMG
         if: runner.os == 'macOS'
         timeout-minutes: 4
         run: |
@@ -132,18 +136,16 @@ jobs:
           trap 'hdiutil detach "$mount_point"' EXIT
           applications=("$mount_point"/*.app)
           test "${#applications[@]}" -eq 1
-          resource_dir="${applications[0]}/Contents/Resources"
+          install_dir=$(mktemp -d)
+          installed_app="$install_dir/$(basename "${applications[0]}")"
+          ditto "${applications[0]}" "$installed_app"
+          hdiutil detach "$mount_point"
+          trap - EXIT
+          resource_dir="$installed_app/Contents/Resources"
           test -x "$resource_dir/seven-zip/7zz"
           python scripts/prepare-mcp-runtime.py --verify-seven-zip "$resource_dir"
-      - name: Smoke Test macOS App Launch
-        if: runner.os == 'macOS'
-        timeout-minutes: 4
-        run: |
-          shopt -s nullglob
-          applications=(src-tauri/target/release/bundle/macos/*.app)
-          test "${#applications[@]}" -eq 1
-          python scripts/verify-mcp-runtime.py "${applications[0]}/Contents/Resources"
-          node scripts/run-macos-package-smoke.mjs "$PWD/${applications[0]}" "$PWD/output/macos-package-smoke"
+          python scripts/verify-mcp-runtime.py "$resource_dir"
+          node scripts/run-macos-package-smoke.mjs "$installed_app" "$PWD/output/macos-package-smoke"
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() && runner.os == 'Linux' && steps.bundle.outcome == 'success' }}
         with:

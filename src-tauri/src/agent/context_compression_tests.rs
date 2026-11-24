@@ -408,7 +408,20 @@ async fn unknown_model_context_overflow_summarizes_remotely_then_retries() {
         })
         .expect("the failed provider request should be retried with the summary");
     assert!(retried["messages"].to_string().contains("继续当前任务"));
-    assert!(!retried.to_string().contains("OLD_HISTORY_EVIDENCE"));
+    // The old raw row is evicted. A bounded language witness may still be
+    // present in the separately attributed context note, but not the system.
+    assert!(retried["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|message| {
+            !message.to_string().contains("OLD_HISTORY_EVIDENCE")
+                || (message["role"] == "assistant"
+                    && message["content"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(crate::agent::response_language::EVIDENCE_PREFIX))
+        }));
 
     let detail = history.get_conversation(&conversation).unwrap();
     assert!(detail

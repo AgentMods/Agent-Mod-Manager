@@ -3,7 +3,7 @@ import { installMockTauri } from './mock-tauri';
 
 async function setup(page: Page) {
   await page.emulateMedia({ colorScheme: 'light' });
-  await installMockTauri(page, {withExternalAdapter: true});
+  await installMockTauri(page, {withExternalAdapter: true, workspaceGames: [{id: 'other-game', name: '另一个游戏'}]});
   await page.goto('/');
   await page.getByRole('button', {name: '游戏库', exact: true}).click();
   await expect(page.getByRole('heading', { name: 'Minecraft Java Edition', exact: true })).toBeVisible();
@@ -12,9 +12,6 @@ async function setup(page: Page) {
     const mock = target.__AMM_TEST__;
     const transport = target.__TAURI_INTERNALS__;
     const invoke = transport.invoke;
-    // The shared transport returns its fixture game list by reference.
-    const games = await invoke('list_games');
-    games.push({ ...games[0], id: 'other-game', name: '另一个游戏', rootPath: '/sandbox/other' });
 
     transport.invoke = async (command: string, args: Record<string, unknown> = {}) => {
       if (command !== 'diagnose_game') return invoke(command, args);

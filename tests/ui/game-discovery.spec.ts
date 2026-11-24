@@ -70,7 +70,7 @@ test("游戏库添加无建议的启动器候选时不采用单独检查的适�
 
   await discovery.getByLabel("游戏目录", {exact: true}).fill("/sandbox/new-game");
   await discovery.getByRole("button", {name: "扫描此目录", exact: true}).click();
-  const scanned = discovery.locator('[data-slot="item"]').filter({has: page.getByText("Broken Fixture", {exact: true})});
+  const scanned = discovery.locator('[data-slot="item"]').filter({has: page.getByText("/sandbox/new-game/Broken", {exact: true})});
   await expect(scanned.getByText("未匹配", {exact: true})).toBeVisible();
   await expect(scanned.getByRole("button", {name: "联网识别"})).toBeEnabled();
   await scanned.getByRole("button", {name: "添加", exact: true}).click();

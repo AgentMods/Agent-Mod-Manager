@@ -18,10 +18,14 @@ export async function installMockTauri(page: Page, {
   duplicatePluginDraftSlug = false, failPluginDraftDeletion = false, seedPublishedPluginRecord = false,
   providerModels = ["fixture-thinking", "fixture-standard"],
   configuredModels,
+  appLocale,
+  systemLocale = "zh-CN",
   askUser,
   storage,
   workspaceGames = [],
   conversationFixtures,
+  appUpdate,
+  mcpCredentialStatuses = {}, failMcpCredentialStatusIds = [], failFirstMcpSecretWrites = [], holdNextMcpCredentialStatus = false,
 }: {
   modLibrary?: Array<{artifactId: string; gameId: string | null; gameName: string; name: string; filename: string; version: string | null; sha256: string; projectPage?: string | null}>;
   onboarding?: boolean;
@@ -42,9 +46,22 @@ export async function installMockTauri(page: Page, {
   seedPublishedPluginRecord?: boolean;
   providerModels?: string[];
   configuredModels?: import("../../src/lib/types").AgentModelSettings[];
+  appLocale?: string | null;
+  systemLocale?: string | null;
   askUser?: {preview: AskUserPreviewFixture; approvalId?: string; toolCallId?: string; deferResult?: boolean};
   workspaceGames?: WorkspaceGameFixture[];
   conversationFixtures?: Array<Record<string, unknown>>;
+  mcpCredentialStatuses?: Record<string, Record<string, boolean>>;
+  failMcpCredentialStatusIds?: string[];
+  failFirstMcpSecretWrites?: string[];
+  holdNextMcpCredentialStatus?: boolean;
+  appUpdate?: {
+    status?: 'idle' | 'checking' | 'downloading' | 'ready' | 'upToDate' | 'error' | 'unsupported';
+    version?: string;
+    message?: string;
+    checkResult?: {status: 'idle' | 'checking' | 'downloading' | 'ready' | 'upToDate' | 'error' | 'unsupported'; version?: string; message?: string};
+    pollStatuses?: {status: 'idle' | 'checking' | 'downloading' | 'ready' | 'upToDate' | 'error' | 'unsupported'; version?: string; message?: string}[];
+  };
   storage?: {
     dataRoot: string;
     parent: string;
@@ -56,7 +73,7 @@ export async function installMockTauri(page: Page, {
 } = {}) {
   // The public-looking manifest image is served offline in browser tests.
   await page.route("https://covers.example.org/minecraft-java.jpg", route => route.fulfill({contentType: "image/png", path: "public/favicon.png"}));
-  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage, workspaceGames, conversationFixtures}) => {
+  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus}) => {
     type Args = Record<string, any>;
     const now = "2026-11-18T00:00:00Z";
     const draftUpdatedAtField = pluginDateFixture === "valid" ? {updatedAt: pluginUpdatedAt} : {};
@@ -67,6 +84,14 @@ export async function installMockTauri(page: Page, {
     let seq = 0;
     let migrationAttempts = 0;
     let releaseStorageMigration: (() => void) | undefined;
+    let updateStatus = {status: appUpdate?.status ?? 'idle', version: appUpdate?.version, message: appUpdate?.message};
+    const updatePollStatuses = structuredClone(appUpdate?.pollStatuses ?? []);
+    let updatePollingStarted = false;
+    const credentialStatuses = structuredClone(mcpCredentialStatuses);
+    const failedCredentialStatusIds = new Set(failMcpCredentialStatusIds);
+    const failedSecretWrites = new Set(failFirstMcpSecretWrites);
+    let holdCredentialStatus = holdNextMcpCredentialStatus;
+    let releaseCredentialStatus: (() => void) | undefined;
     const storageBootstrapKey = "amm.test.storageBootstrapAfterMigration";
     const restoredStorage = storage?.nextBootstrap ? JSON.parse(sessionStorage.getItem(storageBootstrapKey) ?? "{}") : {};
     let pendingGameConflicts = structuredClone(gamePlanConflicts ?? []);
@@ -160,12 +185,20 @@ export async function installMockTauri(page: Page, {
     }] : [])];
     let settings: Args = { base_url: "https://example.com/v1", model: onboarding ? "" : "mock-model", models: configuredModels, permission_mode: "request_approval", api_key_ref: "model.api_key", onboarding_completed: !onboarding };
     let composerPreferences: Args = {model: null, reasoning_effort: null, permission_mode: null};
-    const modOrganizationLanguages: Array<[string, string]> = [
-      ["zh-CN", "简体中文"], ["zh-TW", "繁體中文"], ["en", "English"], ["ja", "日本語"], ["ko", "한국어"],
-      ["fr", "Français"], ["de", "Deutsch"], ["es", "Español"], ["pt-BR", "Português (Brasil)"], ["it", "Italiano"],
-      ["ru", "Русский"], ["pl", "Polski"], ["uk", "Українська"], ["tr", "Türkçe"],
+    const appLocales: Array<[string, string]> = [
+      ["zh-CN", "简体中文"], ["en", "English"], ["ja", "日本語"], ["ko", "한국어"], ["de", "Deutsch"],
+      ["fr", "Français"], ["es", "Español"], ["pt-BR", "Português (Brasil)"], ["ru", "Русский"], ["it", "Italiano"],
     ];
-    let modOrganizationLocale: string | null = null;
+    const appLocaleStorageKey = "amm.test.appLocale";
+    const storedAppLocale = sessionStorage.getItem(appLocaleStorageKey);
+    let selectedAppLocale: string | null = appLocales.some(([code]) => code === storedAppLocale)
+      ? storedAppLocale
+      : appLocales.some(([code]) => code === appLocale) ? appLocale : null;
+    let simulatedSystemLocale = systemLocale;
+    const effectiveLocale = () => selectedAppLocale ?? (
+      appLocales.find(([code]) => code.split("-")[0].toLowerCase() === (simulatedSystemLocale ?? "").trim().split(/[-_.@]/)[0].toLowerCase())?.[0]
+      ?? "en"
+    );
     let onboardingCompleted = !onboarding;
     let onboardingInProgress = onboardingStarted;
     const plan = {
@@ -183,8 +216,8 @@ export async function installMockTauri(page: Page, {
       entries: [{...plan.entries[0], operation: {op: "move", src: "/sandbox/minecraft/options.txt", dst: "/sandbox/data/trash/trash_options/payload"}}],
     };
     const importPlan = {
-      ...plan, id: "txn-import-fixture", summary: "导入本地归档到管理器",
-      entries: [{...plan.entries[0], operation: {op: "copy", src: "/sandbox/data/staging/import-scratch/fixture/Fixture.jar", dst: "/sandbox/data/staging/imports/fixture/Fixture.jar"}}],
+      ...plan, id: "txn-import-fixture", summary: "导入本地归档到管理器：Fixture.jar",
+      entries: [{...plan.entries[0], impact: "add", operation: {op: "copy", src: "/sandbox/data/staging/import-scratch/fixture/Fixture.jar", dst: "/sandbox/data/staging/imports/fixture/Fixture.jar"}}],
     };
     const installPlan = {
       ...plan, id: "txn-install-fixture", summary: "安装 Fixture",
@@ -196,6 +229,8 @@ export async function installMockTauri(page: Page, {
       {name: "system-web-search", description: "查找游戏、模组和加载器资料。", instruction: "仅发送公开的搜索关键词。"},
       {name: "system-mod-download", description: "从来源定位版本并下载 Mod。", instruction: "先核对目标版本和加载器。"},
       {name: "system-mod-commission", description: "引导玩家到 Mod 客栈创建委托。", instruction: "先区分查找现有作品和定制需求。"},
+      {name: "system-mod-install", description: "从游戏分类库安装指定 Mod。", instruction: "先核对本地归档和安装规则。"},
+      {name: "system-mod-uninstall", description: "卸载已登记的 Mod。", instruction: "先核对安装记录和文件归属。"},
       {name: "system-mod-organize", description: "安装成功后由管理器自动整理 Mod 展示名与分类标签。", instruction: "根据已知资料生成展示名和分类标签。"},
     ].map(({name, description, instruction}) => ({
       skill: {name, description, location: `plugins/skills/${name}/SKILL.md`, source: "system", kind: "system", valid: true, enabled: true, issues: []},
@@ -346,7 +381,7 @@ export async function installMockTauri(page: Page, {
           if (!args.options?.directory) return "/sandbox/incoming/Fixture.jar";
           return ++directoryPickCount === 1 ? "/sandbox/new-game" : null;
         }
-        case "list_games": return games;
+        case "list_games": return structuredClone(games);
         case "list_game_conflicts": return structuredClone(pendingGameConflicts
           .filter((conflict: any) => !Array.isArray(conflict.blockedChanges) || conflict.blockedChanges.includes(args.change))
           .map((conflict: any) => {
@@ -383,17 +418,22 @@ export async function installMockTauri(page: Page, {
         case "get_game": return games.find((game) => game.id === args.id) ?? games[0];
         case "get_game_adapter": return {modTypes: [{id: "java-mod", name: "Java 加载器模组", root: "mods", notes: "请核对加载器和依赖"}], installRoots: [{id: "mods", kind: "game", notes: ""}]};
         case "get_settings": return settings;
-        case "get_mod_organization_locale": return {
-          locale: modOrganizationLocale,
-          effective_locale: modOrganizationLocale ?? "zh-CN",
-          languages: modOrganizationLanguages,
-        };
-        case "set_mod_organization_locale": {
-          if (args.locale !== null && !modOrganizationLanguages.some(([code]) => code === args.locale)) {
-            throw new Error("不支持的 Mod 整理目标语言");
+        case "get_app_update_status":
+          if (updatePollingStarted && updatePollStatuses.length) updateStatus = updatePollStatuses.shift()!;
+          return structuredClone(updateStatus);
+        case "check_app_update":
+          updatePollingStarted = true;
+          updateStatus = structuredClone(appUpdate?.checkResult ?? {status: 'upToDate'});
+          return structuredClone(updateStatus);
+        case "get_app_locale": return {locale: selectedAppLocale, effective_locale: effectiveLocale()};
+        case "set_app_locale": {
+          if (args.locale !== null && !appLocales.some(([code]) => code === args.locale)) {
+            throw new Error("不支持的应用语言");
           }
-          modOrganizationLocale = args.locale;
-          return null;
+          selectedAppLocale = args.locale;
+          if (selectedAppLocale === null) sessionStorage.removeItem(appLocaleStorageKey);
+          else sessionStorage.setItem(appLocaleStorageKey, selectedAppLocale);
+          return {locale: selectedAppLocale, effective_locale: effectiveLocale()};
         }
         case "list_agent_models": return providerModels;
         case "get_agent_model_metadata": {
@@ -407,7 +447,16 @@ export async function installMockTauri(page: Page, {
         case "set_settings": settings = args.settings; onboardingCompleted = settings.onboarding_completed; return null;
         case "get_composer_preferences": return composerPreferences;
         case "set_composer_preferences": composerPreferences = args.preferences; return null;
-        case "set_secret": return null;
+        case "set_secret": {
+          if (failedSecretWrites.has(args.key)) {
+            failedSecretWrites.delete(args.key);
+            throw new Error("模拟后端写入失败");
+          }
+          for (const status of Object.values(credentialStatuses)) {
+            if (Object.hasOwn(status, args.key)) status[args.key] = true;
+          }
+          return null;
+        }
         case "start_onboarding": onboardingInProgress = true; return null;
         case "set_onboarding_completed": onboardingCompleted = !!args.completed; settings = {...settings, onboarding_completed: onboardingCompleted}; return null;
         case "list_conversations": return conversations.filter((c) => c.archived === !!args.archived);
@@ -440,9 +489,12 @@ export async function installMockTauri(page: Page, {
           modAction = null;
           const conversation = conversations.find(c => c.id === args.request.conversationId);
           const permissionMode = args.request.permissionMode ?? conversation?.permission_mode ?? settings.permission_mode;
-          const match = /目标（精确 ID）：(\{[^\n]+\})。/.exec(args.request.content);
-          if (match) {
-            const target = JSON.parse(match[1]);
+          const origin = args.origin ?? {kind: "user"};
+          // Single-target tool simulation. The batch protocol fixture may ask
+          // to replay only its first target without altering persisted content.
+          const target = origin.kind === "mod_request" && (!origin.batch || args.mockFirstBatchTarget)
+            ? origin.targets[0] : undefined;
+          if (target) {
             const game = conversation?.game_id;
             if (game !== target.gameId || game !== initialGame.id) {
               throw new Error("Mod action requires exact game context");
@@ -466,6 +518,7 @@ export async function installMockTauri(page: Page, {
           activeConversation = args.request.conversationId;
           const history = messages.get(activeConversation) ?? [];
           history.push({ id: "user-fixture", role: "user", content: args.request.content,
+            origin: origin.kind === "mod_request" ? {...origin, originalContent: args.request.content} : origin,
             ...(args.request.attachments?.length ? { attachments: args.request.attachments } : {}),
             reasoning: null, tool_calls: null, tool_call_id: null });
           history.push({ id: "assistant-fixture", role: "assistant", content: "", reasoning: null, tool_calls: null, tool_call_id: null });
@@ -582,6 +635,14 @@ export async function installMockTauri(page: Page, {
           return importedEntry;
         }
         case "mcp_list": return [];
+        case "mcp_credential_status": {
+          if (failedCredentialStatusIds.has(args.id)) throw new Error("模拟读取配置状态失败");
+          if (holdCredentialStatus) {
+            holdCredentialStatus = false;
+            await new Promise<void>((resolve) => { releaseCredentialStatus = resolve; });
+          }
+          return structuredClone(credentialStatuses[args.id] ?? {});
+        }
         case "mcp_startup_requests": return [];
         case "mcp_connections": return [];
         case "mcp_server_status": return {startupRequested: false, running: false, stopping: false, endpoint: null, tokenRef: "mcp.local_server.token", activeCalls: 0};
@@ -812,6 +873,7 @@ export async function installMockTauri(page: Page, {
     target.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: (_event: string, id: number) => listeners.delete(id) };
     target.__AMM_TEST__ = {
       calls, emit, emitEvent, persistOnly, replayedEvents, events, conversations, games, modLibrary, pluginDrafts, installedPlugins, cloudPluginSlugs, modActionControls,
+      setSystemLocale(locale: string | null) { simulatedSystemLocale = locale; },
       publishQuestionResult() {
         deferredQuestionResult?.();
         deferredQuestionResult = undefined;
@@ -819,6 +881,10 @@ export async function installMockTauri(page: Page, {
       finishStorageMigration() {
         releaseStorageMigration?.();
         releaseStorageMigration = undefined;
+      },
+      finishMcpCredentialStatus() {
+        releaseCredentialStatus?.();
+        releaseCredentialStatus = undefined;
       },
       get pending() { return pending; },
       get modsFolderMissing() { return modsFolderMissing; },
@@ -832,5 +898,5 @@ export async function installMockTauri(page: Page, {
         seq = Math.max(seq, ...values.map((event) => event.seq).filter(Number.isSafeInteger));
       },
     };
-  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, askUser, storage, workspaceGames, conversationFixtures});
+  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus});
 }

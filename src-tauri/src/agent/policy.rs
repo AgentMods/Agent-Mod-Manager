@@ -16,6 +16,7 @@ pub enum Effect {
     GameWrite,
     ManagerWrite,
     ExternalWrite,
+    LaunchGame,
     Publish,
     UncatalogedDownload,
     AskUser,
@@ -31,6 +32,7 @@ impl PermissionMode {
             Effect::GameWrite
             | Effect::ManagerWrite
             | Effect::ExternalWrite
+            | Effect::LaunchGame
             | Effect::Publish
             | Effect::UncatalogedDownload => match self {
                 Self::RequestApproval => true,
@@ -60,6 +62,7 @@ mod tests {
             for effect in [
                 Effect::ManagerWrite,
                 Effect::ExternalWrite,
+                Effect::LaunchGame,
                 Effect::Publish,
                 Effect::UncatalogedDownload,
             ] {

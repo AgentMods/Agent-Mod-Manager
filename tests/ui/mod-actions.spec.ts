@@ -324,7 +324,14 @@ test("local picker approval only imports the archive; a separate click starts it
   const pick = page.getByRole("button", {name: "导入本地归档", exact: true});
   const review = page.getByRole("dialog", {name: "确认文件变更", exact: true});
   await pick.click();
-  await expect(review).toContainText("导入本地归档到管理器");
+  await expect(review.getByText("导入本地归档到管理器：Fixture.jar", {exact: true})).toBeVisible();
+  await expect(review.getByText("新增：1", {exact: true})).toBeVisible();
+  const operation = page.locator('td[data-operation="copy"]');
+  const copyRow = review.getByRole("row").filter({has: operation});
+  await expect(copyRow.locator('td[data-operation="copy"]')).toHaveText("复制");
+  await expect(copyRow.getByText("/sandbox/data/staging/import-scratch/fixture/Fixture.jar", {exact: true})).toBeVisible();
+  await expect(copyRow.getByText("/sandbox/data/staging/imports/fixture/Fixture.jar", {exact: true})).toBeVisible();
+  await expect(review.getByText("事务 txn-import-fixture", {exact: true})).toBeVisible();
   await expect(review).not.toContainText("/sandbox/minecraft/mods");
   await review.getByRole("button", {name: "取消", exact: true}).click();
   expect(await calls(page, "apply_plan", "register_imported_mod", "start_turn")).toEqual([]);

@@ -37,5 +37,10 @@
       "crates/uv-python-interpreter/python/packaging/LICENSE.APACHE": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
       "crates/uv-python-interpreter/python/packaging/LICENSE.BSD": "b70e7e9b742f1cc6f948b34c16aa39ffece94196364bc88ff0d2180f0028fac5"
     }
+  },
+  "nexus": {
+    "filename": "glossmod_nexusmods_mcp-1.0.0+amm.1-py3-none-any.whl",
+    "sha256": "1ec14954066507e3ed3f902fdd994b4ac1c97a3d14a0bcb622bb5cb16fd8442a",
+    "sourceCommit": "831d193b9d5e0a037df8c569d5d601e5b231e69b"
   }
 }

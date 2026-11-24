@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useEffect, useRef, useState, type Ref } from "react";
 import { ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, PlusIcon, ShieldAlertIcon, ShieldIcon, SquareIcon } from "lucide-react";
 import { DropdownMenu as Menu, Popover, Slider } from "radix-ui";
@@ -23,10 +24,10 @@ import { cn } from "@/lib/utils";
 
 const popupPosition = { side: "top", align: "end", sideOffset: 8, collisionPadding: 12 } as const;
 const permissionLabels: Record<PermissionMode | "", string> = {
-  "": "会话设置",
-  request_approval: "逐次审批",
-  auto_approve: "游戏内自动批准",
-  full_trust: "完全信任",
+  get ""() { return tr("会话设置"); },
+  get request_approval() { return tr("逐次审批"); },
+  get auto_approve() { return tr("游戏内自动批准"); },
+  get full_trust() { return tr("完全信任"); },
 };
 
 interface AgentComposerProps {
@@ -85,9 +86,9 @@ export function AgentComposer({
   }
   const selectedModel = models.find((entry) => entry.id === model);
   const levels = selectedModel?.reasoning_levels ?? [];
-  const modelLabel = selectedModel?.display_name?.trim() || model || "未配置模型";
+  const modelLabel = selectedModel?.display_name?.trim() || model || tr("未配置模型");
   const effectivePermission = permission || inheritedPermission;
-  const permissionLabel = effectivePermission ? permissionLabels[effectivePermission] : inheritedPermission === null ? "权限未记录" : "会话设置 · 读取中";
+  const permissionLabel = effectivePermission ? permissionLabels[effectivePermission] : inheritedPermission === null ? tr("权限未记录") : tr("会话设置 · 读取中");
   const elevated = effectivePermission === "full_trust";
   const PermissionIcon = elevated ? ShieldAlertIcon : ShieldIcon;
 
@@ -97,26 +98,26 @@ export function AgentComposer({
   }}>
     {libraryGameName !== undefined && <Field className="mb-3 gap-1.5" data-invalid={invalidGameName || undefined}>
       <div className="flex items-center gap-3">
-        <FieldLabel className="shrink-0" htmlFor="adapter-game-name">游戏库显示名称</FieldLabel>
+        <FieldLabel className="shrink-0" htmlFor="adapter-game-name">{tr("游戏库显示名称")}</FieldLabel>
         <Input id="adapter-game-name" className="min-w-0 max-w-sm" value={editedGameName ?? libraryGameName}
           aria-invalid={invalidGameName} aria-describedby="adapter-game-name-hint" disabled={controlsDisabled}
           onChange={(event) => setEditedGameName(event.target.value)} />
       </div>
-      {invalidGameName ? <FieldError id="adapter-game-name-hint">请输入游戏名称，且不含控制字符。</FieldError>
-        : <FieldDescription id="adapter-game-name-hint">绑定适配包时会同步更新游戏库中的名称。</FieldDescription>}
+      {invalidGameName ? <FieldError id="adapter-game-name-hint">{tr("请输入游戏名称，且不含控制字符。")}</FieldError>
+        : <FieldDescription id="adapter-game-name-hint">{tr("绑定适配包时会同步更新游戏库中的名称。")}</FieldDescription>}
     </Field>}
     {onCancelEdit && <div className="mb-1 flex items-center justify-between gap-2 px-2 text-xs text-muted-foreground">
-      <span>正在编辑消息</span>
-      <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={onCancelEdit}>取消编辑</Button>
+      <span>{tr("正在编辑消息")}</span>
+      <Button type="button" size="xs" variant="ghost" disabled={busy} onClick={onCancelEdit}>{tr("取消编辑")}</Button>
     </div>}
-    <input ref={filePicker} type="file" aria-label="选择附件" hidden multiple disabled={controlsDisabled} onChange={(event) => {
+    <input ref={filePicker} type="file" aria-label={tr("选择附件")} hidden multiple disabled={controlsDisabled} onChange={(event) => {
       const files = Array.from(event.currentTarget.files ?? []);
       event.currentTarget.value = "";
       addFiles(files);
     }} />
     <InputGroup className="rounded-[22px] border-border shadow-sm bg-muted/55 dark:bg-secondary">
       {attachments.length > 0 && <InputGroupAddon align="block-start" className="min-w-0 flex-col items-stretch gap-1 px-3 pt-2 pb-0">
-        <AttachmentGroup aria-label="待发送附件" aria-live="polite" className="max-h-[25dvh] flex-wrap gap-1.5 overflow-y-auto">
+        <AttachmentGroup aria-label={tr("待发送附件")} aria-live="polite" className="max-h-[25dvh] flex-wrap gap-1.5 overflow-y-auto">
           {attachments.map((draft) => <ComposerAttachment key={draft.id} draft={draft} disabled={controlsDisabled}
             onRemove={() => updateAttachments((current) => current.filter((item) => item.id !== draft.id))}
             onRetry={() => retryFailed((item) => item.id === draft.id)} />)}
@@ -124,15 +125,15 @@ export function AgentComposer({
         {needsSetup && <>
           <Button type="button" size="xs" variant="outline" className="self-start" disabled={controlsDisabled || converter.starting}
             aria-busy={converter.starting} onClick={startConverter}>
-            {converter.starting && <Spinner data-icon="inline-start" />}启动 MarkItDown MCP
+            {converter.starting && <Spinner data-icon="inline-start" />}{tr("启动 MarkItDown MCP")}
           </Button>
           <ErrorState error={converter.error} />
         </>}
       </InputGroupAddon>}
       <InputGroupTextarea
         ref={inputRef}
-        aria-label="告诉 Agent 你想做什么"
-        placeholder="和 Agent 一起工作"
+        aria-label={tr("告诉 Agent 你想做什么")}
+        placeholder={tr("和 Agent 一起工作")}
         value={input}
         className="max-h-[min(14rem,34dvh)] min-h-16 resize-none px-4 pt-3.5 pb-2 sm:min-h-20 sm:text-base"
         disabled={disabled}
@@ -154,13 +155,13 @@ export function AgentComposer({
       />
       <InputGroupAddon align="block-end" className="cursor-default flex-wrap justify-between gap-1.5 px-2.5 pb-2.5 pt-0">
         <div className="flex min-w-0 items-center gap-1">
-          <Button type="button" aria-label="添加附件" title="添加附件（图片也可直接粘贴）" size="icon-sm" variant="ghost"
+          <Button type="button" aria-label={tr("添加附件")} title={tr("添加附件（图片也可直接粘贴）")} size="icon-sm" variant="ghost"
             disabled={controlsDisabled} onClick={() => filePicker.current?.click()}>
             <PlusIcon aria-hidden="true" />
           </Button>
           <DropdownMenu modal={false}>
             <DropdownMenuTrigger asChild>
-              <Button type="button" size="sm" variant="ghost" aria-label="本轮权限策略"
+              <Button type="button" size="sm" variant="ghost" aria-label={tr("本轮权限策略")}
                 title={permission ? permissionLabels[permission] : permissionLabel}
                 className={cn("gap-1.5 rounded-full px-2 text-xs has-[>svg]:px-2", elevated && "text-warning")}
                 disabled={controlsDisabled}>
@@ -182,14 +183,14 @@ export function AgentComposer({
             <DropdownMenu modal={false} open={!controlsDisabled && picker === "model"}
               onOpenChange={(open) => setPicker((current) => open ? "model" : current === "model" ? null : current)}>
               <DropdownMenuTrigger asChild>
-                <Button type="button" size="sm" variant="ghost" aria-label="本轮模型" title={modelLabel}
+                <Button type="button" size="sm" variant="ghost" aria-label={tr("本轮模型")} title={modelLabel}
                   className="min-w-0 shrink rounded-full px-2.5 has-[>svg]:px-2.5"
                   disabled={controlsDisabled || !models.length}>
                   <span className="max-w-[min(30vw,13rem)] truncate">{modelLabel}</span>
                   {!levels.length && <ChevronDownIcon aria-hidden="true" className="size-3 opacity-60" />}
                 </Button>
               </DropdownMenuTrigger>
-              <DropdownMenuContent {...popupPosition} aria-label="本轮模型"
+              <DropdownMenuContent {...popupPosition} aria-label={tr("本轮模型")}
                 className="max-h-[min(23rem,var(--radix-dropdown-menu-content-available-height))] w-[min(19rem,calc(100vw-24px))] rounded-2xl p-1.5 shadow-lg">
                 <DropdownMenuRadioGroup value={model} onValueChange={onModelChange}>
                   {models.map(({ id, display_name }) => (
@@ -207,10 +208,10 @@ export function AgentComposer({
               onOpenChange={(open) => setPicker((current) => open ? "reasoning" : current === "reasoning" ? null : current)}
               onOpenModel={() => setPicker("model")} onChange={onReasoningChange} />}
           </div>
-          {onCancel ? <Button key="stop" type="button" aria-label="停止生成" title="停止生成" variant="secondary" size="icon"
+          {onCancel ? <Button key="stop" type="button" aria-label={tr("停止生成")} title={tr("停止生成")} variant="secondary" size="icon"
             className="rounded-full bg-foreground text-background hover:bg-foreground/85 motion-safe:animate-pop-in" onClick={onCancel}>
             <SquareIcon aria-hidden="true" className="size-3 fill-current" />
-          </Button> : <Button key="send" type="submit" aria-label="发送消息" title="发送消息" size="icon" className="rounded-full motion-safe:animate-pop-in" disabled={!canSend}>
+          </Button> : <Button key="send" type="submit" aria-label={tr("发送消息")} title={tr("发送消息")} size="icon" className="rounded-full motion-safe:animate-pop-in" disabled={!canSend}>
             <ArrowUpIcon aria-hidden="true" />
           </Button>}
         </div>
@@ -231,20 +232,20 @@ function ReasoningPicker({ modelLabel, disabled, levels, value, open, onOpenChan
 }) {
   const openingModel = useRef(false);
   const selected = value ? levels.indexOf(value) + 1 : 0;
-  const accessibleLevel = value ? reasoningEffortLabel(value) : "服务默认";
+  const accessibleLevel = value ? reasoningEffortLabel(value) : tr("服务默认");
   const ultra = value === "ultra";
   const levelLabel = ultra ? "Ultra" : accessibleLevel.split("（")[0];
 
   return <Popover.Root open={open} onOpenChange={onOpenChange}>
     <Popover.Trigger asChild>
-      <Button type="button" size="sm" variant="ghost" aria-label="本轮思考等级" title={`推理强度 · ${accessibleLevel}`} disabled={disabled}
+      <Button type="button" size="sm" variant="ghost" aria-label={tr("本轮思考等级")} title={tr("推理强度 · {accessibleLevel}", { accessibleLevel })} disabled={disabled}
         className="gap-1 rounded-full pl-1 pr-2.5 text-xs text-muted-foreground has-[>svg]:pl-1 has-[>svg]:pr-2.5">
         <span className="truncate">{levelLabel}</span>
         <ChevronDownIcon aria-hidden="true" className="size-3 opacity-70" />
       </Button>
     </Popover.Trigger>
     <Popover.Portal>
-      <Popover.Content {...popupPosition} aria-label="本轮思考等级" onCloseAutoFocus={(event) => {
+      <Popover.Content {...popupPosition} aria-label={tr("本轮思考等级")} onCloseAutoFocus={(event) => {
         if (openingModel.current) {
           event.preventDefault();
           openingModel.current = false;
@@ -267,7 +268,7 @@ function ReasoningPicker({ modelLabel, disabled, levels, value, open, onOpenChan
           {!ultra && <div aria-hidden="true" className="pointer-events-none absolute inset-x-3 flex justify-between">
             {["default", ...levels].map((level) => <span key={level} className="size-1 rounded-full bg-popover-foreground/30" />)}
           </div>}
-          <Slider.Thumb aria-label="推理强度" aria-valuetext={accessibleLevel}
+          <Slider.Thumb aria-label={tr("推理强度")} aria-valuetext={accessibleLevel}
             className="block size-7 rounded-full border bg-white shadow-sm outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-popover" />
         </Slider.Root>
       </Popover.Content>

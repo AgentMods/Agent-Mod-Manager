@@ -372,7 +372,7 @@ mod tests {
 
     fn jar(entries: &[(&str, &[u8])], method: CompressionMethod) -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
-        writer.set_comment("archive comment");
+        writer.set_comment("archive comment").unwrap();
         for (name, content) in entries {
             writer
                 .start_file(

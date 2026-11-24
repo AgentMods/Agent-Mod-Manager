@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useId, useMemo, useRef, useState, type FormEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -68,7 +69,7 @@ function summarizeLevels(enabled: ReasoningEffort[]) {
     if (group && REASONING_LEVELS.indexOf(group.at(-1)!) + 1 === REASONING_LEVELS.indexOf(level)) group.push(level);
     else groups.push([level]);
   }
-  return groups.map((group) => group.length >= 3 ? `${group[0]} → ${group.at(-1)}` : group.join(", ")).join(", ") || "服务默认";
+  return groups.map((group) => group.length >= 3 ? `${group[0]} → ${group.at(-1)}` : group.join(", ")).join(", ") || tr("服务默认");
 }
 
 export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props) {
@@ -221,12 +222,12 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
       setApiKey("");
       queryClient.setQueryData(["settings"], next);
       setEdited(undefined);
-      notify(navigation ? "Agent 配置已保存" : "模型设置已保存");
+      notify(navigation ? tr("Agent 配置已保存") : tr("模型设置已保存"));
       onSaved?.();
     } catch (failure) {
       const message = errorText(failure);
       const key = apiKey.trim();
-      setError(key ? message.replaceAll(key, "[已隐藏]") : message);
+      setError(key ? message.replaceAll(key, tr("[已隐藏]")) : message);
     } finally {
       setSaving(false);
       onSavingChange?.(false);
@@ -238,7 +239,7 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
       {(error || settings.error) && <Alert variant="destructive"><AlertDescription>{error || errorText(settings.error)}</AlertDescription></Alert>}
       <div className="grid gap-4 sm:grid-cols-2">
         <Field>
-          <FieldLabel htmlFor={`${id}-url`}>API 地址</FieldLabel>
+          <FieldLabel htmlFor={`${id}-url`}>{tr("API 地址")}</FieldLabel>
           <Input id={`${id}-url`} type="url" value={draft?.base_url ?? ""} disabled={disabled || listing} required
             placeholder="https://api.example.com/v1" onChange={(event) => {
               if (draft) setEdited({...draft, base_url: event.target.value});
@@ -247,15 +248,15 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
         </Field>
         <Field>
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <FieldLabel htmlFor={`${id}-key`}>API 密钥</FieldLabel>
+            <FieldLabel htmlFor={`${id}-key`}>{tr("API 密钥")}</FieldLabel>
             <a className="inline-flex items-center gap-1 text-xs text-primary underline-offset-4 hover:underline" href={KEY_URL} target="_blank" rel="noreferrer" onClick={(event) => {
               if (!backendAvailable) return;
               event.preventDefault();
               void openUrl(KEY_URL).catch((failure) => setError(errorText(failure)));
-            }}>没有AI？从这里获取 <ExternalLinkIcon className="size-3" aria-hidden="true"/></a>
+            }}>{tr("没有AI？从这里获取")} <ExternalLinkIcon className="size-3" aria-hidden="true"/></a>
           </div>
           <Input id={`${id}-key`} type="password" autoComplete="new-password" value={apiKey} disabled={disabled || listing}
-            placeholder={draft?.api_key_ref ? "已加密保存，留空保留" : "输入服务商提供的 API Key"}
+            placeholder={draft?.api_key_ref ? tr("已加密保存，留空保留") : tr("输入服务商提供的 API Key")}
             onChange={(event) => {setApiKey(event.target.value); resetModelList();}}/>
         </Field>
       </div>
@@ -263,59 +264,59 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
       {draft && <section aria-labelledby={`${id}-models`} className="@container flex min-w-0 flex-col gap-3">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="flex min-w-0 flex-col gap-1">
-            <h3 id={`${id}-models`} className="text-sm font-semibold">模型列表</h3>
+            <h3 id={`${id}-models`} className="text-sm font-semibold">{tr("模型列表")}</h3>
             <FieldDescription role="status" className={metadata.isError ? "text-warning" : undefined}>
-              {waitingForDefaults ? "正在读取模型元数据…" : metadata.isError ? "暂时无法读取 BaseLLM 元数据" : "保存后应用到新的 Agent 请求。"}
+              {waitingForDefaults ? tr("正在读取模型元数据…") : metadata.isError ? tr("暂时无法读取 BaseLLM 元数据") : tr("保存后应用到新的 Agent 请求。")}
             </FieldDescription>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Button type="button" variant="outline" size="sm" disabled={disabled || listing || !baseUrl} onClick={() => {void listModels();}}>
               {listing ? <Spinner data-icon="inline-start"/> : <DownloadIcon data-icon="inline-start"/>}
-              {listing ? "获取中…" : "获取模型列表"}
+              {listing ? tr("获取中…") : tr("获取模型列表")}
             </Button>
             <Button type="button" variant="outline" size="sm" disabled={disabled} onClick={() => appendModels([""], true)}>
-              <PlusIcon data-icon="inline-start"/>手动添加
+              <PlusIcon data-icon="inline-start"/>{tr("手动添加")}
             </Button>
           </div>
         </div>
 
-        {listError && <p className="text-sm text-warning" role="status">{listError}。也可以手动添加模型 ID。</p>}
+        {listError && <p className="text-sm text-warning" role="status">{tr("{listError}。也可以手动添加模型 ID。", { listError })}</p>}
         {available && <FieldSet disabled={disabled} className="gap-3 rounded-lg border p-4">
-          <FieldLegend variant="label">服务商模型（可多选）</FieldLegend>
-          <Label htmlFor={`${id}-filter`} className="sr-only">搜索服务商模型</Label>
+          <FieldLegend variant="label">{tr("服务商模型（可多选）")}</FieldLegend>
+          <Label htmlFor={`${id}-filter`} className="sr-only">{tr("搜索服务商模型")}</Label>
           <Input id={`${id}-filter`} type="search" value={filter} onChange={(event) => {
             setFilter(event.target.value);
             showCandidatePage(0);
-          }} placeholder="搜索模型 ID"/>
+          }} placeholder={tr("搜索模型 ID")}/>
           <ScrollArea className="min-w-0 rounded-md border [&_[data-slot=scroll-area-viewport]]:max-h-48 [&_[data-slot=scroll-area-viewport]>div]:block!">
             <div ref={candidateList} className="flex flex-col gap-2 p-3">
               {available.slice(pageStart, pageStart + MODEL_CANDIDATES_PER_PAGE).map((name) => <Label key={name} className="font-normal break-all">
                 <Checkbox checked={selectedIds.has(name)} onCheckedChange={(checked) => setSelection((current) => checked === true ? [...current, name] : current.filter((item) => item !== name))}/>
                 <span>{name}</span>
               </Label>)}
-              {!available.length && <p className="text-sm text-muted-foreground">没有可添加的匹配模型。</p>}
+              {!available.length && <p className="text-sm text-muted-foreground">{tr("没有可添加的匹配模型。")}</p>}
             </div>
           </ScrollArea>
           {available.length > MODEL_CANDIDATES_PER_PAGE && <div className="flex flex-wrap items-center gap-2">
-            <Button type="button" variant="outline" size="sm" disabled={currentPage === 0} onClick={() => showCandidatePage(currentPage - 1)}>上一页模型</Button>
-            <span role="status" className="text-xs text-muted-foreground tabular-nums">第 {currentPage + 1} / {candidatePages} 页，共 {available.length} 个模型</span>
-            <Button type="button" variant="outline" size="sm" disabled={currentPage + 1 === candidatePages} onClick={() => showCandidatePage(currentPage + 1)}>下一页模型</Button>
+            <Button type="button" variant="outline" size="sm" disabled={currentPage === 0} onClick={() => showCandidatePage(currentPage - 1)}>{tr("上一页模型")}</Button>
+            <span role="status" className="text-xs text-muted-foreground tabular-nums">{tr("第 {value1} / {candidatePages} 页，共 {length} 个模型", { value1: currentPage + 1, candidatePages, length: available.length })}</span>
+            <Button type="button" variant="outline" size="sm" disabled={currentPage + 1 === candidatePages} onClick={() => showCandidatePage(currentPage + 1)}>{tr("下一页模型")}</Button>
           </div>}
           <div className="flex flex-wrap gap-2">
-            <Button type="button" size="sm" variant="outline" disabled={!selectedIds.size} onClick={() => appendModels([...selectedIds])}>添加所选（{selectedIds.size}）</Button>
-            <Button type="button" size="sm" variant="ghost" onClick={resetModelList}>收起</Button>
+            <Button type="button" size="sm" variant="outline" disabled={!selectedIds.size} onClick={() => appendModels([...selectedIds])}>{tr("添加所选（{size}）", { size: selectedIds.size })}</Button>
+            <Button type="button" size="sm" variant="ghost" onClick={resetModelList}>{tr("收起")}</Button>
           </div>
         </FieldSet>}
 
         {draft.models.length ? <div className="min-w-0 rounded-lg border">
-          <Table aria-label="模型列表" role="table" className="block @min-[37rem]:table @min-[37rem]:table-fixed">
+          <Table aria-label={tr("模型列表")} role="table" className="block @min-[37rem]:table @min-[37rem]:table-fixed">
             <TableHeader role="rowgroup" className="sr-only @min-[37rem]:not-sr-only @min-[37rem]:table-header-group">
               <TableRow role="row">
-                <TableHead role="columnheader" scope="col" className="h-8 w-9" aria-label="排序"/>
-                <TableHead role="columnheader" scope="col" className={modelColumnHead}>菜单显示名</TableHead>
-                <TableHead role="columnheader" scope="col" className={modelColumnHead}>实际请求模型</TableHead>
-                <TableHead role="columnheader" scope="col" className={cn(modelColumnHead, "w-[24%]")}>思考等级</TableHead>
-                <TableHead role="columnheader" scope="col" className="h-8 w-9" aria-label="删除"/>
+                <TableHead role="columnheader" scope="col" className="h-8 w-9" aria-label={tr("排序")}/>
+                <TableHead role="columnheader" scope="col" className={modelColumnHead}>{tr("菜单显示名")}</TableHead>
+                <TableHead role="columnheader" scope="col" className={modelColumnHead}>{tr("实际请求模型")}</TableHead>
+                <TableHead role="columnheader" scope="col" className={cn(modelColumnHead, "w-[24%]")}>{tr("思考等级")}</TableHead>
+                <TableHead role="columnheader" scope="col" className="h-8 w-9" aria-label={tr("删除")}/>
               </TableRow>
             </TableHeader>
             <TableBody role="rowgroup" className="block @min-[37rem]:table-row-group">
@@ -323,7 +324,7 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
                 const {rowKey} = model;
                 const requestId = model.id.trim();
                 const displayName = model.display_name.trim();
-                const fieldName = requestId || "新模型";
+                const fieldName = requestId || tr("新模型");
                 const rowName = displayName || fieldName;
                 const enabledLevels = levelsFor(model);
                 return <TableRow key={rowKey} role="row" data-state={draggingRow === rowKey ? "selected" : undefined}
@@ -340,8 +341,8 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
                     setDraggingRow(undefined);
                   }}>
                   <TableCell role="cell" className="min-w-0 p-0 @min-[37rem]:px-1">
-                    <Button type="button" variant="ghost" size="icon-sm" aria-label={`移动 ${rowName}`}
-                      title="拖动排序，或按 ↑ / ↓ 移动" aria-keyshortcuts="ArrowUp ArrowDown"
+                    <Button type="button" variant="ghost" size="icon-sm" aria-label={tr("移动 {rowName}", { rowName })}
+                      title={tr("拖动排序，或按 ↑ / ↓ 移动")} aria-keyshortcuts="ArrowUp ArrowDown"
                       disabled={disabled || draft.models.length < 2} draggable={!disabled && draft.models.length > 1}
                       className="cursor-grab active:cursor-grabbing"
                       onDragStart={(event) => {
@@ -363,16 +364,16 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
                     </Button>
                   </TableCell>
                   <TableCell role="cell" className={modelTableCell}>
-                    <span className={compactFieldLabel} aria-hidden="true">菜单显示名</span>
-                    <Input aria-label={`${fieldName} 菜单显示名`} className={modelInput} value={model.display_name}
-                      placeholder={requestId || "可留空"} disabled={disabled}
+                    <span className={compactFieldLabel} aria-hidden="true">{tr("菜单显示名")}</span>
+                    <Input aria-label={tr("{fieldName} 菜单显示名", { fieldName })} className={modelInput} value={model.display_name}
+                      placeholder={requestId || tr("可留空")} disabled={disabled}
                       aria-invalid={!!displayName && !validModelText(displayName)}
                       onChange={(event) => updateModel(rowKey, {display_name: event.target.value})}/>
                   </TableCell>
                   <TableCell role="cell" className={modelTableCell}>
-                    <span className={compactFieldLabel} aria-hidden="true">实际请求模型</span>
-                    <Input aria-label={`${fieldName} 实际请求模型`} className={modelInput} value={model.id}
-                      autoFocus={model.focusOnAdd} autoComplete="off" spellCheck={false} placeholder="输入模型 ID"
+                    <span className={compactFieldLabel} aria-hidden="true">{tr("实际请求模型")}</span>
+                    <Input aria-label={tr("{fieldName} 实际请求模型", { fieldName })} className={modelInput} value={model.id}
+                      autoFocus={model.focusOnAdd} autoComplete="off" spellCheck={false} placeholder={tr("输入模型 ID")}
                       required disabled={disabled} aria-invalid={duplicateIds.has(requestId) || (!!requestId && !validModelText(requestId))}
                       onChange={(event) => updateModel(rowKey, {id: event.target.value})}
                       onBlur={() => {
@@ -380,17 +381,17 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
                       }}/>
                   </TableCell>
                   <TableCell role="cell" className={cn(modelTableCell, "col-span-2 @min-[37rem]:col-auto")}>
-                    <span className={compactFieldLabel} aria-hidden="true">思考等级</span>
+                    <span className={compactFieldLabel} aria-hidden="true">{tr("思考等级")}</span>
                     <DropdownMenu modal={false}>
                       <DropdownMenuTrigger asChild>
                         <Button type="button" variant="outline" size="sm" className="w-full justify-between gap-1.5 px-2 font-normal"
-                          aria-label={`${fieldName} 思考等级`} disabled={disabled} title={enabledLevels.join(", ") || "服务默认"}>
+                          aria-label={tr("{fieldName} 思考等级", { fieldName })} disabled={disabled} title={enabledLevels.join(", ") || tr("服务默认")}>
                           <span className="min-w-0 truncate">{summarizeLevels(enabledLevels)}</span><ChevronDownIcon aria-hidden="true"/>
                         </Button>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end" className="min-w-40">
                         <DropdownMenuGroup>
-                          <DropdownMenuLabel>启用的思考等级</DropdownMenuLabel>
+                          <DropdownMenuLabel>{tr("启用的思考等级")}</DropdownMenuLabel>
                           {REASONING_LEVELS.map((level) => <DropdownMenuCheckboxItem key={level}
                             checked={enabledLevels.includes(level)} onSelect={(event) => event.preventDefault()}
                             onCheckedChange={(checked) => updateModel(rowKey, {reasoning_levels: REASONING_LEVELS.filter((option) =>
@@ -402,8 +403,8 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
                     </DropdownMenu>
                   </TableCell>
                   <TableCell role="cell" className="col-start-2 row-start-1 justify-self-end p-0 text-right @min-[37rem]:px-1">
-                    <Button type="button" variant="ghost" size="icon-sm" aria-label={`删除 ${rowName}`} disabled={disabled}
-                      title="删除模型" onClick={() => removeModel(rowKey)}>
+                    <Button type="button" variant="ghost" size="icon-sm" aria-label={tr("删除 {rowName}", { rowName })} disabled={disabled}
+                      title={tr("删除模型")} onClick={() => removeModel(rowKey)}>
                       <Trash2Icon aria-hidden="true"/>
                     </Button>
                   </TableCell>
@@ -412,44 +413,44 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
             </TableBody>
           </Table>
         </div> : <Empty className="border p-5 md:p-5">
-          <EmptyHeader><EmptyTitle>暂无模型</EmptyTitle><EmptyDescription>从服务商获取模型列表，或手动添加。</EmptyDescription></EmptyHeader>
+          <EmptyHeader><EmptyTitle>{tr("暂无模型")}</EmptyTitle><EmptyDescription>{tr("从服务商获取模型列表，或手动添加。")}</EmptyDescription></EmptyHeader>
         </Empty>}
 
         {modelIds.some((modelId) => !!modelId && !validModelText(modelId)) || invalidNames
-          ? <FieldDescription role="status">模型名称最多 256 字节，且不能包含控制字符。</FieldDescription> : null}
-        {duplicateIds.size > 0 && <FieldDescription role="status">实际请求模型 ID 不能重复。</FieldDescription>}
+          ? <FieldDescription role="status">{tr("模型名称最多 256 字节，且不能包含控制字符。")}</FieldDescription> : null}
+        {duplicateIds.size > 0 && <FieldDescription role="status">{tr("实际请求模型 ID 不能重复。")}</FieldDescription>}
         {draft.models.length > 1 && <Field className="@min-[37rem]:max-w-xs">
-          <FieldLabel htmlFor={`${id}-default`}>默认模型</FieldLabel>
+          <FieldLabel htmlFor={`${id}-default`}>{tr("默认模型")}</FieldLabel>
           <NativeSelect id={`${id}-default`} className="w-full" value={defaultModel?.id ?? ""} disabled={disabled}
             onChange={(event) => {
               const model = draft.models.find((candidate) => candidate.id === event.target.value);
               if (model) setEdited({...draft, defaultModelKey: model.rowKey});
             }}>
             {draft.models.map((model) => <NativeSelectOption key={model.rowKey} value={model.id} disabled={!model.id.trim()}>
-              {model.display_name.trim() || model.id || "新模型"}
+              {model.display_name.trim() || model.id || tr("新模型")}
             </NativeSelectOption>)}
           </NativeSelect>
         </Field>}
       </section>}
 
       <Field>
-        <FieldLabel htmlFor={`${id}-permission`}>默认权限策略</FieldLabel>
+        <FieldLabel htmlFor={`${id}-permission`}>{tr("默认权限策略")}</FieldLabel>
         <NativeSelect id={`${id}-permission`} className="w-full" value={draft?.permission_mode ?? "request_approval"} disabled={disabled} onChange={(event) => {
           if (draft) setEdited({...draft, permission_mode: event.target.value as AppSettings["permission_mode"]});
         }}>
-          <NativeSelectOption value="request_approval">逐次审批（推荐）</NativeSelectOption>
-          <NativeSelectOption value="auto_approve">管理中的游戏目录内自动批准</NativeSelectOption>
-          <NativeSelectOption value="full_trust">完全信任</NativeSelectOption>
+          <NativeSelectOption value="request_approval">{tr("逐次审批（推荐）")}</NativeSelectOption>
+          <NativeSelectOption value="auto_approve">{tr("管理中的游戏目录内自动批准")}</NativeSelectOption>
+          <NativeSelectOption value="full_trust">{tr("完全信任")}</NativeSelectOption>
         </NativeSelect>
       </Field>
-      {draft?.permission_mode === "full_trust" && <Alert variant="warning"><TriangleAlertIcon/><AlertDescription>完全信任会跳过工具确认，包括外部服务写入与发布。第三方 stdio 进程使用当前用户权限。</AlertDescription></Alert>}
+      {draft?.permission_mode === "full_trust" && <Alert variant="warning"><TriangleAlertIcon/><AlertDescription>{tr("完全信任会跳过工具确认，包括外部服务写入与发布。第三方 stdio 进程使用当前用户权限。")}</AlertDescription></Alert>}
     </FieldGroup>
 
     <div className={navigation ? "flex flex-wrap items-center gap-2 border-t p-6" : "flex flex-wrap items-center gap-2"}>
-      {navigation && <><Button variant="ghost" type="button" disabled={saving} onClick={navigation.onBack}><ChevronLeftIcon data-icon="inline-start"/>上一步</Button>
-        <span className="flex-1"/><Button type="button" variant="ghost" disabled={saving} onClick={navigation.onSkip}>跳过配置</Button></>}
+      {navigation && <><Button variant="ghost" type="button" disabled={saving} onClick={navigation.onBack}><ChevronLeftIcon data-icon="inline-start"/>{tr("上一步")}</Button>
+        <span className="flex-1"/><Button type="button" variant="ghost" disabled={saving} onClick={navigation.onSkip}>{tr("跳过配置")}</Button></>}
       <Button type="submit" disabled={!canSubmit}>
-        {saving ? <Spinner data-icon="inline-start"/> : !navigation && <SaveIcon data-icon="inline-start"/>}{saving ? "保存中…" : navigation ? "保存并继续" : "保存设置"}{navigation && !saving && <ChevronRightIcon data-icon="inline-end"/>}
+        {saving ? <Spinner data-icon="inline-start"/> : !navigation && <SaveIcon data-icon="inline-start"/>}{saving ? tr("保存中…") : navigation ? tr("保存并继续") : tr("保存设置")}{navigation && !saving && <ChevronRightIcon data-icon="inline-end"/>}
       </Button>
     </div>
   </form>;

@@ -7,36 +7,19 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
         Arc, Mutex, Weak,
     },
     time::{Duration, Instant},
 };
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const IDLE: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(50);
 const MAX_ACTIVE: usize = 16;
-static ACTIVE_WORKERS: AtomicUsize = AtomicUsize::new(0);
-
-struct WorkerSlot;
-impl WorkerSlot {
-    fn acquire() -> AppResult<Self> {
-        ACTIVE_WORKERS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < MAX_ACTIVE).then_some(active + 1)
-            })
-            .map_err(|_| AppError::Conflict("运行中的分页任务过多，请取消旧任务后重试".into()))?;
-        Ok(Self)
-    }
-}
-impl Drop for WorkerSlot {
-    fn drop(&mut self) {
-        ACTIVE_WORKERS.fetch_sub(1, Ordering::AcqRel);
-    }
-}
+static WORKER_SLOTS: Semaphore = Semaphore::const_new(MAX_ACTIVE);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -161,7 +144,9 @@ impl<T: Send + Default + 'static> Sessions<T> {
                         "运行中的分页任务过多，请取消旧任务后重试".into(),
                     ));
                 }
-                let slot = WorkerSlot::acquire()?;
+                let slot = WORKER_SLOTS.try_acquire().map_err(|_| {
+                    AppError::Conflict("运行中的分页任务过多，请取消旧任务后重试".into())
+                })?;
                 let (sender, receiver) = mpsc::sync_channel(0);
                 let (resume, permit) = mpsc::sync_channel(1);
                 let item = Arc::new(Session {

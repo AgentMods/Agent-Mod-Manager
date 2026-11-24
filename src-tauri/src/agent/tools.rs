@@ -348,7 +348,7 @@ impl Builtin {
                 Effect::Read,
             ),
             _ => (
-                "需要玩家澄清或选择时，用 questions 分步提问：一题只问一件事，能列出合理选项时提供简短 options；路径或其他开放问题可省略 options。默认单选；多个可同时选择的 Mod 在提供 options 的题目设 multiSelect:true，互斥项按组拆成独立的单选题。回答按题目顺序排列：多选为非空文本数组，单选或自填为文本，null 表示跳过，不代表同意。",
+                "When the player needs to clarify or choose, use questions with one topic per item. Write the title, questions and option labels in this turn's reply language. Provide concise options where possible; paths and other open questions may omit them. Default to single choice. Set multiSelect:true for options that may be chosen together; put mutually exclusive groups in separate single-choice questions. Answers are in question order: nonempty text arrays for multi-select, text for single choice or free input, and null for skipped (not consent).",
                 super::questions::schema(),
                 Effect::AskUser,
             ),

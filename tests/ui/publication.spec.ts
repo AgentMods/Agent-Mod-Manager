@@ -50,7 +50,6 @@ test.beforeEach(async ({page}) => {
   await page.addInitScript(installPublicationHandlers, {coverUrl: GAME_COVER_URL, legacyCoverPng: GAME_COVER_BASE64});
   await page.goto('/');
   await page.evaluate(attachPublicationHandlers);
-  await button(page, '游戏库').click();
   await button(page, '插件中心').click();
 });
 

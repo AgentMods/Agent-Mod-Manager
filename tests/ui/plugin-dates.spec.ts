@@ -18,7 +18,7 @@ async function columnIndex(table: Locator, name: string) {
 }
 
 async function expectFormattedTime(page: Page, locator: Locator, timestamp: string) {
-  const expected = await page.evaluate(value => new Date(value).toLocaleString("zh-CN", {dateStyle: "short", timeStyle: "short"}), timestamp);
+  const expected = await page.evaluate(value => new Date(value).toLocaleString(document.documentElement.lang || "zh-CN", {dateStyle: "short", timeStyle: "short"}), timestamp);
   await expect(locator).toHaveAttribute("datetime", timestamp);
   await expect(locator).toHaveText(expected);
 }
@@ -68,7 +68,7 @@ test("installed and draft tables show distinct creation and update times, includ
   await expect(draftRow).toBeVisible();
   const createdAtCell = draftRow.getByRole("cell").nth(await columnIndex(draftsTable, "创建时间"));
   const updatedAtCell = draftRow.getByRole("cell").nth(await columnIndex(draftsTable, "更新时间"));
-  const expectedCreatedAt = await page.evaluate(value => new Date(value).toLocaleString("zh-CN", {dateStyle: "short", timeStyle: "short"}), PLUGIN_CREATED_AT_FIXTURE);
+  const expectedCreatedAt = await page.evaluate(value => new Date(value).toLocaleString(document.documentElement.lang || "zh-CN", {dateStyle: "short", timeStyle: "short"}), PLUGIN_CREATED_AT_FIXTURE);
   await expect(createdAtCell).toHaveText(expectedCreatedAt);
   await expect(updatedAtCell.locator("time")).toHaveAttribute("datetime", PLUGIN_UPDATED_AT_FIXTURE);
   await expectFormattedTime(page, updatedAtCell.locator("time"), PLUGIN_UPDATED_AT_FIXTURE);

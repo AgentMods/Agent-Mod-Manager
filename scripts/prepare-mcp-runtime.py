@@ -215,6 +215,11 @@ def prepare(target):
             runtime.copy_distribution(uv_archive, select_uv)
             with helper.open('rb') as stream:
                 runtime.add(BING_HELPER, stream, os.fstat(stream.fileno()).st_size)
+            wheel = ROOT / 'scripts/vendor' / lock['nexus']['filename']
+            if hash_file(wheel) != lock['nexus']['sha256']:
+                raise ValueError('Bundled Nexus MCP wheel does not match the runtime lock')
+            with wheel.open('rb') as stream:
+                runtime.add(f'nexus/{wheel.name}', stream, wheel.stat().st_size)
             runtime.copy_distribution(playwright_archive, select_playwright)
             for name, sha256 in uv['licenses'].items():
                 license_path = download(f'https://raw.githubusercontent.com/astral-sh/uv/{uv["commit"]}/{name}', sha256)
@@ -348,10 +353,11 @@ def verify_seven_zip(lock, target, resource_dir):
     banner = rf'^7-Zip(?: \(z\))? {re.escape(lock["version"])} '
     if not re.search(banner, info, re.MULTILINE) or 'Formats:' not in info:
         raise ValueError(f'Unexpected 7-Zip CLI output from {directory / cli}')
-    # Some 7-Zip distributions omit the RAR unpackers. Check the packaged binary.
-    for handler in ('Rar', 'Rar5'):
-        if not re.search(rf'^\s*\d+\s+\S+\s+{handler}\s+rar\s', info, re.MULTILINE):
-            raise ValueError(f'Missing {handler} unpacker in {directory / cli}')
+    # Test the two decoders using compressed members. The format-list columns
+    # differ between the standalone Unix binary and the Windows DLL build.
+    fixtures = ROOT / 'src-tauri/tests/fixtures/archive-rar'
+    for archive in ('rar4-legacy.rar', 'rar5-mixed.rar'):
+        run_seven_zip(directory / cli, ['t', '--', str(fixtures / archive)], cwd=directory)
     print(f'{directory}: ran verified 7-Zip {lock["version"]} for {target}')
 
 

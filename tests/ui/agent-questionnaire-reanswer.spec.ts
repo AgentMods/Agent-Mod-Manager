@@ -17,7 +17,7 @@ async function stubReanswerStart(page: Page, rejectFirst: boolean) {
     const invoke = tauri.invoke;
     let attempts = 0;
     tauri.invoke = async (command: string, args: Record<string, any> = {}) => {
-      if (command === "start_turn" && String(args.request?.content).startsWith("补充回答：")) {
+      if (command === "start_turn" && args.origin?.kind === "questionnaire_answer") {
         attempts += 1;
         fixture.calls.push({ command, args });
         if (rejectFirst && attempts === 1) throw new Error("测试模拟 start_turn 首次拒绝");

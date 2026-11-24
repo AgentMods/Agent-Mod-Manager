@@ -28,7 +28,7 @@ env -i PATH="$PATH" HOME="$profile/home" LANG=C.UTF-8 TMPDIR="$profile/tmp" \
     XDG_DATA_HOME="$profile/data" XDG_CONFIG_HOME="$profile/config" \
     XDG_STATE_HOME="$profile/state" XDG_CACHE_HOME="$profile/cache" XDG_RUNTIME_DIR="$profile/run" \
     GDK_BACKEND=x11 WEBKIT_DISABLE_DMABUF_RENDERER=1 \
-    AMM_LINUX_AGENT_SMOKE=1 APPIMAGE_EXTRACT_AND_RUN="$extract" \
+    AMM_DISABLE_ANALYTICS=1 AMM_LINUX_AGENT_SMOKE=1 APPIMAGE_EXTRACT_AND_RUN="$extract" \
     dbus-run-session -- xvfb-run -a -s '-screen 0 1600x1100x24' \
     bash -seu -- "$application" "$smoke" "$evidence" <<'BASH' 2>&1 | tee "$evidence/smoke.log"
 application=$1

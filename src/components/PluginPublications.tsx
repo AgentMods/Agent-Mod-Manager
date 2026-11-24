@@ -1,3 +1,4 @@
+import { formatList, tr } from "@/lib/i18n";
 import { useEffect, useEffectEvent, useRef, useState } from 'react';
 import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
 import { CheckCircle2Icon, CircleAlertIcon, EyeIcon, RefreshCwIcon } from 'lucide-react';
@@ -31,21 +32,21 @@ type LegacyRecord = RecordBase & {
 type HistoryRecord = PublicationRecord | LegacyRecord;
 type Reconciliation = 'verified' | 'unconfirmed';
 const isLegacy = (record: HistoryRecord): record is LegacyRecord => 'phase' in record && 'package' in record.preview;
-const targetName = (target: Target) => target.kind === 'first' ? '首次发布' : '发布新版本';
+const targetName = (target: Target) => target.kind === 'first' ? tr("首次发布") : tr("发布新版本");
 const legacyPhases: Record<string, string> = {
-  prepared: '待确认', createUploadPending: '正在创建上传', uploadCreated: '上传已创建', startUploadPending: '正在启动上传',
-  uploadStarted: '等待传输', partPutPending: '正在传输', partUploaded: '文件已传输', completeUploadPending: '正在完成上传',
-  awaitingScan: '等待安全扫描', uploadReady: '文件已就绪', publishWorkPending: '正在发布作品', completed: '已发布',
+  get prepared() { return tr("待确认"); }, get createUploadPending() { return tr("正在创建上传"); }, get uploadCreated() { return tr("上传已创建"); }, get startUploadPending() { return tr("正在启动上传"); },
+  get uploadStarted() { return tr("等待传输"); }, get partPutPending() { return tr("正在传输"); }, get partUploaded() { return tr("文件已传输"); }, get completeUploadPending() { return tr("正在完成上传"); },
+  get awaitingScan() { return tr("等待安全扫描"); }, get uploadReady() { return tr("文件已就绪"); }, get publishWorkPending() { return tr("正在发布作品"); }, get completed() { return tr("已发布"); },
 };
 function status(record: HistoryRecord) {
-  if (record.state === 'unknown') return '未能确认发布';
-  if (record.state === 'error') return '发布失败';
+  if (record.state === 'unknown') return tr("未能确认发布");
+  if (record.state === 'error') return tr("发布失败");
   if (isLegacy(record)) return legacyPhases[record.phase] ?? record.phase;
   if (record.state === 'completed') {
-    if (record.remote?.hidden) return record.preview.target.kind === 'release' ? '新版已提交，插件仍已下架' : '已提交，插件已下架';
-    return '发布成功';
+    if (record.remote?.hidden) return record.preview.target.kind === 'release' ? tr("新版已提交，插件仍已下架") : tr("已提交，插件已下架");
+    return tr("发布成功");
   }
-  return record.state === 'pending' ? '正在发布' : record.preview.listing ? '待确认' : '历史预览';
+  return record.state === 'pending' ? tr("正在发布") : record.preview.listing ? tr("待确认") : tr("历史预览");
 }
 function StatusBadge({record}: {record: HistoryRecord}) {
   const tone = record.state === 'error' ? 'error' : record.state === 'unknown' || record.state === 'pending' || (!isLegacy(record) && record.remote?.hidden) ? 'warning' : record.state === 'completed' ? 'success' : 'neutral';
@@ -57,7 +58,7 @@ function canReconcile(record: HistoryRecord) {
     (record.state === 'unknown' && ['completeUploadPending', 'publishWorkPending'].includes(record.phase)));
 }
 function Files({files}: {files: PublicationFile[]}) {
-  return <section aria-label="文件原文" className="flex min-w-0 flex-col gap-2">
+  return <section aria-label={tr("文件原文")} className="flex min-w-0 flex-col gap-2">
     {files.map(file => <details key={file.name} className="min-w-0 rounded-md border px-3 py-2 text-sm">
       <summary className="cursor-pointer font-medium"><span className="mx-1">{file.name}</span> <span className="text-xs font-normal text-muted-foreground">{bytes(file.size)}</span></summary>
       <PathText className="mt-2 block">SHA-256 {file.sha256}</PathText>
@@ -82,7 +83,7 @@ function PrepareDialog({draft, writable, onClose, onPrepared}: {
       if (!active) return;
       try {
         const record = await api<PublicationRecord>('prepare_auto_manager_publication', id === undefined ? {slug} : {draftId: id});
-        if (!record.preview.listing) throw new Error('未收到完整的插件发布预览，请重试。');
+        if (!record.preview.listing) throw new Error(tr("未收到完整的插件发布预览，请重试。"));
         if (active) prepared(record);
       } catch (err) {
         if (active) setError(err);
@@ -91,12 +92,12 @@ function PrepareDialog({draft, writable, onClose, onPrepared}: {
     return () => { active = false; };
   }, [id, slug, writable, attempt]);
 
-  return <Modal className="sm:max-w-[600px]" title="发布插件" description={`Mod客栈 · ${slug}`} onClose={onClose} actions={<>
-    <Button variant="outline" onClick={onClose}>取消</Button>
-    {!!error && <Button disabled={!writable} onClick={() => { setError(null); setAttempt(attempt + 1); }}>重试</Button>}
+  return <Modal className="sm:max-w-[600px]" title={tr("发布插件")} description={tr("Mod客栈 · {slug}", { slug })} onClose={onClose} actions={<>
+    <Button variant="outline" onClick={onClose}>{tr("取消")}</Button>
+    {!!error && <Button disabled={!writable} onClick={() => { setError(null); setAttempt(attempt + 1); }}>{tr("重试")}</Button>}
   </>}>
     {error ? <ErrorState error={error}/> : <div role="status" className="flex items-center gap-3 py-4 text-sm text-muted-foreground">
-      <Spinner/>正在核对当前账号的插件，并生成发布内容…
+      <Spinner/>{tr("正在核对当前账号的插件，并生成发布内容…")}
     </div>}
   </Modal>;
 }
@@ -104,15 +105,15 @@ function PrepareDialog({draft, writable, onClose, onPrepared}: {
 function LegacyMetadata({record}: {record: LegacyRecord}) {
   const pack = record.preview.package;
   return <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-sm">
-    <dt className="text-muted-foreground">标题</dt><dd>{pack.title}</dd>
-    <dt className="text-muted-foreground">摘要</dt><dd className="break-words whitespace-pre-wrap">{pack.summary || '—'}</dd>
-    <dt className="text-muted-foreground">描述</dt><dd className="break-words whitespace-pre-wrap">{pack.description || '—'}</dd>
-    <dt className="text-muted-foreground">公开状态</dt><dd>{pack.workStatus}</dd>
-    <dt className="text-muted-foreground">游戏 ID</dt><dd>{pack.gameIds.join('、') || '—'}</dd>
-    <dt className="text-muted-foreground">ZIP 文件</dt><dd className="break-all">{pack.archiveName} ({bytes(pack.archiveSize)})</dd>
+    <dt className="text-muted-foreground">{tr("标题")}</dt><dd>{pack.title}</dd>
+    <dt className="text-muted-foreground">{tr("摘要")}</dt><dd className="break-words whitespace-pre-wrap">{pack.summary || '—'}</dd>
+    <dt className="text-muted-foreground">{tr("描述")}</dt><dd className="break-words whitespace-pre-wrap">{pack.description || '—'}</dd>
+    <dt className="text-muted-foreground">{tr("公开状态")}</dt><dd>{pack.workStatus}</dd>
+    <dt className="text-muted-foreground">{tr("游戏 ID")}</dt><dd>{formatList(pack.gameIds.map(String)) || '—'}</dd>
+    <dt className="text-muted-foreground">{tr("ZIP 文件")}</dt><dd className="break-all">{pack.archiveName} ({bytes(pack.archiveSize)})</dd>
     <dt className="text-muted-foreground">ZIP SHA-256</dt><dd><PathText>{pack.archiveSha256}</PathText></dd>
-    <dt className="text-muted-foreground">发布记录 ID</dt><dd><PathText>{record.id}</PathText></dd>
-    <dt className="text-muted-foreground">远端标识</dt><dd>文件 {record.fileId ?? '—'} / 作品 {record.workId ?? '—'}</dd>
+    <dt className="text-muted-foreground">{tr("发布记录 ID")}</dt><dd><PathText>{record.id}</PathText></dd>
+    <dt className="text-muted-foreground">{tr("远端标识")}</dt><dd>{tr("文件 {value1} / 作品 {value2}", { value1: record.fileId ?? '—', value2: record.workId ?? '—' })}</dd>
   </dl>;
 }
 
@@ -136,7 +137,7 @@ function ReviewDialog({record, writable, onClose, onChange, reload}: {
   const superseded = !!listing?.coverPng && record.state === 'intended';
   const publishable = !!listing && !superseded && record.state === 'intended' && !needsRefresh;
   const previousVersion = !legacy && target?.kind === 'release' ? record.preview.remoteVersion : null;
-  const heading = legacy ? 'Mod客栈 · 旧版普通作品' : `Mod客栈 · ${targetName(record.preview.target)}　${previousVersion ? `${previousVersion} → ` : ''}${pack.version}`;
+  const heading = legacy ? tr("Mod客栈 · 旧版普通作品") : tr("Mod客栈 · {value1}　{value2}{version}", { value1: targetName(record.preview.target), value2: previousVersion ? `${previousVersion} → ` : '', version: pack.version });
 
   async function refresh() {
     try {
@@ -182,37 +183,37 @@ function ReviewDialog({record, writable, onClose, onChange, reload}: {
   }, [autoCheck]);
   const metadata = <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-sm">
     {!legacy && <>
-      <dt className="text-muted-foreground">来源</dt><dd className="wrap-anywhere">{record.preview.source.kind === 'draft' ? `草稿 · ${record.preview.source.draftId}` : `已安装适配包 · ${record.preview.source.slug}`}</dd>
-      <dt className="text-muted-foreground">适配包</dt><dd className="wrap-anywhere">{pack.slug}</dd>
-      {record.preview.originalVersion && <><dt className="text-muted-foreground">本地版本</dt><dd>{record.preview.originalVersion}</dd></>}
-      <dt className="text-muted-foreground">目标插件</dt><dd>{target?.kind === 'release' ? `#${target.pluginId}` : '新建管理器插件'}</dd>
+      <dt className="text-muted-foreground">{tr("来源")}</dt><dd className="wrap-anywhere">{record.preview.source.kind === 'draft' ? tr("草稿 · {draftId}", { draftId: record.preview.source.draftId }) : tr("已安装适配包 · {slug}", { slug: record.preview.source.slug })}</dd>
+      <dt className="text-muted-foreground">{tr("适配包")}</dt><dd className="wrap-anywhere">{pack.slug}</dd>
+      {record.preview.originalVersion && <><dt className="text-muted-foreground">{tr("本地版本")}</dt><dd>{record.preview.originalVersion}</dd></>}
+      <dt className="text-muted-foreground">{tr("目标插件")}</dt><dd>{target?.kind === 'release' ? `#${target.pluginId}` : tr("新建管理器插件")}</dd>
     </>}
-    {!listing && <><dt className="text-muted-foreground">版本标签</dt><dd className="wrap-anywhere">{pack.tags.join('、') || '无标签'}</dd></>}
-    <dt className="text-muted-foreground">发布地址</dt><dd><PathText>{pack.destination}</PathText></dd>
-    <dt className="text-muted-foreground">审批摘要</dt><dd><PathText>{record.preview.digest}</PathText></dd>
+    {!listing && <><dt className="text-muted-foreground">{tr("版本标签")}</dt><dd className="wrap-anywhere">{formatList(pack.tags) || tr("无标签")}</dd></>}
+    <dt className="text-muted-foreground">{tr("发布地址")}</dt><dd><PathText>{pack.destination}</PathText></dd>
+    <dt className="text-muted-foreground">{tr("审批摘要")}</dt><dd><PathText>{record.preview.digest}</PathText></dd>
   </dl>;
-  return <Modal className={legacy ? undefined : 'sm:max-w-[600px]'} title={legacy ? '旧版作品发布记录' : '发布插件'} description={heading} onClose={() => { if (!inFlight.current) onClose(); }} actions={<>
-    <Button variant="outline" disabled={busy} onClick={onClose}>{publishable ? '取消' : '关闭'}</Button>
-    {needsRefresh && <Button variant="outline" disabled={busy} onClick={() => void act('refresh')}>{activity === 'refresh' ? <Spinner/> : <RefreshCwIcon data-icon="inline-start"/>}刷新发布状态</Button>}
-    {canReconcile(record) && !needsRefresh && !checking && <Button variant="outline" disabled={busy || !writable} onClick={() => void act('reconcile')}>{activity === 'reconcile' ? <Spinner/> : <RefreshCwIcon data-icon="inline-start"/>}{legacy ? '核对远端状态' : '刷新发布状态'}</Button>}
-    {publishable && <Button disabled={busy || !writable} onClick={() => void act('publish')}>{activity === 'publish' && <Spinner/>}发布</Button>}
+  return <Modal className={legacy ? undefined : 'sm:max-w-[600px]'} title={legacy ? tr("旧版作品发布记录") : tr("发布插件")} description={heading} onClose={() => { if (!inFlight.current) onClose(); }} actions={<>
+    <Button variant="outline" disabled={busy} onClick={onClose}>{publishable ? tr("取消") : tr("关闭")}</Button>
+    {needsRefresh && <Button variant="outline" disabled={busy} onClick={() => void act('refresh')}>{activity === 'refresh' ? <Spinner/> : <RefreshCwIcon data-icon="inline-start"/>}{tr("刷新发布状态")}</Button>}
+    {canReconcile(record) && !needsRefresh && !checking && <Button variant="outline" disabled={busy || !writable} onClick={() => void act('reconcile')}>{activity === 'reconcile' ? <Spinner/> : <RefreshCwIcon data-icon="inline-start"/>}{legacy ? tr("核对远端状态") : tr("刷新发布状态")}</Button>}
+    {publishable && <Button disabled={busy || !writable} onClick={() => void act('publish')}>{activity === 'publish' && <Spinner/>}{tr("发布")}</Button>}
   </>}>
-    {superseded && <p role="status" className="text-sm text-muted-foreground">这是旧版像素封面预览，请关闭后重新点击「发布插件」使用游戏封面。</p>}
+    {superseded && <p role="status" className="text-sm text-muted-foreground">{tr("这是旧版像素封面预览，请关闭后重新点击「发布插件」使用游戏封面。")}</p>}
     {listing && <PublicationListingPreview listing={listing} files={pack.files}/>}
-    {(!listing || record.state !== 'intended') && <div className="flex flex-wrap items-center gap-2"><strong className="wrap-anywhere">{pack.slug}</strong><span className="text-sm">{pack.version}</span><span aria-live="polite">{checking ? <span className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner/>正在确认发布…</span> : <StatusBadge record={record}/>}</span></div>}
+    {(!listing || record.state !== 'intended') && <div className="flex flex-wrap items-center gap-2"><strong className="wrap-anywhere">{pack.slug}</strong><span className="text-sm">{pack.version}</span><span aria-live="polite">{checking ? <span className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner/>{tr("正在确认发布…")}</span> : <StatusBadge record={record}/>}</span></div>}
     {!legacy && record.remote && <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2 text-sm">
-      <dt className="text-muted-foreground">远端插件 ID</dt><dd>{record.remote.id}</dd>
-      <dt className="text-muted-foreground">远端版本 ID</dt><dd>{record.remote.releaseId}</dd>
-      {record.remote.hidden && record.remote.reason && <><dt className="text-muted-foreground">下架原因</dt><dd className="wrap-anywhere">{record.remote.reason}</dd></>}
+      <dt className="text-muted-foreground">{tr("远端插件 ID")}</dt><dd>{record.remote.id}</dd>
+      <dt className="text-muted-foreground">{tr("远端版本 ID")}</dt><dd>{record.remote.releaseId}</dd>
+      {record.remote.hidden && record.remote.reason && <><dt className="text-muted-foreground">{tr("下架原因")}</dt><dd className="wrap-anywhere">{record.remote.reason}</dd></>}
     </dl>}
     {!listing && metadata}
     {legacy && <><Separator/><LegacyMetadata record={record}/></>}
     <ErrorState error={error}/>
-    {legacy && reconciliation && <Alert role="status" variant={reconciliation === 'verified' ? 'success' : 'warning'}>{reconciliation === 'verified' ? <CheckCircle2Icon/> : <CircleAlertIcon/>}<AlertDescription>{reconciliation === 'verified' ? '已核实远端状态' : '尚未核实，发布状态保持不变'}</AlertDescription></Alert>}
-    {legacy && record.state === 'unknown' && !reconciliation && <Alert variant="warning"><CircleAlertIcon/><AlertDescription>{canReconcile(record) ? '远端可能已经收到本次发布，请先核对结果。' : '请在 Mod客栈核对该作品的发布结果。'}</AlertDescription></Alert>}
-    {managerUnknown && !checking && !error && <Alert variant="warning"><CircleAlertIcon/><AlertDescription>暂时无法确认此版本是否已发布。可稍后刷新状态，无需重新发布。</AlertDescription></Alert>}
+    {legacy && reconciliation && <Alert role="status" variant={reconciliation === 'verified' ? 'success' : 'warning'}>{reconciliation === 'verified' ? <CheckCircle2Icon/> : <CircleAlertIcon/>}<AlertDescription>{reconciliation === 'verified' ? tr("已核实远端状态") : tr("尚未核实，发布状态保持不变")}</AlertDescription></Alert>}
+    {legacy && record.state === 'unknown' && !reconciliation && <Alert variant="warning"><CircleAlertIcon/><AlertDescription>{canReconcile(record) ? tr("远端可能已经收到本次发布，请先核对结果。") : tr("请在 Mod客栈核对该作品的发布结果。")}</AlertDescription></Alert>}
+    {managerUnknown && !checking && !error && <Alert variant="warning"><CircleAlertIcon/><AlertDescription>{tr("暂时无法确认此版本是否已发布。可稍后刷新状态，无需重新发布。")}</AlertDescription></Alert>}
     {listing ? <details className="min-w-0 text-sm">
-      <summary className="cursor-pointer font-medium text-muted-foreground">查看发布文件</summary>
+      <summary className="cursor-pointer font-medium text-muted-foreground">{tr("查看发布文件")}</summary>
       <div className="mt-3 flex flex-col gap-3">{metadata}<Files files={pack.files}/></div>
     </details> : <Files files={pack.files}/>}
   </Modal>;
@@ -262,28 +263,28 @@ export function PluginPublications({draft, showHistory, writable, onDraftClose}:
     if (showHistory) { void manager.refetch(); void legacy.refetch(); }
   }
   return <>
-    {showHistory && <section aria-label="适配包发布记录" className="flex min-w-0 flex-col gap-4">
-      <div className="flex justify-end"><Button variant="outline" disabled={manager.isFetching || legacy.isFetching || !backendAvailable} onClick={() => { void manager.refetch(); void legacy.refetch(); }}><RefreshCwIcon/>刷新记录</Button></div>
+    {showHistory && <section aria-label={tr("适配包发布记录")} className="flex min-w-0 flex-col gap-4">
+      <div className="flex justify-end"><Button variant="outline" disabled={manager.isFetching || legacy.isFetching || !backendAvailable} onClick={() => { void manager.refetch(); void legacy.refetch(); }}><RefreshCwIcon/>{tr("刷新记录")}</Button></div>
       <ErrorState error={manager.error}/><ErrorState error={legacy.error}/>
       {history.length ? <div className="min-w-0 rounded-lg border"><Table>
-        <TableHeader><TableRow><TableHead>适配包</TableHead><TableHead>发布状态</TableHead><TableHead>远端标识</TableHead><TableHead>更新时间</TableHead><TableHead><span className="sr-only">操作</span></TableHead></TableRow></TableHeader>
+        <TableHeader><TableRow><TableHead>{tr("适配包")}</TableHead><TableHead>{tr("发布状态")}</TableHead><TableHead>{tr("远端标识")}</TableHead><TableHead>{tr("更新时间")}</TableHead><TableHead><span className="sr-only">{tr("操作")}</span></TableHead></TableRow></TableHeader>
         <TableBody>{history.map(record => {
           const old = isLegacy(record);
           const title = old ? record.preview.package.title : record.preview.slug;
           const version = old ? record.preview.package.version : record.preview.version;
           return <TableRow key={record.id}>
-            <TableCell className="whitespace-normal"><strong className="break-all font-medium">{title}</strong><span className="block text-xs text-muted-foreground">{version} · {old ? '旧版作品' : targetName(record.preview.target)}</span></TableCell>
+            <TableCell className="whitespace-normal"><strong className="break-all font-medium">{title}</strong><span className="block text-xs text-muted-foreground">{version} · {old ? tr("旧版作品") : targetName(record.preview.target)}</span></TableCell>
             <TableCell><StatusBadge record={record}/></TableCell>
-            <TableCell className="text-xs text-muted-foreground">{old ? <>文件 {record.fileId ?? '—'} / 作品 {record.workId ?? '—'}</> : <>插件 {record.remote?.id ?? (record.preview.target.kind === 'release' ? record.preview.target.pluginId : '—')} / 版本 {record.remote?.releaseId ?? '—'}</>}</TableCell>
+            <TableCell className="text-xs text-muted-foreground">{old ? <>{tr("文件 {value1} / 作品 {value2}", { value1: record.fileId ?? '—', value2: record.workId ?? '—' })}</> : <>{tr("插件 {value1} / 版本 {value2}", { value1: record.remote?.id ?? (record.preview.target.kind === 'release' ? record.preview.target.pluginId : '—'), value2: record.remote?.releaseId ?? '—' })}</>}</TableCell>
             <TableCell>{date(record.updatedAt)}</TableCell>
-            <TableCell><Button variant="outline" size="sm" aria-label={`查看发布 ${title}`} onClick={() => setSelected(record)}><EyeIcon/>查看</Button></TableCell>
+            <TableCell><Button variant="outline" size="sm" aria-label={tr("查看发布 {title}", { title })} onClick={() => setSelected(record)}><EyeIcon/>{tr("查看")}</Button></TableCell>
           </TableRow>;
         })}</TableBody>
-      </Table></div> : !manager.isError && !legacy.isError && <EmptyState title={loading ? '正在读取发布记录…' : '暂无发布记录'}/>}
+      </Table></div> : !manager.isError && !legacy.isError && <EmptyState title={loading ? tr("正在读取发布记录…") : tr("暂无发布记录")}/>}
       {(manager.hasNextPage || legacy.hasNextPage) && <Button variant="outline" disabled={manager.isFetching || legacy.isFetching} onClick={() => {
         if (manager.hasNextPage) void manager.fetchNextPage();
         if (legacy.hasNextPage) void legacy.fetchNextPage();
-      }}>加载更早的发布记录</Button>}
+      }}>{tr("加载更早的发布记录")}</Button>}
     </section>}
     {draft && <PrepareDialog key={draft.id ?? `installed:${draft.slug}`} draft={draft} writable={writable} onClose={onDraftClose} onPrepared={record => { onDraftClose(); remember(record); }}/>}
     {selected && <ReviewDialog key={`${selected.id}-${selected.preview.digest}`} record={selected} writable={writable} onClose={closeReview} onChange={remember} reload={reload}/>}

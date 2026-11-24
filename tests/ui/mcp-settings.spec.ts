@@ -59,8 +59,23 @@ const noCredentialsConfig: McpFixture = {
   builtin: true,
 };
 
-async function openMcpSettings(page: Page) {
-  await installMockTauri(page);
+async function openMcpSettings(page: Page, {
+  credentialStatuses = {},
+  failCredentialStatusIds = [],
+  failFirstSecretWrites = [],
+  holdNextCredentialStatus = false,
+}: {
+  credentialStatuses?: Record<string, Record<string, boolean>>;
+  failCredentialStatusIds?: string[];
+  failFirstSecretWrites?: string[];
+  holdNextCredentialStatus?: boolean;
+} = {}) {
+  await installMockTauri(page, {
+    mcpCredentialStatuses: credentialStatuses,
+    failMcpCredentialStatusIds: failCredentialStatusIds,
+    failFirstMcpSecretWrites: failFirstSecretWrites,
+    holdNextMcpCredentialStatus: holdNextCredentialStatus,
+  });
   await page.goto("/");
 
   // Keep the established mock for every command except the list fixture.
@@ -80,6 +95,10 @@ async function secretCalls(page: Page) {
   return page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "set_secret"));
 }
 
+async function credentialStatusCalls(page: Page) {
+  return page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "mcp_credential_status"));
+}
+
 test("MCP credentials stay out of the list and configure controls follow secret references", async ({page}) => {
   await openMcpSettings(page);
 
@@ -89,16 +108,27 @@ test("MCP credentials stay out of the list and configure controls follow secret 
   await expect(page.locator('input[type="password"]')).toHaveCount(0);
   await expect(page.getByText("mcp.remote_http.bearer", {exact: true})).toHaveCount(0);
   await expect(page.getByText("mcp.local_stdio.github_token", {exact: true})).toHaveCount(0);
+  expect(await credentialStatusCalls(page)).toEqual([]);
   expect(await page.locator("main").evaluate((main) => main.scrollWidth <= main.clientWidth + 1)).toBe(true);
 });
 
 test("HTTP credentials can be discarded or saved from the dialog footer", async ({page}) => {
-  await openMcpSettings(page);
+  await openMcpSettings(page, {
+    credentialStatuses: {[httpConfig.id]: {[httpConfig.bearer_secret_ref!]: true}},
+    holdNextCredentialStatus: true,
+  });
 
   const trigger = page.getByRole("button", {name: "配置 Remote HTTP 凭据", exact: true});
   const dialog = page.getByRole("dialog", {name: "配置 MCP 凭据", exact: true});
   await trigger.click();
   await expect(dialog).toContainText("Remote HTTP");
+  await expect.poll(async () => credentialStatusCalls(page)).toEqual([{
+    command: "mcp_credential_status",
+    args: {id: httpConfig.id},
+  }]);
+  await expect(dialog.getByText("正在检查配置状态…", {exact: true})).toBeVisible();
+  await page.evaluate(() => (window as any).__AMM_TEST__.finishMcpCredentialStatus());
+  await expect(dialog.getByText("已配置", {exact: true})).toBeVisible();
 
   const footer = dialog.locator('[data-slot="dialog-footer"]');
   const back = footer.getByRole("button").nth(0);
@@ -125,6 +155,7 @@ test("HTTP credentials can be discarded or saved from the dialog footer", async 
 
   await trigger.click();
   await expect(bearer).toHaveValue("");
+  await expect(dialog.getByText("已配置", {exact: true})).toBeVisible();
   await expect(bearer).toHaveAttribute("type", "password");
   await expect(save).toBeDisabled();
   await bearer.fill("http-secret-fixture");
@@ -135,6 +166,7 @@ test("HTTP credentials can be discarded or saved from the dialog footer", async 
 
   await trigger.click();
   await expect(bearer).toHaveValue("");
+  await expect(dialog.getByText("已配置", {exact: true})).toBeVisible();
   // Older configs omit credential_url; the credentials dialog remains unchanged for them.
   await expect(dialog.getByRole("link", {name: "获取 Key", exact: true})).toHaveCount(0);
   expect(await secretCalls(page)).toEqual([{
@@ -143,12 +175,22 @@ test("HTTP credentials can be discarded or saved from the dialog footer", async 
   }]);
 });
 
-test("stdio credentials save all nonempty values and retry only failed references", async ({page}) => {
-  await openMcpSettings(page);
+test("stdio credentials refresh status after partial saves and retry only failed references", async ({page}) => {
+  await openMcpSettings(page, {
+    credentialStatuses: {[stdioConfig.id]: {
+      [stdioConfig.env_secret_refs.GITHUB_TOKEN]: false,
+      [stdioConfig.env_secret_refs.MAPS_API_KEY]: false,
+    }},
+    failFirstSecretWrites: [stdioConfig.env_secret_refs.MAPS_API_KEY],
+  });
 
   await page.getByRole("button", {name: "配置 Local Stdio 凭据", exact: true}).click();
   const dialog = page.getByRole("dialog", {name: "配置 MCP 凭据", exact: true});
   await expect(dialog).toContainText("Local Stdio");
+  await expect.poll(async () => credentialStatusCalls(page)).toEqual([{
+    command: "mcp_credential_status",
+    args: {id: stdioConfig.id},
+  }]);
 
   const githubToken = dialog.getByLabel("GITHUB_TOKEN", {exact: true});
   const mapsKey = dialog.getByLabel("MAPS_API_KEY", {exact: true});
@@ -159,22 +201,8 @@ test("stdio credentials save all nonempty values and retry only failed reference
 
   const save = dialog.locator('[data-slot="dialog-footer"]').getByRole("button", {name: "保存", exact: true});
   await expect(save).toBeDisabled();
+  await expect(dialog.getByText("未配置", {exact: true})).toHaveCount(2);
   expect(await secretCalls(page)).toEqual([]);
-
-  // Reject the first write for one reference after the mock records the attempted IPC call.
-  await page.evaluate((failingKey) => {
-    const internals = (window as any).__TAURI_INTERNALS__;
-    const invoke = internals.invoke.bind(internals);
-    let rejected = false;
-    internals.invoke = (command: string, args: any, ...rest: unknown[]) => {
-      const result = invoke(command, args, ...rest);
-      if (command === "set_secret" && args.key === failingKey && !rejected) {
-        rejected = true;
-        return Promise.resolve(result).then(() => { throw new Error("模拟后端写入失败"); });
-      }
-      return result;
-    };
-  }, "mcp.local_stdio.maps_key");
 
   await githubToken.fill("stdio-github-fixture");
   await mapsKey.fill("stdio-maps-fixture");
@@ -186,6 +214,9 @@ test("stdio credentials save all nonempty values and retry only failed reference
   await expect(githubToken).toHaveValue("");
   await expect(mapsKey).toHaveValue("stdio-maps-fixture");
   await expect(save).toBeEnabled();
+  await expect.poll(async () => (await credentialStatusCalls(page)).length).toBeGreaterThan(1);
+  await expect(dialog.getByText("已配置", {exact: true})).toHaveCount(1);
+  await expect(dialog.getByText("未配置", {exact: true})).toHaveCount(1);
 
   await save.click();
   await expect(dialog).toBeHidden();
@@ -200,7 +231,21 @@ test("stdio credentials save all nonempty values and retry only failed reference
   await page.getByRole("button", {name: "配置 Local Stdio 凭据", exact: true}).click();
   await expect(githubToken).toHaveValue("");
   await expect(mapsKey).toHaveValue("");
+  await expect(dialog.getByText("已配置", {exact: true})).toHaveCount(2);
   await expect(save).toBeDisabled();
+});
+
+test("credential status read failures are shown in the credentials dialog", async ({page}) => {
+  await openMcpSettings(page, {failCredentialStatusIds: [httpConfig.id]});
+
+  await page.getByRole("button", {name: "配置 Remote HTTP 凭据", exact: true}).click();
+  const dialog = page.getByRole("dialog", {name: "配置 MCP 凭据", exact: true});
+  await expect(dialog.getByText("无法读取配置状态", {exact: true})).toBeVisible();
+  await expect.poll(async () => credentialStatusCalls(page)).toEqual([{
+    command: "mcp_credential_status",
+    args: {id: httpConfig.id},
+  }]);
+  await expect(dialog.getByLabel("Bearer 密钥", {exact: true})).toHaveValue("");
 });
 
 // Stateful stand-in for the MCP lifecycle commands. Every call is recorded for exact assertions.

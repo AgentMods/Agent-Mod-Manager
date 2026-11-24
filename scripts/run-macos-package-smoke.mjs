@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { access, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { basename, join, resolve } from 'node:path';
@@ -54,17 +54,18 @@ async function run() {
   if (process.platform !== 'darwin') throw new Error('This smoke test must run on macOS');
   if (!isAbsolutePath(application) || !application.endsWith('.app') || !isAbsolutePath(evidenceDir)) usage();
 
-  const binary = join(application, 'Contents', 'MacOS', 'agent-mod-manager');
-  await access(binary);
+  // Tauri rejects executable paths containing symlinks, including macOS /var.
+  const binary = await realpath(join(application, 'Contents', 'MacOS', 'agent-mod-manager'));
   await mkdir(evidenceDir, { recursive: true });
 
-  const profile = await mkdtemp(join(tmpdir(), 'amm-macos-package-smoke-'));
+  const profile = await mkdtemp(join(await realpath(tmpdir()), 'amm-macos-package-smoke-'));
   await mkdir(join(profile, 'tmp'), { recursive: true });
   const output = [];
   const child = spawn(binary, [], {
     cwd: profile,
     env: {
       ...process.env,
+      AMM_DISABLE_ANALYTICS: '1',
       HOME: profile,
       TMPDIR: join(profile, 'tmp'),
       XDG_CONFIG_HOME: join(profile, 'config'),

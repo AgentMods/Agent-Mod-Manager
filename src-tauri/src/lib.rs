@@ -1,7 +1,10 @@
 pub mod agent;
 mod agent_attachment;
 mod agent_notifications;
+mod analytics;
 pub mod app;
+pub mod app_locale;
+mod app_update;
 pub mod archive;
 pub mod artifacts;
 pub mod commands;
@@ -59,6 +62,7 @@ pub mod util;
 #[cfg(not(test))]
 pub fn run() {
     use tauri::Manager;
+    let mut normal_exit = true;
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
@@ -82,6 +86,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
+            commands::get_app_locale,
+            commands::set_app_locale,
+            app_update::get_app_update_status,
+            app_update::check_app_update,
             commands::migrate_storage,
             commands::start_onboarding,
             commands::set_onboarding_completed,
@@ -191,6 +199,7 @@ pub fn run() {
             commands::read_logs,
             commands::diagnose_game,
             commands::mcp_list,
+            commands::mcp_credential_status,
             commands::mcp_create,
             commands::mcp_update,
             commands::mcp_remove,
@@ -291,8 +300,24 @@ pub fn run() {
                     .restore_requested(&agent.settings, &agent.registry, progress)
                     .await;
             });
+            analytics::start(app.package_info().version.to_string());
+            app_update::setup(app.handle());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run Agent Mod Manager");
+        .build(tauri::generate_context!())
+        .expect("failed to build Agent Mod Manager")
+        .run(move |app, event| match event {
+            tauri::RunEvent::ExitRequested { code, .. } => {
+                // In particular, storage migration requests a Tauri restart.
+                normal_exit = code.is_none_or(|code| code == 0);
+            }
+            tauri::RunEvent::Exit => {
+                let staged = app_update::take_at_exit(app, normal_exit);
+                analytics::finish();
+                if let Some(staged) = staged {
+                    staged.install_at_exit();
+                }
+            }
+            _ => {}
+        });
 }

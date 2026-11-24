@@ -23,11 +23,17 @@ mod agent_attachment;
 #[path = "context_compression_tests.rs"]
 pub(super) mod context_compression;
 
+#[path = "response_language_tests.rs"]
+mod response_language;
+
 #[path = "tool_loop_regression_tests.rs"]
 mod tool_loop_regression;
 
 #[path = "game_adapter_flow_tests.rs"]
 mod game_adapter_flow;
+
+#[path = "game_library_flow_tests.rs"]
+mod game_library_flow;
 
 #[path = "live_modrinth_tests.rs"]
 mod live_modrinth;
@@ -255,10 +261,82 @@ fn desktop_turn_dispatch_returns_while_the_database_is_locked() {
                 assert_eq!(body.deserialize::<Value>().unwrap(), json!([]))
             }
             ("start_turn" | "restart_turn", InvokeResponse::Err(error)) => {
-                assert!(error.0.as_str().unwrap().contains("请先恢复归档会话"))
+                assert!(
+                    error.0["message"]
+                        .as_str()
+                        .or_else(|| error.0.as_str())
+                        .is_some_and(|message| message.contains("请先恢复归档会话")),
+                    "{}",
+                    error.0
+                )
             }
             _ => panic!("unexpected IPC result"),
         }
+    }
+}
+
+#[tokio::test]
+async fn synthetic_prompt_metadata_survives_retry_but_not_edit_and_stays_local() {
+    let (_dir, engine, _game) = setup();
+    let history = History::new(engine.db.clone());
+    let (url, job) = server(vec![final_reply(), final_reply(), final_reply()]).await;
+    let (agent, conv, mut rx) = runtime(engine, &url);
+    let content = "Install the selected Mod. Exact ID: archive/例";
+    let request = |text: &str| TurnRequest {
+        conversation_id: conv.clone(),
+        content: text.into(),
+        attachments: None,
+        model: None,
+        permission_mode: None,
+        reasoning_effort: None,
+    };
+    let targets = vec![json!({"gameId":"game-1","artifactId":"archive/例"})];
+    agent
+        .start_turn_with_origin(
+            request(content),
+            super::runtime::PromptOrigin::ModRequest {
+                version: 1,
+                action: "install".into(),
+                batch: false,
+                targets: targets.clone(),
+            },
+        )
+        .unwrap();
+    next(&mut rx, "done").await;
+    let original = history.get_conversation(&conv).unwrap().messages;
+    assert_eq!(original[0].content, content);
+    assert_eq!(
+        original[0].origin,
+        Some(json!({
+            "kind":"mod_request","version":1,"action":"install","batch":false,
+            "targets":targets,"originalContent":content
+        }))
+    );
+
+    agent
+        .restart_turn(request("ignored"), &original[1].id, false)
+        .unwrap();
+    next(&mut rx, "done").await;
+    assert_eq!(
+        history.get_conversation(&conv).unwrap().messages[0],
+        original[0]
+    );
+
+    // Even an explicit edit that resubmits identical bytes must lose provenance.
+    agent
+        .restart_turn(request(content), &original[0].id, true)
+        .unwrap();
+    next(&mut rx, "done").await;
+    let edited = history.get_conversation(&conv).unwrap().messages;
+    assert_eq!(edited[0].id, original[0].id);
+    assert_eq!(edited[0].content, content);
+    assert_eq!(edited[0].origin, Some(json!({"kind":"edited"})));
+
+    for body in job.await.unwrap() {
+        assert_eq!(
+            body["messages"][1],
+            json!({"role":"user","content":content})
+        );
     }
 }
 
@@ -331,9 +409,20 @@ async fn edit_and_retry_replace_context_in_the_same_conversation() {
         .iter()
         .zip(["Original question", "Edited question"])
     {
-        let messages = body["messages"].as_array().unwrap();
+        let transcript: Vec<_> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .filter(|message| {
+                !message["content"].as_str().is_some_and(|text| {
+                    text.starts_with(crate::agent::response_language::EVIDENCE_PREFIX)
+                })
+            })
+            .cloned()
+            .collect();
         assert_eq!(
-            messages[1..],
+            transcript,
             [
                 json!({"role":"user","content":"Earlier question"}),
                 json!({"role":"assistant","content":"Earlier answer"}),
@@ -1725,6 +1814,7 @@ async fn truncated_tool_stream_never_executes() {
 #[tokio::test]
 async fn cancel_stalled_model_request_finishes_without_waiting_for_network_timeout() {
     let (_dir, engine, _game) = setup();
+    crate::app_locale::set(&engine.db, Some("fr".into())).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (tx, accepted) = tokio::sync::oneshot::channel();
@@ -1750,7 +1840,20 @@ async fn cancel_stalled_model_request_finishes_without_waiting_for_network_timeo
         .unwrap()
         .unwrap();
     agent.cancel_turn(&conv, &turn).unwrap();
-    assert_eq!(next(&mut rx, "done").await.payload["status"], "cancelled");
+    let delta = next(&mut rx, "delta").await;
+    assert_eq!(
+        delta.payload["content"],
+        "\n\n[Réponse incomplète : annulée]"
+    );
+    let done = next(&mut rx, "done").await;
+    assert_eq!(
+        done.payload,
+        json!({"status":"cancelled","reason":"Annulé"})
+    );
+    let detail = History::new(agent.engine.db.clone())
+        .get_conversation(&conv)
+        .unwrap();
+    assert_eq!(detail.messages[1].content, delta.payload["content"]);
     server.abort();
     let _ = server.await;
 }
@@ -1852,6 +1955,7 @@ async fn auto_approve_requires_confirmation_for_move_out_of_manager_storage() {
 #[test]
 fn restart_replay_includes_interrupted_turn_and_cancelled_approval() {
     let (_d, e, _g) = setup();
+    crate::app_locale::set(&e.db, Some("en".into())).unwrap();
     let history = History::new(e.db.clone());
     let conv = history.create_conversation("Restart", None).unwrap().id;
     e.db.conn().execute("INSERT INTO agent_turns(id,conversation_id,status,created_at) VALUES ('turn',?1,'running','now')",[&conv]).unwrap();
@@ -1861,7 +1965,9 @@ fn restart_replay_includes_interrupted_turn_and_cancelled_approval() {
     let events = agent.events.replay(&conv, 0, 100).unwrap();
     assert!(events
         .iter()
-        .any(|e| e.kind == "done" && e.payload["status"] == "interrupted"));
+         .any(|e| e.kind == "done"
+            && e.payload["status"] == "interrupted"
+            && e.payload["reason"] == "The app restarted. Check the file transaction recovery results before continuing."));
     assert!(events
         .iter()
         .any(|e| e.kind == "approval-resolved" && e.payload["status"] == "cancelled"));

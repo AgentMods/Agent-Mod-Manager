@@ -4,9 +4,10 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 
 export const modelName = 'amm-native-smoke';
-export const installName = 'Native Smoke Mod';
 export const installFilename = 'smoke_install.jar';
 export const diagnosePrompt = '帮我诊断这个 Minecraft 测试目录';
+// History derives the title locally from the first message, stripping the request prefix.
+export const conversationTitle = '诊断这个 Minecraft 测试目录';
 export const installPrompt = `帮我安装已导入的 ${installFilename}`;
 export const trashPrompt = '帮我把 smoke-note.txt 移入回收站';
 export const cancelPrompt = '验证中途停止这条测试请求';
@@ -62,9 +63,16 @@ export async function startSmokeModel(root, note, artifact) {
   });
 
   async function handle(request, response) {
-    assert.equal(request.method, 'POST');
-    assert.equal(request.url, '/v1/chat/completions');
     assert.ok(!Object.hasOwn(request.headers, 'authorization'), 'The fixture must not receive credentials');
+    if (request.method === 'GET' && request.url === '/v1/models') {
+      // Provide a native context window so the runtime does not need a public catalog fallback.
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ object: 'list', data: [
+        { id: modelName, object: 'model', context_length: 131_072 },
+      ] }));
+      return;
+    }
+    assert.equal(`${request.method} ${request.url}`, 'POST /v1/chat/completions', 'Unexpected model fixture request');
     const chunks = [];
     let bytes = 0;
     for await (const chunk of request) {
@@ -78,11 +86,19 @@ export async function startSmokeModel(root, note, artifact) {
     assert.equal(body.stream_options?.include_usage, true);
     const { messages } = body;
     if (!Object.hasOwn(body, 'tools')) {
-      assert.equal(messages.length, 2);
+      assert.ok(messages.length >= 2, 'Expected system instructions and a transcript for compression');
       assert.equal(messages[0].role, 'system');
-      assert.match(messages[0].content, /只输出摘要/);
-      assert.equal(messages[1].role, 'user');
-      const history = JSON.parse(messages[1].content);
+      assert.match(messages[0].content, /Merge the prior summary and the next transcript segment into a concise task handoff/);
+      assert.match(messages[0].content, /Output only the handoff; do not use tools\./);
+      const transcript = messages.at(-1);
+      assert.equal(transcript.role, 'user');
+      const languageEvidence = messages.slice(1, -1);
+      assert.ok(languageEvidence.length <= 1, 'Expected at most one language evidence note before the transcript');
+      for (const note of languageEvidence) {
+        assert.equal(note.role, 'assistant');
+        assert.match(note.content, /^\[Language evidence only: [^\]\n]+\]\n/);
+      }
+      const history = transcript.content.trim().split('\n').map(line => JSON.parse(line));
       assert.ok(history.some(message => message.role === 'user'), 'Expected prior conversation turns for compression');
       summaries++;
       response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
@@ -91,12 +107,18 @@ export async function startSmokeModel(root, note, artifact) {
     }
     assert.ok(Array.isArray(body.tools), 'Expected a model tool registry');
     assert.ok(body.tools.some(entry => entry.function.name === 'diagnose_game'));
-    assert.ok(body.tools.some(entry => entry.function.name === 'install_mod'));
+    assert.ok(body.tools.some(entry => entry.function.name === 'install_library_mod'));
     assert.ok(body.tools.some(entry => entry.function.name === 'trash_paths'));
-    const currentGame = JSON.parse(messages[0].content.split('。当前游戏: ').at(-1));
+    assert.equal(messages[0].role, 'system');
+    const encoded = messages[0].content.split('。当前工作区游戏: ')[1]?.split('。selection 为 null')[0];
+    assert.ok(encoded, 'Expected game workspace in the Agent system prompt');
+    const { selection, games } = JSON.parse(encoded);
+    assert.equal(games.length, 1);
+    const [currentGame] = games;
+    assert.ok(currentGame.id);
+    assert.deepEqual(selection, [currentGame.id], 'Expected an explicitly selected fixture game');
     assert.equal(pathIdentity(currentGame.rootPath), pathIdentity(root));
     assert.equal(currentGame.adapterSlug, 'minecraft-java');
-    assert.ok(currentGame.id);
     response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
 
     switch (++requests) {
@@ -120,18 +142,16 @@ export async function startSmokeModel(root, note, artifact) {
       }
       case 3:
         assert.deepEqual(messages.at(-1), { role: 'user', content: installPrompt });
-        response.end(tool('install_mod', 'smoke-install', { request: {
-          gameId: currentGame.id, artifactPath: artifact.path, filename: installFilename,
-          name: installName, modType: 'java-mod', expectedSha256: artifact.sha256, source: 'local',
+        response.end(tool('install_library_mod', 'smoke-install', { request: {
+          gameId: currentGame.id, artifactId: artifact.id, mode: 'adapter', modType: 'java-mod',
         } }) + choices({}, 'tool_calls') + end);
         break;
       case 4: {
         const result = toolResult(messages, 'smoke-install');
         assert.equal(result.status, 'committed');
-        const [{ operation: { src, dst, ...operation } }] = result.plan.entries;
-        assert.deepEqual(operation, { op: 'copy' });
-        assert.equal(pathIdentity(src), pathIdentity(artifact.path));
-        assert.equal(pathIdentity(dst), pathIdentity(artifact.destination));
+        assert.match(result.transactionId, /^txn_/);
+        assert.match(result.installId, /^install_/);
+        assert.equal(result.fileCount, 1);
         reply(response, installReply, 21);
         break;
       }

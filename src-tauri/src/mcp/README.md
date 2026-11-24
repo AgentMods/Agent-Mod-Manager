@@ -69,6 +69,22 @@ The four stock uvx launchers above pass their provider-specific `*_DOWNLOAD_DIR`
 to the child process, set to `downloads/incoming` in the active storage directory.
 Custom launch commands and arguments do not receive this override.
 
+The stock Nexus launcher also gives uvx `--isolated --find-links` with the
+packaged `nexus/` wheel directory. The directory supplies `1.0.0+amm.1` for
+file records whose GraphQL `uri` is a storage key. The regular index remains
+available for newer releases. A safe REST `file_name` or legacy archive name
+is preferred. Otherwise the downloader uses the detected extension and file
+UID to create the local name before requesting a mirror.
+
+The wheel and its source/test patch live in `scripts/vendor/`. To reproduce
+it, check out `GlossMod/nexusmods-mcp` at the `sourceCommit` in
+`scripts/mcp-runtime.lock.json` with LF line endings and apply
+`nexus-archive-filenames.patch` using `git apply`. In the upstream
+`pyproject.toml`, set the project version to `1.0.0+amm.1` and the build
+requirement to `hatchling==1.33.0`. Run `uv build --wheel` and compare the
+wheel SHA-256 with the runtime lock. The local wheel can be retired once the
+upstream index distributes the fix.
+
 Schema v9 migrates the stock 3DM stdio preset to the remote endpoint and revokes the old launch consent. Reconnect from Settings to use the new transport.
 
 - [Playwright MCP](https://github.com/microsoft/playwright-mcp) uses the bundled

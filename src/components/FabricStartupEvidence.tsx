@@ -1,16 +1,17 @@
+import { tr } from "@/lib/i18n";
 import { displayPath } from "@/lib/paths";
 import { Badge, PathText, date } from '@/components/ui';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 
 const labels = {
-  unavailable: '启动日志不可用',
-  unrecognized: '未识别到 Fabric 启动记录',
-  startup_observed: '日志记录了启动版本',
-  selection_reported: '日志记录了 Mod 选择清单',
-  partial_selection: '清单不完整',
-  resolution_failed: '日志记录了解析失败',
-  ambiguous: '无法区分启动记录',
+  get unavailable() { return tr("启动日志不可用"); },
+  get unrecognized() { return tr("未识别到 Fabric 启动记录"); },
+  get startup_observed() { return tr("日志记录了启动版本"); },
+  get selection_reported() { return tr("日志记录了 Mod 选择清单"); },
+  get partial_selection() { return tr("清单不完整"); },
+  get resolution_failed() { return tr("日志记录了解析失败"); },
+  get ambiguous() { return tr("无法区分启动记录"); },
 };
 
 export type FabricStartup = {
@@ -32,7 +33,7 @@ export function FabricStartupEvidence({ report }: { report: FabricStartup }) {
   return <section className="min-w-0" aria-labelledby="fabric-evidence-heading">
     <Card>
       <CardHeader className="flex flex-wrap items-center gap-2">
-        <CardTitle id="fabric-evidence-heading">Fabric 启动证据</CardTitle>
+        <CardTitle id="fabric-evidence-heading">{tr("Fabric 启动证据")}</CardTitle>
         <Badge tone={warning ? 'warning' : undefined}>{labels[report.status]}</Badge>
       </CardHeader>
       <CardContent className="flex min-w-0 flex-col gap-3">
@@ -42,25 +43,25 @@ export function FabricStartupEvidence({ report }: { report: FabricStartup }) {
         </dl>}
         <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-sm text-muted-foreground">
           <PathText>{displayPath(report.file)}{report.startupLine !== null && `:${report.startupLine}`}</PathText>
-          {report.selectionLine !== null && <span>清单第 {report.selectionLine} 行</span>}
-          {report.failureLine !== null && <span>失败第 {report.failureLine} 行</span>}
-          {report.modifiedAt && <span>日志更新时间 <time dateTime={report.modifiedAt}>{date(report.modifiedAt)}</time></span>}
+          {report.selectionLine !== null && <span>{tr("清单第 {selectionLine} 行", { selectionLine: report.selectionLine })}</span>}
+          {report.failureLine !== null && <span>{tr("失败第 {failureLine} 行", { failureLine: report.failureLine })}</span>}
+          {report.modifiedAt && <span>{tr("日志更新时间")} <time dateTime={report.modifiedAt}>{date(report.modifiedAt)}</time></span>}
         </div>
         {report.mods.length > 0 && <details className="min-w-0 rounded-md border p-3">
-          <summary className="cursor-pointer rounded-sm text-sm font-medium focus-visible:outline-2 focus-visible:outline-ring">{report.status === 'partial_selection' ? '日志中可读的 Mod' : '启动时选中的 Mod'}（{report.mods.length}）</summary>
+          <summary className="cursor-pointer rounded-sm text-sm font-medium focus-visible:outline-2 focus-visible:outline-ring">{report.status === 'partial_selection' ? tr("日志中可读的 Mod") : tr("启动时选中的 Mod")}（{report.mods.length}）</summary>
           <div className="mt-3 min-w-0">
-            <Table aria-label="Fabric Mod 选择清单">
-              <TableHeader><TableRow><TableHead scope="col">Mod ID</TableHead><TableHead scope="col">版本</TableHead><TableHead scope="col">行号</TableHead></TableRow></TableHeader>
+            <Table aria-label={tr("Fabric Mod 选择清单")}>
+              <TableHeader><TableRow><TableHead scope="col">Mod ID</TableHead><TableHead scope="col">{tr("版本")}</TableHead><TableHead scope="col">{tr("行号")}</TableHead></TableRow></TableHeader>
               <TableBody>{report.mods.map(mod => <TableRow key={mod.line}>
-                <TableCell className="whitespace-normal"><PathText>{mod.id}</PathText>{mod.nested && <> <Badge>内嵌</Badge></>}</TableCell>
+                <TableCell className="whitespace-normal"><PathText>{mod.id}</PathText>{mod.nested && <> <Badge>{tr("内嵌")}</Badge></>}</TableCell>
                 <TableCell className="whitespace-normal"><PathText>{mod.version}</PathText></TableCell>
                 <TableCell>{mod.line}</TableCell>
               </TableRow>)}</TableBody>
             </Table>
           </div>
         </details>}
-        {report.declaredCount !== null && <p className="text-sm text-muted-foreground">日志声明 {report.declaredCount} 项{report.omittedCount > 0 && <> · <span>已省略 {report.omittedCount} 项</span></>}</p>}
-        <p className="text-sm text-muted-foreground">这是日志中的启动记录，不代表当前运行状态或初始化成功。</p>
+        {report.declaredCount !== null && <p className="text-sm text-muted-foreground">{tr("日志声明 {declaredCount} 项", { declaredCount: report.declaredCount })}{report.omittedCount > 0 && <> · <span>{tr("已省略 {omittedCount} 项", { omittedCount: report.omittedCount })}</span></>}</p>}
+        <p className="text-sm text-muted-foreground">{tr("这是日志中的启动记录，不代表当前运行状态或初始化成功。")}</p>
       </CardContent>
     </Card>
   </section>;

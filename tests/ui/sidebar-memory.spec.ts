@@ -29,3 +29,28 @@ test("损坏的侧边栏记录被忽略", async ({page}) => {
   await page.goto("/");
   await expect(rail(page)).toBeVisible();
 });
+
+test("侧栏赞助链接通过系统浏览器打开赞助页", async ({page}) => {
+  await installMockTauri(page);
+  await page.goto("/");
+  const sponsor = page.getByRole("link", {name: "赞助"});
+  await expect(sponsor).toHaveAttribute("href", "https://sponsor.aoe.top/");
+  await expect(sponsor).toHaveText("");
+  const theme = page.getByRole("button", {name: /切换(亮|暗)色主题/});
+  const sponsorBox = (await sponsor.boundingBox())!;
+  const themeBox = (await theme.boundingBox())!;
+  expect(sponsorBox.width).toBe(themeBox.width);
+  expect(sponsorBox.height).toBe(themeBox.height);
+  if (await rail(page).getAttribute("data-state") === "expanded") {
+    expect(sponsorBox.x + sponsorBox.width).toBe(themeBox.x);
+    expect(sponsorBox.y).toBe(themeBox.y);
+  } else {
+    expect(sponsorBox.y + sponsorBox.height).toBe(themeBox.y);
+    expect(sponsorBox.x).toBe(themeBox.x);
+  }
+  await sponsor.focus();
+  await sponsor.press("Enter");
+  expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls)).toContainEqual({
+    command: "plugin:opener|open_url", args: {url: "https://sponsor.aoe.top/"},
+  });
+});

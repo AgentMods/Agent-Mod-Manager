@@ -43,6 +43,70 @@ fn backfills_active_legacy_and_rejects_non_committed_or_hidden() {
 }
 
 #[test]
+fn language_changes_apply_at_enqueue_and_do_not_rewrite_existing_jobs() {
+    let (_temp, engine, _) = crate::transaction::tests::setup();
+    let db = &engine.db;
+    crate::app_locale::set(db, Some("ja".into())).unwrap();
+    for id in ["queued", "completed"] {
+        install(db, id, "Sound Overhaul", json!({}));
+    }
+    initialize(db).unwrap();
+    let completed = db
+        .conn()
+        .query_row(
+            "SELECT locale FROM mod_organization_jobs WHERE install_id='completed'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap();
+    assert_eq!(completed, "ja");
+    db.conn()
+        .execute(
+            "UPDATE mod_organization_jobs SET status='done' WHERE install_id='completed'",
+            [],
+        )
+        .unwrap();
+    let mut metadata = json!({});
+    crate::mod_organization::stage(db, &mut metadata, Some(suggestion("Old Suggestion")));
+    assert_eq!(metadata["organization"]["locale"], "ja");
+    install(db, "new", "Texture Pack", metadata);
+    db.conn().execute_batch("INSERT INTO file_transactions(id,kind,status,plan_json,created_at) VALUES ('t','install','committed','{}','now'); INSERT INTO install_transactions VALUES ('new','t','install','now');").unwrap();
+    crate::app_locale::set(db, Some("de".into())).unwrap();
+    {
+        let mut conn = db.conn();
+        let tx = conn.transaction().unwrap();
+        assert!(crate::mod_organization::finalize(&tx, "t").unwrap());
+        tx.commit().unwrap();
+    }
+    let conn = db.conn();
+    for (id, expected, status) in [
+        ("queued", "ja", "pending"),
+        ("completed", "ja", "done"),
+        ("new", "de", "pending"),
+    ] {
+        let (locale, current_status) = conn
+            .query_row(
+                "SELECT locale,status FROM mod_organization_jobs WHERE install_id=?1",
+                [id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (locale.as_str(), current_status.as_str()),
+            (expected, status)
+        );
+    }
+    let display: Option<String> = conn
+        .query_row(
+            "SELECT display_name FROM install_organizations WHERE install_id='new'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_ne!(display.as_deref(), Some("Old Suggestion"));
+}
+
+#[test]
 fn finalize_is_atomic_and_retry_allows_next_job() {
     let (_temp, engine, _) = crate::transaction::tests::setup();
     let db = &engine.db;

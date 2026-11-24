@@ -68,6 +68,12 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 // process-start and plugin tools are not automatically exported.
 const NATIVE_TOOLS: &[&str] = &[
     "scan_games",
+    "list_games",
+    "register_game",
+    "update_game",
+    "remove_game",
+    "launch_game",
+    "set_game_adapter",
     "read_dir",
     "read_file",
     "extract_preview",
@@ -889,7 +895,7 @@ impl DesktopSession {
             &conv,
             Some(&message.id),
             "tool-result",
-            json!({"toolCallId":call.id,"status":status,"result":value}),
+            json!({"toolCallId":call.id,"name":name,"status":status,"result":value}),
         )?;
         runtime.events.emit(
             &turn,

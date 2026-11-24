@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import * as React from "react"
 import { cva, type VariantProps } from "class-variance-authority"
 import { cn } from "@/lib/utils"
@@ -194,8 +195,8 @@ function Sidebar({
           side={side}
         >
           <SheetHeader className="sr-only">
-            <SheetTitle>导航</SheetTitle>
-            <SheetDescription>主导航</SheetDescription>
+            <SheetTitle>{tr("导航")}</SheetTitle>
+            <SheetDescription>{tr("主导航")}</SheetDescription>
           </SheetHeader>
           <div className="flex h-full w-full flex-col">{children}</div>
         </SheetContent>
@@ -272,7 +273,7 @@ function SidebarTrigger({
       {...props}
     >
       <PanelLeftIcon />
-      <span className="sr-only">切换侧边栏</span>
+      <span className="sr-only">{tr("切换侧边栏")}</span>
     </Button>
   )
 }
@@ -284,10 +285,10 @@ function SidebarRail({ className, ...props }: React.ComponentProps<"button">) {
     <button
       data-sidebar="rail"
       data-slot="sidebar-rail"
-      aria-label="切换侧边栏"
+      aria-label={tr("切换侧边栏")}
       tabIndex={-1}
       onClick={toggleSidebar}
-      title="切换侧边栏"
+      title={tr("切换侧边栏")}
       className={cn(
         "absolute inset-y-0 z-20 hidden w-4 -translate-x-1/2 transition-all ease-linear group-data-[side=left]:-right-4 group-data-[side=right]:left-0 after:absolute after:inset-y-0 after:left-1/2 after:w-[2px] hover:after:bg-sidebar-border sm:flex",
         "in-data-[side=left]:cursor-w-resize in-data-[side=right]:cursor-e-resize",

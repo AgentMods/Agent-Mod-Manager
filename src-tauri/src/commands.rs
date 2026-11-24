@@ -119,6 +119,22 @@ pub async fn mcp_list(state: State<'_, AppServices>) -> AppResult<Vec<crate::mcp
     })
     .await
 }
+/// Desktop-only: return presence for this server's saved references, never their values.
+#[tauri::command]
+pub async fn mcp_credential_status(
+    state: State<'_, AppServices>,
+    agent: State<'_, AgentRuntime>,
+    id: String,
+) -> AppResult<std::collections::BTreeMap<String, bool>> {
+    crate::mcp_connections::require_external(&id)?;
+    let servers = crate::mcp::McpServers::new(state.engine.db.clone());
+    let settings = agent.settings.clone();
+    blocking(servers, move |servers| {
+        servers.credential_status(&settings, &id)
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn mcp_create(
     state: State<'_, AppServices>,
@@ -323,18 +339,25 @@ use crate::{
     agent::{
         approval::ApprovalResponse,
         events::AgentEvent,
-        runtime::{AgentRuntime, TurnRequest},
+        runtime::{AgentRuntime, PromptOrigin, TurnRequest},
     },
     history::{Conversation, ConversationDetail, History},
     settings::AppSettings,
 };
 
 #[tauri::command]
-pub async fn start_turn(state: State<'_, AgentRuntime>, request: TurnRequest) -> AppResult<String> {
-    blocking(state.inner().clone(), move |agent| {
-        agent.start_turn(request)
+pub async fn start_turn(
+    state: State<'_, AgentRuntime>,
+    request: TurnRequest,
+    origin: Option<PromptOrigin>,
+) -> AppResult<String> {
+    let turn_id = blocking(state.inner().clone(), move |agent| match origin {
+        Some(origin) => agent.start_turn_with_origin(request, origin),
+        None => agent.start_turn(request),
     })
-    .await
+    .await?;
+    crate::analytics::track("agent_turn_accepted");
+    Ok(turn_id)
 }
 #[tauri::command]
 pub async fn restart_turn(
@@ -343,10 +366,12 @@ pub async fn restart_turn(
     message_id: String,
     edit: bool,
 ) -> AppResult<String> {
-    blocking(state.inner().clone(), move |agent| {
+    let conversation_id = blocking(state.inner().clone(), move |agent| {
         agent.restart_turn(request, &message_id, edit)
     })
-    .await
+    .await?;
+    crate::analytics::track("agent_turn_restart_accepted");
+    Ok(conversation_id)
 }
 #[tauri::command]
 pub async fn cancel_turn(
@@ -625,10 +650,12 @@ pub async fn confirm_game_identity(
     name: String,
     confirmation: String,
 ) -> AppResult<games::Game> {
-    blocking(state.engine.clone(), move |engine| {
+    let game = blocking(state.engine.clone(), move |engine| {
         crate::game_identity::confirm(&engine, &search_id, candidate_index, &name, &confirmation)
     })
-    .await
+    .await?;
+    crate::analytics::track("game_registered");
+    Ok(game)
 }
 
 #[tauri::command]
@@ -656,7 +683,7 @@ pub async fn register_game(
     cloud_adapter: Option<crate::manager_catalog::CatalogReleaseSelection>,
     discovery_name: Option<String>,
 ) -> AppResult<games::Game> {
-    if let Some(release) = cloud_adapter {
+    let game = if let Some(release) = cloud_adapter {
         if from_discovery != Some(true) || adapter_slug.is_some() {
             return Err(AppError::Invalid(
                 "只有未选本地适配包的扫描结果才能自动安装云端适配包".into(),
@@ -670,26 +697,23 @@ pub async fn register_game(
         let preview =
             crate::manager_catalog::preview(&state.engine, &release.plugin_id, &release.release_id)
                 .await?;
-        return blocking(state.engine.clone(), move |e| {
+        blocking(state.engine.clone(), move |e| {
             crate::plugin_workflow::register_catalog_game(&e, preview, registration)
         })
-        .await;
-    }
-    blocking(state.engine.clone(), move |e| {
-        let _guard = crate::transaction::write_lock();
-        let directory = directory.canonicalize()?;
-        if e.paths.overlaps_storage(&directory) {
-            return Err(AppError::Denied(
-                "游戏目录与管理器数据目录不能互相包含".into(),
-            ));
-        }
-        if from_discovery == Some(true) {
-            games::register_discovered_game(&e.db, &directory, adapter_slug.as_deref())
-        } else {
-            games::register_game(&e.db, &directory, adapter_slug.as_deref())
-        }
-    })
-    .await
+        .await?
+    } else {
+        blocking(state.engine.clone(), move |e| {
+            crate::game_actions::register_local_from_desktop(
+                &e,
+                &directory,
+                adapter_slug.as_deref(),
+                from_discovery == Some(true),
+            )
+        })
+        .await?
+    };
+    crate::analytics::track("game_registered");
+    Ok(game)
 }
 
 #[tauri::command]
@@ -801,7 +825,12 @@ pub async fn open_game_location(
             return app
                 .opener()
                 .reveal_item_in_dir(&directory)
-                .map_err(|error| AppError::Other(format!("无法打开目录: {error}")));
+                .map_err(|error| {
+                    AppError::Presented(crate::error::NativeMessage::new(
+                        "game.open_folder_failed",
+                        [("detail", error.to_string())],
+                    ))
+                });
         }
         let directory = user_path(&directory)
             .into_owned()
@@ -810,30 +839,24 @@ pub async fn open_game_location(
             .map_err(|_| AppError::Invalid("目录路径包含无法表示的字符".into()))?;
         app.opener()
             .open_path(directory, None::<&str>)
-            .map_err(|error| AppError::Other(format!("无法打开目录: {error}")))
+            .map_err(|error| {
+                AppError::Presented(crate::error::NativeMessage::new(
+                    "game.open_folder_failed",
+                    [("detail", error.to_string())],
+                ))
+            })
     })
     .await
 }
 
 #[tauri::command]
-pub async fn launch_game(
-    app: AppHandle,
-    state: State<'_, AppServices>,
-    id: String,
-) -> AppResult<()> {
-    use crate::game_actions::{self, LaunchAction};
+pub async fn launch_game(state: State<'_, AppServices>, id: String) -> AppResult<()> {
     blocking(state.engine.clone(), move |e| {
-        let _guard = crate::transaction::write_lock();
-        let game = games::get_game(&e.db, &id)?;
-        match game_actions::decide_launch(&e.paths, &game)? {
-            LaunchAction::Program(program) => game_actions::launch_program(&program),
-            LaunchAction::Steam(url) => app
-                .opener()
-                .open_url(url, None::<&str>)
-                .map_err(|error| AppError::Other(format!("无法通过 Steam 启动游戏: {error}"))),
-        }
+        crate::game_actions::launch_from_desktop(&e, &id)
     })
-    .await
+    .await?;
+    crate::analytics::track("game_launch_requested");
+    Ok(())
 }
 
 async fn blocking<S: Send + 'static, T: Send + 'static>(
@@ -875,6 +898,19 @@ pub(crate) async fn migrate_storage(
     storage.schedule(&state.engine, &parent)?;
     app.request_restart();
     Ok(())
+}
+
+#[tauri::command]
+pub fn get_app_locale(state: State<'_, AppServices>) -> AppResult<crate::app_locale::AppLocale> {
+    crate::app_locale::get(&state.engine.db)
+}
+
+#[tauri::command]
+pub fn set_app_locale(
+    state: State<'_, AppServices>,
+    locale: Option<String>,
+) -> AppResult<crate::app_locale::AppLocale> {
+    crate::app_locale::set(&state.engine.db, locale)
 }
 
 #[tauri::command]
@@ -1012,7 +1048,9 @@ pub async fn install_manager_plugin(
     plugin_id: String,
     release_id: String,
 ) -> AppResult<()> {
-    crate::manager_catalog::install(&state.engine, &plugin_id, &release_id).await
+    crate::manager_catalog::install(&state.engine, &plugin_id, &release_id).await?;
+    crate::analytics::track("plugin_installed");
+    Ok(())
 }
 
 #[tauri::command]
@@ -1320,20 +1358,53 @@ pub async fn get_file_plan(state: State<'_, AppServices>, plan_id: String) -> Ap
     .map(FilePlan::into_user_paths)
 }
 
+fn desktop_plan_event(
+    db: &crate::db::Db,
+    plan_id: &str,
+    registered_plugins: &[String],
+) -> Option<&'static str> {
+    // Workflow records identify the exact committed plan; summaries and paths
+    // are not provenance. A lookup failure must not fail the already-applied plan.
+    let (import, restore, plugin): (bool, bool, Option<String>) = db
+        .conn()
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM desktop_archive_imports WHERE transaction_id=?1),
+                    EXISTS(SELECT 1 FROM trash_restore_links WHERE transaction_id=?1),
+                    (SELECT slug FROM active_plugin_deployments WHERE transaction_id=?1)",
+            [plan_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok()?;
+    match (import, restore, plugin) {
+        (true, false, None) => Some("mod_archive_import_committed"),
+        (false, true, None) => Some("trash_restored"),
+        (false, false, Some(slug)) if registered_plugins.contains(&slug) => {
+            Some("plugin_installed")
+        }
+        _ => None,
+    }
+}
+
 /// Desktop confirmation endpoint. Agent tools must use the separate approval
 /// coordinator and may not invoke this IPC endpoint.
 #[tauri::command]
 pub async fn apply_plan(state: State<'_, AppServices>, plan_id: String) -> AppResult<FilePlan> {
-    blocking(state.engine.for_local_agent(), move |e| {
+    let (plan, event) = blocking(state.engine.for_local_agent(), move |e| {
         e.approve_plan(&plan_id)?;
         let result = e.apply_file_ops(&plan_id)?;
         crate::install::reconcile(&e.db)?;
-        crate::plugin_workflow::reconcile_after_apply(&e, &result)?;
+        let plugins = crate::plugin_workflow::reconcile_after_apply(&e, &result)?;
         crate::skills::reconcile_deployments(&e)?;
-        Ok(result)
+        let event = crate::analytics::enabled()
+            .then(|| desktop_plan_event(&e.db, &result.id, &plugins.registered))
+            .flatten();
+        Ok((result, event))
     })
-    .await
-    .map(FilePlan::into_user_paths)
+    .await?;
+    if let Some(event) = event {
+        crate::analytics::track(event);
+    }
+    Ok(plan.into_user_paths())
 }
 
 #[tauri::command]
@@ -1430,7 +1501,9 @@ pub async fn rollback_transaction(
         crate::skills::reconcile_deployments(&e)?;
         Ok(())
     })
-    .await
+    .await?;
+    crate::analytics::track("transaction_rolled_back");
+    Ok(())
 }
 
 #[tauri::command]
@@ -1596,5 +1669,7 @@ pub async fn set_mod_tags(
     blocking(state.engine.clone(), move |e| {
         crate::mod_organization::set_mod_tags(&e.db, &game_id, &install_id, &tag_ids)
     })
-    .await
+    .await?;
+    crate::analytics::track("mod_tags_updated");
+    Ok(())
 }

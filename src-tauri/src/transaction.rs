@@ -1402,6 +1402,8 @@ impl FileEngine {
         tx.commit()?;
         drop(conn);
         if organization_queued {
+            // Finalization queues the job exactly once per committed managed install.
+            crate::analytics::track("mod_installed");
             self.organization_wake.notify_one();
         }
         if let Some(slug) = plugin_changed {

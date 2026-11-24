@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useMutation, useMutationState, useQueryClient } from "@tanstack/react-query";
 import { api } from "./api";
 import { useUI } from "./store";
@@ -26,7 +27,7 @@ export function usePluginChange() {
       }
       const keys = ["plugins", "skills", "mcp"];
       await Promise.all(keys.map(key => client.invalidateQueries({ queryKey: [key] })));
-      notify(`${change.action === "install" ? "已安装" : "已移除"}「${change.name}」`);
+      notify(`${change.action === "install" ? tr("已安装") : tr("已移除")}「${change.name}」`);
     },
   });
   function run(change: PluginChange, afterSuccess?: () => void) {

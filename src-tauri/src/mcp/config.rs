@@ -897,6 +897,30 @@ impl McpServers {
         }
     }
 
+    pub(crate) fn credential_status(
+        &self,
+        settings: &Settings,
+        id: &str,
+    ) -> AppResult<BTreeMap<String, bool>> {
+        let config = self.get(id)?;
+        let mut status = BTreeMap::new();
+        for key in config
+            .env_secret_refs
+            .into_values()
+            .chain(config.bearer_secret_ref)
+        {
+            if let std::collections::btree_map::Entry::Vacant(entry) = status.entry(key) {
+                validate_secret_ref(entry.key())?;
+                let configured = settings
+                    .read_secret(entry.key())
+                    .map_err(|_| AppError::Other("无法读取 MCP 凭据状态".into()))?
+                    .is_some_and(|value| !value.trim().is_empty());
+                entry.insert(configured);
+            }
+        }
+        Ok(status)
+    }
+
     pub fn write_secret(&self, settings: &Settings, key: &str, value: &str) -> AppResult<()> {
         validate_secret_ref(key)?;
         settings.write_secret(key, value)

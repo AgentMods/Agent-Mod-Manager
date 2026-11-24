@@ -74,8 +74,9 @@ registration. A changed directory, expired evidence or invalid index fails close
 `preview_game_identity` is local/read-only. `search_game_identity` uses the
 publication effect so default and AutoApprove sessions require review of the
 exact outbound query and Bing destination. FullTrust still obeys validation and
-path restrictions. The Agent cannot confirm or register the result; the user
-must do so in the desktop library. Neither identity tool is automatically added
+path restrictions. Users confirm an online identity result in the desktop library.
+The separate `register_game` tool registers an explicitly requested local directory
+using local evidence. It does not consume or confirm an online search result. Neither identity tool is automatically added
 to the external MCP server's deliberate native-tool allowlist.
 
 ## Verification And Limits

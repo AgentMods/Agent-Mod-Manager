@@ -346,7 +346,7 @@ async fn exact_zip_metadata_and_every_durable_transition_complete_without_duplic
     assert_eq!(zip.len(), 2);
     for (i, expected) in p.files.iter().enumerate() {
         let mut entry = zip.by_index(i).unwrap();
-        assert_eq!(entry.name(), expected.name);
+        assert_eq!(entry.name().unwrap(), expected.name);
         assert_eq!(entry.unix_mode().unwrap() & 0o777, 0o644);
         assert_eq!(entry.compression(), zip::CompressionMethod::Stored);
         let mut bytes = Vec::new();

@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import type { Conversation, Game, GameWorkspace } from "./types";
 
 export function conversationWorkspace(conversation: Conversation): GameWorkspace {
@@ -6,8 +7,9 @@ export function conversationWorkspace(conversation: Conversation): GameWorkspace
 }
 
 export function workspaceLabel(workspace: GameWorkspace, games: Game[] | undefined): string {
-  if (workspace === null) return "全部游戏";
-  if (!workspace.length) return "未选择游戏";
-  if (workspace.length === 1) return games?.find(game => game.id === workspace[0])?.name ?? "已选 1 款游戏";
-  return `已选 ${workspace.length} 款游戏`;
+  if (workspace === null) return tr("全部游戏");
+  if (!workspace.length) return tr("未选择游戏");
+  const game = workspace.length === 1 ? games?.find(game => game.id === workspace[0]) : undefined;
+  if (game) return game.name;
+  return tr("已选 {length} 款游戏", { length: workspace.length });
 }

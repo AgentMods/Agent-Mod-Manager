@@ -135,6 +135,7 @@ for (const theme of ["light", "dark"] as const) {
     await page.getByRole("button", {name: "游戏库", exact: true}).click();
     await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
     await page.getByRole("button", {name: "设置", exact: true}).click();
+    await page.getByRole("tab", {name: "AI 与模型", exact: true}).click();
     await page.getByRole("button", {name: "获取模型列表"}).click();
 
     const picker = page.getByRole("group", {name: "服务商模型（可多选）"});
@@ -167,6 +168,7 @@ test("model credentials use the dedicated secret command, not public settings", 
   await page.goto("/");
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
   await page.getByRole("button", {name: "设置", exact: true}).click();
+  await page.getByRole("tab", {name: "AI 与模型", exact: true}).click();
   await page.getByLabel("API 密钥", {exact: true}).fill("sk-fixture-only");
   await page.getByRole("button", {name: "手动添加", exact: true}).click();
   await page.getByRole("textbox", {name: "新模型 实际请求模型", exact: true}).fill("test-provider-model");
@@ -343,7 +345,7 @@ test("empty package center stays empty until an external draft is installed", as
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
   await page.getByRole("button", {name: "插件中心", exact: true}).click();
 
-  await expect(page.getByRole("heading", {name: "适配包", exact: true})).toBeVisible();
+  await expect(page.getByRole("heading", {name: "插件中心", exact: true})).toBeVisible();
   await expect(page.getByText("暂无已安装适配包", {exact: true})).toBeVisible();
   await expect(page.getByRole("row")).toHaveCount(1);
   await expect(page.getByRole("heading", {name: "适配包详情", exact: true})).toBeVisible();
@@ -486,12 +488,12 @@ test("Settings separates system and standalone Skills from game Skills", async (
 
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await expect(page.getByRole("tablist", {name: "设置分类"}).getByRole("tab")).toHaveText([
-    "AI 与模型", "工具", "Skills", "外观与存储",
+    "外观与存储", "AI 与模型", "工具", "Skills",
   ]);
   const panel = page.getByRole("tabpanel", {name: "Skills", exact: true});
   const system = panel.getByRole("region", {name: "系统 Skills", exact: true});
-  await expect(system.getByRole("row")).toHaveCount(6);
-  for (const name of ["创建与修改适配包", "联网搜索", "从网站下载 Mod", "定制 Mod 委托", "安装后整理 Mod"]) {
+  await expect(system.getByRole("row")).toHaveCount(8);
+  for (const name of ["创建与修改适配包", "联网搜索", "从网站下载 Mod", "定制 Mod 委托", "安装 Mod", "安装后整理 Mod", "卸载 Mod"]) {
     const button = system.getByRole("button", {name, exact: true});
     await expect(button).toBeVisible();
     const row = system.getByRole("row").filter({has: page.getByRole("button", {name, exact: true})});

@@ -1,7 +1,7 @@
 //! Application-owned MCP launchers. Bare aliases never fall back to a binary on PATH.
 use crate::error::{AppError, AppResult};
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, File},
     io::{self, Seek},
     path::{Path, PathBuf},
@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 const PYPI_INDEX: &str = "https://pypi.tuna.tsinghua.edu.cn/simple";
 const NPM_REGISTRY: &str = "https://registry.npmmirror.com";
 const NPX_CLI: &str = "npm/bin/npx-cli.js";
+const NEXUS_WHEEL: &str = "nexus/glossmod_nexusmods_mcp-1.0.0+amm.1-py3-none-any.whl";
 const BING_HELPER: &str = "bin/bing-search.cjs";
 const PLAYWRIGHT_PACKAGE: &str = "bin/node_modules/playwright-core/package.json";
 const PLAYWRIGHT_CLI: &str = "bin/node_modules/playwright-core/cli.js";
@@ -59,8 +60,7 @@ impl McpRuntime {
     ) -> AppResult<Command> {
         let path = std::env::var_os("PATH");
         let Some(launcher) = Launcher::from_command(executable) else {
-            let mut cmd = Command::new(executable);
-            cmd.env_clear();
+            let mut cmd = background_command(executable);
             if let Some(path) = path {
                 cmd.env("PATH", path);
             }
@@ -68,6 +68,15 @@ impl McpRuntime {
         };
         let root = self.prepare_root(cancel, Bundle::root).await?;
         bundled_command(launcher, &root, path)
+    }
+
+    pub(super) async fn nexus_command(&self, cancel: &CancellationToken) -> AppResult<Command> {
+        let root = self.prepare_root(cancel, Bundle::root).await?;
+        verify_files([root.join(NEXUS_WHEEL)])?;
+        let mut cmd = bundled_command(Launcher::Uvx, &root, std::env::var_os("PATH"))?;
+        cmd.args(["--isolated", "--find-links"])
+            .arg(dunce::simplified(&root).join("nexus"));
+        Ok(cmd)
     }
 
     pub(crate) async fn bing_search_command(
@@ -234,20 +243,26 @@ fn windows_installer_proxy(install: &mut Command) {
     }
 }
 
+fn background_command(program: impl AsRef<OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_clear();
+    // MCP helpers communicate over pipes and can be restored before the first UI interaction.
+    #[cfg(windows)]
+    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    cmd
+}
+
 fn browser_node(root: &Path, script: &str) -> Command {
     let root = dunce::simplified(root);
-    let mut cmd = Command::new(root.join("bin").join(NODE));
+    let mut cmd = background_command(root.join("bin").join(NODE));
     cmd.arg("--no-global-search-paths")
         .arg(root.join(script))
-        .kill_on_drop(true)
-        .env_clear();
+        .kill_on_drop(true);
     for key in BROWSER_ENV {
         if let Some(value) = std::env::var_os(key) {
             cmd.env(key, value);
         }
     }
-    #[cfg(windows)]
-    cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     cmd
 }
 
@@ -259,8 +274,8 @@ fn bundled_command(launcher: Launcher, root: &Path, path: Option<OsString>) -> A
         std::iter::once(bin.clone()).chain(path.iter().flat_map(std::env::split_paths)),
     )
     .map_err(|_| AppError::Invalid("内置运行时路径无法加入子进程 PATH".into()))?;
-    let mut cmd = Command::new(bin.join(if launcher == Launcher::Npx { NODE } else { UVX }));
-    cmd.env_clear().env("PATH", path);
+    let mut cmd = background_command(bin.join(if launcher == Launcher::Npx { NODE } else { UVX }));
+    cmd.env("PATH", path);
     match launcher {
         Launcher::Npx => {
             cmd.arg(root.join(NPX_CLI))
@@ -349,7 +364,7 @@ fn extract(input: File, root: &Path) -> AppResult<()> {
     let mut zip = zip::ZipArchive::new(input)?;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i)?;
-        let path = crate::paths::safe_join(root, entry.name())?;
+        let path = crate::paths::safe_join(root, &entry.name()?)?;
         if entry.is_symlink() {
             return Err(AppError::UnsafeArchive(
                 "内置运行时不允许包含符号链接".into(),
@@ -440,6 +455,38 @@ mod tests {
         let reopened = McpRuntime::bundled(dir.join("fixture.zip"), dir.join("cache"));
         reopened.command("uvx", &cancel).await.unwrap();
         assert_eq!(dir.join("cache").read_dir().unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn nexus_launcher_adds_the_packaged_wheel_directory_as_one_argument() {
+        let tmp = tempfile::Builder::new()
+            .prefix("nexus runtime ")
+            .tempdir()
+            .unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let cancel = CancellationToken::new();
+        let runtime = archive(&dir, &[NEXUS_WHEEL]);
+        let cmd = runtime.nexus_command(&cancel).await.unwrap();
+        let cmd = cmd.as_std();
+        let args: Vec<_> = cmd.get_args().collect();
+        assert!(cmd.get_program().to_string_lossy().ends_with(UVX));
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], "--isolated");
+        assert_eq!(args[1], "--find-links");
+        let wheel = Path::new(args[2]).join(Path::new(NEXUS_WHEEL).file_name().unwrap());
+        assert!(wheel.is_file());
+        fs::remove_file(wheel).unwrap();
+        assert!(runtime.nexus_command(&cancel).await.is_err());
+        assert_eq!(
+            runtime
+                .command("uvx", &cancel)
+                .await
+                .unwrap()
+                .as_std()
+                .get_args()
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]

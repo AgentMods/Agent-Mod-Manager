@@ -1,19 +1,39 @@
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::BTreeMap, sync::LazyLock};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering::Relaxed},
+        LazyLock,
+    },
+};
 
 // The runtime still consumes contiguous strings. Budget the live model buffers against
 // local memory, not a provider token/count limit. Leave room for allocator growth,
 // reqwest, SQLite, IPC and the rest of the desktop process. Every concurrent model
 // attempt shares the reservations, including the completion until it is consumed.
-static RESERVED_MODEL_MEMORY: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static RESERVED_MODEL_MEMORY: AtomicUsize = AtomicUsize::new(0);
+
+// AtomicUsize::try_update requires Rust 1.95. These counters only track capacity.
+pub(crate) fn update_memory_reservation(
+    pool: &AtomicUsize,
+    mut next_total: impl FnMut(usize) -> Option<usize>,
+) -> Result<usize, usize> {
+    let mut reserved = pool.load(Relaxed);
+    loop {
+        let next = next_total(reserved).ok_or(reserved)?;
+        match pool.compare_exchange_weak(reserved, next, Relaxed, Relaxed) {
+            Ok(previous) => return Ok(previous),
+            Err(current) => reserved = current,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct ResponseLimit {
     bytes: usize,
-    pool: &'static std::sync::atomic::AtomicUsize,
+    pool: &'static AtomicUsize,
 }
 
 impl Default for ResponseLimit {
@@ -48,7 +68,7 @@ impl ResponseLimit {
     pub(super) fn for_test(bytes: usize) -> Self {
         Self {
             bytes,
-            pool: Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0))),
+            pool: Box::leak(Box::new(AtomicUsize::new(0))),
         }
     }
 }
@@ -127,6 +147,10 @@ pub(crate) fn available_memory() -> Option<usize> {
 #[cfg(target_os = "macos")]
 pub(crate) fn available_memory() -> Option<usize> {
     // Retain one send right for the process instead of acquiring one per request.
+    #[allow(
+        deprecated,
+        reason = "libc recommends a separate mach2 dependency for this one binding"
+    )]
     static HOST: LazyLock<libc::mach_port_t> = LazyLock::new(|| unsafe { libc::mach_host_self() });
     let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64_data_t>::zeroed();
     let mut count = libc::HOST_VM_INFO64_COUNT;
@@ -166,49 +190,41 @@ fn response_memory_error() -> AppError {
 
 impl ResponseMemory {
     fn grow(&mut self, bytes: usize) -> AppResult<()> {
-        use std::sync::atomic::Ordering::Relaxed;
         if bytes == 0 {
             return Ok(());
         }
-        self.limit
-            .pool
-            .fetch_update(Relaxed, Relaxed, |reserved| {
-                reserved
-                    .checked_add(bytes)
-                    .filter(|&total| total <= self.limit.bytes)
-            })
-            .map_err(|_| response_memory_error())?;
+        update_memory_reservation(self.limit.pool, |reserved| {
+            reserved
+                .checked_add(bytes)
+                .filter(|&total| total <= self.limit.bytes)
+        })
+        .map_err(|_| response_memory_error())?;
         self.held += bytes;
         Ok(())
     }
 
     fn reserve_buffer(&mut self, needed: usize, capacity: usize) -> AppResult<usize> {
-        use std::sync::atomic::Ordering::Relaxed;
         let minimum = needed - capacity;
         let preferred = needed.max(capacity.saturating_mul(2)) - capacity;
         let mut extra = 0;
         // Grow geometrically up to the available budget. Avoid repeatedly
         // reallocating one byte at a time as a remote response nears the limit.
-        self.limit
-            .pool
-            .fetch_update(Relaxed, Relaxed, |reserved| {
-                let available = self.limit.bytes.checked_sub(reserved)?;
-                if available < minimum {
-                    return None;
-                }
-                extra = preferred.min(available);
-                Some(reserved + extra)
-            })
-            .map_err(|_| response_memory_error())?;
+        update_memory_reservation(self.limit.pool, |reserved| {
+            let available = self.limit.bytes.checked_sub(reserved)?;
+            if available < minimum {
+                return None;
+            }
+            extra = preferred.min(available);
+            Some(reserved + extra)
+        })
+        .map_err(|_| response_memory_error())?;
         self.held += extra;
         Ok(extra)
     }
 
     fn release(&mut self, bytes: usize) {
         self.held -= bytes;
-        self.limit
-            .pool
-            .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.limit.pool.fetch_sub(bytes, Relaxed);
     }
 
     fn json(limit: ResponseLimit, bytes: &[u8]) -> AppResult<Self> {

@@ -3,7 +3,6 @@ use crate::{
     error::{AppError, AppResult},
     mod_organization::{clean, insert_automatic_tags, local_tags, OrganizationSuggestion},
     mod_organization_fallback::display_name as fallback_display_name,
-    settings::effective_mod_locale,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
@@ -32,7 +31,7 @@ fn eligible() -> String {
 pub(crate) fn initialize(db: &Db) -> AppResult<()> {
     let mut conn = db.conn();
     let tx = conn.transaction()?;
-    let locale = effective_mod_locale(&tx);
+    let locale = crate::app_locale::effective_conn(&tx);
     let ids = {
         let mut stmt = tx.prepare(&format!("SELECT installs.id FROM installs JOIN games g ON g.id=installs.game_id WHERE {} AND NOT EXISTS(SELECT 1 FROM mod_organization_jobs j WHERE j.install_id=installs.id) ORDER BY installs.rowid", eligible()))?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -246,10 +245,16 @@ pub(crate) fn next(db: &Db) -> AppResult<Option<Job>> {
         "title":safe_text(title,200).filter(|title| meaningful_title(title)), "fileName":basename(filename), "provider":safe_text(provider,48)
     }))
     };
+    let staged = &metadata["organization"];
+    let suggestion = staged["displayName"]
+        .as_str()
+        .filter(|_| staged["locale"].as_str() == Some(&job.locale))
+        .and_then(|name| safe_text(name, 200))
+        .filter(|name| meaningful_title(name));
     job.evidence = json!({
         "gameName":safe_text(&game,200), "originalTitle":safe_text(&original,200),
         "currentDisplayName":display.as_deref().and_then(|s| safe_text(s,200)).filter(|s| meaningful_title(s)),
-        "suggestedDisplayName":metadata["organization"]["displayName"].as_str().and_then(|s| safe_text(s,200)).filter(|s| meaningful_title(s)),
+        "suggestedDisplayName":suggestion,
         "fileName":library.as_ref().and_then(|row| basename(&row.1)).or_else(|| receipt.as_ref().and_then(|row| basename(&row.1))).or_else(|| metadata["artifactPath"].as_str().and_then(basename)),
         "relativeFilePaths":files, "assignedTags":tags.iter().filter_map(|tag| safe_text(tag,48)).collect::<Vec<_>>(), "existingTags":existing.iter().filter_map(|tag| safe_text(tag,48)).collect::<Vec<_>>(),
         "source":safe_text(&source,48), "modType":metadata["modType"].as_str().and_then(|s| safe_text(s,48)),

@@ -554,15 +554,17 @@ fn process_zip(file: &mut (impl Read + Seek), processing: &mut Processing<'_>) -
     let mut entries = Vec::new();
     for i in 0..zip.len() {
         let entry = zip.by_index_raw(i)?;
-        check_mode(entry.unix_mode().unwrap_or(0), entry.is_dir(), entry.name())?;
+        let name = entry.name()?;
+        check_mode(entry.unix_mode().unwrap_or(0), entry.is_dir(), &name)?;
         let end = entry
             .data_start()
-            .checked_add(entry.compressed_size())
-            .filter(|end| *end <= central && entry.data_start() > entry.header_start())
+            .filter(|start| *start > entry.header_start())
+            .and_then(|start| start.checked_add(entry.compressed_size()))
+            .filter(|end| *end <= central)
             .ok_or_else(|| unsafe_archive("ZIP 条目超出压缩数据范围"))?;
         ranges.push((entry.header_start(), end));
         entries.push(ArchiveEntry {
-            path: entry.name().to_string(),
+            path: name.into_owned(),
             is_dir: entry.is_dir(),
             size: entry.size(),
             compressed_size: entry.compressed_size(),

@@ -1,3 +1,4 @@
+import { tr } from "@/lib/i18n";
 import { useEffect } from "react";
 import { api, errorText } from "./api";
 import type { AgentAttachment } from "./types";
@@ -29,7 +30,7 @@ function imageDataUrl(blob: Blob, signal: AbortSignal): Promise<string> {
     signal.addEventListener("abort", abort, { once: true });
     reader.onabort = () => reject(signal.reason);
     reader.onloadend = () => signal.removeEventListener("abort", abort);
-    reader.onerror = () => reject(new Error("图片读取失败，请重新选择文件。"));
+    reader.onerror = () => reject(new Error(tr("图片读取失败，请重新选择文件。")));
     reader.onload = () => resolve(reader.result as string);
     reader.readAsDataURL(blob);
   });
@@ -41,9 +42,9 @@ export function readyAttachment(attachment: AgentAttachment, id: string = crypto
 
 async function prepareAttachment(file: File, id: string, signal: AbortSignal): Promise<DraftAttachment> {
   const type = imageType(file);
-  if (!file.size) throw new Error("附件为空，请选择包含内容的文件。");
+  if (!file.size) throw new Error(tr("附件为空，请选择包含内容的文件。"));
   if (type) {
-    if (!nativeImageFormats.has(type)) throw new Error("请将图片另存为 PNG、JPEG、WebP 或 GIF 后添加。");
+    if (!nativeImageFormats.has(type)) throw new Error(tr("请将图片另存为 PNG、JPEG、WebP 或 GIF 后添加。"));
     const dataUrl = await imageDataUrl(file.type === type ? file : file.slice(0, file.size, type), signal);
     signal.throwIfAborted();
     return readyAttachment({ kind: "image", name: file.name, dataUrl }, id);
@@ -71,7 +72,7 @@ async function prepareAttachment(file: File, id: string, signal: AbortSignal): P
       },
     });
     signal.throwIfAborted();
-    if (!markdown.trim()) throw new Error("未从附件中读取到文本，请检查文件内容。");
+    if (!markdown.trim()) throw new Error(tr("未从附件中读取到文本，请检查文件内容。"));
     return readyAttachment({ kind: "document", name: file.name, markdown }, id);
   } catch (failure) {
     // If transport failed before the upload reached Rust, release its reservation.
@@ -99,7 +100,7 @@ export function usePrepareAttachments(attachments: DraftAttachment[], update: (a
         if (signal.aborted) return;
         const cause = failure instanceof Error ? failure.cause : null;
         const needsConsent = !!cause && typeof cause === "object" && "code" in cause && cause.code === "consent_required";
-        result = { id, state: "error", file, needsConsent, error: needsConsent ? "等待启动 MarkItDown MCP" : errorText(failure) };
+        result = { id, state: "error", file, needsConsent, error: needsConsent ? tr("等待启动 MarkItDown MCP") : errorText(failure) };
       }
       if (!signal.aborted) update((current) => current.map((item) => item === next ? result : item));
     }
