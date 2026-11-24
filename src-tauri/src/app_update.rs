@@ -1,3 +1,5 @@
+use crate::{db::Db, error::AppResult};
+use route::{ReleaseSource, UpdateRoute};
 use serde::Serialize;
 use std::fs::File;
 use std::io::{self, Read, Seek, Write};
@@ -7,6 +9,9 @@ use std::time::Duration;
 use tauri::Manager;
 use tauri::{AppHandle, Runtime, State};
 use tauri_plugin_updater::{Update, Updater, UpdaterExt};
+use url::Url;
+
+mod route;
 
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -119,44 +124,85 @@ impl Phase {
 }
 
 #[derive(Clone)]
-pub(crate) struct AppUpdates(Arc<Mutex<Phase>>);
+pub(crate) struct AppUpdates {
+    phase: Arc<Mutex<Phase>>,
+    db: Db,
+}
 
 impl AppUpdates {
-    fn new(phase: Phase) -> Self {
-        Self(Arc::new(Mutex::new(phase)))
+    fn new(phase: Phase, db: Db) -> Self {
+        Self {
+            phase: Arc::new(Mutex::new(phase)),
+            db,
+        }
     }
 
     fn phase(&self) -> MutexGuard<'_, Phase> {
-        self.0.lock().expect("application updater state poisoned")
+        self.phase
+            .lock()
+            .expect("application updater state poisoned")
+    }
+
+    fn claim_check(&self) -> (Option<UpdateRoute>, AppUpdateStatus) {
+        let mut phase = self.phase();
+        if !phase.begin_check() {
+            return (None, phase.status());
+        }
+        // Snapshot the persisted route before spawning. Saving another route
+        // doesn't interrupt this check or invalidate an already verified update.
+        match UpdateRoute::load(&self.db) {
+            Ok(route) => (Some(route), phase.status()),
+            Err(error) => {
+                tracing::warn!(%error, "could not load application update route");
+                *phase = Phase::Error(CHECK_ERROR);
+                (None, phase.status())
+            }
+        }
     }
 
     // Claim the work before spawning. Startup and every IPC caller share this same slot.
     fn start_check<R: Runtime>(&self, app: &AppHandle<R>) -> AppUpdateStatus {
-        let (start, status) = {
-            let mut phase = self.phase();
-            (phase.begin_check(), phase.status())
-        };
-        if start {
+        let (route, status) = self.claim_check();
+        if let Some(route) = route {
             let state = self.clone();
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
+                let Some(source) =
+                    ReleaseSource::from_config(app.config().plugins.0.get("updater"))
+                else {
+                    let mut phase = state.phase();
+                    if matches!(*phase, Phase::Checking) {
+                        *phase = Phase::Error(CHECK_ERROR);
+                    }
+                    return;
+                };
+                let redirect_source = source.clone();
                 let updater = app
                     .updater_builder()
-                    .timeout(CHECK_TIMEOUT)
-                    .configure_client(|client| {
-                        client
-                            .https_only(true)
-                            .tls_danger_accept_invalid_certs(false)
-                            .tls_danger_accept_invalid_hostnames(false)
+                    .endpoints(vec![route.apply(&source.manifest)])
+                    .and_then(|builder| {
+                        builder
+                            .timeout(CHECK_TIMEOUT)
+                            .configure_client(move |client| {
+                                redirect_source.configure_client(route, client)
+                            })
+                            .build()
+                    });
+                state
+                    .check_and_download(updater, |update| {
+                        source.artifact(route, &update.download_url, &update.version)
                     })
-                    .build();
-                state.check_and_download(updater).await;
+                    .await;
             });
         }
         status
     }
 
-    async fn check_and_download(&self, updater: tauri_plugin_updater::Result<Updater>) {
+    async fn check_and_download(
+        &self,
+        updater: tauri_plugin_updater::Result<Updater>,
+        resolve_asset: impl FnOnce(&Update) -> Option<Url>,
+    ) {
         let result = async { updater?.check().await }.await;
         let mut update = {
             let mut phase = self.phase();
@@ -164,7 +210,13 @@ impl AppUpdates {
                 return;
             }
             match result {
-                Ok(Some(update)) => {
+                Ok(Some(mut update)) => {
+                    let Some(download_url) = resolve_asset(&update) else {
+                        tracing::warn!(version = %update.version, "invalid application update asset URL");
+                        *phase = Phase::Error(DOWNLOAD_ERROR);
+                        return;
+                    };
+                    update.download_url = download_url;
                     *phase = Phase::Downloading {
                         version: update.version.clone(),
                     };
@@ -231,15 +283,17 @@ pub(crate) fn check_app_update<R: Runtime>(
     state.start_check(&app)
 }
 
-fn configured(config: Option<&serde_json::Value>) -> bool {
-    config.is_some_and(|config| {
-        config["pubkey"]
-            .as_str()
-            .is_some_and(|key| !key.trim().is_empty())
-            && config["endpoints"]
-                .as_array()
-                .is_some_and(|endpoints| !endpoints.is_empty())
-    })
+#[tauri::command]
+pub(crate) fn get_app_update_route(state: State<'_, AppUpdates>) -> AppResult<&'static str> {
+    Ok(UpdateRoute::load(&state.db)?.as_str())
+}
+
+#[tauri::command]
+pub(crate) fn set_app_update_route(
+    route: String,
+    state: State<'_, AppUpdates>,
+) -> AppResult<&'static str> {
+    Ok(UpdateRoute::save(&state.db, &route)?.as_str())
 }
 
 fn manifest_target(
@@ -294,8 +348,8 @@ fn installed_target(app: &AppHandle) -> Option<String> {
 }
 
 #[cfg(not(test))]
-pub(crate) fn setup(app: &AppHandle) {
-    let phase = if !configured(app.config().plugins.0.get("updater")) {
+pub(crate) fn setup(app: &AppHandle, db: Db) {
+    let phase = if ReleaseSource::from_config(app.config().plugins.0.get("updater")).is_none() {
         Phase::Unsupported("此版本未配置签名更新。")
     } else if let Some(target) = installed_target(app) {
         // Require the exact installer key. An OS/arch-only fallback could switch
@@ -314,7 +368,7 @@ pub(crate) fn setup(app: &AppHandle) {
     } else {
         Phase::Unsupported("此安装方式不支持自动更新。")
     };
-    let state = AppUpdates::new(phase);
+    let state = AppUpdates::new(phase, db);
     app.manage(state.clone());
     state.start_check(app);
 }

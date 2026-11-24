@@ -167,6 +167,18 @@
     "ru": "Неизвестная ошибка",
     "it": "Errore sconosciuto"
   },
+  "app_update.route_unsupported": {
+    "zh-CN": "不支持此应用更新线路，请从线路列表中选择。",
+    "en": "This update route is not supported. Choose one from the list.",
+    "de": "Diese Update-Route wird nicht unterstützt. Wählen Sie eine Route aus der Liste.",
+    "es": "Esta ruta de actualización no es compatible. Elige una de la lista.",
+    "fr": "Cette voie de mise à jour n’est pas prise en charge. Choisissez-en une dans la liste.",
+    "it": "Questo percorso di aggiornamento non è supportato. Scegline uno dall’elenco.",
+    "ja": "この更新経路はサポートされていません。一覧から選択してください。",
+    "ko": "지원되지 않는 업데이트 경로입니다. 목록에서 선택하세요.",
+    "pt-BR": "Esta rota de atualização não é compatível. Escolha uma opção da lista.",
+    "ru": "Этот маршрут обновления не поддерживается. Выберите один из списка."
+  },
   "locale.unsupported": {
     "zh-CN": "不支持此应用语言，请从语言列表中选择",
     "en": "This app language is not supported. Choose a language from the list.",

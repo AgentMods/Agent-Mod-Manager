@@ -101,6 +101,14 @@ ZIP writers produced byte-identical plugin packages for the comparison fixture,
 preserving its preview hash. A Linux release-mode smoke test exercised both
 directions of `VariantStrIter` against the pinned patch.
 
+**Desktop update routes (2026-11-25).** Settings → Appearance and storage
+defaults to `cdn.gh-proxy.org` and also offers four other proxies and GitHub direct. Startup and manual checks
+use the saved route for both the manifest and the signed release asset. A
+route change applies to the next check. All 15 Rust updater tests passed, including persisted route selection, redirect handling and signature verification. All 27 updater UI checks passed
+across three viewport sizes. A read-only check of the public manifest
+returned version `1.0.2` via GitHub and four proxies. The TLS handshake
+for `ghfast.top` failed from the Windows test machine.
+
 **Desktop application updates (2026-11-24).** Signed desktop builds check the
 GitHub Releases manifest on launch. Settings offers a manual check and shows
 progress and errors. A verified update waits in a temporary file until normal

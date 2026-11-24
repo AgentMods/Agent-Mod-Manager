@@ -89,6 +89,8 @@ pub fn run() {
             commands::get_app_locale,
             commands::set_app_locale,
             app_update::get_app_update_status,
+            app_update::get_app_update_route,
+            app_update::set_app_update_route,
             app_update::check_app_update,
             commands::migrate_storage,
             commands::start_onboarding,
@@ -285,6 +287,7 @@ pub fn run() {
                 );
                 app.manage(organizer);
             }
+            let update_db = services.engine.db.clone();
             app.manage(services);
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -301,7 +304,7 @@ pub fn run() {
                     .await;
             });
             analytics::start(app.package_info().version.to_string());
-            app_update::setup(app.handle());
+            app_update::setup(app.handle(), update_db);
             Ok(())
         })
         .build(tauri::generate_context!())

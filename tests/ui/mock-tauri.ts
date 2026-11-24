@@ -25,6 +25,7 @@ export async function installMockTauri(page: Page, {
   workspaceGames = [],
   conversationFixtures,
   appUpdate,
+  failAppUpdateRoute = false,
   mcpCredentialStatuses = {}, failMcpCredentialStatusIds = [], failFirstMcpSecretWrites = [], holdNextMcpCredentialStatus = false,
 }: {
   modLibrary?: Array<{artifactId: string; gameId: string | null; gameName: string; name: string; filename: string; version: string | null; sha256: string; projectPage?: string | null}>;
@@ -62,6 +63,7 @@ export async function installMockTauri(page: Page, {
     checkResult?: {status: 'idle' | 'checking' | 'downloading' | 'ready' | 'upToDate' | 'error' | 'unsupported'; version?: string; message?: string};
     pollStatuses?: {status: 'idle' | 'checking' | 'downloading' | 'ready' | 'upToDate' | 'error' | 'unsupported'; version?: string; message?: string}[];
   };
+  failAppUpdateRoute?: boolean;
   storage?: {
     dataRoot: string;
     parent: string;
@@ -73,7 +75,7 @@ export async function installMockTauri(page: Page, {
 } = {}) {
   // The public-looking manifest image is served offline in browser tests.
   await page.route("https://covers.example.org/minecraft-java.jpg", route => route.fulfill({contentType: "image/png", path: "public/favicon.png"}));
-  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus}) => {
+  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus}) => {
     type Args = Record<string, any>;
     const now = "2026-11-18T00:00:00Z";
     const draftUpdatedAtField = pluginDateFixture === "valid" ? {updatedAt: pluginUpdatedAt} : {};
@@ -421,6 +423,13 @@ export async function installMockTauri(page: Page, {
         case "get_app_update_status":
           if (updatePollingStarted && updatePollStatuses.length) updateStatus = updatePollStatuses.shift()!;
           return structuredClone(updateStatus);
+        case "get_app_update_route": return sessionStorage.getItem("amm.test.appUpdateRoute") ?? "cdn.gh-proxy.org";
+        case "set_app_update_route": {
+          if (failAppUpdateRoute) throw new Error("线路保存失败");
+          if (typeof args.route !== "string") throw new Error("无效的更新线路");
+          sessionStorage.setItem("amm.test.appUpdateRoute", args.route);
+          return args.route;
+        }
         case "check_app_update":
           updatePollingStarted = true;
           updateStatus = structuredClone(appUpdate?.checkResult ?? {status: 'upToDate'});
@@ -898,5 +907,5 @@ export async function installMockTauri(page: Page, {
         seq = Math.max(seq, ...values.map((event) => event.seq).filter(Number.isSafeInteger));
       },
     };
-  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus});
+  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus});
 }
