@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Agent Mod Manager is a desktop game-mod manager with an LLM agent that plans and applies file operations, including for registered games. Tauri v2 + Rust backend, React 19 + TypeScript frontend, single SQLite database.
 
-The desktop release target is `1.0.0`; see [Chinese release notes](docs/releases/1.0.0.md) for user-facing scope and installation limitations. `docs/implementation-status.md` is the running inventory of what is implemented, tested, and still missing. Read it before non-trivial work and update it when you finish a slice.
+The desktop release target is `1.0.1`; see [Chinese release notes](docs/releases/1.0.1.md) for user-facing scope and installation limitations. `docs/implementation-status.md` is the running inventory of what is implemented, tested, and still missing. Read it before non-trivial work and update it when you finish a slice.
 
 Data flow: React pages → `src/lib/api.ts::api()` → Tauri `invoke` → `src-tauri/src/commands.rs` → domain modules. The agent's turns live in the same Rust process and share the same `FileEngine`.
 
