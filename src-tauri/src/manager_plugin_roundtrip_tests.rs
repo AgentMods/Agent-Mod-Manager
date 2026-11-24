@@ -42,11 +42,11 @@ const SKILL_BYTES: &[u8] =
 const PLUGIN_ID: i64 = 41001;
 const GAMES_PATH: &str = "/api/v1/manager-plugins/games";
 const OFFICIAL_ADAPTER_SHA256: &str =
-    "5f44312d0d8f78dd946c793ff684efe023f71e926764f403d8e8c3e1206aa41c";
+    "77981d4d1b0b1261174297cbe1d7eaf49b7e16ba5c94d12a87416d6eecc51afd";
 const OFFICIAL_SKILL_SHA256: &str =
-    "114b6ba609a87ce358a3f024639a3def2c5b43d079e4cbcee4a0839dc22b0af4";
+    "c54e1d07b4e9c7e60bae60d541e10e27d94aa8f60322fdd13ba25b3a1a5263d7";
 
-// These fixture files are byte-for-byte the official manager-plugin testdata
+// These fixture blobs are byte-for-byte the official manager-plugin testdata
 // at glossmod.com commit 67c02c7, under
 // server/router/managerplugins/testdata/v1/minecraft-java/.
 // Their official Git blob IDs are 377b49596359b8aed2763f404bcdda330be761e4
@@ -250,14 +250,14 @@ fn apply(engine: &FileEngine, plan: &FilePlan) {
 
 #[tokio::test]
 async fn published_manager_plugin_is_listed_imported_installed_byte_exact() {
-    assert_eq!(
-        hex::encode(Sha256::digest(ADAPTER_BYTES)),
-        OFFICIAL_ADAPTER_SHA256
-    );
-    assert_eq!(
-        hex::encode(Sha256::digest(SKILL_BYTES)),
-        OFFICIAL_SKILL_SHA256
-    );
+    // Hash the Git blob's LF form regardless of the checkout's line endings.
+    for (fixture, expected) in [
+        (ADAPTER_BYTES, OFFICIAL_ADAPTER_SHA256),
+        (SKILL_BYTES, OFFICIAL_SKILL_SHA256),
+    ] {
+        let text = std::str::from_utf8(fixture).unwrap().replace("\r\n", "\n");
+        assert_eq!(hex::encode(Sha256::digest(text)), expected);
+    }
     let mut manifest: Value = serde_json::from_slice(ADAPTER_BYTES).unwrap();
     manifest["gameName"] = json!(GAME_NAME);
     manifest["name"] = json!("Local instance manager");
@@ -297,6 +297,11 @@ async fn assert_publication_roundtrip(mut authoring_adapter: Value) {
     let cancel = CancellationToken::new();
     // Publish the same committed 1.0.0 source twice. Only the first receipt can
     // identify the existing remote plugin when preparing the second release.
+    let long_description = format!(
+        "## 数据包\n\n{}\n```text\nDatapack layout\n```\n\n[参考](https://example.org/guide)\n<em>原样保留</em>",
+        "- 查看 `datapacks` 与世界存档。\n".repeat(256)
+    );
+    assert!(long_description.chars().count() > 4096);
     let cases = [
         (
             PublicationTarget::First,
@@ -316,7 +321,7 @@ async fn assert_publication_roundtrip(mut authoring_adapter: Value) {
             "1.0.1",
             json!({
                 "title": "Minecraft Java 世界与模组", "summary": "按世界区分数据包。",
-                "description": "为选定世界管理数据包。\n\n查看世界存档与实例资源目录的区别。",
+                "description": long_description,
                 "tags": ["数据包", "世界存档"]
             }),
         ),

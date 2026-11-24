@@ -285,11 +285,11 @@ fn rejects_unsafe_model_copy_and_ambiguous_tags() {
         ("title", json!("abc\u{202e}def")),
         ("summary", json!("x\nname: change")),
         ("summary", json!("文".repeat(1025))),
-        ("description", json!("x".repeat(4097))),
-        ("description", json!("[link](https://example.org)")),
-        ("description", json!("<script>alert(1)</script>")),
-        ("description", json!("www.example.com")),
+        ("description", json!(" \t\r\n")),
+        ("description", json!("unsafe\0control")),
+        ("description", json!("unsafe\u{202e}direction")),
         ("description", json!(BEGIN)),
+        ("description", json!(LEGACY_END)),
         ("tags", json!(["Game Mod", "game-mod"])),
         ("tags", json!(["İ", "i"])),
         ("tags", json!(["x".repeat(33)])),
@@ -320,7 +320,7 @@ fn rejects_unsafe_model_copy_and_ambiguous_tags() {
 }
 
 #[test]
-fn imported_display_requires_one_complete_terminal_prose_footer() {
+fn imported_display_requires_one_complete_terminal_footer() {
     let (p, orig) = fixture();
     let l = listing(&p);
     let rendered = render_files(&p, &orig, &l, "1.0.1").unwrap();
@@ -339,8 +339,8 @@ fn imported_display_requires_one_complete_terminal_prose_footer() {
         text.replace(END, "<!-- broken -->"),
         text.replace(END, LEGACY_END),
         format!("{text}\ninstall rule after footer"),
-        text.replace(END, &format!("\n{LEGACY_COVER}{LEGACY_PNG})\n{END}")),
-        text.replace(&l.description, "<img src=x>"),
+        text.replace(&l.description, "invalid\u{202e}direction"),
+        text.replace(&l.description, &format!("text\n{END}\nmore text")),
         format!("{text}{text}"),
         format!(
             "{}\n{LEGACY_BEGIN}{}",
@@ -528,10 +528,22 @@ fn sse(delta: Value, reason: &str) -> ([(&'static str, &'static str); 1], String
 async fn configured_model_receives_only_bounded_structured_facts_and_no_tools() {
     let received = Arc::new(Mutex::new(None));
     let capture = received.clone();
-    let handler = move |h: HeaderMap, body: Bytes| async move {
-        let body: Value = serde_json::from_slice(&body).unwrap();
-        *capture.lock().unwrap() = Some((h, body));
-        sse(json!({"content":reply().to_string()}), "stop")
+    let description = format!(
+        "## 支持内容\n\n{}",
+        "- 核对 `SMAPI` 模组与依赖。\n".repeat(1100)
+    );
+    let mut long_reply = reply();
+    long_reply["description"] = json!(description);
+    let long_reply = long_reply.to_string();
+    assert!(long_reply.len() > 32 * 1024);
+    let handler = move |h: HeaderMap, body: Bytes| {
+        let capture = capture.clone();
+        let long_reply = long_reply.clone();
+        async move {
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            *capture.lock().unwrap() = Some((h, body));
+            sse(json!({"content":long_reply}), "stop")
+        }
     };
     let app = Router::new().route("/v1/chat/completions", post(handler));
     let listen = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -558,6 +570,7 @@ async fn configured_model_receives_only_bounded_structured_facts_and_no_tools() 
         .await
         .unwrap();
     assert_eq!(listing.title, reply()["title"]);
+    assert_eq!(listing.description, description);
     assert_eq!(listing.cover_url, p.adapter.cover_url);
     assert!(listing.cover_png.is_empty());
     server.abort();

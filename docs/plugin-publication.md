@@ -19,7 +19,7 @@ Configure an approved creator's Mod客栈 key with both `manager_plugins.read` (
 | Title and version | `name` and `version` in the published copy of `adapter.json` |
 | Game name in the library | `gameName` in the published manifest. When the source omits it, publication copies the original `name` before setting the release title. |
 | Short introduction | `description` in the `SKILL.md` frontmatter |
-| Full description | A display section in `SKILL.md` |
+| Full description | A Markdown-capable display section in `SKILL.md`, with no separate character limit. Preview and catalog show the source as inert text. |
 | Game cover | The original `coverUrl` in `adapter.json`, unchanged; no image is generated or uploaded |
 | Tags | The first tag uses the same game name as the published manifest. Other tags come from the generated copy. The reviewed list is sent unchanged as the manager-plugin MCP `tags` parameter. |
 
