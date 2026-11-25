@@ -1,3 +1,4 @@
+use super::browse::{credential_revision, public_modio_base, CredentialRevision};
 use super::config::{McpServers, McpTransport, ServerConfig, PLAYWRIGHT_COMMAND};
 use super::redaction::ConnectionSecrets;
 use super::McpRuntime;
@@ -9,8 +10,14 @@ use crate::{
 use futures_util::StreamExt;
 use reqwest_mcp::header::{HeaderName, HeaderValue};
 use rmcp::{
-    model::{CallToolRequestParams, ClientJsonRpcMessage, PaginatedRequestParams},
-    service::{ClientInitializeError, RunningService, ServiceError},
+    model::{
+        CallToolRequest, CallToolRequestParams, CallToolResult, ClientJsonRpcMessage,
+        PaginatedRequestParams, ServerResult,
+    },
+    service::{
+        ClientInitializeError, NotificationContext, PeerRequestOptions, RequestHandle,
+        RunningService, ServiceError,
+    },
     transport::{
         async_rw::{AsyncRwTransport, DEFAULT_MAX_LINE_LENGTH},
         common::client_side_sse::BoxedSseResponse,
@@ -20,7 +27,7 @@ use rmcp::{
         },
         StreamableHttpClientTransport,
     },
-    RoleClient, ServiceExt,
+    ClientHandler, RoleClient, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -48,6 +55,7 @@ use tokio_util::sync::CancellationToken;
 static RESERVED_MCP_MEMORY: AtomicUsize = AtomicUsize::new(0);
 pub(crate) const MARKDOWN_TOOL: &str = "convert_to_markdown";
 const TOOL_PAGE_TIMEOUT: Duration = Duration::from_secs(30);
+const BROWSE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const CONNECTION_CLOSED_MESSAGE: &str = "MCP 连接已关闭；远端工具可能已经产生外部影响";
 const REMOTE_ERROR_MESSAGE: &str = "MCP request failed (remote details suppressed)";
 const TIMEOUT_MESSAGE: &str = "MCP request timed out; external effects may already have occurred";
@@ -57,6 +65,12 @@ const HTTP_QUEUE: usize = 4;
 // Fixed success-body input cap in the pinned rmcp reqwest backend; reserve
 // raw buffer/capacity only while a POST can hold it, not while a client is idle.
 const RMCP_HTTP_JSON_CAP: usize = 16 * 1024 * 1024;
+
+enum ToolCall {
+    Ordinary,
+    AgentBridge,
+    Browse,
+}
 
 /// For stdio, the initialize deadline also covers anything the launcher must
 /// install before an MCP server exists. This never extends tool call timeouts.
@@ -229,8 +243,37 @@ fn stdio_job(child: &Child) -> io::Result<std::os::windows::io::OwnedHandle> {
     Ok(job)
 }
 
+// Like the default handler, advertises no capability for local tools, roots,
+// sampling or elicitation. A changed tool catalog invalidates browse grants.
+#[derive(Clone, Default)]
+struct CatalogObserver(CancellationToken);
+
+impl ClientHandler for CatalogObserver {
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        self.0.cancel();
+    }
+}
+
+// Some desktop consumers impose a shorter timeout than the transport. A
+// dropped query future must not leave an admitted RPC running indefinitely.
+struct BrowsePending(Option<RequestHandle<RoleClient>>);
+
+impl Drop for BrowsePending {
+    fn drop(&mut self) {
+        if let (Some(request), Ok(runtime)) = (self.0.take(), tokio::runtime::Handle::try_current())
+        {
+            runtime.spawn(async move {
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(250), request.cancel(None)).await;
+            });
+        }
+    }
+}
+
 struct Session {
-    service: RunningService<RoleClient, ()>,
+    service: RunningService<RoleClient, CatalogObserver>,
+    catalog_observer: CatalogObserver,
+    browse_credentials: Option<CredentialRevision>,
     lifetime: CancellationToken,
     child: Mutex<Option<Child>>,
     stdio_scope: StdioScope,
@@ -309,6 +352,12 @@ impl McpClient {
             return Err(AppError::Cancelled);
         }
         let lifetime = CancellationToken::new();
+        let catalog_observer = CatalogObserver::default();
+        // A tracking failure disables browse, not unrelated Agent MCP use.
+        let mut browse_credentials = config
+            .is_stock_browse_source()
+            .then(|| credential_revision(&servers, &config, true).ok())
+            .flatten();
         let mut resolved_secrets = Vec::new();
         let (service, child, stdio_scope, secrets, has_secrets, frames) = match config.transport {
             McpTransport::StreamableHttp => {
@@ -345,7 +394,9 @@ impl McpClient {
                 let service = bounded_startup(
                     cancel,
                     StartupBudget::HTTP,
-                    ().serve_with_ct(transport, lifetime.clone()),
+                    catalog_observer
+                        .clone()
+                        .serve_with_ct(transport, lifetime.clone()),
                 )
                 .await
                 .map_err(|err| frames.prefer_overflow(err))?;
@@ -404,6 +455,12 @@ impl McpClient {
                     let Some(value) = stdio_secret(settings, &config, env, key)? else {
                         continue;
                     };
+                    if config.id == "modio"
+                        && env == "MODIO_API_BASE_URL"
+                        && !public_modio_base(&value)
+                    {
+                        browse_credentials = None;
+                    }
                     command.env(env, &value);
                     resolved_secrets.push(value);
                 }
@@ -460,7 +517,9 @@ impl McpClient {
                 let service = match bounded_startup(
                     cancel,
                     budget,
-                    ().serve_with_ct(transport, lifetime.clone()),
+                    catalog_observer
+                        .clone()
+                        .serve_with_ct(transport, lifetime.clone()),
                 )
                 .await
                 {
@@ -488,6 +547,8 @@ impl McpClient {
             config,
             session: Arc::new(Session {
                 service,
+                catalog_observer,
+                browse_credentials,
                 lifetime,
                 child: Mutex::new(child),
                 stdio_scope,
@@ -555,6 +616,43 @@ impl McpClient {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn uses_browse_database(&self, servers: &McpServers) -> bool {
+        Arc::ptr_eq(&self.servers.db.0, &servers.db.0)
+    }
+
+    pub(crate) fn ensure_browse_current(&self) -> AppResult<()> {
+        self.ensure_current()?;
+        if self.session.catalog_observer.0.is_cancelled() {
+            return Err(AppError::Unsupported(
+                "MCP 工具契约已变化；请重新连接".into(),
+            ));
+        }
+        let Some(revision) = &self.session.browse_credentials else {
+            return Err(AppError::Denied("浏览仅允许原厂公开来源".into()));
+        };
+        if credential_revision(&self.servers, &self.config, false)? != *revision {
+            return Err(AppError::Denied(
+                "MCP 凭据已变化；请重新连接并确认游览".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Exercise the internal read transport against a loopback fixture only.
+    /// The stock-source/discovery gate deliberately still rejects this peer.
+    #[cfg(test)]
+    pub(super) fn fixture_read_transport(&mut self) {
+        assert!(self
+            .config
+            .url
+            .as_deref()
+            .is_some_and(|url| url.starts_with("http://127.0.0.1:")));
+        Arc::get_mut(&mut self.session)
+            .expect("unshared fixture client")
+            .browse_credentials =
+            Some(credential_revision(&self.servers, &self.config, true).unwrap());
     }
 
     pub async fn list_tools(&self, cancel: &CancellationToken) -> AppResult<Vec<McpTool>> {
@@ -698,8 +796,65 @@ impl McpClient {
         args: Value,
         cancel: &CancellationToken,
     ) -> AppResult<Value> {
+        self.call_tool_filtered(name, args, cancel, ToolCall::Ordinary)
+            .await
+    }
+
+    /// Only the Agent bridge calls this after its existing approval checks.
+    pub(super) async fn call_agent_tool(
+        &self,
+        name: &str,
+        args: Value,
+        cancel: &CancellationToken,
+    ) -> AppResult<Value> {
+        self.call_tool_filtered(name, args, cancel, ToolCall::AgentBridge)
+            .await
+    }
+
+    /// Internal to the exact stock browse whitelist. Other modules must not
+    /// get this raw dispatcher; `BrowseReader` verifies the discovered schema.
+    pub(super) async fn call_browse_tool(
+        &self,
+        name: &str,
+        args: Value,
+        cancel: &CancellationToken,
+    ) -> AppResult<Value> {
+        self.call_tool_filtered(name, args, cancel, ToolCall::Browse)
+            .await
+    }
+
+    /// Text-only MCP servers can escape an echoed credential in their nested
+    /// JSON. Filter the decoded value as well as the outer wire envelope.
+    pub(super) fn redact_browse_catalog(&self, catalog: Value) -> AppResult<Value> {
+        if !self.session.has_secrets {
+            return Ok(catalog);
+        }
+        let mut memory = McpMemory::new();
+        let bytes = json_bytes(&catalog, BROWSE_RESPONSE_BYTES).ok_or_else(browse_size_error)?;
+        memory.charge(
+            bytes
+                .saturating_mul(22)
+                .saturating_add(json_heap_bytes(&catalog).saturating_mul(2)),
+        )?;
+        let filtered = self.session.secrets.redact_value(catalog)?;
+        json_bytes(&filtered, BROWSE_RESPONSE_BYTES).ok_or_else(browse_size_error)?;
+        Ok(filtered)
+    }
+
+    async fn call_tool_filtered(
+        &self,
+        name: &str,
+        args: Value,
+        cancel: &CancellationToken,
+        call: ToolCall,
+    ) -> AppResult<Value> {
+        let browse = matches!(call, ToolCall::Browse);
         let _operation = self.lock_operation(cancel).await?;
-        self.ensure_current()?;
+        if browse {
+            self.ensure_browse_current()?;
+        } else {
+            self.ensure_current()?;
+        }
         let Value::Object(arguments) = args else {
             return Err(AppError::Invalid("MCP 工具参数必须是 JSON 对象".into()));
         };
@@ -712,27 +867,42 @@ impl McpClient {
         let Value::Object(arguments) = args else {
             unreachable!()
         };
-        let result = self
-            .request(
-                cancel,
-                None,
-                self.session.service.peer().call_tool(
-                    CallToolRequestParams::new(name.to_owned()).with_arguments(arguments),
-                ),
-            )
-            .await;
+        let params = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments);
+        let result = if browse {
+            // A canceled read, timeout, or denied read does not revoke the Agent's
+            // whole existing connection. Transport overflows still stop it.
+            Ok(self.browse_request(params, cancel).await?)
+        } else {
+            self.request(cancel, None, self.session.service.peer().call_tool(params))
+                .await
+        };
         let filtered = result.and_then(|result| {
             memory.refresh();
-            let bytes = self.message_bytes(&result, "工具结果")?;
+            let bytes = if browse {
+                json_bytes(
+                    &result,
+                    self.session.frames.bytes.min(BROWSE_RESPONSE_BYTES),
+                )
+                .ok_or_else(browse_size_error)?
+            } else {
+                self.message_bytes(&result, "工具结果")?
+            };
             // Redaction can replace a one-byte credential with ten bytes. Allow
             // for the redacted tree and its encoded verification copy before
             // doing that work, not just after allocation.
             let copies = if self.session.has_secrets { 22 } else { 2 };
             memory.charge(bytes.saturating_mul(copies))?;
-            let value = serde_json::to_value(result)
+            let mut value = serde_json::to_value(result)
                 .map_err(|_| AppError::Other("无法序列化 MCP 结果".into()))?;
             let heap = json_heap_bytes(&value);
             memory.charge(heap.saturating_mul(if self.session.has_secrets { 2 } else { 1 }))?;
+            if matches!(call, ToolCall::AgentBridge)
+                && self.session.has_secrets
+                && self.session.browse_credentials.is_some()
+                && self.server_config().is_stock_browse_source()
+            {
+                redact_stock_agent_json_text(&self.session.secrets, &mut value, &mut memory)?;
+            }
             let value = self.session.secrets.redact_value(value)?;
             self.message_bytes(&value, "脱敏后的工具结果")?;
             memory.charge(json_heap_bytes(&value).saturating_sub(heap))?;
@@ -740,10 +910,57 @@ impl McpClient {
             // Untrusted data: do not follow links, read resources or honor tool calls.
             Ok(value)
         });
-        if filtered.is_err() {
+        if filtered.is_err() && !browse {
             self.disconnect();
         }
+        if browse && filtered.is_ok() {
+            self.ensure_browse_current()?;
+        }
         filtered
+    }
+
+    async fn browse_request(
+        &self,
+        params: CallToolRequestParams,
+        cancel: &CancellationToken,
+    ) -> AppResult<CallToolResult> {
+        self.check_request_active(cancel)?;
+        let deadline = tokio::time::Instant::now() + TOOL_PAGE_TIMEOUT;
+        let timeout = || AppError::Other("MCP 目录读取超时".into());
+        let closed = || AppError::Conflict("MCP 连接已关闭；请重新确认游览".into());
+        let changed = || AppError::Unsupported("MCP 工具契约已变化；请重新连接".into());
+        let handle = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(AppError::Cancelled),
+            _ = self.session.catalog_observer.0.cancelled() => return Err(changed()),
+            _ = self.session.lifetime.cancelled() => return Err(closed()),
+            _ = tokio::time::sleep_until(deadline) => return Err(timeout()),
+            res = self.session.service.peer().send_request_with_option(
+                CallToolRequest::new(params).into(), PeerRequestOptions::no_options(),
+            ) => res.map_err(browse_service_failure)?,
+        };
+        let mut pending = BrowsePending(Some(handle));
+        let error = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => AppError::Cancelled,
+            _ = self.session.catalog_observer.0.cancelled() => changed(),
+            _ = self.session.frames.overflow.cancelled() => return Err(self.session.frames.error()),
+            _ = self.session.lifetime.cancelled() => return Err(closed()),
+            _ = tokio::time::sleep_until(deadline) => timeout(),
+            response = &mut pending.0.as_mut().expect("pending browse request").rx => {
+                pending.0.take();
+                return match response.map_err(|_| closed())?.map_err(browse_service_failure)? {
+                    ServerResult::CallToolResult(result) => Ok(result),
+                    _ => Err(AppError::Other(REMOTE_ERROR_MESSAGE.into())),
+                };
+            }
+        };
+        // Notify the remote tool when possible, while keeping local cancellation
+        // responsive even if it stalls. Never restart/retry the tool implicitly.
+        if let Some(handle) = pending.0.take() {
+            let _ = tokio::time::timeout(Duration::from_millis(250), handle.cancel(None)).await;
+        }
+        Err(error)
     }
 
     fn message_bytes(&self, value: &impl Serialize, subject: &str) -> AppResult<usize> {
@@ -810,6 +1027,36 @@ fn attachment_call_error(err: AppError) -> AppError {
         _ => AppError::Other(format!(
             "MarkItDown MCP 调用失败。{ADVICE}也可在「设置 → 工具」中重新启动 MarkItDown 后重试。"
         )),
+    }
+}
+
+fn browse_size_error() -> AppError {
+    AppError::Invalid("MCP 公开目录响应超过处理预算".into())
+}
+
+fn browse_service_failure(error: ServiceError) -> AppError {
+    let denied = match &error {
+        ServiceError::McpError(error) => matches!(error.code.0, 401 | 403 | -32001 | -32003),
+        ServiceError::TransportSend(error) => {
+            match error.error.downcast_ref::<HttpError>() {
+                Some(
+                    StreamableHttpError::AuthRequired(_)
+                    | StreamableHttpError::InsufficientScope(_),
+                ) => true,
+                // Same SDK-generated prefix used by startup_failure_hint when
+                // the rejected endpoint did not include a WWW-Authenticate challenge.
+                Some(StreamableHttpError::UnexpectedServerResponse(message)) => {
+                    message.starts_with("HTTP 401 ") || message.starts_with("HTTP 403 ")
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    };
+    if denied {
+        AppError::Denied("MCP 目录读取权限不足".into())
+    } else {
+        service_failure(error)
     }
 }
 
@@ -1217,6 +1464,46 @@ impl ToolCatalog<'_> {
     }
 }
 
+/// Some approved stock tools return a single text block containing JSON. The
+/// wire-level filter cannot see alternate Unicode escapes inside that string.
+/// Do not strip URLs or credential-looking field names; signed downloads can
+/// contain both. If no session credential matched, keep the original text.
+fn redact_stock_agent_json_text(
+    secrets: &ConnectionSecrets,
+    envelope: &mut Value,
+    memory: &mut McpMemory<'_>,
+) -> AppResult<()> {
+    let Some(block) = envelope
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| match blocks.as_mut_slice() {
+            [block] if block["type"] == "text" => Some(block),
+            _ => None,
+        })
+    else {
+        return Ok(());
+    };
+    let Some(text) = block["text"].as_str() else {
+        return Ok(());
+    };
+    if !text.trim_start().starts_with(['{', '[']) {
+        return Ok(());
+    }
+    // Reserve before parsing: a short, dense JSON string can decode to many
+    // map and array entries. Allow room for serialization and redaction too.
+    memory.charge(text.len().saturating_mul(64))?;
+    let Ok(decoded) = serde_json::from_str::<Value>(text) else {
+        return Ok(());
+    };
+    let encode = |value: &Value| {
+        serde_json::to_string(value).map_err(|_| AppError::Other("无法序列化 MCP 结果".into()))
+    };
+    if secrets.contains(&encode(&decoded)?) {
+        block["text"] = Value::String(encode(&secrets.redact_value(decoded)?)?);
+    }
+    Ok(())
+}
+
 // Estimate retained JSON allocation, including structure overhead for dense schemas.
 fn json_heap_bytes(value: &Value) -> usize {
     match value {
@@ -1474,6 +1761,31 @@ pub fn namespaced_tool_name(server: &str, tool: &str) -> String {
 #[cfg(test)]
 mod timeout_tests {
     use super::*;
+
+    #[test]
+    fn stock_agent_json_text_redacts_decoded_credentials_but_preserves_signed_downloads() {
+        let secrets = ConnectionSecrets::new(vec!["fixture-private-key".into()]).unwrap();
+        let pool = AtomicUsize::new(0);
+        let mut memory = McpMemory::with_limit(64 * 1024, &pool);
+        let signed =
+            r#"{ "download_url": "https://downloads.example/a.zip?token=fixture-signed-url" }"#;
+        let escaped = r#"{"\u0066ixture-private-key":["\u0066ixture-private-key"],"download_url":"https://downloads.example/a.zip?token=fixture-signed-url"}"#;
+        let envelope = |text| serde_json::json!({"content":[{"type":"text","text":text}]});
+        let mut unchanged = envelope(signed);
+        redact_stock_agent_json_text(&secrets, &mut unchanged, &mut memory).unwrap();
+        assert_eq!(unchanged, envelope(signed));
+
+        let mut value = envelope(escaped);
+        redact_stock_agent_json_text(&secrets, &mut value, &mut memory).unwrap();
+        let decoded: Value =
+            serde_json::from_str(value["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(decoded["[REDACTED]"][0], "[REDACTED]");
+        assert_eq!(
+            decoded["download_url"],
+            "https://downloads.example/a.zip?token=fixture-signed-url"
+        );
+        assert!(!value.to_string().contains("fixture-private-key"));
+    }
 
     #[test]
     fn playwright_provisions_only_explicit_managed_chromium() {

@@ -1,0 +1,140 @@
+{
+  "get-game-list": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "page": {
+        "description": "页码",
+        "default": 1,
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 9007199254740991
+      },
+      "pageSize": {
+        "description": "每页数量，最大 50",
+        "default": 20,
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 50
+      },
+      "gameType": {
+        "description": "游戏类型筛选",
+        "type": "string",
+        "maxLength": 100
+      },
+      "search": {
+        "description": "搜索游戏名、英文名或描述",
+        "type": "string",
+        "maxLength": 100
+      },
+      "sortBy": {
+        "description": "排序字段，allcount 总 Mod 数，tcount 最近 30 天更新数",
+        "default": "allcount",
+        "type": "string",
+        "enum": [
+          "allcount",
+          "tcount"
+        ]
+      },
+      "sortOrder": {
+        "description": "排序方向",
+        "default": "desc",
+        "type": "string",
+        "enum": [
+          "asc",
+          "desc"
+        ]
+      }
+    }
+  },
+  "get-mod-list": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "type": "object",
+    "properties": {
+      "page": {
+        "default": 1,
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 9007199254740991
+      },
+      "pageSize": {
+        "default": 24,
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 100
+      },
+      "search": {
+        "type": "string",
+        "maxLength": 100
+      },
+      "original": {
+        "description": "1 原创，2 二创，3 翻译，4 精华",
+        "type": "number"
+      },
+      "time": {
+        "description": "1 今天，2 最近一周，3 最近一月，4 最近三月",
+        "type": "number"
+      },
+      "order": {
+        "description": "排序方式，0默认，1最多浏览，2最多下载，3最多点赞，4最多收藏，5最新发布",
+        "default": 0,
+        "type": "number"
+      },
+      "key": {
+        "description": "标签筛选，匹配 mods_key，可传单个标签或标签数组",
+        "anyOf": [
+          {
+            "type": "string",
+            "maxLength": 100
+          },
+          {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 100
+            }
+          }
+        ]
+      },
+      "gameId": {
+        "description": "游戏 ID，可传单值或数组",
+        "anyOf": [
+          {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          }
+        ]
+      },
+      "gameTypeId": {
+        "description": "实际含义是 mods_type_id, 不是游戏类型",
+        "type": "integer",
+        "minimum": -9007199254740991,
+        "maximum": 9007199254740991
+      },
+      "mods_publish": {
+        "description": "发布者 UID",
+        "type": "integer",
+        "minimum": -9007199254740991,
+        "maximum": 9007199254740991
+      },
+      "support_gmm": {
+        "description": "是否支持 GMM",
+        "type": "boolean"
+      },
+      "local": {
+        "description": "是否为本地下载",
+        "type": "boolean"
+      }
+    }
+  }
+}

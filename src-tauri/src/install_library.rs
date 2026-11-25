@@ -55,6 +55,9 @@ pub struct LibraryInstallRequest {
     deny_unknown_fields
 )]
 pub enum LibraryInstallMode {
+    GtaRpf {
+        job_id: String,
+    },
     Adapter {
         mod_type: String,
         folder_name: Option<String>,
@@ -101,7 +104,7 @@ pub struct LibraryAdapterMatch {
     pub mod_type: String,
     pub root_id: String,
     pub layout: ArchiveLayout,
-    /// `matched`, `requiresFolderName`, `requiresUser`, `ambiguous`, or `rootUnavailable`.
+    /// `matched`, `requiresFolderName`, `requiresGtaRpf`, `unsupportedEdition`, `requiresUser`, `ambiguous`, or `rootUnavailable`.
     pub status: &'static str,
 }
 
@@ -355,6 +358,9 @@ fn resolve_root(
     let registered = Path::new(&game.root_path);
     // Even a registered game can never grant a deployment into app storage.
     engine.paths.stable_directory(registered)?;
+    if let Some(adapter) = adapter {
+        super::gta_layout::check_edition(game, &adapter.slug)?;
+    }
     let root = if let (Some(adapter), Some(ty)) = (adapter, selected) {
         let user_roots = game_roots::registered_user_roots(&engine.db, &game.id)?;
         let declared = adapter
@@ -545,7 +551,46 @@ pub fn match_library_install_cancellable(
     }
     let mut candidates = Vec::new();
     if let Some(adapter) = &adapter {
+        let gta = super::gta_layout::is_gta(&adapter.slug).then(|| {
+            let names = scan
+                .as_ref()
+                .map(|s| s.names.keys().map(String::as_str).collect())
+                .unwrap_or_else(|| vec![entry.filename.as_str()]);
+            super::gta_layout::classify(names)
+        });
+        if let Some(hints) = &gta {
+            warnings.extend(hints.warnings.iter().map(|s| (*s).to_string()));
+            if adapter.slug == "gta5-enhanced"
+                && hints.types.iter().any(|ty| ty.starts_with("rpf-"))
+            {
+                warnings.push(
+                    "增强版 RPF 尚无独立兼容性验证；不要启动或借用 Legacy 工具处理。".to_owned(),
+                );
+            }
+        }
         for ty in &adapter.mod_types {
+            if let Some(hints) = &gta {
+                if !hints.types.contains(&ty.id.as_str()) {
+                    continue;
+                }
+                if ty.id.starts_with("rpf-") || hints.review {
+                    candidates.push(LibraryAdapterMatch {
+                        mod_type: ty.id.clone(),
+                        root_id: ty.root.clone(),
+                        layout: ArchiveLayout::Manual,
+                        status: if super::gta_layout::check_edition(&game, &adapter.slug).is_err() {
+                            "rootUnavailable"
+                        } else if adapter.slug == "gta5-enhanced" && ty.id.starts_with("rpf-") {
+                            "unsupportedEdition"
+                        } else if hints.review {
+                            "requiresUser"
+                        } else {
+                            "requiresGtaRpf"
+                        },
+                    });
+                    continue;
+                }
+            }
             let rules: Vec<_> = adapter
                 .archive_rules
                 .iter()
@@ -854,6 +899,33 @@ fn validate_cache(
     Ok(verified)
 }
 
+/// The optional GTA builder only receives snapshots of members verified against the library archive.
+/// Never accept a caller-supplied extraction path. Preserve wrapper directories for explicit selections.
+pub(super) fn gta_payload(
+    engine: &FileEngine,
+    game_id: &str,
+    artifact_id: &str,
+    cancel: &CancellationToken,
+) -> AppResult<(mod_library::LibraryEntry, Payload)> {
+    check_cancel(cancel)?;
+    let entry = load_entry(engine, game_id, artifact_id)?;
+    let members = if archive_intent(&entry)? {
+        let scan = scan_archive(&entry, false, false, cancel)?;
+        materialize(engine, &entry, &scan, cancel)?;
+        scan.names
+            .into_iter()
+            .map(|(name, rel)| (name, entry.payload_root().join(rel)))
+            .collect()
+    } else {
+        BTreeMap::from([(entry.filename.clone(), entry.archive.clone())])
+    };
+    let verified = mod_library::verify_for_install(engine, game_id, artifact_id)?;
+    if verified.entry.sha256 != entry.sha256 || verified.archive_path != entry.archive {
+        return Err(AppError::Conflict("GTA 模组原包在暂存期间发生变化".into()));
+    }
+    Ok((verified.entry, members))
+}
+
 /// An invalid existing cache is never overwritten or silently repaired. A new
 /// extraction becomes visible only by publishing the complete directory.
 fn materialize(
@@ -970,13 +1042,27 @@ pub fn plan_library_install_with_organization(
     cancel: &CancellationToken,
 ) -> AppResult<InstallPreview> {
     check_cancel(cancel)?;
+    if let LibraryInstallMode::GtaRpf { job_id } = &request.mode {
+        return super::gta_rpf::plan_install(
+            engine,
+            &request.game_id,
+            &request.library_entry_id,
+            job_id,
+            organization,
+            cancel,
+        );
+    }
     let entry = load_entry(engine, &request.game_id, &request.library_entry_id)?;
     let game = games::get_game(&engine.db, &request.game_id)?;
     let adapter = adapter_for(engine, &game)?;
     let requested_type = match &request.mode {
+        LibraryInstallMode::GtaRpf { .. } => unreachable!("handled above"),
         LibraryInstallMode::Adapter { mod_type, .. } => Some(mod_type.as_str()),
         LibraryInstallMode::ApprovedMappings { mod_type, .. } => mod_type.as_deref(),
     };
+    if let Some(adapter) = &adapter {
+        super::gta_layout::check_copy_type(&adapter.slug, requested_type)?;
+    }
     let ty = select_type(adapter.as_ref(), requested_type)?;
     let root = resolve_root(engine, &game, adapter.as_ref(), ty)?;
     let mod_type = ty.map_or(MANUAL_TYPE, |ty| ty.id.as_str());
@@ -987,6 +1073,7 @@ pub fn plan_library_install_with_organization(
     }
     let scan;
     let (source_kind, (payload, ignored_files)) = match &request.mode {
+        LibraryInstallMode::GtaRpf { .. } => unreachable!("handled above"),
         LibraryInstallMode::ApprovedMappings {
             source_kind,
             mappings,
@@ -1104,6 +1191,15 @@ pub fn plan_library_install_with_organization(
         ));
     }
     let destinations = destinations(engine, &root, &payload)?;
+    if let Some(adapter) = &current_adapter {
+        for dst in &destinations {
+            super::gta_layout::check_copy_destination(
+                &adapter.slug,
+                Path::new(&game.root_path),
+                dst,
+            )?;
+        }
+    }
     super::verify_unowned_paths(engine, destinations.iter().map(PathBuf::as_path))?;
     let is_archive = source_kind == LibrarySourceKind::Archive;
     let hashes = if is_archive {
@@ -1264,6 +1360,13 @@ pub(crate) fn validate_library_apply(engine: &FileEngine, plan: &FilePlan) -> Ap
             }
             LibrarySourceKind::Archive => src != &payload && src.starts_with(&payload),
         };
+        if let Some(adapter) = &adapter {
+            super::gta_layout::check_copy_destination(
+                &adapter.slug,
+                Path::new(&game.root_path),
+                dst,
+            )?;
+        }
         if !is_library_source || dst == root || !dst.starts_with(root) {
             return Err(AppError::Denied(
                 "模组库安装的来源或目标超出已审核范围".into(),

@@ -6,6 +6,54 @@ installation limitations. This page records implementation and verification
 evidence; it does not establish that the release workflow or CI has passed.
 The broader project scope remains active.
 
+**Mod Browse (2026-11-25).** The desktop sidebar opens a responsive cover-card
+catalog for registered games. With the user's consent, it reads connected stock
+MCP catalogs, groups results across selected games, and searches the original
+and translated terms. The configured model localizes public metadata and
+classifies results. The page preserves the original author and title, opens
+verified project pages in the system browser, and supports installation review
+and task recovery in place. See the [desktop command contract](browse-ipc.md).
+
+The production frontend build and 33 mocked-IPC Browse tests passed across
+1280, 1440 and 390 px viewports. They cover both themes, cover geometry,
+keyboard project opening, filtered pagination and installation approvals.
+The full Rust library suite passed with six test threads (1,239 passed, 16
+ignored). Stock provider and installation contracts were exercised offline.
+
+**Grand Theft Auto V external adapters (2026-11-25).** Separate Windows packages for
+Legacy (271590 / `GTA5.exe`) and Enhanced (3240220 / `GTA5_Enhanced.exe`) live in
+[`packages/gta-adapters`](../packages/gta-adapters/README.md). Their manual mappings
+cover story-mode Script Hook V, ASI and scripts. RPF candidates use a separate native
+job, not archive-as-directory mappings. Mixed payloads need selection, OIV installers
+are not run, and Enhanced RPF is explicitly unavailable. Neither package is bundled,
+auto-bound, or a source of implicit stdio launch consent.
+
+The optional [RPF MCP](../tools/gta-rpf-mcp/README.md) uses a local, version-pinned
+wheel. The separate prerequisite is the unmodified 3DM project 205014 / resource
+356110 (1.4.0) ZIP; pinning the observed digest is not a publisher signature. It
+only edits disposable Legacy copies. AMM verifies outputs, uses existing file plan
+approval/recovery, and records contributions for gameconfig, DLC, vehicles and peds.
+Uninstall rebuilds affected shared archives from the baseline and surviving
+contributions; external drift or stale jobs stop the transaction. Tests include
+disposable RPF files with the real 3DM release and native synthetic journal fixtures.
+This does not verify a particular retail build or in-game behavior. No game files
+or official tool binaries are distributed by these packages.
+
+**Desktop game launch methods (2026-11-25).** The arrow beside **Launch game**
+lists available Steam, direct and modded launch methods without changing the
+existing one-click default. On Windows the desktop checks known layouts for
+Stardew Valley / SMAPI and Elden Ring / Mod Engine 2. Other layouts can use a
+named, per-game launcher inside the registered game root, with one argument
+per line. Editing or clearing it does not overwrite the ordinary launch path
+or modify the game installation. Explicit launch requests pass a method ID,
+not a command line; the native backend revalidates the selected executable,
+starts it in its own directory, and does not fall back on error. Agent and MCP
+continue to use the existing approved launch path. Frontend build, 12 launcher
+UI checks and 57 existing library/cache checks passed across three viewports;
+light/dark menus and settings dialogs were also checked using mocked IPC.
+All six Windows launcher-specific Rust tests passed against local fixtures;
+live games and Unix executables were not exercised in this verification.
+
 **GitHub Security follow-up (2026-11-24).** Reviewed seven open CodeQL
 alerts and one Dependabot alert; Secret Scanning reported no open alerts.
 Model metadata caches use process-local random-key HMAC tags to keep provider
@@ -721,6 +769,11 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   `localStorage` (`amm.sidebar`, same mechanism as the theme). Without a saved
   choice it still follows the window width; an invalid value is ignored. Covered
   by `tests/ui/sidebar-memory.spec.ts`.
+- In an empty Agent composer, adding a game or migrating Mods opens a directory
+  helper with a native folder picker. Finding and installing Mods instead fills
+  an editable draft asking for fun Mods and selects the game-name placeholder.
+  Users can type over it or optionally choose the game from their library. No
+  preset sends a message automatically. See `tests/ui/agent-prompt-presets.spec.ts`.
 - Agent messages expose copy, edit, and retry in the message footer. Edit
   restores the original text in the composer. Sending an edit or retrying a
   reply regenerates from the selected question in the same conversation,
@@ -883,9 +936,9 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   [source restrictions and evidence](mod-sources.md).
   Shared provider HTTP caching and rate limiting are implemented;
   Bing search uses a fresh browser session and keeps raw pages out of that cache.
-- Agent Chat provides the in-app Mod search and download workflow. The Mod
-  Discovery page and its standalone download history and install dialog were
-  removed. Mod source settings remain available.
+- Agent Chat supports conversational Mod search and downloads. The desktop Browse
+  page also searches connected Mod catalogs and opens installation tasks in place.
+  Its [IPC contract](browse-ipc.md) describes source consent, pagination and task recovery.
 - Modrinth releases can be browsed by game version and loader via the read-only
   desktop IPC, Agent and local MCP version list. Resolve the exact ID with the
   same filters before downloading. Thunderstore direct dependency declarations are now also
@@ -1028,12 +1081,14 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   CurseForge, GameBanana, 3DM, Nexus Mods and Thunderstore. Insert-only seeding
   adds the Thunderstore preset on startup without overwriting an existing
   connection with that ID. The preset resolves `thunderstore-mcp@latest` through
-  the bundled uvx using official PyPI, needs no credentials, and sets
+  the bundled uvx using its default Tsinghua PyPI mirror, needs no credentials, and sets
   `THUNDERSTORE_DOWNLOAD_DIR` for the stock process to the active
   `downloads/incoming` folder. Mod downloads continue through the normal
   approval and receipt flow; the native Thunderstore catalog is unchanged.
   Schema v25 updates the stock preview command from the 0.1.0 pin to `@latest`
   and revokes the old startup consent without editing custom connections.
+  Schema v26 removes the official PyPI override from the stock Thunderstore
+  command. Users who enabled automatic startup click Start once to approve it again.
   A Windows smoke test with the bundled launcher registered all 16 Thunderstore
   tools and prepared the managed inbox; a separate public community lookup
   succeeded. No live archive was downloaded in these tests.
@@ -1046,7 +1101,11 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   Schema v9 moves the stock 3DM stdio preset to `https://mod.3dmgame.com/mcp`
   and expires its old launch consent while retaining the credential reference. Desktop bundles carry Node.js/npm/npx and uv/uvx. A confirmed
   bare launcher uses the packaged runtime with a child-only npm or PyPI mirror
-  (npmmirror or Tsinghua). Explicit executable paths retain their own configuration.
+  (npmmirror or Tsinghua). When uvx needs to download CPython, it uses the
+  npmmirror `python-build-standalone` archive via `UV_PYTHON_INSTALL_MIRROR`.
+  Explicit executable paths retain their own configuration. A Windows x64 cold-start
+  check using bundled uvx 0.13.9 and empty caches downloaded CPython 3.15.2,
+  installed `thunderstore-mcp` 0.1.0 and its dependencies, and listed all 16 MCP tools.
   Schema v11 updates the six stock npm/PyPI launch commands to fetch current
   releases from the configured package index. Users can still pin a version in
   their own launch arguments. Schema v17 switches the stock Playwright MCP preset to the bundled Node and
@@ -1083,6 +1142,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   service name. Hover or keyboard focus reveals the full text. Built-in services
   include Chinese descriptions, custom connections can be edited in Settings,
   and adapters can supply a `description` per service in `mcpServers`.
+  Settings and onboarding show bundled website logos for the seven built-in Mod sources.
   The per-service credentials dialog handles Bearer and stdio environment secrets.
   Each password field shows whether a nonblank value is saved locally, or whether
   its status could not be read. The desktop status command returns booleans for
@@ -1607,6 +1667,14 @@ All requirements in the original approved plan remain in scope.
 - 2026-11-21 验证：`yarn typecheck`、`vite build` 与 `motion.spec.ts`（3 个视口 21 个用例）通过。整套 `yarn test:ui` 在并行负载下有偶发超时，相关文件单独重复运行通过；`workflows.spec.ts` 中依赖已隐藏的「历史对话」导航项的 2 个用例在改动前就失败。`yarn build` 当前被他人未提交的 `SettingsPage.tsx` 中未使用的 `SecretField` 阻断（TS6133），与动画无关。
 
 ### Resumable discovery and diagnosis
+
+- In the library scan dialog, candidates appear in a responsive grid. Each card
+  shows the game cover above its name and directory, with the match status,
+  Add/Managed button and More menu in the footer. More can copy the path and,
+  when eligible, identify the game online or add it without a cloud adapter.
+  Artwork comes from an enabled, validated local adapter or the matched cloud
+  release (loaded only when visible). A missing or failed cover does not block
+  registration. The onboarding workflow is unchanged.
 
 - Installed-game discovery has no fixed depth/directory/entry ceiling for
   explicitly selected trees; `maxDepth`, `maxDirectories`, and `maxEntries`

@@ -190,14 +190,21 @@ impl<'a> FileEvidencePass<'a> {
 
     fn manifest(&self, id: &str) -> AppResult<ManifestEvidence> {
         let row = self.engine.db.conn().query_row(
-            "SELECT install_root, CASE WHEN length(CAST(files_json AS BLOB)) <= ?3 THEN files_json END
+            "SELECT install_root, CASE WHEN length(CAST(files_json AS BLOB)) <= ?3 THEN files_json END, coalesce(json_extract(metadata_json,'$.gtaRpf'),0)
              FROM installs WHERE id=?1 AND game_id=?2",
             params![id, self.game_id, MAX_MANIFEST_BYTES],
-            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, bool>(2)?)),
         ).optional()?;
-        let Some((Some(root), json)) = row else {
+        let Some((Some(root), json, gta_rpf)) = row else {
             return Ok(ManifestEvidence::default());
         };
+        if gta_rpf {
+            let files = crate::install::gta_rpf::active_files(self.engine, self.game_id, id)?;
+            return Ok(ManifestEvidence {
+                files: (!files.is_empty()).then(|| (PathBuf::from(root), files)),
+                limit_reached: false,
+            });
+        }
         let limit_reached = json.is_none();
         let files = json
             .and_then(|json| serde_json::from_str::<Vec<InstalledFile>>(&json).ok())

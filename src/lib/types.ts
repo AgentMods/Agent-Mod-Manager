@@ -1,7 +1,7 @@
 import type { NativeMessage } from "./native-error";
 import type { ModRequestOrigin } from './mod-request';
 
-export type PageName = "library" | "detail" | "agent" | "plugins" | "trash" | "history" | "settings" | "onboarding";
+export type PageName = "browse" | "library" | "detail" | "agent" | "plugins" | "trash" | "history" | "settings" | "onboarding";
 export type PermissionMode = "request_approval" | "auto_approve" | "full_trust";
 export interface Game {
   id: string; name: string; slug: string; rootPath: string; platform: string;

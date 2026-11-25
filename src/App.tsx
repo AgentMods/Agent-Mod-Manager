@@ -1,7 +1,7 @@
 import { version } from "../package.json";
 import { tr, useLocale } from "@/lib/i18n";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
-import { Gamepad2Icon, HeartIcon, HistoryIcon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
+import { CompassIcon, Gamepad2Icon, HeartIcon, HistoryIcon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -26,6 +26,7 @@ import { cn } from "@/lib/utils";
 import { stagger } from "@/lib/motion";
 
 const LibraryPage = lazy(() => import("./pages/LibraryPage"));
+const BrowsePage = lazy(() => import("./pages/BrowsePage"));
 const GameDetailPage = lazy(() => import("./pages/GameDetailPage"));
 const AgentPage = lazy(() => import("./pages/AgentPage"));
 const PluginsPage = lazy(() => import("./pages/PluginsPage"));
@@ -37,6 +38,7 @@ const OnboardingPage = lazy(() => import("./pages/OnboardingPage"));
 const navigation = [
     { id: "agent", label: "Agent", icon: MessageSquareIcon },
     { id: "library", get label() { return tr("游戏库"); }, icon: LibraryIcon },
+    { id: "browse", get label() { return tr("游览"); }, icon: CompassIcon },
     { id: "plugins", get label() { return tr("插件中心"); }, icon: PuzzleIcon },
     { id: "trash", get label() { return tr("回收站"); }, icon: Trash2Icon },
     { id: "history", get label() { return tr("历史对话"); }, icon: HistoryIcon },
@@ -44,7 +46,7 @@ const navigation = [
 const settingsItem = { id: "settings", get label() { return tr("设置"); }, icon: SettingsIcon } as const;
 const SPONSOR_URL = "https://sponsor.aoe.top/";
 const APP_VERSION = `v${version}`;
-const pages = { library: LibraryPage, detail: GameDetailPage, agent: AgentPage, plugins: PluginsPage, trash: TrashPage, history: HistoryPage, settings: SettingsPage };
+const pages = { browse: BrowsePage, library: LibraryPage, detail: GameDetailPage, agent: AgentPage, plugins: PluginsPage, trash: TrashPage, history: HistoryPage, settings: SettingsPage };
 
 /** The navigation rail collapses to icons below this width so content keeps its room. */
 const WIDE_QUERY = "(min-width: 1100px)";

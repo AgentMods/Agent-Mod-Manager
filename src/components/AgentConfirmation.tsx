@@ -107,7 +107,8 @@ export function BackgroundApprovalLink({ visibleConversation }: { visibleConvers
   const pending = useMemo(() => {
     for (const [id, events] of Object.entries(milestones)) {
       if (id === visibleConversation) continue;
-      const request = describeAgentTools(events).map(pendingToolApproval).find(Boolean);
+      const request = describeAgentTools(events).map(pendingToolApproval).find((event) =>
+        event && event.payload.reviewSurface !== "browseInstall");
       if (request) return { id, operation: Object.values(switches).find(entry =>
         entry.conversationId === id && entry.turnId === request.turnId) };
     }

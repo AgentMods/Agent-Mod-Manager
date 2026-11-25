@@ -42,6 +42,8 @@ export function createModRequestMessage(kind: BatchAction, targets: ModRequestTa
         }), tr('仅在 {safeUninstall} 时用 {uninstallMod}；在 {rollbackInstall} 或 {rollbackReplacement} 时，用报告中的事务 ID（{transactionId}）和相同的 {gameId}、{installId} 申请 {rollbackTransaction}。', {
             safeUninstall: 'safe_uninstall', uninstallMod: 'uninstall_mod', rollbackInstall: 'rollback_install', rollbackReplacement: 'rollback_replacement',
             transactionId: 'transaction_id', gameId: 'game_id', installId: 'install_id', rollbackTransaction: 'rollback_transaction',
+        }), tr('GTA RPF 例外：若报告建议 {prepareJob}，按游戏适配包 Skill 重建其余贡献，然后用 {uninstallJob} 提交。', {
+            prepareJob: 'prepare_gta_rpf_job', uninstallJob: 'uninstall_mod({game_id, install_id, rpf_job_id})',
         }), kind === 'remove'
             ? tr('在这些卸载或回滚分支中，成功后才对同一记录调用 {forgetUninstalledMod}。', { forgetUninstalledMod: 'forget_uninstalled_mod' }) : '',
         tr('其他异常先说明原因和冲突并提交审核，未解决前保留管理记录。')].filter(Boolean).join(separator);

@@ -11,7 +11,9 @@ async function openIdentity(page: Page) {
   await expect(discovery.getByRole('status').filter({hasText: '已检查'})).toBeVisible();
   await discovery.getByLabel('游戏目录', {exact: true}).fill('/sandbox/unknown-game');
   await discovery.getByRole('button', {name: '检查单个游戏', exact: true}).click();
-  await discovery.getByRole('button', {name: '联网识别', exact: true}).click();
+  const candidate = discovery.getByRole('listitem').filter({has: page.getByText('/sandbox/unknown-game', {exact: true})});
+  await candidate.getByRole('button', {name: '更多操作', exact: true}).click();
+  await page.getByRole('menuitem', {name: '联网识别', exact: true}).click();
   const modal = page.getByRole('dialog', {name: '联网识别游戏', exact: true});
   await expect(modal.getByLabel('公开搜索词', {exact: true})).toHaveValue('FixtureGame.exe game');
   return modal;
@@ -80,12 +82,18 @@ test('changed queries and reopened identity dialogs discard earlier consent', as
   const discovery = page.getByRole('dialog', {name: '扫描游戏', exact: true});
   await expect(discovery).toBeVisible();
   await expect(discovery.getByLabel('游戏目录', {exact: true})).toHaveValue('/sandbox/unknown-game');
-  await discovery.getByRole('button', {name: '联网识别', exact: true}).click();
+  const candidate = discovery.getByRole('listitem').filter({has: page.getByText('/sandbox/unknown-game', {exact: true})});
+  const more = candidate.getByRole('button', {name: '更多操作', exact: true});
+  await expect(more).toBeFocused();
+  await more.click();
+  await page.getByRole('menuitem', {name: '联网识别', exact: true}).click();
   modal = page.getByRole('dialog', {name: '联网识别游戏', exact: true});
   await expect(modal.getByLabel('同意发送公开搜索词', {exact: true})).not.toBeChecked();
   await expect(modal.getByRole('radio')).toHaveCount(0);
   await expect(modal.getByRole('button', {name: '添加', exact: true})).toBeDisabled();
   expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === 'confirm_game_identity'))).toHaveLength(0);
+  await modal.getByRole('button', {name: '取消', exact: true}).click();
+  await expect(more).toBeFocused();
 });
 
 test('built-in search cannot start without browser components and offers recovery steps', async ({page}) => {

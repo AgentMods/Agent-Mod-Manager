@@ -1,0 +1,288 @@
+{
+  "schemaVersion": 1,
+  "slug": "gta5-enhanced",
+  "name": "GTA V Enhanced 单机适配包",
+  "gameName": "Grand Theft Auto V Enhanced",
+  "version": "1.0.0",
+  "platforms": [
+    "windows"
+  ],
+  "steamAppId": "3240220",
+  "markers": [
+    {
+      "path": "GTA5_Enhanced.exe",
+      "kind": "file",
+      "required": true,
+      "platforms": [
+        "windows"
+      ]
+    }
+  ],
+  "mcpServers": [
+    {
+      "id": "rpf",
+      "name": "GTA V Enhanced · RPF 暂存",
+      "transport": "stdio",
+      "command": "uvx",
+      "args": [
+        "--offline",
+        "--no-index",
+        "--from",
+        "./tools/gta-rpf-mcp/dist/gta_rpf_mcp-1.0.0-py3-none-any.whl",
+        "gta-rpf-mcp"
+      ]
+    }
+  ],
+  "installRoots": [
+    {
+      "id": "game",
+      "kind": "game",
+      "relativePath": ".",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [],
+      "notes": "只审查与本版主程序同级且确有必要的文件。"
+    },
+    {
+      "id": "scripts",
+      "kind": "game",
+      "relativePath": "scripts",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [],
+      "notes": "脚本及其同目录资源，保持子目录。"
+    },
+    {
+      "id": "mods",
+      "kind": "game",
+      "relativePath": "mods",
+      "platforms": [
+        "windows"
+      ],
+      "discoveryHints": [],
+      "notes": "RPF 专用派生产物；不是散装资源的通用复制根。"
+    }
+  ],
+  "modTypes": [
+    {
+      "id": "scripthookv",
+      "name": "Script Hook V",
+      "root": "game",
+      "extensions": [
+        "dll"
+      ],
+      "notes": "依发行包、游戏版本和选件逐文件审查；不能将 bin/ 整份复制。"
+    },
+    {
+      "id": "asi",
+      "name": "ASI 插件",
+      "root": "game",
+      "extensions": [
+        "asi"
+      ],
+      "notes": "根目录插件；保留作者指定的同目录配置及依赖，不自动安装加载器。"
+    },
+    {
+      "id": "script",
+      "name": "scripts 脚本或依赖",
+      "root": "scripts",
+      "extensions": [
+        "dll",
+        "cs",
+        "vb"
+      ],
+      "notes": "仅作者明确指定的单机脚本及所选 API 同级资源；不得重复创建 scripts/scripts/。"
+    },
+    {
+      "id": "game-root",
+      "name": "人工确认的根目录组件",
+      "root": "game",
+      "extensions": [],
+      "notes": "有明确作者目标和所选版本才准入。并非剩余文件或未知 DLL 的默认目的地。"
+    },
+    {
+      "id": "rpf-gameconfig",
+      "name": "RPF · 游戏配置",
+      "root": "mods",
+      "extensions": [
+        "xml"
+      ],
+      "notes": "仅匹配所选版本的 gameconfig.xml；需要 RPF 任务，禁止普通复制或覆盖原版。"
+    },
+    {
+      "id": "rpf-dlc",
+      "name": "RPF · 独立 DLC",
+      "root": "mods",
+      "extensions": [
+        "rpf"
+      ],
+      "notes": "只接收作者指定的 dlc.rpf；须在归档内核验 setup2.xml/nameHash。"
+    },
+    {
+      "id": "rpf-vehicle",
+      "name": "RPF · 散装载具",
+      "root": "mods",
+      "extensions": [
+        "yft",
+        "ytd"
+      ],
+      "notes": "需明确模型、组件与模板；替换包或未知格式不自动转换。"
+    },
+    {
+      "id": "rpf-ped",
+      "name": "RPF · 行人模型",
+      "root": "mods",
+      "extensions": [
+        "ydd",
+        "ymt",
+        "ytd",
+        "yft",
+        "yld"
+      ],
+      "notes": "区分普通与 Streamed，核对模型名及组件目录；未匹配则停止。"
+    }
+  ],
+  "archiveRules": [
+    {
+      "modType": "scripthookv",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "依发行包、游戏版本和选件逐文件审查；不能将 bin/ 整份复制。"
+    },
+    {
+      "modType": "asi",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "根目录插件；保留作者指定的同目录配置及依赖，不自动安装加载器。"
+    },
+    {
+      "modType": "script",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "仅作者明确指定的单机脚本及所选 API 同级资源；不得重复创建 scripts/scripts/。"
+    },
+    {
+      "modType": "game-root",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "有明确作者目标和所选版本才准入。并非剩余文件或未知 DLL 的默认目的地。"
+    },
+    {
+      "modType": "rpf-gameconfig",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "当前版本无 Enhanced RPF 写入验证，停止。只允许经过验证的版本专属 RPF 暂存任务；不可生成直接文件映射。"
+    },
+    {
+      "modType": "rpf-dlc",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "当前版本无 Enhanced RPF 写入验证，停止。只允许经过验证的版本专属 RPF 暂存任务；不可生成直接文件映射。"
+    },
+    {
+      "modType": "rpf-vehicle",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "当前版本无 Enhanced RPF 写入验证，停止。只允许经过验证的版本专属 RPF 暂存任务；不可生成直接文件映射。"
+    },
+    {
+      "modType": "rpf-ped",
+      "layout": "manual",
+      "sourcePrefix": null,
+      "requiredFiles": [],
+      "notes": "当前版本无 Enhanced RPF 写入验证，停止。只允许经过验证的版本专属 RPF 暂存任务；不可生成直接文件映射。"
+    }
+  ],
+  "loadOrder": {
+    "kind": "loader_dependencies",
+    "paths": [],
+    "notes": "先核对与游戏 build 对应的加载器和脚本 API；不自动安装前置、不修改启动配置、不重排整份 dlclist.xml。"
+  },
+  "savePaths": [],
+  "logPaths": [],
+  "uninstallNotes": [
+    "普通包只撤销本次登记的文件和备份，保留共用加载器、其他脚本、配置与存档。",
+    "共享 RPF 只可使用同一游戏的受管贡献重建；基线、贡献或当前指纹不符则停止，禁止删除整个 mods/ 或替换原版归档。"
+  ],
+  "sources": [
+    {
+      "title": "Steam · Grand Theft Auto V Enhanced",
+      "url": "https://store.steampowered.com/app/3240220/",
+      "checkedAt": "2026-11-25"
+    },
+    {
+      "title": "Alexander Blade · Script Hook V",
+      "url": "https://www.dev-c.com/gtav/scripthookv/",
+      "checkedAt": "2026-11-25"
+    },
+    {
+      "title": "GameplayFixesV 3.4 · 作者发行",
+      "url": "https://github.com/SuleMareVientu/GameplayFixesV-ScriptHookV/releases/tag/3.4",
+      "checkedAt": "2026-11-25"
+    },
+    {
+      "title": "SHVDN Enhanced 1.1.0.6 · 作者发行",
+      "url": "https://github.com/Chiheb-Bacha/ScriptHookVDotNetEnhanced/releases/tag/v1.1.0.6",
+      "checkedAt": "2026-11-25"
+    },
+    {
+      "title": "LemonUI 2.2 · 作者发行",
+      "url": "https://github.com/LemonUIbyLemon/LemonUI/releases/tag/v2.2",
+      "checkedAt": "2026-11-25"
+    },
+    {
+      "title": "LemonUI 2.2 · 框架与安装位置",
+      "url": "https://github.com/LemonUIbyLemon/LemonUI/blob/v2.2/README.md",
+      "checkedAt": "2026-11-25"
+    },
+    {
+      "title": "FULLYCRX · gameconfig.xml 发布文件",
+      "url": "https://github.com/FULLYCRX/GTA-5-Legacy-Enhanced-gameconfig.xml-Version-3889-and-lower/releases/tag/Version",
+      "checkedAt": "2026-11-25"
+    },
+    {
+      "title": "GMM · RPF 有限操作及模板",
+      "url": "https://github.com/GlossMod/gmm-plug-in/tree/main/rpf",
+      "checkedAt": "2026-11-25"
+    },
+    {
+      "title": "3DM 205014 · 指定的 GMM RPF 工具",
+      "url": "https://mod.3dmgame.com/mod/205014",
+      "checkedAt": "2026-11-25"
+    },
+    {
+      "title": "GMM · 旧适配器（映射参考，不证明兼容性）",
+      "url": "https://github.com/GlossMod/Gloss-Mod-Manager/blob/febf706658be47dda03aa63c37c7a56c14cd564d/src/lib/GTA5Handler.ts",
+      "checkedAt": "2026-11-25"
+    },
+    {
+      "title": "Weeny Issi Hardtop · 作者分版 DLC 安装说明",
+      "url": "https://www.gta5-mods.com/vehicles/cut-beta-issi-hardtop-add-on-legacy-enhanced",
+      "checkedAt": "2026-11-25"
+    },
+    {
+      "title": "GameplayFixesV · 作者指定游戏根",
+      "url": "https://www.gta5-mods.com/scripts/gameplayfixesv",
+      "checkedAt": "2026-11-25"
+    },
+    {
+      "title": "BMW M3 GTR · 必须替换原归档的反例",
+      "url": "https://www.gta5-mods.com/vehicles/bmw-m3-gtr-e46-most-wanted",
+      "checkedAt": "2026-11-25"
+    },
+    {
+      "title": "John Wick · 作者声明 AddonPeds 前置",
+      "url": "https://www.gta5-mods.com/player/john-wick",
+      "checkedAt": "2026-11-25"
+    }
+  ]
+}

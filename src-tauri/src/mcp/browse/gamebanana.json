@@ -1,0 +1,93 @@
+{
+  "browse_mods": {
+    "properties": {
+      "game_id": {
+        "anyOf": [
+          {
+            "description": "GameBanana game _idRow.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Game Id"
+      },
+      "page": {
+        "default": 1,
+        "description": "One-based GameBanana page number.",
+        "minimum": 1,
+        "title": "Page",
+        "type": "integer"
+      },
+      "per_page": {
+        "default": 20,
+        "description": "Page size for directory listing (1–50).",
+        "maximum": 50,
+        "minimum": 1,
+        "title": "Per Page",
+        "type": "integer"
+      }
+    },
+    "title": "browse_modsArguments",
+    "type": "object"
+  },
+  "search_games": {
+    "properties": {
+      "page": {
+        "default": 1,
+        "description": "One-based GameBanana page number.",
+        "minimum": 1,
+        "title": "Page",
+        "type": "integer"
+      },
+      "query": {
+        "minLength": 1,
+        "title": "Query",
+        "type": "string"
+      }
+    },
+    "required": [
+      "query"
+    ],
+    "title": "search_gamesArguments",
+    "type": "object"
+  },
+  "search_mods": {
+    "properties": {
+      "game_id": {
+        "anyOf": [
+          {
+            "description": "GameBanana game _idRow.",
+            "minimum": 1,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Game Id"
+      },
+      "page": {
+        "default": 1,
+        "description": "One-based GameBanana page number.",
+        "minimum": 1,
+        "title": "Page",
+        "type": "integer"
+      },
+      "query": {
+        "minLength": 1,
+        "title": "Query",
+        "type": "string"
+      }
+    },
+    "required": [
+      "query"
+    ],
+    "title": "search_modsArguments",
+    "type": "object"
+  }
+}

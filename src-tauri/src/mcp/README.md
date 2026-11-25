@@ -64,11 +64,12 @@ The presets below appear in Settings → 工具.
 | CurseForge | `curseforge-mcp@latest` | `CURSEFORGE_API_KEY` from CurseForge for Studios |
 | GameBanana | `gamebanana-mcp@latest` | Anonymous |
 | Nexus Mods | `--upgrade --from glossmod-nexusmods-mcp nexusmods-mcp` | Anonymous public lookup, optional `NEXUSMODS_API_KEY` for account-authorized operations |
-| [Thunderstore](https://pypi.org/project/thunderstore-mcp/) | `--default-index https://pypi.org/simple thunderstore-mcp@latest` | Anonymous |
+| [Thunderstore](https://pypi.org/project/thunderstore-mcp/) | `thunderstore-mcp@latest` | Anonymous |
 
 The five stock uvx launchers above pass their provider-specific `*_DOWNLOAD_DIR`
 to the child process, set to `downloads/incoming` in the active storage directory.
-Custom launch commands and arguments do not receive this override.
+The previous stock Thunderstore command with its official PyPI index still gets
+the same download directory if retained. Other custom commands and arguments do not.
 
 The stock Nexus launcher also gives uvx `--isolated --find-links` with the
 packaged `nexus/` wheel directory. The directory supplies `1.0.0+amm.1` for
@@ -106,13 +107,13 @@ Schema v9 migrates the stock 3DM stdio preset to the remote endpoint and revokes
   URIs can read files available to the OS user, outside the manager's game roots.
 
 Click Start on a service in Settings to connect immediately. A stdio command runs with the current OS user’s permissions. Bare `npx`, `npx.cmd`, `npx.exe`, `uvx` and `uvx.exe` (case-insensitive) use
-application-owned launchers. Their child environments select npmmirror
-(`npm_config_registry`) or the Tsinghua PyPI mirror (`UV_DEFAULT_INDEX`).
-Explicit CLI registry options take precedence. MarkItDown inherits the bundled uvx default.
-Thunderstore resolves `@latest` on official PyPI because the bundled mirror did
-not serve the package when the preset was added. Schema v25 updates the stock
-preview command pinned to 0.1.0 and expires its auto-start consent; use Start to
-approve the new command. Custom launch configurations are preserved.
+application-owned launchers. The bundled npx uses npmmirror (`npm_config_registry`).
+The bundled uvx uses the Tsinghua PyPI mirror for packages (`UV_DEFAULT_INDEX`)
+and the npmmirror `python-build-standalone` archive for managed CPython downloads
+(`UV_PYTHON_INSTALL_MIRROR`). Explicit CLI index options take precedence.
+Schema v26 removes the official PyPI override from the stock Thunderstore command.
+If the preset was previously authorized for automatic startup, click Start once
+in Settings → 工具 to approve its updated command. Custom arguments are preserved.
 Other commands, including absolute paths, keep their own executable and package configuration.
 Package-backed MCPs and their Python interpreters are fetched by their launchers.
 Schema v4 revokes old auto-start consent for affected bare aliases, including custom connections,
@@ -238,3 +239,44 @@ Verification after parent integration on 2026-11-17:
 The temporary verification harness imports `mcp/mod.rs` by path and re-exports
 the application's existing db/settings/agent interfaces. It does not modify
 repository integration files.
+
+### Desktop Browse catalog (not an Agent or inbound MCP tool)
+
+Browse borrows the existing session for the seven stock launch configurations;
+listing its availability does not connect, restart, or call any tool. Tool names
+and the scalar argument schema must match what the MCP client discovered at
+connection setup. A reconnect, a tool-list-changed notification, or a change to
+an associated credential reference invalidates the desktop grant. The browse
+adapter never reads the credential store; the existing connection already owns
+its auth and redaction policy. The credential observer records only a monotonic
+SQLite revision and reference presence, not a key or its digest.
+
+| Stock source | Public games / communities | Scoped work catalog |
+| --- | --- | --- |
+| Mod 客栈 | `list_games` | `list_works` with `scope=""` |
+| 3DM | `get-game-list` | `get-mod-list` |
+| mod.io | `search_games` | `search_mods` (production API URL only) |
+| CurseForge | `list_games` | `search_mods` |
+| GameBanana | `search_games` | `browse_mods` / `search_mods` |
+| Nexus Mods | `find_games` | `find_mods` |
+| Thunderstore | `list_communities` | `search_packages` |
+
+These adapters never run download, resource, mutation, or account tools. A work
+lookup requires an explicit source game ID; numeric IDs are not guessed from
+local game names. Only projected public card fields and locally validated project
+and image URLs are returned; an unavailable cover or verifiable project URL
+is left empty. A vendor's next-page URL is never followed. Cancellation does
+not intentionally disconnect the Agent session; the existing transport still
+closes connections on frame overflows.
+
+The approved Agent bridge also filters known session credentials after decoding a
+single JSON text result from a stock server. It leaves other response shapes and
+provider-issued download signatures unchanged unless they contain a matching
+session credential; the existing Agent approval and effect classification apply.
+
+`browse/*.json` contains only the selected `tools/list` input schemas. The 3DM
+and Mod 客栈 fixtures were captured from their anonymous HTTP MCP endpoints; the
+other five were captured from the corresponding local stdio package, using the
+bundled wheel for Nexus Mods. There are no credentials, live account results,
+or download responses in those fixtures. `browse::providers::tests` supplies
+offline samples for the seven distinct catalog and pagination shapes.

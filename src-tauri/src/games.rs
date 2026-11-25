@@ -57,6 +57,41 @@ pub struct Game {
 }
 
 impl Game {
+    /// A launcher title can differ from the localized library name. Only the
+    /// title is eligible for catalogue queries, never the local directory name.
+    pub(crate) fn steam_catalog_title(&self) -> Option<String> {
+        let steam_id = self.steam_app_id.as_deref()?;
+        let id = app_id(steam_id).ok()?;
+        let root = Path::new(&self.root_path);
+        let identification = &self.metadata["lastIdentification"];
+        if identification["rootPath"].as_str().map(Path::new) == Some(root) {
+            let saved = identification["sources"].as_array().and_then(|sources| {
+                sources.iter().find_map(|source| {
+                    (source["kind"] == "steam" && source["steamAppId"].as_str() == Some(steam_id))
+                        .then(|| source["displayName"].as_str())
+                        .flatten()
+                        .and_then(|name| display_text(name).ok())
+                })
+            });
+            if saved.is_some() {
+                return saved;
+            }
+        }
+        // Manually registered Steam games may have no saved launcher evidence.
+        let common = root.parent()?;
+        let apps = common.parent()?;
+        if !root.is_absolute()
+            || !common.file_name()?.eq_ignore_ascii_case("common")
+            || !apps.file_name()?.eq_ignore_ascii_case("steamapps")
+        {
+            return None;
+        }
+        let file = apps.join(format!("appmanifest_{id}.acf"));
+        let manifest = read_steam_appmanifest(&file, id).ok()?;
+        let installed = canonical_directory(&common.join(&manifest.install_dir)).ok()?;
+        (installed == canonical_directory(root).ok()?).then_some(manifest.name)
+    }
+
     pub(crate) fn automatic_adapter_name<'a>(&self, adapter: &'a GameAdapter) -> Option<&'a str> {
         // A missing or mismatched record cannot establish the origin of the current name.
         let automatic = self
@@ -85,6 +120,9 @@ fn serialize_game_metadata<S: serde::Serializer>(
     }
     let mut metadata = metadata.clone();
     display_field(metadata.get_mut("launchPath"));
+    if let Some(launcher) = metadata.get_mut("modLauncher") {
+        display_field(launcher.get_mut("path"));
+    }
     if let Some(candidate) = metadata.get_mut("lastIdentification") {
         display_field(candidate.get_mut("rootPath"));
         if let Some(sources) = candidate.get_mut("sources").and_then(Value::as_array_mut) {

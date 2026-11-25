@@ -355,6 +355,8 @@ async fn tools_are_allowlisted_and_real_reads_reuse_desktop_file_guards() {
         "configure_settings",
         "start_process",
         "open_game_location",
+        "list_game_launch_options",
+        "set_game_mod_launcher",
         "remove_game_adapter",
     ] {
         fixture
@@ -392,6 +394,8 @@ async fn tools_are_allowlisted_and_real_reads_reuse_desktop_file_guards() {
         "configure_settings",
         "start_process",
         "open_game_location",
+        "list_game_launch_options",
+        "set_game_mod_launcher",
         "remove_game_adapter",
         "amm_approve",
         "download_web_mod",

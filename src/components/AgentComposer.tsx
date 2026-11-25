@@ -1,5 +1,6 @@
 import { tr } from "@/lib/i18n";
-import { useEffect, useRef, useState, type Ref } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
+import { flushSync } from "react-dom";
 import { ArrowUpIcon, CheckIcon, ChevronDownIcon, ChevronRightIcon, PlusIcon, ShieldAlertIcon, ShieldIcon, SquareIcon } from "lucide-react";
 import { DropdownMenu as Menu, Popover, Slider } from "radix-ui";
 import { Button } from "@/components/ui/button";
@@ -7,6 +8,8 @@ import { Field, FieldDescription, FieldError, FieldLabel } from "@/components/ui
 import { Input } from "@/components/ui/input";
 import { AttachmentGroup } from "@/components/ui/attachment";
 import { Spinner } from "@/components/ui/spinner";
+import { AgentPromptPresetDialog } from "./AgentPromptPresetDialog";
+import { promptPresets, renderPreset, type PromptPresetId } from "@/lib/agent-prompt-presets";
 import { ComposerAttachment, useAttachmentConverterStart } from "./AgentAttachments";
 import { ErrorState } from "./ui";
 import type { DraftAttachment } from "@/lib/agent-attachments";
@@ -19,7 +22,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { InputGroup, InputGroupAddon, InputGroupTextarea } from "@/components/ui/input-group";
 import { reasoningEffortLabel } from "@/lib/reasoning-effort";
-import type { AgentAttachment, AgentModelSettings, PermissionMode, ReasoningEffort } from "@/lib/types";
+import type { AgentAttachment, AgentModelSettings, Game, PermissionMode, ReasoningEffort } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const popupPosition = { side: "top", align: "end", sideOffset: 8, collisionPadding: 12 } as const;
@@ -32,11 +35,12 @@ const permissionLabels: Record<PermissionMode | "", string> = {
 
 interface AgentComposerProps {
   input: string;
-  inputRef?: Ref<HTMLTextAreaElement>;
+  inputRef: RefObject<HTMLTextAreaElement | null>;
   onCancelEdit?: () => void;
   onInputChange: (value: string) => void;
   attachments: DraftAttachment[];
   updateAttachments: (apply: (current: DraftAttachment[]) => DraftAttachment[]) => void;
+  games: Game[];
   libraryGameName?: string;
   onSend: (attachments: AgentAttachment[], newGameName?: string) => void;
   onCancel?: () => void;
@@ -53,7 +57,7 @@ interface AgentComposerProps {
 }
 
 export function AgentComposer({
-  input, inputRef, onCancelEdit, onInputChange, attachments, updateAttachments, libraryGameName, onSend, onCancel, disabled, busy, permission, inheritedPermission,
+  input, inputRef, onCancelEdit, onInputChange, attachments, updateAttachments, games, libraryGameName, onSend, onCancel, disabled, busy, permission, inheritedPermission,
   onPermissionChange, model, models, onModelChange, reasoningEffort, onReasoningChange,
 }: AgentComposerProps) {
   const [picker, setPicker] = useState<"model" | "reasoning" | null>(null);
@@ -68,6 +72,23 @@ export function AgentComposer({
   const controlsDisabled = disabled || busy;
   const ready = attachments.filter((item) => item.state === "ready");
   const canSend = !controlsDisabled && !invalidGameName && ready.length === attachments.length && (Boolean(input.trim()) || ready.length > 0);
+
+  const [presetPicker, setPresetPicker] = useState<{ id: PromptPresetId; opener: HTMLButtonElement } | null>(null);
+  const selectionAfterFill = useRef<[number, number] | undefined>(undefined);
+  const canUsePresets = !controlsDisabled && !onCancelEdit && libraryGameName === undefined && !attachments.length;
+  const showPresets = canUsePresets && !input;
+  const install = renderPreset("install", {});
+  const showGameHelper = canUsePresets && input === install.draft;
+  const presets = showPresets || showGameHelper ? promptPresets() : [];
+  const activePreset = presets.find(preset => preset.id === presetPicker?.id);
+
+  function focusDraft(selection?: [number, number]) {
+    const textarea = inputRef.current;
+    if (!textarea) return;
+    textarea.focus();
+    const [start, end] = selection ?? [textarea.value.length, textarea.value.length];
+    textarea.setSelectionRange(start, end);
+  }
 
   function retryFailed(shouldRetry: (item: Extract<DraftAttachment, { state: "error" }>) => boolean) {
     updateAttachments((current) => current.map((item) => item.state === "error" && shouldRetry(item)
@@ -92,10 +113,22 @@ export function AgentComposer({
   const elevated = effectivePermission === "full_trust";
   const PermissionIcon = elevated ? ShieldAlertIcon : ShieldIcon;
 
-  return <form onSubmit={(event) => {
+  return <><form onSubmit={(event) => {
     event.preventDefault();
     if (canSend) onSend(ready.map((item) => item.attachment), newGameName);
   }}>
+    {showPresets && <div role="group" aria-label={tr("预设提示词")} className="mb-2 flex flex-wrap gap-1.5">
+      {presets.map(({ id, label }) => <Button key={id} type="button" variant="outline" size="sm" aria-haspopup={id === "install" ? undefined : "dialog"}
+        className="h-auto max-w-full rounded-full py-1.5 text-xs whitespace-normal"
+        onClick={event => {
+          if (id !== "install") { setPresetPicker({ id, opener: event.currentTarget }); return; }
+          // Commit the controlled textarea value before selecting its game-name slot.
+          flushSync(() => onInputChange(install.draft));
+          focusDraft(install.firstUnfilled);
+        }}>{label}</Button>)}
+    </div>}
+    {showGameHelper && <Button type="button" size="sm" variant="outline" aria-haspopup="dialog" className="mb-2 rounded-full"
+      onClick={event => setPresetPicker({ id: "install", opener: event.currentTarget })}>{tr("使用模板")}</Button>}
     {libraryGameName !== undefined && <Field className="mb-3 gap-1.5" data-invalid={invalidGameName || undefined}>
       <div className="flex items-center gap-3">
         <FieldLabel className="shrink-0" htmlFor="adapter-game-name">{tr("游戏库显示名称")}</FieldLabel>
@@ -217,7 +250,18 @@ export function AgentComposer({
         </div>
       </InputGroupAddon>
     </InputGroup>
-  </form>;
+  </form>
+    {activePreset && presetPicker && <AgentPromptPresetDialog preset={activePreset} games={games} onClose={() => setPresetPicker(null)}
+      onFill={(text, selection) => {
+        selectionAfterFill.current = selection;
+        setPresetPicker(null);
+        onInputChange(text);
+      }}
+      onRestoreFocus={filled => {
+        if (!filled) { if (presetPicker.opener.isConnected) presetPicker.opener.focus(); return; }
+        focusDraft(selectionAfterFill.current);
+      }} />}
+  </>;
 }
 
 function ReasoningPicker({ modelLabel, disabled, levels, value, open, onOpenChange, onOpenModel, onChange }: {

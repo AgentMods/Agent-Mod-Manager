@@ -277,8 +277,8 @@ const GLOSSMOD_3DM_CREDENTIAL_URL: &str = "https://mod.3dmgame.com/Workshop/Api"
 const MODIO_ID: &str = "modio";
 pub(super) const NEXUSMODS_ID: &str = "nexusmods";
 const THUNDERSTORE_ID: &str = "thunderstore";
-// Use official PyPI; the bundled mirror did not serve this package.
-const THUNDERSTORE_ARGS: &[&str] = &[
+const THUNDERSTORE_V26_ARGS: &[&str] = &["thunderstore-mcp@latest"];
+const THUNDERSTORE_V25_ARGS: &[&str] = &[
     "--default-index",
     "https://pypi.org/simple",
     "thunderstore-mcp@latest",
@@ -301,7 +301,7 @@ const MOD_SOURCE_PRESETS: &[ModSourcePreset] = &[
         name: "Thunderstore MCP",
         description: "搜索 Thunderstore 社区与模组，查看版本、文档和依赖，并下载指定版本。",
         download_dir_env: "THUNDERSTORE_DOWNLOAD_DIR",
-        args: THUNDERSTORE_ARGS,
+        args: THUNDERSTORE_V26_ARGS,
         credential_url: None,
         bindings: &[],
     },
@@ -457,20 +457,36 @@ pub(crate) fn migrate_descriptions(conn: &Connection) -> AppResult<()> {
 
 /// Schema v25: upgrade only the launch config seeded by the pinned preview.
 pub(crate) fn migrate_thunderstore_to_latest(conn: &Connection) -> AppResult<()> {
-    let previous = [
-        "--default-index",
-        "https://pypi.org/simple",
-        "thunderstore-mcp==0.1.0",
-    ];
+    migrate_stock_thunderstore_args(
+        conn,
+        &[
+            "--default-index",
+            "https://pypi.org/simple",
+            "thunderstore-mcp==0.1.0",
+        ],
+        THUNDERSTORE_V25_ARGS,
+    )
+}
+
+/// Schema v26: use the runtime's package index for the stock Thunderstore preset.
+pub(crate) fn migrate_thunderstore_package_index(conn: &Connection) -> AppResult<()> {
+    migrate_stock_thunderstore_args(conn, THUNDERSTORE_V25_ARGS, THUNDERSTORE_V26_ARGS)
+}
+
+fn migrate_stock_thunderstore_args(
+    conn: &Connection,
+    previous: &[&str],
+    next: &[&str],
+) -> AppResult<()> {
     conn.execute(
         "UPDATE mcp_servers SET args_json=?1, startup_digest=NULL
          WHERE id=?2 AND builtin=1 AND plugin_slug IS NULL AND name='Thunderstore MCP'
            AND transport='stdio' AND command='uvx' AND args_json=?3
            AND url IS NULL AND credential_url IS NULL AND env_json='{}' AND secret_ref IS NULL",
         params![
-            serde_json::to_string(THUNDERSTORE_ARGS)?,
+            serde_json::to_string(next)?,
             THUNDERSTORE_ID,
-            serde_json::to_string(&previous)?
+            serde_json::to_string(previous)?
         ],
     )?;
     Ok(())
@@ -563,8 +579,47 @@ impl ServerConfig {
         }
         MOD_SOURCE_PRESETS
             .iter()
-            .find(|preset| self.id == preset.id && self.args == preset.args)
+            .find(|preset| {
+                self.id == preset.id
+                    && (self.args == preset.args
+                        // Retained v25 launches still use the managed download directory.
+                        || (preset.id == THUNDERSTORE_ID && self.args == THUNDERSTORE_V25_ARGS))
+            })
             .map(|preset| preset.download_dir_env)
+    }
+
+    /// Identify the built-in catalogue transport. A live read also checks the
+    /// exact connected configuration and the revision of its chosen credentials.
+    pub(crate) fn is_stock_browse_source(&self) -> bool {
+        if !self.builtin || self.plugin_slug.is_some() {
+            return false;
+        }
+        match self.id.as_str() {
+            GLOSSMOD_HTTP_ID | GLOSSMOD_3DM_ID => {
+                let key = self.bearer_secret_ref.as_deref();
+                let stock_http = if self.id == GLOSSMOD_3DM_ID {
+                    // 3DM allows guest access and a desktop-selected API key reference.
+                    self.uses_3dm_authorization()
+                        && key.is_none_or(|reference| validate_secret_ref(reference).is_ok())
+                } else {
+                    self.is_glossmod_endpoint() && key == Some("mcp.glossmod_http.api_key")
+                };
+                stock_http
+                    && self.command.is_none()
+                    && self.args.is_empty()
+                    && self.env_secret_refs.is_empty()
+            }
+            _ => MOD_SOURCE_PRESETS
+                .iter()
+                .find(|p| self.id == p.id)
+                .is_some_and(|p| {
+                    let stock = p.config();
+                    self.source_download_dir_env().is_some()
+                        && self.url.is_none()
+                        && self.bearer_secret_ref.is_none()
+                        && self.env_secret_refs == stock.env_secret_refs
+                }),
+        }
     }
 
     pub(super) fn is_glossmod_endpoint(&self) -> bool {

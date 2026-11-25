@@ -7,6 +7,7 @@ pub mod app_locale;
 mod app_update;
 pub mod archive;
 pub mod artifacts;
+pub(crate) mod browse;
 pub mod commands;
 pub mod db;
 pub mod diagnostics;
@@ -75,8 +76,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .manage(agent_attachment::AttachmentConversions::default())
+        .manage(browse::BrowseState::default())
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {
+                if let Some(browse) = window.try_state::<browse::BrowseState>() {
+                    browse.cancel_window(window.label());
+                }
                 if let Some(conversions) =
                     window.try_state::<agent_attachment::AttachmentConversions>()
                 {
@@ -86,6 +91,16 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap_state,
+            browse::browse_list_sources,
+            browse::browse_authorize,
+            browse::browse_start_search,
+            browse::browse_get_page,
+            browse::browse_select_game_match,
+            browse::browse_open_project,
+            browse::browse_cancel_search,
+            browse::install::browse_install_task,
+            browse::install::start_browse_install,
+            browse::install::list_browse_install_tasks,
             commands::get_app_locale,
             commands::set_app_locale,
             app_update::get_app_update_status,
@@ -147,6 +162,8 @@ pub fn run() {
             commands::resolve_game_conflict,
             commands::remove_game,
             commands::open_game_location,
+            commands::list_game_launch_options,
+            commands::set_game_mod_launcher,
             commands::launch_game,
             commands::identify_game,
             commands::preview_game_identity,

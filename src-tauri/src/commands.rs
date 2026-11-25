@@ -850,9 +850,36 @@ pub async fn open_game_location(
 }
 
 #[tauri::command]
-pub async fn launch_game(state: State<'_, AppServices>, id: String) -> AppResult<()> {
+pub async fn list_game_launch_options(
+    state: State<'_, AppServices>,
+    id: String,
+) -> AppResult<Vec<crate::game_actions::GameLaunchOption>> {
+    blocking(state.engine.clone(), move |engine| {
+        crate::game_actions::list_game_launch_options(&engine, &id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn set_game_mod_launcher(
+    state: State<'_, AppServices>,
+    id: String,
+    launcher: serde_json::Value,
+) -> AppResult<games::Game> {
+    blocking(state.engine.clone(), move |engine| {
+        crate::game_actions::set_game_mod_launcher(&engine, &id, launcher)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn launch_game(
+    state: State<'_, AppServices>,
+    id: String,
+    method: Option<String>,
+) -> AppResult<()> {
     blocking(state.engine.clone(), move |e| {
-        crate::game_actions::launch_from_desktop(&e, &id)
+        crate::game_actions::launch_from_desktop(&e, &id, method.as_deref())
     })
     .await?;
     crate::analytics::track("game_launch_requested");

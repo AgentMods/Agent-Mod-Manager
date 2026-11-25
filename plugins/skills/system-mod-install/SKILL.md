@@ -7,6 +7,8 @@ description: "从 Mods 游戏分类库安装或重装指定 Mod。先匹配适�
 
 1. 用当前已登记游戏的 `game_id` 和 `list_mod_library` 选择用户指定的 `artifactId`。若用户已从游戏详情点选条目，沿用传入的 ID。同名项目或多个版本需要用户决定时，用 `ask_user` 列出候选。若条目尚未绑定且用户已选定本机游戏，调用 `bind_mod_library_entry`。游戏尚未登记时可先按游戏名下载，安装时由用户在游戏库登记目标目录。
 2. 调用 `match_mod_install({game_id, artifact_id})`，核对原包、目录结构、适配规则、包内 README 和 FOMOD。若返回非空的 `activeInstallId`，用当前 `game_id` 和该 ID 调用 `inspect_install`，先核对已有部署并按下文处理。只有一个明确匹配时使用 `install_library_mod` 的 `mode: adapter` 和对应 `modType`。确定性 FOMOD 传 `fomodSelection: automatic`。需要选项时，使用返回的分组和逐文件映射，让用户选择有分歧的组件。若 `archiveEntriesTruncated` 为 `true` 且报告缺少所需成员，先用 `extract_preview` 对已核实的原包路径分页查看清单。
+   - GTA V 的 `requiresGtaRpf` **不是复制规则**。核对绑定的是 Legacy 还是 Enhanced，先读该适配包的 SKILL；只有用户已启动对应的可选 RPF MCP 且版本能力已验证时，才能 `prepare_gta_rpf_job({game_id,artifact_id,kind,options})`。将返回的 `jobId` 交给返回的 `mcpTool`。DLC 内部名字未知时，先做探测，用 `options.inspectJobId` 再准备正式任务。最后用 `install_library_mod({request:{gameId,artifactId,mode:"gtaRpf",jobId}})` 预览并审批。只以事务提交和安装记录为准，不以工具回报成功为准。
+   - `unsupportedEdition` 表示该版 RPF 未验证，不启动 MCP。GTA V 混合包、多个 gameconfig 或未知布局需用户选择；普通脚本、ASI 不需要 RPF 服务。OIV 或工具包不按 Mod 复制；缺工具、缺版别证明、共享文件漂移时停下，不用逐文件映射或通用文件操作代替归档编辑。
 3. 本地 README 已说明安装方法且与当前版本及包内文件相符时，直接整理映射。仅在本地无法确定时查看该 Mod 作者的说明：先按库条目的来源、项目 ID 和版本查询已连接的来源 MCP 的作品详情；仍缺少正文时，用已连接的 Playwright 打开核实过的作者项目页或文件页，读取安装章节及具体版本的差异。库里缺少项目页时，可用游戏名、Mod 名和版本定位官方作品页，再核对作者与文件；查询只传公开名称。搜索摘要、文件扩展名或同名项目不足以确定目标。无法取得作者正文时说明具体缺项，请用户提供作者说明或明确路径。
 4. 按作者说明或用户确认的选项部署时，用 `install_library_mod` 的 `mode: approvedMappings`。即使游戏没有适配包，也可以使用明确的逐文件映射。
    - ZIP 等分发归档用 `sourceKind: archive`。每项 `source` 使用 `archiveEntries` 中实际存在的完整成员路径，保留包内目录和大小写。每项 `destination` 是相对安装根的文件路径，含目标文件名。省略 `modType` 时以已登记的游戏根为准，明确使用某个适配类型时才传 `modType` 并以该类型的根为准。

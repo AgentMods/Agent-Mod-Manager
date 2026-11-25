@@ -7,6 +7,7 @@ description: "卸载或从管理列表移除已登记的 Mod，逐文件核对�
 
 1. 用户从游戏详情点选时沿用 `game_id` 和 `install_id`。聊天仅给出名称时，用 `list_installs` 在目标游戏中核对版本和启用状态。没有对应安装记录时说明原因，保留游戏文件。
 2. 调用 `inspect_install({game_id, install_id})` 核对实际磁盘文件、安装清单、覆盖备份和其他安装的占用情况。按 `reconciliation.recommendedAction` 决定下一步：
+   - GTA V 共享 RPF 贡献：按适配包 SKILL，用户启用并连接该包的 RPF MCP 后，调用 `prepare_gta_rpf_job({game_id,install_id})`，交给返回的 `mcpTool({jobId})`；工具成功后才用 `uninstall_mod({game_id,install_id,rpf_job_id})` 提交，其中 `rpf_job_id` 是同一次卸载的 `jobId`。其余贡献从基线重建，不回滚整个归档、不删除共享 dlclist 或玩家条目。有漂移、任务过期或工具不可用时保留现状。
    - `safe_uninstall`：用 `uninstall_mod({game_id, install_id})` 将本次安装独占且未改变的文件移出游戏目录。
    - `rollback_install` 或 `rollback_replacement`：核对当前文件和冲突；使用 `rollback_transaction`，同时传入本游戏、本安装和报告给出的 `transaction_id`。向用户说明回滚将恢复哪些原文件或前一版本。报告为 `rollback_install` 且有 `otherInstallIds` 时，管理器已核实这笔事务覆盖了先前的安装，仍按该建议回滚。
    - `forget_missing_files`：安装清单中的文件已全部缺失，且无覆盖、共享或版本替换关系。仅在用户明确要求“删除”或“从管理列表移除”时，直接调用 `forget_uninstalled_mod({game_id, install_id})`，只移除这条管理记录，无需卸载或回滚，不改动游戏文件，保留磁盘归档和事务历史。同一归档没有其他在管安装或计划时，它也从该游戏列表隐藏。用户只要求卸载时，只说明清单文件已不在，保留安装记录和库条目；不执行写操作，不报告卸载成功。

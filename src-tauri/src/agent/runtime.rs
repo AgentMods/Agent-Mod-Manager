@@ -10,6 +10,7 @@ use super::{
     tools::{ToolContext, ToolRegistry},
 };
 use crate::{
+    browse::install::{self as browse_install, InstallScope},
     db::Db,
     error::{AppError, AppResult},
     history::History,
@@ -96,6 +97,7 @@ impl AgentRuntime {
         runtime: crate::mcp::McpRuntime,
         sink: EventSink,
     ) -> AppResult<Self> {
+        browse_install::init(&engine.db)?;
         let events = Events {
             db: engine.db.clone(),
             sink,
@@ -184,7 +186,15 @@ impl AgentRuntime {
         request: TurnRequest,
         origin: PromptOrigin,
     ) -> AppResult<String> {
-        self.begin_turn(request, None, origin)
+        self.begin_turn(request, None, origin, None)
+    }
+
+    pub(crate) fn start_browse_turn(
+        &self,
+        request: TurnRequest,
+        scope: InstallScope,
+    ) -> AppResult<String> {
+        self.begin_turn(request, None, PromptOrigin::User, Some(scope))
     }
 
     pub fn restart_turn(
@@ -194,7 +204,7 @@ impl AgentRuntime {
         edit: bool,
     ) -> AppResult<String> {
         let conversation = request.conversation_id.clone();
-        self.begin_turn(request, Some((message_id, edit)), PromptOrigin::User)?;
+        self.begin_turn(request, Some((message_id, edit)), PromptOrigin::User, None)?;
         Ok(conversation)
     }
 
@@ -203,10 +213,19 @@ impl AgentRuntime {
         mut request: TurnRequest,
         restart: Option<(&str, bool)>,
         origin: PromptOrigin,
+        scope: Option<InstallScope>,
     ) -> AppResult<String> {
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         if active.contains_key(&request.conversation_id) {
             return Err(AppError::Conflict("此会话已有正在运行的任务".into()));
+        }
+        if scope.is_some()
+            != browse_install::is_task_conversation(
+                &self.engine.db.conn(),
+                &request.conversation_id,
+            )?
+        {
+            return Err(AppError::Denied("页内安装任务只能从浏览页发起".into()));
         }
         let mut config = self.settings.load()?;
         let effective_model = request.model.as_deref().unwrap_or(&config.model);
@@ -233,9 +252,13 @@ impl AgentRuntime {
             .get(&crate::settings::conversation_permission_key(
                 &request.conversation_id,
             ))?;
-        let mode = request.permission_mode.unwrap_or(serde_json::from_value(
-            stored.unwrap_or(json!(config.permission_mode)),
-        )?);
+        let mode = if scope.is_some() {
+            PermissionMode::RequestApproval
+        } else {
+            request.permission_mode.unwrap_or(serde_json::from_value(
+                stored.unwrap_or(json!(config.permission_mode)),
+            )?)
+        };
         let id = util::new_id("turn");
         let cancel = CancellationToken::new();
         let (mut error_message_id, start) =
@@ -263,6 +286,7 @@ impl AgentRuntime {
                     &cancel,
                     &mut error_message_id,
                     &locale,
+                    scope.as_ref(),
                 )
                 .await;
             let (status, error) = match result {
@@ -430,8 +454,11 @@ impl AgentRuntime {
         cancel: &CancellationToken,
         error_message_id: &mut String,
         locale: &str,
+        scope: Option<&InstallScope>,
     ) -> AppResult<()> {
         let conv = &request.conversation_id;
+        let browse_approvals = scope.map(|_| self.approvals.for_browse_install());
+        let approvals = browse_approvals.as_ref().unwrap_or(&self.approvals);
         let key_ref = config
             .api_key_ref
             .as_deref()
@@ -460,7 +487,18 @@ impl AgentRuntime {
         // they are not represented as chat messages. Keep one immutable
         // snapshot for the whole turn so compression and the actual request
         // count the same schemas.
-        let tools = self.registry.definitions();
+        let mut tools = self.registry.definitions();
+        if let Some(scope) = scope {
+            scope.check_game(&self.engine.db)?;
+            tools.retain(|value| {
+                value["function"]["name"].as_str().is_some_and(|name| {
+                    self.registry
+                        .get(name)
+                        .ok()
+                        .is_some_and(|tool| scope.allows(name, tool.as_ref()))
+                })
+            });
+        }
         let context_window = self.context_window(&model, cancel).await?;
         let compression = Compression {
             client: &client,
@@ -623,7 +661,15 @@ impl AgentRuntime {
                 let result: AppResult<Value> = async {
                     let tool = self.registry.get(&call.name)?;
                     host_tool_kind = tool.host_tool_kind();
+                    let stock_tool = scope.and_then(|_| tool.stock_source_tool());
+                    let args = match scope {
+                        Some(scope) => scope.arguments(&self.engine.db, tool.as_ref(), &call.name, args.clone())?,
+                        None => args.clone(),
+                    };
                     let prepared = tokio::select! {biased; _=cancel.cancelled()=>return Err(AppError::Cancelled),value=tool.prepare(&context,&args)=>value?};
+                    if let Some(scope) = scope {
+                        scope.validate_prepared(&self.engine.db, &call.name, tool.as_ref(), &args, &prepared)?;
+                    }
                     if prepared.effect == Effect::Forbidden {
                         return Err(AppError::Denied("此工具始终禁止执行".into()));
                     }
@@ -632,8 +678,7 @@ impl AgentRuntime {
                             "UPDATE tool_calls SET approval_status='pending' WHERE id=?1",
                             [&local],
                         )?;
-                        let response = self
-                            .approvals
+                        let response = approvals
                             .request(
                                 turn,
                                 conv,
@@ -655,7 +700,21 @@ impl AgentRuntime {
                     if prepared.effect == Effect::AskUser {
                         return Ok(json!({"answer":response.map(|r|r.answer)}));
                     }
-                    tool.execute(&context, args.clone(), prepared).await
+                    if let Some(scope) = scope {
+                        if cancel.is_cancelled() { return Err(AppError::Cancelled); }
+                        scope.record_plan(&self.engine.db, &call.name, &args, &prepared)?;
+                        if stock_tool != tool.stock_source_tool() {
+                            return Err(AppError::Denied("原厂来源连接已变化".into()));
+                        }
+                        scope.before_tool(stock_tool);
+                        let value = tool.execute(&context, args.clone(), prepared).await?;
+                        if stock_tool != tool.stock_source_tool() {
+                            return Err(AppError::Denied("原厂来源连接已变化".into()));
+                        }
+                        scope.finish_tool(&self.registry, &self.resolutions, &context, (&call.name, stock_tool), &args, value).await
+                    } else {
+                        tool.execute(&context, args, prepared).await
+                    }
                 }
                 .await;
                 let (value, status, error) = match &result {
@@ -695,6 +754,19 @@ impl AgentRuntime {
                 }
                 self.events
                     .emit(turn, conv, Some(&message), "tool-result", payload)?;
+                if let Some(scope) = scope {
+                    if call.name == "install_library_mod" && scope.verified(&self.engine.db)? {
+                        // One installation is the entire intent. A streamed follow-up or
+                        // another tool call must not start a second install.
+                        return Ok(());
+                    }
+                    if result.is_err() && self.engine.db.conn().query_row(
+                        "SELECT EXISTS(SELECT 1 FROM approvals WHERE tool_call_id=?1 AND status='rejected' AND title<>'ask_user')",
+                        [&local], |row| row.get::<_, bool>(0),
+                    )? {
+                        return Ok(());
+                    }
+                }
                 if matches!(result, Err(AppError::Cancelled)) {
                     return Err(AppError::Cancelled);
                 }

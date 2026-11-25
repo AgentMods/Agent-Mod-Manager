@@ -28,14 +28,17 @@ fn validate_name(name: &str) -> AppResult<&str> {
     Ok(name)
 }
 
+mod desktop_launch;
 mod registration;
 mod review;
+pub(crate) use desktop_launch::{
+    launch_from_desktop, list_game_launch_options, set_game_mod_launcher, GameLaunchOption,
+};
 pub(crate) use registration::{
     apply_registration, prepare_registration, register_local_from_desktop,
 };
 pub(crate) use review::{
-    apply_launch, apply_removal, apply_update, launch_from_desktop, prepare_launch,
-    prepare_removal, prepare_update,
+    apply_launch, apply_removal, apply_update, prepare_launch, prepare_removal, prepare_update,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1047,41 +1050,59 @@ pub(crate) enum LaunchAction {
     Steam(String),
 }
 
-pub(crate) fn decide_launch(paths: &AppPaths, game: &Game) -> AppResult<LaunchAction> {
+fn configured_launch_program(paths: &AppPaths, game: &Game) -> AppResult<Option<PathBuf>> {
     match game.metadata.get("launchPath") {
         Some(serde_json::Value::String(path)) if !path.trim().is_empty() => {
             let launch = validate_launch_path(paths, Path::new(&game.root_path), Path::new(path))?;
-            return Ok(LaunchAction::Program(launch.program));
+            Ok(Some(launch.program))
         }
-        None | Some(serde_json::Value::Null | serde_json::Value::String(_)) => {}
-        Some(_) => {
-            return Err(AppError::Invalid(
-                "已保存的启动程序路径无效，请在“编辑”中重新选择".into(),
-            ));
-        }
+        None | Some(serde_json::Value::Null | serde_json::Value::String(_)) => Ok(None),
+        Some(_) => Err(AppError::Invalid(
+            "已保存的启动程序路径无效，请在“编辑”中重新选择".into(),
+        )),
     }
-    if let Some(id) = &game.steam_app_id {
-        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(AppError::Invalid("Steam App ID 必须为纯数字".into()));
-        }
-        return Ok(LaunchAction::Steam(format!("steam://rungameid/{id}")));
+}
+
+fn steam_launch_url(game: &Game) -> AppResult<Option<String>> {
+    game.steam_app_id
+        .as_deref()
+        .map(|id| {
+            if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(AppError::Invalid("Steam App ID 必须为纯数字".into()));
+            }
+            Ok(format!("steam://rungameid/{id}"))
+        })
+        .transpose()
+}
+
+pub(crate) fn decide_launch(paths: &AppPaths, game: &Game) -> AppResult<LaunchAction> {
+    if let Some(program) = configured_launch_program(paths, game)? {
+        return Ok(LaunchAction::Program(program));
+    }
+    if let Some(url) = steam_launch_url(game)? {
+        return Ok(LaunchAction::Steam(url));
     }
     Err(AppError::Other(
         "尚未设置启动方式，请在“编辑”中选择游戏可执行文件".into(),
     ))
 }
 
-pub(crate) fn launch_program(program: &Path) -> AppResult<()> {
+fn program_command(program: &Path, args: &[String]) -> AppResult<Command> {
     let directory = program
         .parent()
         .ok_or_else(|| AppError::Invalid("无法确定启动程序所在目录".into()))?;
     let mut command = Command::new(program);
     command
+        .args(args)
         .current_dir(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    spawn_program(command).map_err(|error| {
+    Ok(command)
+}
+
+fn launch_program(program: &Path, args: &[String]) -> AppResult<()> {
+    spawn_program(program_command(program, args)?).map_err(|error| {
         AppError::Presented(crate::error::NativeMessage::new(
             "game.launch_failed",
             [("detail", error.to_string())],
@@ -1105,16 +1126,27 @@ fn spawn_program(mut command: Command) -> std::io::Result<()> {
         ffi::CString,
         io,
         os::unix::{ffi::OsStrExt, process::CommandExt},
-        sync::mpsc,
+        sync::{atomic::AtomicPtr, mpsc},
     };
     let path = CString::new(command.get_program().as_bytes())?;
+    let args = command
+        .get_args()
+        .map(|arg| CString::new(arg.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()?;
+    // AtomicPtr has the same size and bit validity as a pointer and makes
+    // this owned, immutable argv Send + Sync for the pre_exec hook.
+    let argv = std::iter::once(&path)
+        .chain(&args)
+        .map(|arg| AtomicPtr::new(arg.as_ptr().cast_mut()))
+        .chain(std::iter::once(AtomicPtr::new(std::ptr::null_mut())))
+        .collect::<Vec<_>>();
     // Command's execvp fallback may invoke a shell for an unrecognized file.
     // SAFETY: execv is async-signal-safe. The owned CString and the terminated
     // argv stay valid during the call, and the closure does no allocation.
     unsafe {
         command.pre_exec(move || {
-            let argv = [path.as_ptr(), std::ptr::null()];
-            libc::execv(path.as_ptr(), argv.as_ptr());
+            let _keep_args_alive = &args;
+            libc::execv(path.as_ptr(), argv.as_ptr().cast());
             Err(io::Error::last_os_error())
         });
     }

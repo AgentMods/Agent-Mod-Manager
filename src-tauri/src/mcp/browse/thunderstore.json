@@ -1,0 +1,154 @@
+{
+  "list_communities": {
+    "properties": {
+      "limit": {
+        "default": 20,
+        "maximum": 100,
+        "minimum": 1,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "offset": {
+        "default": 0,
+        "minimum": 0,
+        "title": "Offset",
+        "type": "integer"
+      },
+      "search": {
+        "anyOf": [
+          {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Search"
+      }
+    },
+    "title": "list_communitiesArguments",
+    "type": "object"
+  },
+  "search_packages": {
+    "properties": {
+      "community": {
+        "maxLength": 256,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$",
+        "title": "Community",
+        "type": "string"
+      },
+      "excluded_categories": {
+        "anyOf": [
+          {
+            "items": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Excluded Categories"
+      },
+      "include_deprecated": {
+        "default": false,
+        "title": "Include Deprecated",
+        "type": "boolean"
+      },
+      "include_nsfw": {
+        "default": false,
+        "title": "Include Nsfw",
+        "type": "boolean"
+      },
+      "included_categories": {
+        "anyOf": [
+          {
+            "items": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Included Categories"
+      },
+      "namespace": {
+        "anyOf": [
+          {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_][A-Za-z0-9_.-]*$",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Namespace"
+      },
+      "ordering": {
+        "default": "last-updated",
+        "enum": [
+          "last-updated",
+          "most-downloaded",
+          "newest",
+          "top-rated"
+        ],
+        "title": "Ordering",
+        "type": "string"
+      },
+      "page": {
+        "default": 1,
+        "minimum": 1,
+        "title": "Page",
+        "type": "integer"
+      },
+      "query": {
+        "anyOf": [
+          {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Query"
+      },
+      "section": {
+        "anyOf": [
+          {
+            "format": "uuid",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Section"
+      }
+    },
+    "required": [
+      "community"
+    ],
+    "title": "search_packagesArguments",
+    "type": "object"
+  }
+}

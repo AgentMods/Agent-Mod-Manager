@@ -9,10 +9,9 @@ import { Badge, EmptyState, ErrorState, IconButton } from "@/components/ui";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group";
-import { Skeleton } from "@/components/ui/skeleton";
+import { CatalogGameCover, type ReleaseDisplay } from "@/components/CatalogGameCover";
 import { Spinner } from "@/components/ui/spinner";
 
-type ReleaseDisplay = { description: string; coverUrl: string | null };
 type ReleasePreview = {
   display?: ReleaseDisplay | null;
   gameName: string; plugin: Candidate; source: string; adapterJson: string; skillMarkdown: string;
@@ -25,29 +24,6 @@ function candidateByline(candidate: Candidate) {
   return [candidate.authorName, candidate.version, candidate.platforms.map(platform => platformNames[platform] ?? platform).join(" / ")].join(" · ");
 }
 
-// The public index contains metadata only. Fetch artwork for visible releases on demand.
-function CatalogArtwork({ releaseId, name }: { releaseId: string; name: string }) {
-  const container = useRef<HTMLDivElement>(null);
-  const [visible, setVisible] = useState(false);
-  useEffect(() => {
-    if (!container.current) return;
-    const observer = new IntersectionObserver(entries => {
-      if (entries.some(entry => entry.isIntersecting)) {
-        setVisible(true);
-        observer.disconnect();
-      }
-    });
-    observer.observe(container.current);
-    return () => observer.disconnect();
-  }, []);
-  const display = useBackendQuery<ReleaseDisplay | null>(["manager-plugin-display", releaseId], "get_manager_plugin_display", {releaseId}, visible);
-  return <div ref={container} className="aspect-video w-full overflow-hidden rounded-lg">
-    {visible && !display.isLoading
-      ? <GameCover name={name} url={display.data?.coverUrl} className="aspect-video" />
-      : <Skeleton className="size-full" />}
-  </div>;
-}
-
 function CatalogCard({ game, plugin, onSelect, action }: {
   action: React.ReactNode;
   game: CatalogGame; plugin: Candidate; onSelect: (plugin: Candidate, trigger: HTMLButtonElement) => void;
@@ -55,7 +31,7 @@ function CatalogCard({ game, plugin, onSelect, action }: {
   const steamId = plugin.steamAppId || game.steamAppId;
   return <Card className="h-full min-w-0 gap-4 p-4">
     <CardHeader className="grid-cols-[minmax(0,38%)_minmax(0,1fr)] grid-rows-[auto] items-center gap-3 p-0">
-      <CatalogArtwork releaseId={plugin.releaseId} name={plugin.name} />
+      <CatalogGameCover releaseId={plugin.releaseId} name={plugin.name} />
       <div className="flex min-w-0 flex-col items-start gap-1.5">
         {game.name !== plugin.name && <p className="wrap-anywhere text-xs text-muted-foreground">{game.name}</p>}
         <CardTitle className="wrap-anywhere text-base leading-snug">{plugin.name}</CardTitle>

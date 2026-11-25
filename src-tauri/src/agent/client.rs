@@ -76,6 +76,36 @@ impl ModelClient {
             .build()?;
         Ok(Self { http })
     }
+    /// Run an optional, tool-free task with one SSE attempt. Unlike the
+    /// interactive Agent, a failed background task does not retry or log the
+    /// provider error; its caller decides how to fall back.
+    pub(crate) async fn stream_once(
+        &self,
+        config: &ModelConfig,
+        messages: &[Value],
+        cancel: &CancellationToken,
+        mut on_delta: impl FnMut(&Delta, &Completion) -> AppResult<()>,
+    ) -> AppResult<Completion> {
+        parse_model_base_url(&config.base_url)?;
+        if config.model.trim().is_empty() {
+            return Err(AppError::Invalid("请先在设置中选择模型".into()));
+        }
+        let completion = self
+            .complete_once(config, messages, &[], true, cancel, &mut on_delta)
+            .await
+            .map_err(|failure| match failure {
+                StreamFailure::Transient(error)
+                | StreamFailure::Interrupted(error)
+                | StreamFailure::Fatal(error) => error,
+            })?;
+        // complete_once validates the finish reason and consistency of the tool
+        // list. A valid tool-call completion still isn't valid for this task.
+        if completion.finish_reason.as_deref() != Some("stop") {
+            return Err(AppError::Invalid("此模型请求不允许工具调用".into()));
+        }
+        Ok(completion)
+    }
+
     pub async fn stream(
         &self,
         config: &ModelConfig,

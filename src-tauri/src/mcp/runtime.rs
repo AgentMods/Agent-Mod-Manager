@@ -11,6 +11,8 @@ use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
 const PYPI_INDEX: &str = "https://pypi.tuna.tsinghua.edu.cn/simple";
+const PYTHON_INSTALL_MIRROR: &str =
+    "https://registry.npmmirror.com/-/binary/python-build-standalone";
 const NPM_REGISTRY: &str = "https://registry.npmmirror.com";
 const NPX_CLI: &str = "npm/bin/npx-cli.js";
 const NEXUS_WHEEL: &str = "nexus/glossmod_nexusmods_mcp-1.0.0+amm.1-py3-none-any.whl";
@@ -282,7 +284,8 @@ fn bundled_command(launcher: Launcher, root: &Path, path: Option<OsString>) -> A
                 .env("npm_config_registry", NPM_REGISTRY);
         }
         Launcher::Uvx => {
-            cmd.env("UV_DEFAULT_INDEX", PYPI_INDEX);
+            cmd.env("UV_DEFAULT_INDEX", PYPI_INDEX)
+                .env("UV_PYTHON_INSTALL_MIRROR", PYTHON_INSTALL_MIRROR);
         }
     }
     Ok(cmd)
@@ -416,7 +419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bare_commands_use_packaged_launchers_path_and_only_their_own_mirror() {
+    async fn bare_commands_use_packaged_launchers_path_and_only_their_own_mirrors() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().canonicalize().unwrap();
         let runtime = archive(&dir, &[]);
@@ -432,17 +435,19 @@ mod tests {
                 .get_envs()
                 .map(|(k, v)| (k.to_str().unwrap().to_ascii_lowercase(), v.unwrap()))
                 .collect();
-            assert_eq!(env.len(), 2);
             assert_eq!(
                 std::env::split_paths(env["path"]).next().unwrap(),
                 exe.parent().unwrap()
             );
             if npx {
+                assert_eq!(env.len(), 2);
                 assert!(Path::new(cmd.get_args().next().unwrap()).ends_with(NPX_CLI));
                 assert_eq!(env["npm_config_registry"], NPM_REGISTRY);
             } else {
+                assert_eq!(env.len(), 3);
                 assert_eq!(cmd.get_args().count(), 0);
                 assert_eq!(env["uv_default_index"], PYPI_INDEX);
+                assert_eq!(env["uv_python_install_mirror"], PYTHON_INSTALL_MIRROR);
             }
             #[cfg(unix)]
             {

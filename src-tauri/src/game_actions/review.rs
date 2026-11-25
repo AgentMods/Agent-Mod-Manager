@@ -321,16 +321,9 @@ pub(crate) fn apply_launch(engine: &FileEngine, approved: &LaunchPreview) -> App
     apply_launch_with(engine, approved, dispatch_launch)
 }
 
-/// The desktop invokes this immediately with an ID, not an approval payload.
-pub(crate) fn launch_from_desktop(engine: &FileEngine, id: &str) -> AppResult<()> {
-    let _guard = transaction::write_lock();
-    let game = games::get_game(&engine.db, id)?;
-    dispatch_launch(decide_launch(&engine.paths, &game)?)
-}
-
-fn dispatch_launch(action: LaunchAction) -> AppResult<()> {
+pub(super) fn dispatch_launch(action: LaunchAction) -> AppResult<()> {
     match action {
-        LaunchAction::Program(program) => launch_program(&program),
+        LaunchAction::Program(program) => launch_program(&program, &[]),
         LaunchAction::Steam(url) => tauri_plugin_opener::open_url(url, None::<&str>)
             .map_err(|error| AppError::Other(format!("无法通过 Steam 启动游戏: {error}"))),
     }

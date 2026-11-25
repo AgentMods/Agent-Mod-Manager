@@ -1,4 +1,5 @@
 import { tr } from "@/lib/i18n";
+import { mcpSiteLogo } from "@/assets/mcp-sites";
 import { startMcpConnection, type McpConfig } from "@/lib/mcp-connection";
 import { Fragment, useEffect, useId, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
@@ -275,12 +276,15 @@ export function McpTools({ onboarding = false, onBusyChange }: { onboarding?: bo
         const starting = pending === "enable" && !active;
         const stopping = pending === "disable" && !!active;
         const description = config.description?.trim();
+        const logo = config.builtin ? mcpSiteLogo(config.id) : undefined;
         const endpoint = config.url || [config.command, ...config.args].join(" ");
         const hasCredentials = Boolean(config.bearer_secret_ref || Object.values(config.env_secret_refs).some(Boolean));
         return <Fragment key={config.id}>
           {index > 0 && <ItemSeparator />}
           <Item role="listitem" size="sm" className="flex-nowrap gap-2 border-0 px-2 py-2 sm:gap-3 sm:px-3">
-            <ItemMedia variant="icon" className="hidden sm:flex"><ServerIcon /></ItemMedia>
+            <ItemMedia variant="icon" aria-hidden="true" className="size-6 sm:size-8">
+              {logo ? <img src={logo} alt="" className="size-4 object-contain sm:size-6" /> : <ServerIcon />}
+            </ItemMedia>
             <ItemContent className="min-w-0 gap-0.5">
               <ItemTitle className="w-full">
                 <span className={description ? "max-w-3/5 shrink-0 truncate" : "truncate"} title={config.name}>{config.name}</span>

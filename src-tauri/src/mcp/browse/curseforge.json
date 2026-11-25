@@ -1,0 +1,214 @@
+{
+  "list_games": {
+    "properties": {
+      "index": {
+        "default": 0,
+        "exclusiveMaximum": 10000,
+        "minimum": 0,
+        "title": "Index",
+        "type": "integer"
+      },
+      "name": {
+        "anyOf": [
+          {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Name"
+      },
+      "page_size": {
+        "default": 50,
+        "maximum": 50,
+        "minimum": 1,
+        "title": "Page Size",
+        "type": "integer"
+      },
+      "slug": {
+        "anyOf": [
+          {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Slug"
+      }
+    },
+    "title": "list_gamesArguments",
+    "type": "object"
+  },
+  "search_mods": {
+    "properties": {
+      "category_id": {
+        "anyOf": [
+          {
+            "exclusiveMinimum": 0,
+            "maximum": 2147483647,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Category Id"
+      },
+      "class_id": {
+        "anyOf": [
+          {
+            "exclusiveMinimum": 0,
+            "maximum": 2147483647,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Class Id"
+      },
+      "game_id": {
+        "exclusiveMinimum": 0,
+        "maximum": 2147483647,
+        "title": "Game Id",
+        "type": "integer"
+      },
+      "game_version": {
+        "anyOf": [
+          {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Game Version"
+      },
+      "game_version_type_id": {
+        "anyOf": [
+          {
+            "exclusiveMinimum": 0,
+            "maximum": 2147483647,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Game Version Type Id"
+      },
+      "index": {
+        "default": 0,
+        "exclusiveMaximum": 10000,
+        "minimum": 0,
+        "title": "Index",
+        "type": "integer"
+      },
+      "keyword": {
+        "anyOf": [
+          {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Keyword"
+      },
+      "mod_loader_type": {
+        "anyOf": [
+          {
+            "description": "0=Any, 1=Forge, 2=Cauldron, 3=LiteLoader, 4=Fabric, 5=Quilt, 6=NeoForge",
+            "maximum": 6,
+            "minimum": 0,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Mod Loader Type"
+      },
+      "page_size": {
+        "default": 25,
+        "maximum": 50,
+        "minimum": 1,
+        "title": "Page Size",
+        "type": "integer"
+      },
+      "slug": {
+        "anyOf": [
+          {
+            "maxLength": 256,
+            "minLength": 1,
+            "pattern": "\\S",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Slug"
+      },
+      "sort_field": {
+        "anyOf": [
+          {
+            "description": "CurseForge ModsSearchSortField (1=Featured, 3=LastUpdated, 6=TotalDownloads)",
+            "maximum": 12,
+            "minimum": 1,
+            "type": "integer"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Sort Field"
+      },
+      "sort_order": {
+        "anyOf": [
+          {
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Sort Order"
+      }
+    },
+    "required": [
+      "game_id"
+    ],
+    "title": "search_modsArguments",
+    "type": "object"
+  }
+}

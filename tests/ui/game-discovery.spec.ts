@@ -1,4 +1,4 @@
-import {expect, test, type Page} from "@playwright/test";
+import {expect, test, type Locator, type Page} from "@playwright/test";
 import {installMockTauri} from "./mock-tauri";
 
 async function openLibrary(page: Page) {
@@ -21,6 +21,11 @@ async function inspectDirectory(page: Page, directory: string) {
   return row;
 }
 
+async function openCandidateMenu(page: Page, row: Locator) {
+  await row.getByRole("button", {name: "更多操作", exact: true}).click();
+  return page.getByRole("menuitem", {name: "联网识别", exact: true});
+}
+
 function registrationArgs(page: Page) {
   return page.evaluate(() => (window as any).__AMM_TEST__.calls
     .filter((call: any) => call.command === "register_game").map((call: any) => call.args));
@@ -32,21 +37,26 @@ test("单目录检查不显示弱匹配分数，按自动建议提供联网识�
   await expect(weak.getByText("unknown-game", {exact: true})).toBeVisible();
   await expect(weak.getByText("未匹配", {exact: true})).toBeVisible();
   await expect(weak.getByText("8% 匹配", {exact: true})).toHaveCount(0);
-  await expect(weak.getByRole("button", {name: "联网识别"})).toBeEnabled();
+  await expect(await openCandidateMenu(page, weak)).toBeEnabled();
+  await page.keyboard.press("Escape");
 
   const below = await inspectDirectory(page, "/sandbox/below-threshold");
   await expect(below.getByText("未匹配", {exact: true})).toBeVisible();
   await expect(below.getByText("80% 匹配", {exact: true})).toHaveCount(0);
-  await expect(below.getByRole("button", {name: "联网识别"})).toBeEnabled();
+  await expect(await openCandidateMenu(page, below)).toBeEnabled();
+  await page.keyboard.press("Escape");
 
   const tied = await inspectDirectory(page, "/sandbox/near-tie");
   await expect(tied.getByText("待确认", {exact: true})).toBeVisible();
   await expect(tied.getByText("92% 匹配", {exact: true})).toHaveCount(0);
-  await expect(tied.getByRole("button", {name: "联网识别"})).toBeEnabled();
+  await expect(await openCandidateMenu(page, tied)).toBeEnabled();
+  await page.keyboard.press("Escape");
 
   const matched = await inspectDirectory(page, "/sandbox/at-threshold");
   await expect(matched.getByText("80% 匹配", {exact: true})).toBeVisible();
-  await expect(matched.getByRole("button", {name: "联网识别"})).toHaveCount(0);
+  await openCandidateMenu(page, matched);
+  await expect(page.getByRole("menuitem", {name: "联网识别", exact: true})).toHaveCount(0);
+  await page.keyboard.press("Escape");
   expect(await registrationArgs(page)).toEqual([]);
   await matched.getByRole("button", {name: "添加", exact: true}).click();
   await expect(page.getByText("已将「Fixture Game」添加到游戏库", {exact: true})).toBeVisible();
@@ -72,7 +82,9 @@ test("游戏库添加无建议的启动器候选时不采用单独检查的适�
   await discovery.getByRole("button", {name: "扫描此目录", exact: true}).click();
   const scanned = discovery.locator('[data-slot="item"]').filter({has: page.getByText("/sandbox/new-game/Broken", {exact: true})});
   await expect(scanned.getByText("未匹配", {exact: true})).toBeVisible();
-  await expect(scanned.getByRole("button", {name: "联网识别"})).toBeEnabled();
+  await openCandidateMenu(page, scanned);
+  await expect(page.getByRole("menuitem", {name: "联网识别", exact: true})).toBeEnabled();
+  await page.keyboard.press("Escape");
   await scanned.getByRole("button", {name: "添加", exact: true}).click();
   await expect(page.getByText("已将「Broken」添加到游戏库", {exact: true})).toBeVisible();
   await expect(discovery).toBeVisible();

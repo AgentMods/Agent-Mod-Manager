@@ -16,6 +16,7 @@ pub fn register(registry: &ToolRegistry) -> AppResult<()> {
     for name in [
         "list_mod_library",
         "match_mod_install",
+        "prepare_gta_rpf_job",
         "install_library_mod",
         "bind_mod_library_entry",
         "forget_uninstalled_mod",
@@ -26,7 +27,10 @@ pub fn register(registry: &ToolRegistry) -> AppResult<()> {
         "uninstall_mod",
         "rollback_transaction",
     ] {
-        registry.register(Arc::new(InstallTool { name: name.into() }))?;
+        registry.register(Arc::new(InstallTool {
+            name: name.into(),
+            tool_available: Arc::new(registry.tool_available()),
+        }))?;
     }
     registry.register(Arc::new(CheckModrinthDependencies))?;
     registry.register(Arc::new(VerifyInstallFiles))
@@ -189,7 +193,68 @@ impl AgentTool for CheckModrinthDependencies {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GtaJobArgs {
+    game_id: String,
+    artifact_id: Option<String>,
+    install_id: Option<String>,
+    kind: Option<String>,
+    options: Option<Value>,
+}
+impl GtaJobArgs {
+    fn validate(&self) -> AppResult<()> {
+        match (
+            self.artifact_id.as_deref(),
+            self.install_id.as_deref(),
+            self.kind.as_deref(),
+        ) {
+            (Some(id), None, Some("gameconfig" | "dlc" | "vehicle" | "ped")) if !id.is_empty() => {
+                Ok(())
+            }
+            (None, Some(id), None) if !id.is_empty() && self.options.is_none() => Ok(()),
+            _ => Err(AppError::Invalid(
+                "GTA 安装需提供 artifact_id 与 kind；卸载仅提供 install_id".into(),
+            )),
+        }
+    }
+}
+
+// Use the manager's complete package-scoped identity, never a similarly named custom service.
+fn gta_mcp_tool(
+    engine: &crate::transaction::FileEngine,
+    game: &str,
+    available: &dyn Fn(&str) -> bool,
+) -> AppResult<String> {
+    let game = crate::games::get_game(&engine.db, game)?;
+    let slug = game
+        .adapter_slug
+        .as_deref()
+        .filter(|s| matches!(*s, "gta5-legacy" | "gta5-enhanced"))
+        .ok_or_else(|| AppError::Denied("游戏尚未绑定 GTA V 适配包".into()))?;
+    if slug == "gta5-enhanced" {
+        return Err(AppError::Unsupported(
+            "增强版 RPF 尚未独立验证，无需为此启动工具。".into(),
+        ));
+    }
+    let id = format!("plugin_{slug}_rpf");
+    let config = crate::mcp::McpServers::new(engine.db.clone()).get(&id)?;
+    if config.plugin_slug.as_deref() != Some(slug) || !config.enabled {
+        return Err(AppError::Denied(
+            "请先从本游戏适配包的工具设置启用 RPF MCP".into(),
+        ));
+    }
+    let tool = crate::mcp::client::namespaced_tool_name(&id, "gta_rpf_prepare");
+    if !available(&tool) {
+        return Err(AppError::Denied(
+            "RPF MCP 尚未连接或未提供 gta_rpf_prepare；请在本适配包的工具设置中启动并确认。".into(),
+        ));
+    }
+    Ok(tool)
+}
+
 struct InstallTool {
+    tool_available: Arc<dyn Fn(&str) -> bool + Send + Sync>,
     name: String,
 }
 fn text<'a>(args: &'a Value, key: &str) -> AppResult<&'a str> {
@@ -252,13 +317,20 @@ impl AgentTool for InstallTool {
         let (description,mut properties,required,effect) = match self.name.as_str() {
             "list_mod_library" => ("列出当前已登记游戏可用的 Mods 原包、artifactId、来源和作者项目页。game_id 是本机登记 ID。gameId 为空的条目下载时按游戏名分类。", json!({"game_id":{"type":"string"}}),vec!["game_id"],Effect::Read),
             "match_mod_install" => ("只读核对目标游戏的本地适配规则、已校验原包、README、归档清单及 FOMOD。若 activeInstallId 非空，先用当前 game_id 和该安装 ID 调用 inspect_install，按报告核对已有部署。根据候选状态选择安装方法，需要用户选择时询问具体选项。手工映射时从 archiveEntries 取实际文件的完整成员路径（含包内目录）。archiveEntriesTruncated 为 true 时先补查所需成员，勿猜文件名或用外层 ZIP 文件名代替。", json!({"game_id":{"type":"string"},"artifact_id":{"type":"string"}}),vec!["game_id","artifact_id"],Effect::Read),
+            "prepare_gta_rpf_job" => (
+                "仅供已绑定 GTA 适配包的本地游戏。先核对玩家已启动该包的 RPF MCP；按批准的选项，把校验过的输入复制到独立任务目录，不修改游戏、不启动 MCP。安装提供 artifact_id 和 kind；卸载仅提供 install_id。将返回的 jobId 交给返回的 mcpTool，再用 install_library_mod 的 gtaRpf 模式或 uninstall_mod 的 rpf_job_id 提交。",
+                json!({"game_id":{"type":"string"},"artifact_id":{"type":"string"},"install_id":{"type":"string"},
+                    "kind":{"type":"string","enum":["dlc","gameconfig","vehicle","ped"]}, "options":{"type":"object","additionalProperties":false,
+                    "properties":{"inspectJobId":{"type":"string","pattern":"^[a-f0-9]{32}$","description":"DLC 暂存探测任务返回的 jobId；与 packName 互斥。"},"sourceDir":{"type":"string"},"packName":{"type":"string"},"modelName":{"type":"string"},
+                    "sex":{"type":"string","enum":["Male","Female"]},"streamed":{"type":"boolean"},"menyoo":{"type":"boolean"}}}}),vec!["game_id"],Effect::ManagerWrite),
             "forget_uninstalled_mod" => ("仅用于用户明确要求从管理列表删除：卸载或回滚成功后，或 inspect_install 建议 forget_missing_files 时，移除同一游戏的记录。文件均已缺失时无需卸载、回滚或补回文件。保留磁盘归档和审计历史。普通卸载不要调用。",json!({"game_id":{"type":"string"},"install_id":{"type":"string"}}),vec!["game_id","install_id"],Effect::ManagerWrite),
             "bind_mod_library_entry" => ("把下载时尚未登记游戏的库条目关联到用户选定的本机游戏实例。同名候选先让用户指定目标。",json!({"game_id":{"type":"string"},"artifact_id":{"type":"string"}}),vec!["game_id","artifact_id"],Effect::ManagerWrite),
             "install_library_mod" => (
-                "从目标游戏的 Mods 库安装或重装原包，准备并按审批提交同一份复制计划。先运行 match_mod_install。mode=adapter 使用已匹配的 modType。mode=approvedMappings 按作者说明或用户选项逐文件映射。部署 ZIP 成员时用 sourceKind=archive，不能复制外层 ZIP 来代替或冒充组件。仅在适配规则或作者说明明确要求游戏读取原文件时，才用 sourceKind=singleFile 原样部署，例如 Minecraft JAR。省略 modType 时目标相对已登记的游戏根。匹配结果中的 activeInstallId 非空时先用 inspect_install 核对该安装及建议操作。其他目标冲突可用 list_installs 和 inspect_install 核对归属。",
+                "从目标游戏的 Mods 库安装或重装原包，准备并按审批提交同一份复制计划。先运行 match_mod_install。GTA 归档走 mode=gtaRpf 与已处理的 jobId，不用整包复制。mode=adapter 使用已匹配的 modType。mode=approvedMappings 按作者说明或用户选项逐文件映射。部署 ZIP 成员时用 sourceKind=archive，不能复制外层 ZIP 来代替或冒充组件。仅在适配规则或作者说明明确要求游戏读取原文件时，才用 sourceKind=singleFile 原样部署，例如 Minecraft JAR。省略 modType 时目标相对已登记的游戏根。匹配结果中的 activeInstallId 非空时先用 inspect_install 核对该安装及建议操作。其他目标冲突可用 list_installs 和 inspect_install 核对归属。",
                 json!({"request":{"type":"object","properties":{
                     "gameId":{"type":"string"},"artifactId":{"type":"string"},
-                    "mode":{"type":"string","enum":["adapter","approvedMappings"]},
+                    "mode":{"type":"string","enum":["adapter","approvedMappings","gtaRpf"]},
+                    "jobId":{"type":"string","pattern":"^[a-f0-9]{32}$","description":"仅 gtaRpf 模式；由 prepare_gta_rpf_job 签发并经该适配包的 MCP 处理。"},
                     "modType":{"type":"string"},"folderName":{"type":"string"},
                     "fomodSelection":{"type":"string","enum":["automatic"]},
                     "sourceKind":{"type":"string","enum":["singleFile","archive"],"description":"仅 mode=approvedMappings 使用。archive 逐文件部署归档成员，singleFile 原样部署一个游戏原生载荷。"},
@@ -278,7 +350,7 @@ impl AgentTool for InstallTool {
                 vec!["request"], if self.name == "plan_install" {Effect::Read} else {Effect::ManagerWrite}),
             "list_installs" => ("读取游戏安装事务、逐文件清单和状态。downloadOrigin 记录部署时的来源、项目和精确版本 ID；null 表示未绑定，不要从显示版本推断。记录不证明来源真实性或加载器已启用",json!({"game_id":{"type":"string"}}),vec!["game_id"],Effect::Read),
             "inspect_install" => ("只读检查一个安装的文件指纹、缺失或修改、覆盖过的原文件和与其他安装的路径重叠。协调预览可能建议安全卸载、回滚、仅移除文件均缺失的记录（forget_missing_files）或人工审查。rollbackTransactionId 只是建议，不会自动执行；本工具不调用 reconcile、不创建计划、不修改文件或数据库",json!({"game_id":{"type":"string"},"install_id":{"type":"string"}}),vec!["game_id","install_id"],Effect::Read),
-            "uninstall_mod" => ("按游戏与安装记录核对归属，将独占且未修改的文件移入回收站。覆盖过原文件时用带 game_id、install_id 的 rollback_transaction 恢复备份。",json!({"game_id":{"type":"string"},"install_id":{"type":"string"}}),vec!["install_id"],Effect::ManagerWrite),
+            "uninstall_mod" => ("按游戏与安装记录核对归属，将独占且未修改的文件移入回收站。GTA RPF 需先重建其余贡献，并提供 rpf_job_id。其他覆盖过原文件的普通安装按报告用 rollback_transaction 恢复备份。",json!({"game_id":{"type":"string"},"install_id":{"type":"string"},"rpf_job_id":{"type":"string","pattern":"^[a-f0-9]{32}$"}}),vec!["install_id"],Effect::ManagerWrite),
             _ => ("回滚一个已提交文件事务，展示原计划影响；冲突时保留现场而非强行覆盖",json!({"transaction_id":{"type":"string"},"game_id":{"type":"string"},"install_id":{"type":"string"}}),vec!["transaction_id"],Effect::ManagerWrite),
         };
         if matches!(
@@ -300,11 +372,23 @@ impl AgentTool for InstallTool {
             effect,
         }
     }
+    fn inbound_definition(&self) -> ToolDefinition {
+        let mut definition = self.definition();
+        if self.name == "uninstall_mod" {
+            if let Some(properties) = definition.parameters["properties"].as_object_mut() {
+                properties.remove("rpf_job_id");
+            }
+            definition.description =
+                "按已登记清单安全卸载普通 Mod。GTA RPF 贡献只能由桌面适配包工作流重建。".into();
+        }
+        definition
+    }
     async fn prepare(&self, context: &ToolContext, args: &Value) -> AppResult<PreparedTool> {
         if context.cancel.is_cancelled() {
             return Err(AppError::Cancelled);
         }
         let name = self.name.clone();
+        let available = self.tool_available.clone();
         let engine = if name == "rollback_transaction" {
             context.file_engine()
         } else {
@@ -326,7 +410,17 @@ impl AgentTool for InstallTool {
                 let selected = super::workspace::selection(&engine.db, conversation)?;
                 super::workspace::resolve(selected.as_deref(), Some(target))?;
             }
+            if matches!(scope, crate::sources::resolutions::ResolutionScope::Mcp(_))
+                && (name == "prepare_gta_rpf_job" || args.get("rpf_job_id").is_some() || args["request"]["mode"] == "gtaRpf") {
+                return Err(AppError::Denied("GTA RPF 任务仅面向本地桌面 Agent".into()));
+            }
             let (preview, plan) = match name.as_str() {
+                "prepare_gta_rpf_job" => {
+                    let spec: GtaJobArgs = serde_json::from_value(args.clone())?;
+                    spec.validate()?;
+                    gta_mcp_tool(&engine, &spec.game_id, &*available)?;
+                    (args.clone(), None)
+                }
                 "forget_uninstalled_mod" => {
                     let game_id = text(&args, "game_id")?;
                     let install_id = text(&args, "install_id")?;
@@ -358,8 +452,12 @@ impl AgentTool for InstallTool {
                     (json!(preview), Some(preview.plan))
                 }
                 "uninstall_mod" => {
-                    check_uninstall_action(&engine, &args, false)?;
-                    let plan = install::plan_uninstall(&engine, text(&args, "install_id")?)?;
+                    let plan = if let Some(job) = args.get("rpf_job_id") {
+                        install::gta_rpf::plan_uninstall(&engine, text(&args, "game_id")?, text(&args, "install_id")?, job.as_str().ok_or_else(|| AppError::Invalid("rpf_job_id 无效".into()))?, &cancel)?
+                    } else {
+                        check_uninstall_action(&engine, &args, false)?;
+                        install::plan_uninstall(&engine, text(&args, "install_id")?)?
+                    };
                     let preview = serialize_user_plan(&plan, serde_json::value::Serializer)?;
                     (preview, Some(plan))
                 }
@@ -399,6 +497,7 @@ impl AgentTool for InstallTool {
             return Err(AppError::Cancelled);
         }
         let name = self.name.clone();
+        let available = self.tool_available.clone();
         let engine = if name == "rollback_transaction" {
             context.file_engine()
         } else {
@@ -407,7 +506,7 @@ impl AgentTool for InstallTool {
         let cancel = context.cancel.clone();
         tokio::task::spawn_blocking(move || {
             if let Some(plan) = prepared.plan {
-                if name == "uninstall_mod" {
+                if name == "uninstall_mod" && args.get("rpf_job_id").is_none() {
                     check_uninstall_action(&engine, &args, false)?;
                 }
                 engine.approve_plan(&plan.id)
@@ -438,6 +537,18 @@ impl AgentTool for InstallTool {
                 return Ok(json!({"plan":plan.into_user_paths(),"status":"committed","preview":prepared.preview}));
             }
             match name.as_str() {
+                "prepare_gta_rpf_job" => {
+                    if prepared.effect != Effect::ManagerWrite || prepared.preview != args {
+                        return Err(AppError::Denied("GTA 暂存任务与批准的选项不一致".into()));
+                    }
+                    let spec: GtaJobArgs = serde_json::from_value(args)?;
+                    spec.validate()?;
+                    let tool = gta_mcp_tool(&engine, &spec.game_id, &*available)?;
+                    let job = install::gta_rpf::prepare_job(&engine, &spec.game_id, spec.artifact_id.as_deref(), spec.install_id.as_deref(), spec.kind.as_deref(), spec.options.as_ref(), &cancel)?;
+                    let mut receipt = json!(job);
+                    receipt["mcpTool"] = json!(tool);
+                    Ok(receipt)
+                }
                 "forget_uninstalled_mod" => {
                     let game = text(&args,"game_id")?;
                     let id = text(&args,"install_id")?;

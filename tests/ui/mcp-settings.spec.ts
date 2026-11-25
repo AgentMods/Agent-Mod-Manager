@@ -512,6 +512,38 @@ test("the editor has no separate enable switch", async ({page}) => {
   await expect(dialog.getByRole("button", {name: "移除配置", exact: true})).toBeVisible();
 });
 
+test("built-in Mod source presets show distinct local logos and other connections keep the server icon", async ({page}) => {
+  const presets = [
+    {...httpConfig, id: "glossmod_3dm", name: "3DM MCP", url: "https://mod.3dmgame.com/mcp"},
+    {...stdioConfig, id: "curseforge", name: "CurseForge MCP"},
+    {...stdioConfig, id: "gamebanana", name: "GameBanana MCP"},
+    {...httpConfig, id: "glossmod_http", name: "Mod客栈", url: "https://www.glossmod.com/api/v1/mcp"},
+    {...stdioConfig, id: "nexusmods", name: "Renamed Nexus connection"},
+    {...stdioConfig, id: "thunderstore", name: "Thunderstore MCP"},
+    {...stdioConfig, id: "modio", name: "mod.io MCP"},
+  ].map(config => ({...config, builtin: true}));
+  const generic = [
+    {...stdioConfig, id: "markitdown", name: "MarkItDown MCP", builtin: true},
+    {...stdioConfig, id: "playwright", name: "Playwright MCP", builtin: true},
+    {...httpConfig, name: "Custom Nexus Mods MCP"},
+  ];
+  await openLifecycle(page, [...presets, ...generic]);
+  const sources = new Set<string>();
+  for (const preset of presets) {
+    const image = mcpRow(page, preset.name).locator("img");
+    await expect(image).toBeVisible();
+    await expect(image).toHaveAttribute("alt", "");
+    await expect.poll(() => image.evaluate(node => (node as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+    const src = await image.evaluate(node => (node as HTMLImageElement).src);
+    expect(src.startsWith("data:image/") || new URL(src).origin === new URL(page.url()).origin).toBe(true);
+    sources.add(src);
+  }
+  expect(sources.size).toBe(presets.length);
+  for (const config of generic) {
+    await expect(mcpRow(page, config.name).locator('[data-slot="item-media"] svg')).toBeVisible();
+  }
+});
+
 test("MCP descriptions stay on one line and reveal their full text on hover and focus", async ({page}) => {
   const description = "A long service description that explains the purpose, supported operations, and expected behavior of this remote MCP connection. The complete text remains available when the inline summary is shortened.";
   const config = {...httpConfig, name: "Described MCP", description};

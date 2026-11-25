@@ -286,6 +286,26 @@ pub(crate) fn validate_apply(engine: &FileEngine, plan: &FilePlan) -> AppResult<
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
+    // Recheck only GTA legacy-style installations, not every install in the game's library.
+    if let Some((id, action, _)) = &link {
+        if action == "install" {
+            let gta: Option<(String,String)> = engine.db.conn().query_row("SELECT game_id,json_extract(metadata_json,'$.adapterSlug') FROM installs WHERE id=?1 AND json_extract(metadata_json,'$.adapterSlug') IN ('gta5-legacy','gta5-enhanced')", [id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+            if let Some((game_id, slug)) = gta {
+                let game = crate::games::get_game(&engine.db, &game_id)?;
+                if game.adapter_slug.as_deref() != Some(&slug) {
+                    return Err(conflict("GTA 适配包绑定已变化"));
+                }
+                super::gta_layout::check_edition(&game, &slug)?;
+                for entry in &plan.entries {
+                    super::gta_layout::check_copy_destination(
+                        &slug,
+                        Path::new(&game.root_path),
+                        entry.operation.dst(),
+                    )?;
+                }
+            }
+        }
+    }
     if let Some((next_id, _, Some(previous_id))) = link {
         let next = get_install(engine, &next_id)?;
         if next.status != "planned" {

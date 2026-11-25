@@ -1,0 +1,158 @@
+{
+  "find_games": {
+    "properties": {
+      "count": {
+        "default": 20,
+        "maximum": 100,
+        "minimum": 1,
+        "title": "Count",
+        "type": "integer"
+      },
+      "direction": {
+        "default": "ASC",
+        "enum": [
+          "ASC",
+          "DESC"
+        ],
+        "title": "Direction",
+        "type": "string"
+      },
+      "name": {
+        "default": "",
+        "title": "Name",
+        "type": "string"
+      },
+      "offset": {
+        "default": 0,
+        "maximum": 2147483647,
+        "minimum": 0,
+        "title": "Offset",
+        "type": "integer"
+      },
+      "sort": {
+        "default": "name",
+        "enum": [
+          "name",
+          "downloads",
+          "mods",
+          "collections",
+          "approved",
+          "relevance"
+        ],
+        "title": "Sort",
+        "type": "string"
+      }
+    },
+    "title": "find_gamesArguments",
+    "type": "object"
+  },
+  "find_mods": {
+    "properties": {
+      "adult_content": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Adult Content"
+      },
+      "author": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Author"
+      },
+      "category": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Category"
+      },
+      "count": {
+        "default": 20,
+        "maximum": 100,
+        "minimum": 1,
+        "title": "Count",
+        "type": "integer"
+      },
+      "direction": {
+        "default": "DESC",
+        "enum": [
+          "ASC",
+          "DESC"
+        ],
+        "title": "Direction",
+        "type": "string"
+      },
+      "game_domain": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Game Domain"
+      },
+      "name": {
+        "default": "",
+        "title": "Name",
+        "type": "string"
+      },
+      "offset": {
+        "default": 0,
+        "maximum": 2147483647,
+        "minimum": 0,
+        "title": "Offset",
+        "type": "integer"
+      },
+      "sort": {
+        "default": "updatedAt",
+        "enum": [
+          "updatedAt",
+          "createdAt",
+          "downloads",
+          "uniqueDownloads",
+          "endorsements",
+          "name",
+          "size",
+          "relevance"
+        ],
+        "title": "Sort",
+        "type": "string"
+      },
+      "tag": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Tag"
+      }
+    },
+    "title": "find_modsArguments",
+    "type": "object"
+  }
+}

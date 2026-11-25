@@ -494,6 +494,7 @@ export function AgentChat() {
             onSubmit={(answers) => submitAnswers(activeQuestion, answers)}
             onCancel={pendingQuestion ? () => void cancel(pendingQuestion.request.turnId) : () => setReanswerRequest(null)}
           /> : <AgentComposer
+            key={conversationId ?? "new"} games={games.data ?? []}
             libraryGameName={adapterChat?.gameId && workspace?.length === 1 && workspace[0] === adapterChat.gameId && !activeEdit ? adapterChat.label : undefined}
             input={draft.text}
             inputRef={composerInput}

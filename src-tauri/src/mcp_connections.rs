@@ -3,7 +3,9 @@
 use crate::{
     agent::tools::ToolRegistry,
     error::{AppError, AppResult},
-    mcp::{ConnectionConsent, McpClient, McpRuntime, McpServers, ServerConfig},
+    mcp::{
+        browse::BrowseReader, ConnectionConsent, McpClient, McpRuntime, McpServers, ServerConfig,
+    },
     settings::Settings,
 };
 use serde::Serialize;
@@ -38,6 +40,7 @@ enum Slot {
     Running {
         client: Box<McpClient>,
         names: Vec<String>,
+        browse: Option<Box<BrowseReader>>,
     },
 }
 impl Slot {
@@ -51,7 +54,7 @@ impl Slot {
     fn revoke(self, registry: &ToolRegistry) -> Option<Box<McpClient>> {
         match self {
             Self::Starting { cancel, .. } => cancel.cancel(),
-            Self::Running { client, names } => {
+            Self::Running { client, names, .. } => {
                 registry.unregister(&names);
                 client.disconnect();
                 return Some(client);
@@ -104,6 +107,32 @@ impl McpConnections {
                 }),
             })
             .collect()
+    }
+
+    /// Desktop browse can borrow only the restricted reader of an existing
+    /// slot. It cannot start a process, rediscover, or obtain the raw client.
+    pub(crate) fn browse_reader(&self, servers: &McpServers, id: &str) -> AppResult<BrowseReader> {
+        let slots = self.lock_slots();
+        let disconnected = || AppError::NotFound("尚未连接 MCP 来源".into());
+        let current = servers.get(id)?;
+        if !current.is_stock_browse_source() {
+            return Err(AppError::Unsupported("游览不使用非原厂 MCP 配置".into()));
+        }
+        let Some(Slot::Running { client, browse, .. }) = slots.get(id) else {
+            return Err(disconnected());
+        };
+        if !current.enabled
+            || !client.uses_browse_database(servers)
+            || client.is_closed()
+            || !current.same_connection_config(client.server_config())
+        {
+            return Err(disconnected());
+        }
+        client.ensure_browse_current()?;
+        browse
+            .as_deref()
+            .cloned()
+            .ok_or_else(|| AppError::Unsupported("MCP 未提供匹配的公开目录工具契约".into()))
     }
 
     pub async fn connect(
@@ -328,7 +357,7 @@ impl McpConnections {
         slot: Option<&Slot>,
         expected: &ServerConfig,
     ) -> AppResult<(ConnectionInfo, McpClient)> {
-        if let Some(Slot::Running { client, names }) = slot {
+        if let Some(Slot::Running { client, names, .. }) = slot {
             if client.server_config().same_connection_config(expected) {
                 return Ok((
                     ConnectionInfo {
@@ -366,14 +395,16 @@ impl McpConnections {
                 &cancel,
             )
             .await?;
-            let tools = match client.agent_tools(&cancel).await {
+            let catalog = match client.list_tools(&cancel).await {
                 Ok(tools) => tools,
                 Err(err) => {
                     client.disconnect_and_wait().await?;
                     return Err(err);
                 }
             };
-            Ok((client, tools))
+            let browse = BrowseReader::from_discovery(&client, &catalog).map(Box::new);
+            let tools = client.agent_tools_from_catalog(catalog);
+            Ok((client, tools, browse))
         }
         .await;
         let mut client_to_close = None;
@@ -390,11 +421,11 @@ impl McpConnections {
                 {
                     slots.remove(&expected.id);
                 }
-                client_to_close = prepared.ok().map(|(client, _)| client);
+                client_to_close = prepared.ok().map(|(client, _, _)| client);
                 return Err(AppError::Cancelled);
             }
             slots.remove(&expected.id);
-            let (client, tools) = prepared?;
+            let (client, tools, browse) = prepared?;
             let names: Vec<_> = tools.iter().map(|t| t.definition().name).collect();
             let result = (|| {
                 client.ensure_current()?;
@@ -423,6 +454,7 @@ impl McpConnections {
                 Slot::Running {
                     client: Box::new(client.clone()),
                     names,
+                    browse,
                 },
             );
             Ok((info, client))

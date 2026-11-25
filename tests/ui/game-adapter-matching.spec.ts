@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 import type { GameCandidate } from "../../src/lib/types";
 import { openGameAdapterMatchingFixture } from "./game-adapter-matching-fixture";
 import { release } from "./manager-plugin-catalog-fixture";
@@ -48,6 +48,10 @@ async function startOnboardingScan(page: Page) {
 function commandArgs(page: Page, command: string) {
   return page.evaluate((name) => (window as any).__AMM_TEST__.calls
     .filter((call: any) => call.command === name).map((call: any) => call.args), command);
+}
+
+async function openCandidateMenu(page: Page, candidate: Locator) {
+  await candidate.getByRole("button", { name: "更多操作", exact: true }).click();
 }
 
 test("游戏库扫描按 Steam 来源和云目录别名匹配，冲突与未知游戏仍可本地添加", async ({ page }) => {
@@ -108,8 +112,10 @@ test("游戏库扫描按 Steam 来源和云目录别名匹配，冲突与未知�
   }
   for (const item of [steamRow, aliasRow]) {
     await expect(item.getByRole("button", { name: "添加", exact: true })).toBeEnabled();
-    await expect(item.getByRole("button", { name: "联网识别", exact: true })).toHaveCount(0);
-    await expect(item.getByRole("button", { name: "仅添加本地", exact: true })).toHaveCount(0);
+    await openCandidateMenu(page, item);
+    await expect(page.getByRole("menuitem", { name: "联网识别", exact: true })).toHaveCount(0);
+    await expect(page.getByRole("menuitem", { name: "仅添加本地", exact: true })).toHaveCount(0);
+    await page.keyboard.press("Escape");
     await expect(item.getByRole("button", { name: "添加", exact: true })).toHaveCount(1);
   }
   for (const candidateItem of [localSuggestion, incomplete, ambiguous, unmatched]) {
@@ -176,6 +182,33 @@ test("已登记的扫描结果显示游戏库名称", async ({ page }) => {
   await expect(rows.getByText("云插件独立标题", { exact: true })).toHaveCount(0);
   await expect(rows.getByText("云端已匹配", { exact: true })).toHaveCount(0);
   await expect(rows.getByRole("button", { name: "管理中", exact: true })).toBeDisabled();
+});
+
+test("游戏库扫描的云添加失败后可从更多操作仅添加本地", async ({ page }) => {
+  const steam = candidate({
+    rootPath: "/sandbox/steam/library-fallback",
+    name: "扫描失败回退候选",
+    sources: [{ kind: "steam", steamAppId: "413150" }],
+  });
+  await openGameAdapterMatchingFixture(page, { candidates: [steam], failCloudRegistrationOnce: true });
+  await page.getByRole("button", { name: "游戏库", exact: true }).click();
+  await page.getByRole("button", { name: "扫描游戏", exact: true }).click();
+  const rows = page.getByRole("list", { name: "扫描候选游戏", exact: true });
+  const row = rows.getByRole("listitem").filter({ has: page.getByText(steam.rootPath, { exact: true }) });
+
+  await row.getByRole("button", { name: "添加", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "扫描游戏", exact: true });
+  await expect(dialog.getByRole("alert")).toContainText("模拟云端适配包安装失败");
+  await openCandidateMenu(page, row);
+  const localOnly = page.getByRole("menuitem", { name: "仅添加本地", exact: true });
+  await expect(localOnly).toBeEnabled();
+  await localOnly.click();
+  await expect(row.getByRole("button", { name: "管理中", exact: true })).toBeDisabled();
+
+  const registrations = await commandArgs(page, "register_game");
+  expect(registrations).toHaveLength(2);
+  expect(registrations[0]).toHaveProperty("cloudAdapter", { pluginId: release.pluginId, releaseId: release.releaseId });
+  expect(registrations[1]).toEqual({ directory: steam.rootPath, adapterSlug: null, fromDiscovery: true });
 });
 
 test("首次设置等待云目录后以 release.gameName 显示并注册", async ({ page }) => {

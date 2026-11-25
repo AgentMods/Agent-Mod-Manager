@@ -3,18 +3,20 @@ import { useCloudGameMatch } from '@/lib/cloud-game-match';
 import { useEffect, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { open } from "@tauri-apps/plugin-dialog";
-import { EllipsisIcon, FolderOpenIcon, Gamepad2Icon, GlobeIcon, PencilIcon, PlayIcon, PuzzleIcon, RefreshCwIcon, SearchIcon, SparklesIcon, Trash2Icon, XIcon } from "lucide-react";
+import { EllipsisIcon, FolderOpenIcon, Gamepad2Icon, GlobeIcon, PencilIcon, PuzzleIcon, RefreshCwIcon, SearchIcon, SparklesIcon, Trash2Icon, XIcon } from "lucide-react";
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { useUI } from "@/lib/store";
 import { displayPath, gameDirectoryKey } from "@/lib/paths";
-import { candidateWarnings, reconcileCandidates } from "@/lib/game-discovery";
+import { reconcileCandidates } from "@/lib/game-discovery";
 import { invalidateGameQueries } from "@/lib/game-cache";
 import type { BootstrapState, Game, GameCandidate, Plugin, ScanReport } from "@/lib/types";
 import { Badge, EmptyState, ErrorState, IconButton, Modal, Page, PageHeader, PathText } from "@/components/ui";
 import { GameConflictPanel, useGameConflicts } from "@/components/GameConflictPanel";
+import { GameLaunchButton, type LaunchMethod } from "@/components/GameLaunchButton";
+import { chooseGameProgram } from "@/lib/game-launch";
 import { GameCover } from "@/components/GameCover";
+import { ScanGameCard } from "@/components/ScanGameCard";
 import { ManagerPluginCatalog } from "@/components/ManagerPluginCatalog";
-import { GameMatchBadge } from "@/components/GameMatchBadge";
 import { GameIdentityDialog } from "@/components/GameIdentityDialog";
 import { AlertDialog, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
@@ -22,7 +24,7 @@ import { Card, CardDescription, CardFooter, CardHeader, CardTitle } from "@/comp
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group";
-import { Item, ItemActions, ItemContent, ItemDescription, ItemGroup, ItemMedia, ItemTitle } from "@/components/ui/item";
+import { ItemGroup } from "@/components/ui/item";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -31,9 +33,9 @@ import { stagger } from "@/lib/motion";
 const storedLaunchPath = (game: Game) => typeof game.metadata?.launchPath === "string" ? game.metadata.launchPath : "";
 const launchPathDraft = (raw: string) => ({ raw, text: displayPath(raw) });
 
-function GameCard({ game, index, coverUrl, disabled, busy, onOpen, onLaunch, onLocation, onEdit, onRemove, onChooseAdapter, onCreateAdapter }: {
+function GameCard({ game, index, coverUrl, disabled, busy, writable, onOpen, onLaunch, onLocation, onEdit, onRemove, onChooseAdapter, onCreateAdapter }: {
   game: Game; index: number; coverUrl: string | null; disabled: boolean; busy: string | null;
-  onOpen: () => void; onLaunch: () => void; onLocation: (target: "root" | "mods") => void; onEdit: () => void; onRemove: () => void;
+  writable: boolean; onOpen: () => void; onLaunch: (method?: LaunchMethod) => void; onLocation: (target: "root" | "mods") => void; onEdit: () => void; onRemove: () => void;
   onChooseAdapter: () => void; onCreateAdapter: () => void;
 }) {
   const working = busy === game.id;
@@ -46,9 +48,7 @@ function GameCard({ game, index, coverUrl, disabled, busy, onOpen, onLaunch, onL
       </CardHeader>
     </button>
     <CardFooter className="gap-2 border-t px-5 py-3">
-      <Button size="sm" className="flex-1" disabled={disabled || working} onClick={onLaunch}>
-        {working ? <Spinner data-icon="inline-start" /> : <PlayIcon data-icon="inline-start" />}{tr("启动游戏")}
-      </Button>
+      <GameLaunchButton game={game} disabled={disabled} working={working} writable={writable} onLaunch={onLaunch} />
       {!game.adapterSlug && <IconButton title={tr("创建适配包")} disabled={disabled} onClick={onCreateAdapter}>
         <SparklesIcon />
       </IconButton>}
@@ -81,8 +81,7 @@ function EditGameDialog({ game, onClose, onSaved }: { game: Game; onClose: () =>
   async function choose() {
     setError(null);
     try {
-      const windows = navigator.userAgent.includes("Windows");
-      const selected = await open({ multiple: false, directory: false, defaultPath: game.rootPath, title: tr("选择游戏启动程序"), filters: windows ? [{ name: tr("可执行文件"), extensions: ["exe"] }] : undefined });
+      const selected = await chooseGameProgram(game.rootPath);
       if (typeof selected === "string") setLaunchPath(launchPathDraft(selected));
     } catch (failure) { setError(failure); }
   }
@@ -317,6 +316,7 @@ export default function LibraryPage() {
 
   const discoveryRows = reconcileCandidates(candidates, games.data);
   const rows = (games.data ?? []).filter((game) => game.name.toLowerCase().includes(search.toLowerCase()));
+  const coversByAdapter = new Map((plugins.data ?? []).filter(plugin => plugin.enabled && plugin.validated).map(plugin => [plugin.slug, plugin.coverUrl]));
   const actionsDisabled = !backendAvailable || !!actionBusy;
   return <Page data-testid="library-page">
     <PageHeader title={tr("游戏库")} subtitle={backendAvailable ? tr("{value1} 个管理中的游戏", { value1: games.data?.length ?? 0 }) : tr("桌面能力未连接")}
@@ -331,18 +331,18 @@ export default function LibraryPage() {
     {games.error && <ErrorState error={games.error} />}
     {error != null && <ErrorState error={error} />}
     {rows.length > 0 && <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,17rem),1fr))] gap-4">
-      {rows.map((game, index) => <GameCard key={game.id} game={game} index={index} disabled={actionsDisabled} busy={actionBusy}
-        coverUrl={plugins.data?.find((plugin) => plugin.slug === game.adapterSlug && plugin.enabled && plugin.validated)?.coverUrl ?? null}
+      {rows.map((game, index) => <GameCard key={game.id} game={game} index={index} disabled={actionsDisabled} busy={actionBusy} writable={writable}
+        coverUrl={game.adapterSlug ? coversByAdapter.get(game.adapterSlug) ?? null : null}
         onCreateAdapter={() => startAdapterChat({ name: game.name, gameId: game.id })}
         onChooseAdapter={() => setChoosingAdapter(game)}
         onOpen={() => selectGame(game.id)}
-        onLaunch={() => { void perform(game, "launch_game", { id: game.id }, tr("已发出启动请求")); }}
+        onLaunch={method => { void perform(game, "launch_game", method ? { id: game.id, method } : { id: game.id }, tr("已发出启动请求")); }}
         onLocation={(target) => { void perform(game, "open_game_location", { id: game.id, target }); }}
         onEdit={() => setEditing(game)} onRemove={() => setRemoving(game)} />)}
     </div>}
     {!rows.length && !games.error && <EmptyState icon={<Gamepad2Icon />} title={!backendAvailable ? tr("桌面能力未连接") : games.isLoading ? tr("正在读取游戏库…") : search ? tr("没有匹配的游戏") : tr("尚无管理中的游戏")} />}
 
-    {scanOpen && <Modal title={tr("扫描游戏")} description={tr("扫描常用位置或指定目录，然后选择要添加的游戏。")} className="sm:max-w-3xl"
+    {scanOpen && <Modal title={tr("扫描游戏")} description={tr("扫描常用位置或指定目录，然后选择要添加的游戏。")} className="sm:w-[calc(100%-2rem)] sm:max-w-[68rem]"
       onClose={() => { stopScan(); setScanOpen(false); }} onCloseAutoFocus={(event) => { event.preventDefault(); scanButton.current?.focus(); }}>
       <form className="flex flex-col gap-2" onSubmit={(event) => { event.preventDefault(); if (directory.trim()) void discover(() => scan(directory)); }}>
         <div className="flex items-center gap-2">
@@ -356,10 +356,10 @@ export default function LibraryPage() {
         </div>
       </form>
       {scanning && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner />{scanRoot ? tr("正在扫描指定目录…") : tr("正在扫描常用位置…")}</p>}
-      <div className="flex flex-wrap gap-2">
+      {(scanning || report?.nextCursor) && <div className="flex flex-wrap gap-2">
         {report?.nextCursor && !scanning && <Button type="button" variant="outline" disabled={busy} onClick={() => void discover(() => scan(scanRoot ?? undefined, report.nextCursor!))}>{tr("下一批候选")}</Button>}
-        {(scanning || report?.nextCursor) && <Button type="button" variant="ghost" onClick={stopScan}>{tr("停止扫描")}</Button>}
-      </div>
+        <Button type="button" variant="ghost" onClick={stopScan}>{tr("停止扫描")}</Button>
+      </div>}
       <ErrorState error={discoveryError} />
       {report && <div role="status" className="flex flex-col gap-1 text-sm text-muted-foreground">
         {scanRoot && <PathText>{tr("扫描目录：{value1}", { value1: displayPath(scanRoot) })}</PathText>}
@@ -372,26 +372,12 @@ export default function LibraryPage() {
           {report.warnings.map((warning, index) => <li key={index}><PathText className="text-warning">{displayPath(warning.path)}：{errorText(warning)}</PathText></li>)}
         </ul>
       </details>}
-      {discoveryRows.length > 0 && <ItemGroup aria-label={tr("扫描候选游戏")} className="gap-2">
-        {discoveryRows.map((candidate, index) => {
-          const matched = cloud.match(candidate);
-          const waiting = cloud.waiting(candidate);
-          return <Item role="listitem" variant="outline" key={gameDirectoryKey(candidate.rootPath)} className="motion-safe:animate-rise-in" style={stagger(index)}>
-            <ItemMedia variant="icon"><Gamepad2Icon /></ItemMedia>
-            <ItemContent className="min-w-0">
-              <ItemTitle className="max-w-full break-all">{matched?.gameName ?? candidate.name}</ItemTitle>
-              <ItemDescription className="line-clamp-none"><PathText>{displayPath(candidate.rootPath)}</PathText></ItemDescription>
-              {matched && <p className="wrap-anywhere text-xs text-muted-foreground">{matched.pluginName} · {matched.reusable ? tr("将校验并复用已安装适配包") : tr("适配包将随添加安装")}</p>}
-              {candidateWarnings(candidate).map((warning) => <p key={warning} className="text-xs text-warning">{warning}</p>)}
-            </ItemContent>
-            <ItemActions className="w-full flex-wrap sm:w-auto">
-              <GameMatchBadge loading={waiting} candidate={candidate} cloudMatched={!!matched} />
-              {!matched && !waiting && !candidate.suggestedAdapterSlug && !candidate.registeredGameId && <Button variant="outline" size="sm" disabled={!backendAvailable || busy || games.isLoading} onClick={(event) => setIdentity({ directory: candidate.rootPath, trigger: event.currentTarget })}><GlobeIcon data-icon="inline-start" />{tr("联网识别")}</Button>}
-              <Button size="sm" variant={candidate.registeredGameId ? "outline" : "default"} disabled={!writable || busy || cloud.pending || waiting || games.isLoading || !!candidate.registeredGameId} onClick={() => { void register(candidate); }}>{candidate.registeredGameId ? tr("管理中") : waiting ? tr("正在匹配…") : tr("添加")}</Button>
-              {!candidate.registeredGameId && (waiting || failedRegistrations[candidate.rootPath]) && <Button variant="outline" size="sm" disabled={!writable || busy || cloud.pending || games.isLoading} onClick={() => void register(candidate, true)}>{tr("仅添加本地")}</Button>}
-            </ItemActions>
-          </Item>;
-        })}
+      {discoveryRows.length > 0 && <ItemGroup aria-label={tr("扫描候选游戏")} className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,17rem),1fr))] gap-4">
+        {discoveryRows.map((candidate, index) => <ScanGameCard key={gameDirectoryKey(candidate.rootPath)} candidate={candidate} index={index}
+          coverUrl={candidate.suggestedAdapterSlug ? coversByAdapter.get(candidate.suggestedAdapterSlug) : null}
+          matched={cloud.match(candidate)} waiting={cloud.waiting(candidate)} failed={!!failedRegistrations[candidate.rootPath]}
+          disableRegister={!writable || busy || cloud.pending || games.isLoading} disableIdentify={!backendAvailable || busy || games.isLoading}
+          onRegister={localOnly => void register(candidate, localOnly)} onIdentify={trigger => setIdentity({ directory: candidate.rootPath, trigger })} />)}
       </ItemGroup>}
       {identity && <GameIdentityDialog key={identity.directory} directory={identity.directory} writable={writable} onClose={() => setIdentity(null)}
         onCloseAutoFocus={(event) => {

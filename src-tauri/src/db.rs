@@ -28,6 +28,7 @@ impl Db {
     fn migrate(&self) -> AppResult<()> {
         let mut c = self.conn();
         c.execute_batch(SCHEMA)?;
+        c.execute_batch(crate::install::gta_rpf::SCHEMA)?;
         let has_auto_title: bool = c.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='auto_title_pending')",
             [],
@@ -207,6 +208,9 @@ impl Db {
             if version < 25 {
                 crate::mcp::config::migrate_thunderstore_to_latest(&tx)?;
             }
+            if version < 26 {
+                crate::mcp::config::migrate_thunderstore_package_index(&tx)?;
+            }
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
             tx.commit()?;
         }
@@ -220,7 +224,7 @@ impl Db {
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 25;
+pub const SCHEMA_VERSION: i64 = 26;
 
 // SQLite appends rowid to the index key: these indexes bound scans to the
 // conversation's insertion-order suffix and the most recent retained user.

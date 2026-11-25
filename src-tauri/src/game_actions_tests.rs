@@ -11,15 +11,15 @@ use crate::{
 };
 use serde_json::json;
 
-struct Fixture {
+pub(super) struct Fixture {
     _temp: tempfile::TempDir,
-    engine: FileEngine,
-    root: PathBuf,
-    outside: PathBuf,
+    pub(super) engine: FileEngine,
+    pub(super) root: PathBuf,
+    pub(super) outside: PathBuf,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let paths = AppPaths::new(temp.path().join("data")).unwrap();
         let db = Db::open(&paths.db_file()).unwrap();
@@ -35,7 +35,7 @@ impl Fixture {
         }
     }
 
-    fn game(&self) -> Game {
+    pub(super) fn game(&self) -> Game {
         games::get_game(&self.engine.db, "g").unwrap()
     }
 }
@@ -53,7 +53,7 @@ fn insert_game(engine: &FileEngine, id: &str, root: &Path) {
     ).unwrap();
 }
 
-fn executable(path: &Path) -> PathBuf {
+pub(super) fn executable(path: &Path) -> PathBuf {
     fs::write(path, b"inert test fixture").unwrap();
     #[cfg(unix)]
     {

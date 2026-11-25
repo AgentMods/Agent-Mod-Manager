@@ -28,14 +28,24 @@ struct Pending {
 pub struct Approvals {
     events: Events,
     pending: Arc<Mutex<HashMap<String, Pending>>>,
+    browse_install: bool,
 }
 impl Approvals {
     pub fn new(events: Events) -> Self {
         Self {
             events,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            browse_install: false,
         }
     }
+
+    pub(super) fn for_browse_install(&self) -> Self {
+        Self {
+            browse_install: true,
+            ..self.clone()
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn request(
         &self,
@@ -62,13 +72,14 @@ impl Approvals {
                     sender: tx,
                 },
             );
-        if let Err(error) = self.events.emit(
-            turn,
-            conv,
-            Some(message),
-            "approval-request",
-            json!({"approvalId":id,"toolCallId":call,"title":title,"preview":payload}),
-        ) {
+        let mut event = json!({"approvalId":id,"toolCallId":call,"title":title,"preview":payload});
+        if self.browse_install {
+            event["reviewSurface"] = json!("browseInstall");
+        }
+        if let Err(error) = self
+            .events
+            .emit(turn, conv, Some(message), "approval-request", event)
+        {
             self.pending
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -124,5 +135,67 @@ impl Approvals {
         }
         let p = map.remove(id).unwrap();
         p.sender.send(response).map_err(|_| AppError::Cancelled)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{history::History, transaction::tests::setup};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn browse_approval_routes_live_and_replayed_requests_without_changing_chat() {
+        let (_temp, engine, _) = setup();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let events = Events {
+            db: engine.db.clone(),
+            sink: Arc::new(move |event| sender.send(event.clone()).unwrap()),
+        };
+        let approvals = Approvals::new(events.clone());
+        for (broker, expected) in [
+            (approvals.for_browse_install(), json!("browseInstall")),
+            (approvals.clone(), Value::Null),
+        ] {
+            let conversation = History::new(engine.db.clone())
+                .create_conversation("Test", None)
+                .unwrap();
+            let conv = conversation.id.clone();
+            let waiter = tokio::spawn(async move {
+                broker
+                    .request(
+                        "turn",
+                        &conv,
+                        "msg",
+                        "call",
+                        "download_mod",
+                        json!({"reviewSurface": "from preview"}),
+                        &CancellationToken::new(),
+                    )
+                    .await
+            });
+            let live = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(live.kind, "approval-request");
+            assert_eq!(live.payload["reviewSurface"], expected);
+            assert_eq!(
+                events.replay(&conversation.id, 0, 10).unwrap()[0].payload,
+                live.payload
+            );
+            approvals
+                .respond(
+                    &conversation.id,
+                    live.payload["approvalId"].as_str().unwrap(),
+                    ApprovalResponse {
+                        approved: true,
+                        answer: Value::Null,
+                    },
+                )
+                .unwrap();
+            assert!(waiter.await.unwrap().unwrap().approved);
+            assert_eq!(receiver.recv().await.unwrap().kind, "approval-resolved");
+        }
     }
 }

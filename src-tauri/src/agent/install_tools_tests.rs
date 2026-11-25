@@ -627,7 +627,10 @@ async fn workspace_rejects_implicit_uninstall_plan_and_file_verification() {
         ("uninstall_mod", json!({"install_id":"workspace-owned"})),
         ("plan_install", json!({"request":{"gameId":"g"}})),
     ] {
-        let tool = InstallTool { name: name.into() };
+        let tool = InstallTool {
+            name: name.into(),
+            tool_available: Arc::new(|_| false),
+        };
         assert!(
             matches!(
                 tool.prepare(&context, &args).await,

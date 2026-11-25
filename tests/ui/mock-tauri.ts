@@ -2,6 +2,8 @@ import type { Page } from "@playwright/test";
 import type { GameCandidate } from "../../src/lib/types";
 
 type WorkspaceGameFixture = {id: string; name: string};
+type GameLaunchOptionFixture = {id: string; label: string | null};
+type GameModLauncherFixture = {name: string; path: string; args: string[]};
 type AskUserQuestionFixture = {question: string; options?: string[]; multiSelect?: boolean};
 type AskUserPreviewFixture = {title?: string; questions: AskUserQuestionFixture[]} | {question: string};
 
@@ -11,7 +13,7 @@ export const PLUGIN_UPDATED_AT_FIXTURE = "2026-11-20T16:45:00Z";
 // Test-only IPC transport. It is never imported by the shipped application.
 export async function installMockTauri(page: Page, {
   modLibrary = [], onboarding = false, onboardingStarted = false, failRegistration = false,
-  gameRootPath = "/sandbox/minecraft", gameLaunchPath, gameWithoutAdapter = false, gameWithoutMods = false, adapterDisabled = false, withExternalAdapter = false, holdAgentTurn = false,
+  gameRootPath = "/sandbox/minecraft", gameLaunchPath, gameSteamAppId = null, gameModLauncher, gameLaunchOptions, failGameLaunchOptions = false, failGameLaunchMethods = [], gameWithoutAdapter = false, gameWithoutMods = false, adapterDisabled = false, withExternalAdapter = false, holdAgentTurn = false,
   gamePlanConflicts = [],
   pluginDateFixture = "valid",
   failInstalledPluginRemoval = null,
@@ -34,6 +36,11 @@ export async function installMockTauri(page: Page, {
   failRegistration?: boolean;
   gameRootPath?: string;
   gameLaunchPath?: string;
+  gameSteamAppId?: string | null;
+  gameModLauncher?: GameModLauncherFixture;
+  gameLaunchOptions?: GameLaunchOptionFixture[];
+  failGameLaunchOptions?: boolean;
+  failGameLaunchMethods?: string[];
   gameWithoutAdapter?: boolean;
   gameWithoutMods?: boolean;
   adapterDisabled?: boolean;
@@ -75,7 +82,7 @@ export async function installMockTauri(page: Page, {
 } = {}) {
   // The public-looking manifest image is served offline in browser tests.
   await page.route("https://covers.example.org/minecraft-java.jpg", route => route.fulfill({contentType: "image/png", path: "public/favicon.png"}));
-  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus}) => {
+  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameSteamAppId, gameModLauncher, gameLaunchOptions, failGameLaunchOptions, failGameLaunchMethods, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus}) => {
     type Args = Record<string, any>;
     const now = "2026-11-18T00:00:00Z";
     const draftUpdatedAtField = pluginDateFixture === "valid" ? {updatedAt: pluginUpdatedAt} : {};
@@ -105,8 +112,10 @@ export async function installMockTauri(page: Page, {
     const initialGame: Args = {
       id: "game-fixture", name: "Minecraft Java Edition", slug: "minecraft-java",
       rootPath: gameRootPath, platform: "windows", adapterSlug: withExternalAdapter && !gameWithoutAdapter ? "minecraft-java" : null,
-      adapterVersion: withExternalAdapter && !gameWithoutAdapter ? "1.0.0" : null, confidence: 1, coverPath: null, steamAppId: null,
-      lastScannedAt: now, installedModCount: gameWithoutMods ? 0 : 1, enabledModCount: gameWithoutMods ? 0 : 1, metadata: gameLaunchPath === undefined ? {} : {launchPath: gameLaunchPath}, createdAt: now, updatedAt: now,
+      adapterVersion: withExternalAdapter && !gameWithoutAdapter ? "1.0.0" : null, confidence: 1, coverPath: null,
+      lastScannedAt: now, installedModCount: gameWithoutMods ? 0 : 1, enabledModCount: gameWithoutMods ? 0 : 1,
+      metadata: {...(gameLaunchPath === undefined ? {} : {launchPath: gameLaunchPath}), ...(gameModLauncher ? {modLauncher: gameModLauncher} : {})},
+      steamAppId: gameSteamAppId, createdAt: now, updatedAt: now,
     };
     const games: Args[] = onboarding && !onboardingStarted ? [] : [
       gameWithoutAdapter ? {...initialGame, adapterSlug: null, adapterVersion: null} : initialGame,
@@ -115,6 +124,14 @@ export async function installMockTauri(page: Page, {
       ...initialGame, id: game.id, name: game.name, slug: game.id, rootPath: `/sandbox/${game.id}`,
       adapterSlug: null, adapterVersion: null, installedModCount: 0, enabledModCount: 0, metadata: {},
     })));
+    const availableLaunchOptions = (game: Args): GameLaunchOptionFixture[] => {
+      if (gameLaunchOptions !== undefined) return structuredClone(gameLaunchOptions);
+      const options: GameLaunchOptionFixture[] = [];
+      if (game.steamAppId) options.push({id: "steam", label: null});
+      if (game.metadata?.launchPath) options.push({id: "direct", label: null});
+      if (game.metadata?.modLauncher) options.push({id: "custom", label: game.metadata.modLauncher.name});
+      return options;
+    };
     const onboardingCandidates: GameCandidate[] = [
       {rootPath: "/sandbox/steam/Fixture", name: "Fixture Game", confidence: 0.92, status: "high_confidence", suggestedAdapterSlug: withExternalAdapter ? "minecraft-java" : null, registeredGameId: null, platform: "windows", warnings: ["这是一个测试扫描候选，请确认目录后再添加"]},
       {rootPath: "/sandbox/steam/Broken", name: "Broken Fixture", confidence: 0.6, status: "candidate", suggestedAdapterSlug: null, registeredGameId: null, platform: "unknown", warnings: []},
@@ -815,12 +832,39 @@ export async function installMockTauri(page: Page, {
           const candidates = args.options?.userRoots?.includes("/sandbox/new-game") ? libraryCandidates : onboarding ? onboardingCandidates : [];
           return { candidates: structuredClone(candidates), warnings: [], directoriesChecked: 3, entriesChecked: 18, truncated: false };
         }
-        // Game-card actions. The native commands resolve every path from the game id, so the mock never accepts a path from the UI.
+        // Launch selects by game ID and method; file paths are supplied only when editing launcher settings.
         case "launch_game": {
           const game = games.find((item) => item.id === args.id);
           if (!game) throw new Error(`未找到: 游戏: ${args.id}`);
+          if (typeof args.method === "string") {
+            if (!availableLaunchOptions(game).some((option) => option.id === args.method)) throw new Error(`无效输入: 不支持的启动方式: ${args.method}`);
+            if (failGameLaunchMethods.includes(args.method)) throw new Error(`模拟启动失败: ${args.method}`);
+            return null;
+          }
           if (!game.metadata?.launchPath && !game.steamAppId) throw new Error("尚未设置启动方式，请在“编辑”中选择游戏可执行文件");
           return null;
+        }
+        case "list_game_launch_options": {
+          const game = games.find((item) => item.id === args.id);
+          if (!game) throw new Error(`未找到: 游戏: ${args.id}`);
+          if (failGameLaunchOptions) throw new Error("模拟读取启动方式失败");
+          return availableLaunchOptions(game);
+        }
+        case "set_game_mod_launcher": {
+          const game = games.find((item) => item.id === args.id);
+          if (!game) throw new Error(`未找到: 游戏: ${args.id}`);
+          if (args.launcher === null) {
+            const {modLauncher: _removed, ...metadata} = game.metadata ?? {};
+            game.metadata = metadata;
+          } else {
+            const launcher = args.launcher;
+            if (!launcher || typeof launcher.name !== "string" || typeof launcher.path !== "string" || !Array.isArray(launcher.args)) {
+              throw new Error("无效输入: 启动器配置格式无效");
+            }
+            game.metadata = {...(game.metadata ?? {}), modLauncher: structuredClone(launcher)};
+          }
+          game.updatedAt = now;
+          return structuredClone(game);
         }
         case "open_game_location": {
           if (!games.some((item) => item.id === args.id)) throw new Error(`未找到: 游戏: ${args.id}`);
@@ -907,5 +951,5 @@ export async function installMockTauri(page: Page, {
         seq = Math.max(seq, ...values.map((event) => event.seq).filter(Number.isSafeInteger));
       },
     };
-  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus});
+  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameSteamAppId, gameModLauncher, gameLaunchOptions, failGameLaunchOptions, failGameLaunchMethods, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus});
 }

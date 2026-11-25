@@ -24,6 +24,10 @@ pub(crate) use replacement::{
     verify_unowned_paths,
 };
 
+#[path = "gta_layout.rs"]
+mod gta_layout;
+pub(crate) mod gta_rpf;
+
 #[path = "install_library.rs"]
 mod library;
 use crate::mod_organization::{self, OrganizationSuggestion};
@@ -425,6 +429,8 @@ pub fn plan_install_with_organization(
         &game_roots::registered_user_roots(&engine.db, &game.id)?,
         &engine.roots()?,
     )?;
+    gta_layout::check_edition(&game, &adapter.slug)?;
+    gta_layout::check_copy_type(&adapter.slug, Some(&ty.id))?;
     let artifact = artifact(engine, request)?;
     let artifact_sha256 = archive::hash_file_cancellable(&artifact, cancel)?;
     let catalog = artifacts::for_path(&engine.db, &artifact)?;
@@ -677,6 +683,7 @@ pub fn plan_install_with_organization(
             &install_root.join(&name),
             std::slice::from_ref(&install_root),
         )?;
+        gta_layout::check_copy_destination(&adapter.slug, Path::new(&game.root_path), &dst)?;
         ops.push(FileOp::Copy { src, dst });
     }
     check_cancel()?;
@@ -862,7 +869,7 @@ pub(crate) const INSTALL_STATE: &str = "CASE
         AND EXISTS(SELECT 1 FROM trash_items t WHERE t.transaction_id=f.id AND NOT EXISTS(SELECT 1 FROM trash_restore_links r JOIN file_transactions rf ON rf.id=r.transaction_id WHERE r.item_id=t.id AND rf.status='committed'))
         AND EXISTS(SELECT 1 FROM trash_items t WHERE t.transaction_id=f.id AND EXISTS(SELECT 1 FROM trash_restore_links r JOIN file_transactions rf ON rf.id=r.transaction_id WHERE r.item_id=t.id AND rf.status='committed'))) THEN 'partially_restored'
       WHEN EXISTS(SELECT 1 FROM install_transactions a JOIN file_transactions f ON f.id=a.transaction_id WHERE a.install_id=installs.id AND a.action='uninstall' AND f.status='committed'
-        AND EXISTS(SELECT 1 FROM trash_items t WHERE t.transaction_id=f.id AND NOT EXISTS(SELECT 1 FROM trash_restore_links r JOIN file_transactions rf ON rf.id=r.transaction_id WHERE r.item_id=t.id AND rf.status='committed'))) THEN 'uninstalled'
+        AND (f.kind='gta_rpf' OR EXISTS(SELECT 1 FROM trash_items t WHERE t.transaction_id=f.id AND NOT EXISTS(SELECT 1 FROM trash_restore_links r JOIN file_transactions rf ON rf.id=r.transaction_id WHERE r.item_id=t.id AND rf.status='committed')))) THEN 'uninstalled'
       WHEN EXISTS(SELECT 1 FROM install_missing_removals m WHERE m.install_id=installs.id) THEN 'removed_missing'
       ELSE 'enabled' END";
 
@@ -1193,6 +1200,9 @@ pub fn inspect_install(engine: &FileEngine, id: &str) -> AppResult<InstallInspec
         .iter()
         .find(|install| install.id == id)
         .ok_or_else(|| AppError::NotFound(id.into()))?;
+    if installed.metadata["gtaRpf"] == true {
+        return gta_rpf::inspect(engine, installed);
+    }
     let roots = engine.roots()?;
     let candidates: Vec<_> = installs
         .iter()
@@ -1432,6 +1442,11 @@ fn validate_uninstall_apply(engine: &FileEngine, plan: &FilePlan, id: &str) -> A
 pub fn plan_uninstall(engine: &FileEngine, id: &str) -> AppResult<FilePlan> {
     let guard = crate::transaction::write_lock();
     let installed = get_install(engine, id)?;
+    if installed.metadata["gtaRpf"] == true {
+        return Err(AppError::Denied(
+            "GTA RPF 卸载必须先按剩余贡献重建，使用 prepare_gta_rpf_job。".into(),
+        ));
+    }
     let sources = uninstall_sources(engine, &installed)?;
     let summary = format!("卸载 {}", installed.name);
     let drafts = trash::prepare_trash(

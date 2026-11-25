@@ -311,6 +311,27 @@ fn sqlite_crud_presets_markitdown_inherits_uvx_default_and_secret_references() {
 }
 
 #[test]
+fn three_dm_browse_recognizes_saved_credentials_and_guest_access_only_on_the_stock_endpoint() {
+    let (_dir, servers, _, _) = fixture();
+    servers.seed_presets().unwrap();
+    let stock = servers.get("glossmod_3dm").unwrap();
+    assert!(stock.is_stock_browse_source());
+    let mut saved = stock.clone();
+    for key in [Some("mcp.personal.3dm_key"), None] {
+        saved.bearer_secret_ref = key.map(str::to_owned);
+        assert!(servers.update(&saved).unwrap());
+        let current = servers.get(&saved.id).unwrap();
+        assert!(current.is_stock_browse_source());
+        assert!(!current.same_connection_config(&stock));
+    }
+    saved.bearer_secret_ref = Some("model.api_key".into());
+    assert!(!saved.is_stock_browse_source());
+    saved.bearer_secret_ref = Some("mcp.personal.3dm_key".into());
+    saved.url = Some("https://example.test/mcp".into());
+    assert!(!saved.is_stock_browse_source());
+}
+
+#[test]
 fn mod_source_presets_bind_their_published_stdio_commands_and_credentials() {
     let (_dir, servers, settings, _) = fixture();
     servers.seed_presets().unwrap();
@@ -318,14 +339,7 @@ fn mod_source_presets_bind_their_published_stdio_commands_and_credentials() {
         ("modio", vec!["modio-mcp@latest"]),
         ("curseforge", vec!["curseforge-mcp@latest"]),
         ("gamebanana", vec!["gamebanana-mcp@latest"]),
-        (
-            "thunderstore",
-            vec![
-                "--default-index",
-                "https://pypi.org/simple",
-                "thunderstore-mcp@latest",
-            ],
-        ),
+        ("thunderstore", vec!["thunderstore-mcp@latest"]),
         (
             "nexusmods",
             vec![
@@ -344,6 +358,10 @@ fn mod_source_presets_bind_their_published_stdio_commands_and_credentials() {
     }
     let thunderstore = servers.get("thunderstore").unwrap();
     assert_eq!(thunderstore.name, "Thunderstore MCP");
+    assert_eq!(
+        thunderstore.source_download_dir_env(),
+        Some("THUNDERSTORE_DOWNLOAD_DIR")
+    );
     assert!(thunderstore.env_secret_refs.is_empty());
     assert!(thunderstore.credential_url.is_none());
     assert!(thunderstore.bearer_secret_ref.is_none());
@@ -411,7 +429,9 @@ fn v24_upgrade_unpins_only_stock_thunderstore_and_revokes_its_old_consent() {
         expected.builtin = builtin;
         expected.description = Some("Custom display text".into());
         let mut old = expected.clone();
-        *old.args.last_mut().unwrap() = package.into();
+        old.args = ["--default-index", "https://pypi.org/simple", package]
+            .map(String::from)
+            .into();
         if builtin {
             servers.update(&old).unwrap();
         } else {
@@ -433,6 +453,92 @@ fn v24_upgrade_unpins_only_stock_thunderstore_and_revokes_its_old_consent() {
             assert_eq!(upgraded.get(&old.id).unwrap(), old);
             assert!(ConnectionConsent::from_remembered(&upgraded, &old).is_ok());
         }
+    }
+}
+
+#[test]
+fn v25_upgrade_removes_official_index_and_requires_new_thunderstore_consent() {
+    let (_dir, servers, _, context) = fixture();
+    servers.seed_presets().unwrap();
+    let mut expected = servers.get("thunderstore").unwrap();
+    expected.enabled = true;
+    expected.description = Some("Custom display text".into());
+    let mut old = expected.clone();
+    old.args = [
+        "--default-index",
+        "https://pypi.org/simple",
+        "thunderstore-mcp@latest",
+    ]
+    .map(String::from)
+    .into();
+    servers.update(&old).unwrap();
+    servers.remember_start(&old).unwrap();
+    assert!(ConnectionConsent::from_remembered(&servers, &old).is_ok());
+    servers
+        .db
+        .conn()
+        .pragma_update(None, "user_version", 25)
+        .unwrap();
+
+    let db_path = context.engine.paths.db_file();
+    let upgraded = McpServers::new(Db::open(&db_path).unwrap());
+    upgraded.seed_presets().unwrap();
+    assert_eq!(upgraded.get(&old.id).unwrap(), expected);
+    assert!(upgraded.startup_digest(&old.id).unwrap().is_none());
+    assert!(upgraded.startup_requests().unwrap().is_empty());
+    assert!(ConnectionConsent::from_remembered(&upgraded, &expected).is_err());
+    upgraded.remember_start(&expected).unwrap();
+    assert!(ConnectionConsent::from_remembered(&upgraded, &expected).is_ok());
+
+    // An explicit choice of official PyPI after the upgrade survives future opens.
+    upgraded.update(&old).unwrap();
+    upgraded.remember_start(&old).unwrap();
+    let reopened = McpServers::new(Db::open(&db_path).unwrap());
+    reopened.seed_presets().unwrap();
+    let retained = reopened.get(&old.id).unwrap();
+    assert_eq!(retained, old);
+    assert_eq!(
+        retained.source_download_dir_env(),
+        Some("THUNDERSTORE_DOWNLOAD_DIR")
+    );
+    assert!(ConnectionConsent::from_remembered(&reopened, &retained).is_ok());
+}
+
+#[test]
+fn v25_upgrade_preserves_custom_thunderstore_connections_and_consent() {
+    for (builtin, command, index) in [
+        (false, "uvx", "https://pypi.org/simple"),
+        (true, "custom-wrapper", "https://pypi.org/simple"),
+        (true, "uvx", "https://pypi.example.test/simple"),
+    ] {
+        let (_dir, servers, _, context) = fixture();
+        servers.seed_presets().unwrap();
+        let mut custom = servers.get("thunderstore").unwrap();
+        custom.builtin = builtin;
+        custom.enabled = true;
+        custom.command = Some(command.into());
+        custom.args = ["--default-index", index, "thunderstore-mcp@latest"]
+            .map(String::from)
+            .into();
+        if builtin {
+            servers.update(&custom).unwrap();
+        } else {
+            servers.remove(&custom.id).unwrap();
+            servers.create(&custom).unwrap();
+        }
+        servers.remember_start(&custom).unwrap();
+        servers
+            .db
+            .conn()
+            .pragma_update(None, "user_version", 25)
+            .unwrap();
+
+        let upgraded = McpServers::new(Db::open(&context.engine.paths.db_file()).unwrap());
+        upgraded.seed_presets().unwrap();
+        let retained = upgraded.get(&custom.id).unwrap();
+        assert_eq!(retained, custom);
+        assert!(retained.source_download_dir_env().is_none());
+        assert!(ConnectionConsent::from_remembered(&upgraded, &retained).is_ok());
     }
 }
 
@@ -2676,7 +2782,9 @@ async fn live_3dm_public_http_initializes_and_registers_tools() {
     let (_dir, servers, settings, _) = fixture();
     servers.seed_presets().unwrap();
     servers.set_enabled("glossmod_3dm", true).unwrap();
-    let config = servers.get("glossmod_3dm").unwrap();
+    let mut config = servers.get("glossmod_3dm").unwrap();
+    config.bearer_secret_ref = Some("mcp.personal.3dm_key".into());
+    servers.update(&config).unwrap();
 
     let registry = ToolRegistry::default();
     let connections = McpConnections::default();
@@ -2689,6 +2797,9 @@ async fn live_3dm_public_http_initializes_and_registers_tools() {
     for name in &info.tools {
         assert!(registry.get(name).is_ok(), "tool not registered: {name}");
     }
+    connections
+        .browse_reader(&servers, &info.server_id)
+        .expect("the connected stock 3DM catalogue must be available to desktop Browse");
     connections
         .disconnect(&registry, &servers, &info.server_id)
         .await

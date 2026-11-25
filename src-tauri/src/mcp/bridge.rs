@@ -22,9 +22,13 @@ impl McpClient {
         &self,
         cancel: &CancellationToken,
     ) -> AppResult<Vec<Arc<dyn AgentTool>>> {
-        Ok(self
-            .list_tools(cancel)
-            .await?
+        self.list_tools(cancel)
+            .await
+            .map(|tools| self.agent_tools_from_catalog(tools))
+    }
+
+    pub(crate) fn agent_tools_from_catalog(&self, tools: Vec<McpTool>) -> Vec<Arc<dyn AgentTool>> {
+        tools
             .into_iter()
             // The built-in publication workflow binds consent to an exact package and target.
             .filter(|tool| {
@@ -48,7 +52,7 @@ impl McpClient {
                     tool,
                 }) as Arc<dyn AgentTool>
             })
-            .collect())
+            .collect()
     }
 
     pub async fn register_tools(
@@ -81,6 +85,20 @@ impl AgentTool for McpAgentTool {
             parameters: self.tool.input_schema.clone(),
             effect: Effect::ExternalWrite,
         }
+    }
+
+    fn host_tool_kind(&self) -> Option<&'static str> {
+        (self.client.server_config().is_glossmod_endpoint()
+            && self.tool.remote_name == "list_work_files")
+            .then_some("glossmod_work_files")
+    }
+
+    fn stock_source_tool(&self) -> Option<(&str, &str)> {
+        // Identity metadata for the existing Agent install scope, not a
+        // permission or an additional way to call the tool.
+        (self.client.server_config().is_stock_browse_source()
+            && self.client.ensure_browse_current().is_ok())
+        .then(|| (self.client.server_id(), self.tool.remote_name.as_str()))
     }
 
     async fn prepare(&self, context: &ToolContext, args: &Value) -> AppResult<PreparedTool> {
@@ -120,7 +138,7 @@ impl AgentTool for McpAgentTool {
             ));
         }
         self.client
-            .call_tool(&self.tool.remote_name, args, &context.cancel)
+            .call_agent_tool(&self.tool.remote_name, args, &context.cancel)
             .await
     }
 }

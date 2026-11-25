@@ -10,8 +10,8 @@ Windows prefers the installed Microsoft Edge browser.
 
 ## Desktop Workflow
 
-1. Check a chosen game directory in the library. Low-confidence candidates
-   offer online identification.
+1. Check a chosen game directory in the library. For an unmatched candidate,
+   open **更多操作 → 联网识别** on its scan card.
 2. Review the local name signals and editable public query. A separate consent
    checkbox must be selected before the exact query is sent to Bing through the
    app-provided browser.

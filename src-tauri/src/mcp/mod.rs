@@ -1,6 +1,7 @@
 //! Outbound MCP clients only. See README.md for the explicit stdio trust boundary.
 
 pub mod bridge;
+pub(crate) mod browse;
 pub mod client;
 pub mod config;
 mod glossmod_download;

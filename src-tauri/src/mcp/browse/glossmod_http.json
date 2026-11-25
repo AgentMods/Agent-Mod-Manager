@@ -1,0 +1,57 @@
+{
+  "list_games": {
+    "type": "object",
+    "properties": {
+      "q": {
+        "type": "string",
+        "description": "search canonical names or aliases, at most 120 characters"
+      },
+      "limit": {
+        "type": "integer",
+        "description": "1-100, defaults to 20"
+      },
+      "offset": {
+        "type": "integer",
+        "description": "zero-based offset"
+      }
+    },
+    "additionalProperties": false
+  },
+  "list_works": {
+    "type": "object",
+    "properties": {
+      "scope": {
+        "type": "string",
+        "description": "'' for the public catalogue, or 'mine' for the caller's own works including drafts"
+      },
+      "status": {
+        "type": "string",
+        "description": "work status filter, only meaningful with scope=mine"
+      },
+      "creator_id": {
+        "type": "integer",
+        "description": "restrict to one creator's published works (scope='' only)"
+      },
+      "keyword": {
+        "type": "string",
+        "description": "case-insensitive title search; own shelf also searches summary"
+      },
+      "tag": {
+        "type": "string",
+        "description": "restrict to works carrying one tag slug"
+      },
+      "game": {
+        "type": "string",
+        "description": "canonical game slug, name or alias, at most 120 characters"
+      },
+      "limit": {
+        "type": "integer",
+        "description": "1-100, defaults to 20"
+      },
+      "offset": {
+        "type": "integer"
+      }
+    },
+    "additionalProperties": false
+  }
+}

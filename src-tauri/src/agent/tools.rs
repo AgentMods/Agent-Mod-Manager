@@ -76,6 +76,11 @@ pub trait AgentTool: Send + Sync {
     fn host_tool_kind(&self) -> Option<&'static str> {
         None
     }
+    /// Exact stock client provenance for card-scoped installs; external names and
+    /// optional MCP annotations cannot manufacture this host-side capability.
+    fn stock_source_tool(&self) -> Option<(&str, &str)> {
+        None
+    }
     fn inbound_definition(&self) -> ToolDefinition {
         self.definition()
     }
@@ -131,6 +136,18 @@ impl ToolRegistry {
         let mut map = self.tools.write().unwrap_or_else(|e| e.into_inner());
         for name in names {
             map.remove(name);
+        }
+    }
+    /// A non-owning view for workflows that depend on an explicitly connected MCP tool.
+    pub(super) fn tool_available(&self) -> impl Fn(&str) -> bool + Send + Sync + 'static {
+        let weak = Arc::downgrade(&self.tools);
+        move |name| {
+            weak.upgrade().is_some_and(|tools| {
+                tools
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(name)
+            })
         }
     }
     pub fn get(&self, name: &str) -> AppResult<Arc<dyn AgentTool>> {

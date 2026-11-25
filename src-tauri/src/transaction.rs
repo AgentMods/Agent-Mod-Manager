@@ -903,13 +903,19 @@ impl FileEngine {
         let plan = self.get_plan(id)?;
         let internal = matches!(
             kind,
-            "internal" | crate::plugin_workflow::PLUGIN_REMOVE_KIND
+            "internal" | crate::plugin_workflow::PLUGIN_REMOVE_KIND | crate::install::gta_rpf::KIND
         );
+        let gta_rpf = kind == crate::install::gta_rpf::KIND;
         let library_install = kind == crate::install::LIBRARY_INSTALL_KIND;
         if library_install {
             crate::install::validate_library_apply(self, &plan)?;
         }
-        crate::install::validate_apply(self, &plan)?;
+        if gta_rpf {
+            crate::install::gta_rpf::validate_apply(self, &plan)?;
+        } else {
+            crate::install::gta_rpf::guard_foreign_plan(self, &plan)?;
+            crate::install::validate_apply(self, &plan)?;
+        }
         crate::trash::validate_apply(self, &plan)?;
         crate::plugin_workflow::validate_deployment_source(self, &plan)?;
         let mut evidence = Vec::with_capacity(plan.entries.len());
@@ -953,7 +959,7 @@ impl FileEngine {
             let mut source = None;
             if let Some(src) = e.operation.src() {
                 self.stable_path(src, internal || library_install)?;
-                if library_install || matches!(e.operation, FileOp::Move { .. }) {
+                if gta_rpf || library_install || matches!(e.operation, FileOp::Move { .. }) {
                     source = Some(require_identity(src)?);
                 }
                 if fingerprint(src)? != e.source {
@@ -1458,8 +1464,15 @@ impl FileEngine {
         }
         let mut journal = Self::decode_journal(&self.db.conn(), id, &json)?;
         if status == "committed" {
+            if kind == crate::install::gta_rpf::KIND {
+                crate::install::gta_rpf::validate_rollback(&engine, id)?;
+            } else {
+                crate::install::gta_rpf::guard_foreign_plan(&engine, &engine.get_plan(id)?)?;
+            }
             crate::plugin_workflow::validate_plugin_rollback(&engine, id, &kind)?;
-            if crate::install::validate_rollback(&engine, id)? {
+            if kind == crate::install::gta_rpf::KIND
+                || crate::install::validate_rollback(&engine, id)?
+            {
                 // Old Copy journals recorded output identity only. Carry the recorded
                 // digest into each inverse rename, including crash recovery after this point.
                 for entry in &mut journal {
