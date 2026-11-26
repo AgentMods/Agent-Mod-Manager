@@ -529,7 +529,7 @@ test("batch deletion renders a reusable task card while keeping the full Agent m
 
 test("ordinary Markdown messages remain plain chat instead of becoming Mod task cards", async ({page}) => {
   await installMockTauri(page);
-  await page.goto("/");
+  await page.goto("/#/agent");
 
   const content = "这是一条**普通文本**消息，请正常回答。";
   await page.getByRole("textbox", {name: "告诉 Agent 你想做什么", exact: true}).fill(content);

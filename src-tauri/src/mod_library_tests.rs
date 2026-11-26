@@ -380,6 +380,50 @@ fn native_metadata_survives_restart_even_if_no_library_row_was_reserved() {
 }
 
 #[test]
+fn old_curseforge_archive_recovers_exact_file_label_and_page_for_installation() {
+    let (_temp, engine) = setup();
+    register(&engine, "game", "Cool Game");
+    let (file, mut resolved) = catalog_fixture(&engine, "Fixture-v9.9.zip", b"released archive");
+    resolved.source_id = "curseforge".into();
+    resolved.project_id = "123456".into();
+    resolved.version_id = "98765".into();
+    resolved.version = "Release 2".into();
+    let url = "https://www.curseforge.com/minecraft/mc-mods/fixture";
+    resolved.homepage_url = Some(url.into());
+    artifacts::record(&engine, &file, &resolved).unwrap();
+    let receipt = artifacts::for_id(&engine.db, &file.id).unwrap().unwrap();
+    let entry = ingest_new_download(&engine, &receipt, "Cool Game", Some("game")).unwrap();
+    engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE mod_library_entries SET version='', project_page=NULL WHERE id=?1",
+            [&entry.id],
+        )
+        .unwrap();
+    for restored in [
+        list_for_game(&engine.db, "game").unwrap().remove(0),
+        verify_for_install(&engine, "game", &entry.id)
+            .unwrap()
+            .entry,
+    ] {
+        assert_eq!(restored.version, "Release 2");
+        assert_eq!(restored.project_page.as_deref(), Some(url));
+    }
+    engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE download_artifacts SET version_id='another-file' WHERE id=?1",
+            [&entry.id],
+        )
+        .unwrap();
+    let unrelated = list_for_game(&engine.db, "game").unwrap().remove(0);
+    assert_eq!(unrelated.version, "9.9"); // filename only, never another file's label
+    assert_ne!(unrelated.project_page.as_deref(), Some(url));
+}
+
+#[test]
 fn provider_homepage_wins_and_transfer_endpoints_are_not_persisted() {
     let (_tmp, engine) = setup();
     let (artifact, resolved) = catalog_fixture(&engine, "Verified.zip", b"provider download");

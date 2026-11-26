@@ -1,7 +1,8 @@
 //! Deploy immutable Mod Library entries using the existing approval/journal engine.
 use super::{
-    basename, invalid, logical_files, map_rule, strip_wrapper, validate_payload_sources,
-    FomodSelection, InstallPreview, InstalledFile, ManualMapping, MappedPayload, Payload,
+    basename, invalid, logical_files, map_rule, replacement::Replacement, strip_wrapper,
+    validate_payload_sources, FomodSelection, InstallPreview, InstalledFile, ManualMapping,
+    MappedPayload, Payload,
 };
 use crate::{
     archive,
@@ -11,7 +12,7 @@ use crate::{
     plugins::{self, ArchiveLayout, ArchiveRule, GameAdapter, ModType, RootKind},
     safe_fs,
     transaction::{self, FileEngine, FileOp, FilePlan},
-    util,
+    trash, util,
 };
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,8 @@ pub struct LibraryInstallRequest {
     pub game_id: String,
     #[serde(rename = "artifactId", alias = "libraryEntryId")]
     pub library_entry_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replace_install_id: Option<String>,
     #[serde(flatten)]
     pub mode: LibraryInstallMode,
 }
@@ -125,6 +128,7 @@ struct Entry {
     sha256: String,
     name: String,
     version: Option<String>,
+    website: Option<String>,
     source: String,
     origin: Option<DownloadOrigin>,
 }
@@ -149,10 +153,9 @@ fn load_entry(engine: &FileEngine, game_id: &str, id: &str) -> AppResult<Entry> 
     {
         return Err(invalid("模组库 SHA-256 无效"));
     }
-    let version = (!entry.version.trim().is_empty()
-        && entry.version.len() <= 256
-        && !entry.version.chars().any(char::is_control))
-    .then_some(entry.version);
+    let version = crate::mod_metadata::display_version(&entry.version)
+        .map(str::to_owned)
+        .or_else(|| crate::mod_metadata::filename_version(&entry.filename));
     Ok(Entry {
         id: entry.id,
         payload: verified.payload_path,
@@ -161,6 +164,7 @@ fn load_entry(engine: &FileEngine, game_id: &str, id: &str) -> AppResult<Entry> 
         sha256: entry.sha256,
         name: entry.name,
         version,
+        website: entry.project_page,
         source: entry.source_id,
         origin: verified.origin,
     })
@@ -1045,6 +1049,9 @@ pub fn plan_library_install_with_organization(
 ) -> AppResult<InstallPreview> {
     check_cancel(cancel)?;
     if let LibraryInstallMode::GtaRpf { job_id } = &request.mode {
+        if request.replace_install_id.is_some() {
+            return Err(invalid("gtaRpf 模式不支持 replaceInstallId"));
+        }
         return super::gta_rpf::plan_install(
             engine,
             &request.game_id,
@@ -1192,6 +1199,11 @@ pub fn plan_library_install_with_organization(
             "模组库或游戏安装配置已变化，请重新生成计划".into(),
         ));
     }
+    let replacement = request
+        .replace_install_id
+        .as_deref()
+        .map(|id| Replacement::load(engine, id, &game.id, &root, mod_type, entry.origin.as_ref()))
+        .transpose()?;
     let destinations = destinations(engine, &root, &payload)?;
     if let Some(adapter) = &current_adapter {
         for dst in &destinations {
@@ -1202,7 +1214,9 @@ pub fn plan_library_install_with_organization(
             )?;
         }
     }
-    super::verify_unowned_paths(engine, destinations.iter().map(PathBuf::as_path))?;
+    if replacement.is_none() {
+        super::verify_unowned_paths(engine, destinations.iter().map(PathBuf::as_path))?;
+    }
     let is_archive = source_kind == LibrarySourceKind::Archive;
     let hashes = if is_archive {
         materialize(
@@ -1216,7 +1230,7 @@ pub fn plan_library_install_with_organization(
         BTreeMap::from([(entry.archive.clone(), entry.sha256.clone())])
     };
     let payload_root = entry.payload_root();
-    let ops = payload
+    let copies: Vec<_> = payload
         .into_values()
         .zip(destinations)
         .map(|(src, dst)| FileOp::Copy {
@@ -1228,12 +1242,34 @@ pub fn plan_library_install_with_organization(
             dst,
         })
         .collect();
-    let mut plan = engine.build_locked_library_plan(
-        &guard,
-        ops,
-        format!("从模组库安装 {} 到 {}", entry.name, game.name),
-        &hashes,
-    )?;
+    let (drafts, summary) = if let Some(replacement) = &replacement {
+        warnings.push("这是明确选择的版本替换，不判断版本先后、加载器兼容性或依赖是否满足".into());
+        let drafts = replacement.drafts(engine, &copies)?;
+        if let Some(adapter) = &current_adapter {
+            for draft in &drafts {
+                super::gta_layout::check_copy_destination(
+                    &adapter.slug,
+                    Path::new(&game.root_path),
+                    draft
+                        .operation
+                        .src()
+                        .expect("replacement trash move source"),
+                )?;
+            }
+        }
+        (drafts, replacement.summary(&entry.name, &game.name))
+    } else {
+        (
+            vec![],
+            format!("从模组库安装 {} 到 {}", entry.name, game.name),
+        )
+    };
+    let ops = drafts
+        .iter()
+        .map(|draft| draft.operation.clone())
+        .chain(copies)
+        .collect();
+    let mut plan = engine.build_locked_library_plan(&guard, ops, summary, &hashes)?;
     plan.requires_review = true;
     validate_payload_sources(
         &plan,
@@ -1241,6 +1277,9 @@ pub fn plan_library_install_with_organization(
         &entry.sha256,
         is_archive.then_some(&hashes),
     )?;
+    if let Some(replacement) = &replacement {
+        replacement.inspect_plan(engine, &plan, None)?;
+    }
     super::require_install_space(&plan, &root, cancel)?;
     if load_entry(engine, &game.id, &entry.id)? != entry {
         return Err(AppError::Conflict(
@@ -1250,6 +1289,7 @@ pub fn plan_library_install_with_organization(
     let files: Vec<_> = plan
         .entries
         .iter()
+        .filter(|entry| matches!(entry.operation, FileOp::Copy { .. }))
         .map(|entry| {
             let source = entry
                 .source
@@ -1259,7 +1299,12 @@ pub fn plan_library_install_with_organization(
                 path: entry.operation.dst().into(),
                 size: source.size,
                 sha256: source.sha256.clone(),
-                before: entry.before.clone(),
+                // The replacement journal keeps the previous version's bytes.
+                before: if replacement.is_some() {
+                    None
+                } else {
+                    entry.before.clone()
+                },
             }
         })
         .collect();
@@ -1278,6 +1323,11 @@ pub fn plan_library_install_with_organization(
     metadata["sourceModId"] =
         serde_json::json!(entry.origin.as_ref().map(|origin| &origin.project_id));
     metadata["downloadOrigin"] = serde_json::json!(entry.origin);
+    if let Some(replacement) = &replacement {
+        metadata["replacesInstallId"] = serde_json::json!(replacement.previous.id);
+    }
+    metadata["archiveFilename"] = serde_json::json!(entry.filename);
+    metadata["projectPage"] = serde_json::json!(entry.website);
     metadata["warnings"] = serde_json::json!(warnings);
     metadata["ignoredFiles"] = serde_json::json!(ignored_files);
     crate::mod_organization::stage(&engine.db, &mut metadata, organization);
@@ -1289,11 +1339,18 @@ pub fn plan_library_install_with_organization(
     FileEngine::persist_plan_kind(&tx, &plan, LIBRARY_INSTALL_KIND)?;
     tx.execute("INSERT INTO installs(id,game_id,name,version,source,status,install_root,files_json,metadata_json,installed_at,updated_at) VALUES (?1,?2,?3,?4,?5,'planned',?6,?7,?8,?9,?9)",
         params![id, game.id, entry.name, entry.version, entry.source, root.to_string_lossy(), serde_json::to_string(&files)?, metadata.to_string(), timestamp])?;
+    crate::mod_metadata::inherit_archive_edit(&tx, &game.id, &binding.library_entry_id, &id)?;
     tx.execute("INSERT INTO install_transactions(install_id,transaction_id,action,created_at) VALUES (?1,?2,'install',?3)", params![id, plan.id, timestamp])?;
+    if let Some(replacement) = replacement {
+        tx.execute("INSERT INTO install_replacements(transaction_id,replaced_install_id,replacement_install_id) VALUES (?1,?2,?3)",
+            params![plan.id, replacement.previous.id, id])?;
+        trash::record_prepared(engine, &tx, &plan.id, drafts)?;
+    }
     tx.execute(
         "UPDATE file_transactions SET game_id=?1 WHERE id=?2",
         params![game.id, plan.id],
     )?;
+    check_cancel(cancel)?;
     tx.commit()?;
     Ok(InstallPreview {
         install_id: id,
@@ -1312,16 +1369,15 @@ pub fn plan_library_install_with_organization(
 /// Called for the dedicated journal kind only. Check durable provenance and
 /// current game/adapter binding before FileEngine permits any source exception.
 pub(crate) fn validate_library_apply(engine: &FileEngine, plan: &FilePlan) -> AppResult<()> {
-    let (game_id, root, metadata): (String, String, String) = engine.db.conn().query_row(
-        "SELECT i.game_id,i.install_root,i.metadata_json FROM installs i JOIN install_transactions t ON t.install_id=i.id WHERE t.transaction_id=?1 AND t.action='install'",
-        [&plan.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    let (game_id, install_id, root, metadata, previous_id): (String, String, String, String, Option<String>) = engine.db.conn().query_row(
+        "SELECT i.game_id,i.id,i.install_root,i.metadata_json,r.replaced_install_id
+         FROM installs i JOIN install_transactions t ON t.install_id=i.id
+         LEFT JOIN install_replacements r ON r.transaction_id=t.transaction_id AND r.replacement_install_id=i.id
+         WHERE t.transaction_id=?1 AND t.action='install'",
+        [&plan.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
     ).optional()?.ok_or_else(|| AppError::Denied("模组库安装事务缺少对应安装清单".into()))?;
     let binding: InstallBinding = serde_json::from_str(&metadata)?;
     require_artifact_not_active(engine, &game_id, &binding.library_entry_id)?;
-    super::verify_unowned_paths(
-        engine,
-        plan.entries.iter().map(|entry| entry.operation.dst()),
-    )?;
     let entry = load_entry(engine, &game_id, &binding.library_entry_id)?;
     let game = games::get_game(&engine.db, &game_id)?;
     if entry.sha256 != binding.artifact_sha256 || game.adapter_slug != binding.adapter_slug {
@@ -1347,9 +1403,39 @@ pub(crate) fn validate_library_apply(engine: &FileEngine, plan: &FilePlan) -> Ap
     if binding.source_kind == LibrarySourceKind::Archive {
         engine.paths.stable_directory(&payload)?;
     }
+    if let Some(previous_id) = &previous_id {
+        let next = super::get_install(engine, &install_id)?;
+        if next.download_origin != entry.origin {
+            return Err(AppError::Conflict(
+                "模组库归档的精确版本标识已变化，请重新生成计划".into(),
+            ));
+        }
+        Replacement::validate_successor(engine, plan, previous_id, &next)?;
+    } else {
+        super::verify_unowned_paths(
+            engine,
+            plan.entries.iter().map(|entry| entry.operation.dst()),
+        )?;
+    }
     for planned in &plan.entries {
-        let FileOp::Copy { src, dst } = &planned.operation else {
-            return Err(AppError::Denied("模组库安装只能复制已验证文件".into()));
+        let (src, dst) = match &planned.operation {
+            FileOp::Copy { src, dst } => (src, dst),
+            // Replacement validation above checks the old manifest, fingerprint and trash destination.
+            FileOp::Move { src, .. } if previous_id.is_some() => {
+                if let Some(adapter) = &adapter {
+                    super::gta_layout::check_copy_destination(
+                        &adapter.slug,
+                        Path::new(&game.root_path),
+                        src,
+                    )?;
+                }
+                continue;
+            }
+            _ => {
+                return Err(AppError::Denied(
+                    "模组库安装只能复制已验证文件或在版本替换时回收旧文件".into(),
+                ))
+            }
         };
         let is_library_source = match binding.source_kind {
             LibrarySourceKind::SingleFile => {

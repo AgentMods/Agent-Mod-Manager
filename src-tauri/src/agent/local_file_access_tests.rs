@@ -515,6 +515,32 @@ async fn archive_sample_pages_keep_global_metadata_and_validate_unreturned_entri
 }
 
 #[tokio::test]
+async fn extract_preview_directory_error_is_localized_after_path_access_check() {
+    let f = Fixture::new();
+    let ctx = f.agent();
+    let directory = f.external.join("game-files");
+    fs::create_dir(&directory).unwrap();
+
+    let error = f
+        .call(
+            &ctx,
+            "extract_preview",
+            json!({"path":directory,"legacy_extension":true}),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, crate::error::AppError::Invalid(ref detail)
+        if detail == "此路径是目录，请使用 read_dir 列出目录内容。"));
+
+    let [_, mcp] = f.restricted();
+    let error = f
+        .call(&mcp, "extract_preview", json!({"path":directory}))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, crate::error::AppError::PathEscape(_)));
+}
+
+#[tokio::test]
 async fn mixed_external_plan_is_reviewed_and_cannot_be_claimed_by_mcp() {
     let f = Fixture::new();
     let src = f.external.join("source.txt");

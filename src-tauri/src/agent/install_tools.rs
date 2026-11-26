@@ -456,9 +456,10 @@ impl AgentTool for InstallTool {
             "forget_uninstalled_mod" => ("仅用于用户明确要求从管理列表删除：卸载或回滚成功后，或 inspect_install 建议 forget_missing_files 时，移除同一游戏的记录。文件均已缺失时无需卸载、回滚或补回文件。保留磁盘归档和审计历史。普通卸载不要调用。",json!({"game_id":{"type":"string"},"install_id":{"type":"string"}}),vec!["game_id","install_id"],Effect::ManagerWrite),
             "bind_mod_library_entry" => ("把下载时尚未登记游戏的库条目关联到用户选定的本机游戏实例。同名候选先让用户指定目标。",json!({"game_id":{"type":"string"},"artifact_id":{"type":"string"}}),vec!["game_id","artifact_id"],Effect::ManagerWrite),
             "install_library_mod" => (
-                "从目标游戏的 Mods 库安装或重装原包，准备并按审批提交同一份复制计划。先运行 match_mod_install。GTA 归档走 mode=gtaRpf 与已处理的 jobId，不用整包复制。mode=adapter 使用已匹配的 modType。mode=approvedMappings 按作者说明或用户选项逐文件映射。部署 ZIP 成员时用 sourceKind=archive，不能复制外层 ZIP 来代替或冒充组件。仅在适配规则或作者说明明确要求游戏读取原文件时，才用 sourceKind=singleFile 原样部署，例如 Minecraft JAR。省略 modType 时目标相对已登记的游戏根。匹配结果中的 activeInstallId 非空时先用 inspect_install 核对该安装及建议操作。其他目标冲突可用 list_installs 和 inspect_install 核对归属。",
+                "从目标游戏的 Mods 库安装、重装或替换原包，准备并按审批提交同一份计划。先运行 match_mod_install。用户明确要求替换同一来源和项目的不同精确版本时，将新版库归档的 ID 填入 artifactId，用 list_installs 和 inspect_install 核对当前启用的旧安装，将其安装记录 ID 填入 replaceInstallId。旧版专有文件移入回收站，可通过替换事务回滚。GTA 归档走 mode=gtaRpf 与已处理的 jobId，不接受 replaceInstallId。mode=adapter 使用已匹配的 modType。mode=approvedMappings 按作者说明或用户选项逐文件映射。部署 ZIP 成员时用 sourceKind=archive，不能复制外层 ZIP 来代替或冒充组件。仅在适配规则或作者说明明确要求游戏读取原文件时，才用 sourceKind=singleFile 原样部署，例如 Minecraft JAR。省略 modType 时目标相对已登记的游戏根。匹配结果中的 activeInstallId 非空时先用 inspect_install 核对该安装及建议操作。其他目标冲突可用 list_installs 和 inspect_install 核对归属。",
                 json!({"request":{"type":"object","properties":{
                     "gameId":{"type":"string"},"artifactId":{"type":"string"},
+                    "replaceInstallId":{"type":"string","description":"可选。当前启用的旧版安装记录 ID，仅用于桌面 Agent 普通会话下 mode=adapter 或 mode=approvedMappings 的同项目精确版本替换；浏览卡片安装请省略。"},
                     "mode":{"type":"string","enum":["adapter","approvedMappings","gtaRpf"]},
                     "jobId":{"type":"string","pattern":"^[a-f0-9]{32}$","description":"仅 gtaRpf 模式；由 prepare_gta_rpf_job 签发并经该适配包的 MCP 处理。"},
                     "modType":{"type":"string"},"folderName":{"type":"string"},
@@ -559,7 +560,14 @@ impl AgentTool for InstallTool {
                     (json!({"action":action,"gameId":game_id,"installId":install_id,"name":name,"status":status}), None)
                 }
                 "install_library_mod" => {
-                    let request = serde_json::from_value(args["request"].clone())?;
+                    let request: install::LibraryInstallRequest = serde_json::from_value(args["request"].clone())?;
+                    if request.replace_install_id.is_some() {
+                        if let crate::sources::resolutions::ResolutionScope::Agent(conversation) = &scope {
+                            if crate::browse::install::conversation_scope(&engine.db.conn(), conversation)?.is_some() {
+                                return Err(AppError::Denied("浏览卡片只授权安装，版本替换请使用普通桌面 Agent 会话".into()));
+                            }
+                        }
+                    }
                     let preview = install::plan_library_install_with_organization(&engine, &request, suggestion(&args)?, &cancel)?;
                     (json!(preview), Some(preview.plan))
                 }
@@ -650,7 +658,12 @@ impl AgentTool for InstallTool {
                     })?;
                 install::reconcile(&engine.db)?;
                 if name == "install_library_mod" {
-                    return Ok(json!({"status":"committed", "transactionId":plan.id, "installId":prepared.preview["installId"], "fileCount":plan.entries.len()}));
+                    let file_count = if args["request"]["mode"] == "gtaRpf" {
+                        plan.entries.len()
+                    } else {
+                        plan.entries.iter().filter(|entry| matches!(entry.operation, FileOp::Copy { .. })).count()
+                    };
+                    return Ok(json!({"status":"committed", "transactionId":plan.id, "installId":prepared.preview["installId"], "fileCount":file_count}));
                 }
                 if name == "install_mod" && args["request"]["fomodSelection"] == "automatic" {
                     let file_count = plan

@@ -166,7 +166,7 @@ test.describe("首次启动引导", () => {
     await expectCurrent(2);
     await page.getByRole("button", {name: "下一步", exact: true}).click();
     await expectCurrent(3);
-    await page.getByRole("button", {name: "扫描已安装游戏", exact: true}).click();
+    await expect(page.getByRole("button", {name: "重新扫描", exact: true})).toBeVisible();
     await expect(page.getByRole("button", {name: "下一步", exact: true})).toBeVisible();
     await page.getByRole("button", {name: "下一步", exact: true}).click();
     await expectCurrent(4);
@@ -177,6 +177,58 @@ test.describe("首次启动引导", () => {
     }
   });
 
+  test("进入扫描步骤自动开始扫描，扫描中仍可停止、跳过与返回", async ({page}) => {
+    await installMockTauri(page, {onboarding: true});
+    await enterInitialSetup(page);
+    await page.evaluate(() => {
+      const internals = (window as any).__TAURI_INTERNALS__;
+      const invoke = internals.invoke.bind(internals);
+      const scans: any[] = [];
+      (window as any).__SCAN_CALLS__ = scans;
+      internals.invoke = (command: string, args: any = {}, ...rest: unknown[]) => {
+        if (command !== "scan_games") return invoke(command, args, ...rest);
+        scans.push(structuredClone(args.options.page));
+        if (args.options.page.cancel) return Promise.resolve({candidates: [], warnings: [], directoriesChecked: 0, entriesChecked: 0, truncated: false});
+        return new Promise(() => {});
+      };
+    });
+    const scanCalls = () => page.evaluate(() => (window as any).__SCAN_CALLS__);
+
+    await continueToModelSetup(page);
+    await skipModelSetup(page);
+    expect(await scanCalls()).toEqual([]);
+    await page.getByRole("button", {name: "下一步", exact: true}).click();
+    await expectOnboardingStep(page, 3);
+    await expect(page.getByRole("button", {name: "正在扫描…", exact: true})).toBeDisabled();
+    await expect(page.getByText("正在检查常见游戏目录", {exact: true})).toBeVisible();
+    await expect(page.getByRole("button", {name: "停止扫描", exact: true})).toBeVisible();
+    await expect(page.getByRole("button", {name: "上一步", exact: true})).toBeEnabled();
+    await expect(page.getByRole("button", {name: "退出引导", exact: true})).toBeEnabled();
+    expect(await scanCalls()).toEqual([{requestId: expect.any(String)}]);
+    const [{requestId}] = await scanCalls();
+
+    await page.getByRole("button", {name: "停止扫描", exact: true}).click();
+    await expect(page.getByRole("button", {name: "扫描已安装游戏", exact: true})).toBeEnabled();
+    await expect(page.getByRole("button", {name: "稍后再扫", exact: true})).toBeEnabled();
+    expect(await scanCalls()).toEqual([{requestId}, {requestId, cancel: true}]);
+
+    await page.getByRole("button", {name: "稍后再扫", exact: true}).click();
+    await expectOnboardingStep(page, 4);
+    await page.getByRole("button", {name: "上一步", exact: true}).click();
+    await expectOnboardingStep(page, 3);
+    await expect(page.getByRole("button", {name: "扫描已安装游戏", exact: true})).toBeEnabled();
+    expect(await scanCalls()).toHaveLength(2);
+
+    await page.getByRole("button", {name: "扫描已安装游戏", exact: true}).click();
+    await expect(page.getByRole("button", {name: "正在扫描…", exact: true})).toBeDisabled();
+    expect(await scanCalls()).toHaveLength(3);
+    const manual = (await scanCalls())[2].requestId;
+    await page.getByRole("button", {name: "稍后再扫", exact: true}).click();
+    await expectOnboardingStep(page, 4);
+    expect((await scanCalls()).slice(3)).toEqual([{requestId: manual, cancel: true}]);
+    await expect(page.getByRole("button", {name: "完成并进入游戏库", exact: true})).toBeEnabled();
+  });
+
   test("保留当前存储目录后可跳过扫描并完成引导", async ({page}) => {
     await installMockTauri(page, {onboarding: true});
     await enterInitialSetup(page);
@@ -184,7 +236,7 @@ test.describe("首次启动引导", () => {
     await expect(page.getByText("/sandbox/data", {exact: true})).toBeVisible();
 
     await continueToGameScan(page);
-    await page.getByRole("button", {name: "稍后再扫", exact: true}).click();
+    await page.getByRole("button", {name: "下一步", exact: true}).click();
     await expectOnboardingStep(page, 4);
     await expect(page.getByText("/sandbox/data", {exact: true})).toBeVisible();
     await expect(page.getByText("尚未配置", {exact: true})).toBeVisible();
@@ -279,13 +331,59 @@ test.describe("首次启动引导", () => {
     await expect(page.getByText(/迁移失败，仍在使用原目录/)).toBeVisible();
   });
 
+  test("引导扫描复用封面卡片并按视口排列", async ({page}) => {
+    await installMockTauri(page, {onboarding: true, withExternalAdapter: true});
+    await enterInitialSetup(page);
+    await continueToGameScan(page);
+
+    const candidates = page.getByRole("list", {name: "扫描候选游戏", exact: true});
+    const cards = candidates.getByRole("listitem");
+    await expect(cards).toHaveCount(2);
+    const fixture = cards.filter({has: page.getByText("/sandbox/steam/Fixture", {exact: true})});
+    const broken = cards.filter({has: page.getByText("/sandbox/steam/Broken", {exact: true})});
+    for (const card of [fixture, broken]) {
+      await expect(card.locator("h3")).toBeVisible();
+      await expect(card.getByRole("button", {name: "更多操作", exact: true})).toBeVisible();
+      await expect(card.getByRole("button", {name: "添加", exact: true})).toBeEnabled();
+      const cover = card.locator(":scope > div").first();
+      await expect(cover).toBeVisible();
+      const ratio = await cover.evaluate((element) => {
+        const {width, height} = element.getBoundingClientRect();
+        return width / height;
+      });
+      expect(ratio).toBeGreaterThan(1.8);
+      expect(ratio).toBeLessThan(2.2);
+    }
+    await expect(fixture).toContainText("92% 匹配");
+    await expect(fixture).toContainText("/sandbox/steam/Fixture");
+    await expect(fixture).toContainText("这是一个测试扫描候选，请确认目录后再添加");
+    await expect(broken).toContainText("未匹配");
+    await expect(broken).toContainText("/sandbox/steam/Broken");
+
+    const positions = await cards.evaluateAll((elements) => elements.map((element) => {
+      const {left, top} = element.getBoundingClientRect();
+      return {left: Math.round(left), top: Math.round(top)};
+    }));
+    const width = page.viewportSize()?.width ?? 0;
+    if (width <= 500) {
+      expect(new Set(positions.map(({left}) => left)).size).toBe(1);
+      expect(new Set(positions.map(({top}) => top)).size).toBe(2);
+    } else {
+      expect(new Set(positions.map(({left}) => left)).size).toBe(2);
+      expect(new Set(positions.map(({top}) => top)).size).toBe(1);
+    }
+
+    await fixture.getByRole("button", {name: "更多操作", exact: true}).click();
+    await expect(page.getByRole("menuitem", {name: "复制游戏目录", exact: true})).toBeVisible();
+    await page.keyboard.press("Escape");
+  });
+
   test("扫描候选不会自动添加，失败候选不影响其他候选", async ({page}) => {
     await installMockTauri(page, {onboarding: true, failRegistration: true, withExternalAdapter: true});
     await enterInitialSetup(page);
     await continueToGameScan(page);
     await expect(page.getByRole("navigation", {name: "主导航"})).toHaveCount(0);
 
-    await page.getByRole("button", {name: "扫描已安装游戏"}).click();
     const fixture = page.getByRole("listitem").filter({hasText: "Fixture Game"});
     const broken = page.getByRole("listitem").filter({hasText: "Broken Fixture"});
     await expect(fixture).toContainText("/sandbox/steam/Fixture");
@@ -321,7 +419,6 @@ test.describe("首次启动引导", () => {
     await installMockTauri(page, {onboarding: true});
     await enterInitialSetup(page);
     await continueToGameScan(page);
-    await page.getByRole("button", {name: "扫描已安装游戏"}).click();
     const directory = "/sandbox/steam/Broken";
     const rows = page.getByRole("list", {name: "扫描候选游戏", exact: true});
     // Registration can replace the discovery title with the library name; the directory stays the same.
@@ -390,8 +487,8 @@ test.describe("首次启动引导", () => {
 
     await page.getByRole("button", {name: "下一步", exact: true}).click();
     await expectOnboardingStep(page, 3);
-    await expect(page.getByRole("button", {name: "稍后再扫", exact: true})).toBeVisible();
-    await page.getByRole("button", {name: "稍后再扫", exact: true}).click();
+    await expect(page.getByRole("button", {name: "下一步", exact: true})).toBeVisible();
+    await page.getByRole("button", {name: "下一步", exact: true}).click();
     await expectOnboardingStep(page, 4);
     await expect(page.getByText("fixture-thinking", {exact: true})).toBeVisible();
     await expect(page.getByText("0 款游戏", {exact: true})).toBeVisible();
@@ -444,7 +541,7 @@ test.describe("首次启动引导", () => {
 
     await page.getByRole("button", {name: "下一步", exact: true}).click();
     await expectOnboardingStep(page, 3);
-    await page.getByRole("button", {name: "稍后再扫", exact: true}).click();
+    await page.getByRole("button", {name: "下一步", exact: true}).click();
     await expectOnboardingStep(page, 4);
     await page.getByRole("button", {name: "上一步", exact: true}).click();
     await expectOnboardingStep(page, 3);
@@ -624,7 +721,7 @@ test.describe("首次启动引导", () => {
     expect(models).toEqual([{display_name: "local-model", id: "local-model", reasoning_levels: []}]);
     await page.getByRole("button", {name: "下一步", exact: true}).click();
     await expectOnboardingStep(page, 3);
-    await page.getByRole("button", {name: "稍后再扫", exact: true}).click();
+    await page.getByRole("button", {name: "下一步", exact: true}).click();
     await expectOnboardingStep(page, 4);
   });
 
@@ -680,7 +777,7 @@ test.describe("首次启动引导", () => {
     await page.getByRole("button", {name: "重新查看新手引导"}).click();
     await expectOnboardingStep(page, 0);
     await continueToGameScan(page);
-    await page.getByRole("button", {name: "稍后再扫", exact: true}).click();
+    await page.getByRole("button", {name: "下一步", exact: true}).click();
     await expectOnboardingStep(page, 4);
     await page.getByRole("button", {name: "完成并进入游戏库", exact: true}).click();
     await expect(page.getByTestId("library-page")).toBeVisible();
@@ -713,6 +810,7 @@ test.describe("首次启动引导", () => {
 
       await page.getByRole("button", {name: "下一步", exact: true}).click();
       await expectOnboardingStep(page, 3);
+      await expect(page.getByRole("button", {name: "重新扫描", exact: true})).toBeVisible();
       expect(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth + 1), `${theme}/${info.project.name}/scan`).toBe(false);
       await page.getByRole("button", {name: "上一步", exact: true}).click();
       await expectOnboardingStep(page, 2);

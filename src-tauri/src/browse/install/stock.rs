@@ -9,6 +9,7 @@ use crate::{
     error::{AppError, AppResult},
     paths,
 };
+use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -42,7 +43,7 @@ pub(super) fn number(value: &str) -> AppResult<u64> {
         .ok_or_else(boundary)
 }
 
-fn valid_version(version: &str) -> bool {
+pub(super) fn valid_version(version: &str) -> bool {
     version.len() <= 64
         && version.split('.').count() == 3
         && version
@@ -174,6 +175,122 @@ pub(super) fn list_result(value: &Value) -> AppResult<Value> {
     Ok(sanitized(result(value)?))
 }
 
+pub(super) fn version_list_tool(source: &str) -> Option<&'static str> {
+    match source {
+        "modio" | "curseforge" => Some("list_mod_files"),
+        "nexusmods" => Some("list_files"),
+        // GameBanana only publishes a work-level version, not a file label.
+        _ => None,
+    }
+}
+
+pub(super) fn clean_version(text: &str) -> Option<&str> {
+    (!text.chars().any(char::is_control) && !text.contains("://"))
+        .then(|| crate::mod_metadata::display_version(text))
+        .flatten()
+}
+
+/// Exact file versions only. Never interpret a project/active-file version,
+/// a compatibility game version, or a numeric file ID as a version label.
+pub(super) fn listed_file_version<'a>(
+    key: &WorkKey,
+    file_id: &str,
+    result: &'a Value,
+) -> Result<Option<&'a str>, ()> {
+    let (rows, id_field, project_field, version_field) = match key.source_id.as_str() {
+        "modio" => (&result["data"], "id", "mod_id", "version"),
+        "curseforge" => (&result["data"], "id", "modId", "displayName"),
+        "nexusmods" => (&result["files"], "fileId", "modId", "version"),
+        _ => return Ok(None),
+    };
+    let Some(rows) = rows.as_array().filter(|rows| rows.len() <= 100) else {
+        return Ok(None);
+    };
+    let selected = number(file_id).map_err(|_| ())?;
+    let mut matches = rows
+        .iter()
+        .filter(|row| row[id_field].as_u64() == Some(selected));
+    let Some(row) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some()
+        || row.get(project_field).is_some_and(|mod_id| {
+            let project = key
+                .project_id
+                .rsplit('/')
+                .next()
+                .and_then(|id| number(id).ok());
+            project.is_none() || project != mod_id.as_u64()
+        })
+    {
+        return Err(());
+    }
+    Ok(row[version_field].as_str().and_then(clean_version))
+}
+
+pub(super) enum FileVersionEvidence {
+    Unknown,
+    Exact(String),
+    Ambiguous,
+}
+
+impl FileVersionEvidence {
+    pub(super) fn exact(self) -> Option<String> {
+        match self {
+            Self::Exact(version) => Some(version),
+            Self::Unknown | Self::Ambiguous => None,
+        }
+    }
+}
+
+pub(super) fn history_file_version(
+    conn: &Connection,
+    key: &WorkKey,
+    conversation: &str,
+    file_id: &str,
+    before_rowid: Option<i64>,
+) -> AppResult<FileVersionEvidence> {
+    let Some(remote) = version_list_tool(&key.source_id) else {
+        return Ok(FileVersionEvidence::Unknown);
+    };
+    let name = crate::mcp::client::namespaced_tool_name(&key.source_id, remote);
+    let mut stmt = conn.prepare(
+        "SELECT arguments_json,result_json FROM main.tool_calls
+         WHERE conversation_id=?1 AND name=?2 AND status='done' AND result_json IS NOT NULL
+           AND (?3 IS NULL OR rowid<?3) ORDER BY rowid DESC LIMIT 101",
+    )?;
+    let mut rows = stmt.query(params![conversation, name, before_rowid])?;
+    let mut version = None;
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        count += 1;
+        // A truncated scan cannot rule out contradictory evidence.
+        if count > 100 {
+            return Ok(FileVersionEvidence::Ambiguous);
+        }
+        let raw_args: String = row.get(0)?;
+        let Ok(mut args) = serde_json::from_str(&raw_args) else {
+            continue;
+        };
+        // History stores the model arguments, not the scoped arguments.
+        if arguments(key, remote, &mut args).is_err() {
+            continue;
+        }
+        let raw_result: String = row.get(1)?;
+        let Ok(result) = serde_json::from_str(&raw_result) else {
+            continue;
+        };
+        match listed_file_version(key, file_id, &result) {
+            Ok(Some(label)) if version.as_deref().is_none_or(|v| v == label) => {
+                version = Some(label.to_owned());
+            }
+            Ok(None) => {}
+            _ => return Ok(FileVersionEvidence::Ambiguous),
+        }
+    }
+    Ok(version.map_or(FileVersionEvidence::Unknown, FileVersionEvidence::Exact))
+}
+
 #[derive(Clone)]
 pub(super) struct StockReceipt {
     pub filename: String,
@@ -181,16 +298,25 @@ pub(super) struct StockReceipt {
     pub size: u64,
     pub sha256: String,
     pub file_id: String,
+    pub version: Option<String>,
 }
 
 impl StockReceipt {
     pub(super) fn import_args(&self, key: &WorkKey) -> Value {
-        json!({"filename": self.filename, "gameId":key.game_id})
+        let mut args = json!({"filename": self.filename, "gameId":key.game_id});
+        if let Some(page) = key.project_page() {
+            args["projectPage"] = json!(page);
+        }
+        args
     }
 
     pub(super) fn saved(&self, key: &WorkKey) -> Value {
-        json!({"status":"saved", "filename":self.filename, "sha256":self.sha256,
-            "size":self.size, "fileId":self.file_id, "gameId":key.game_id})
+        let mut value = json!({"status":"saved", "filename":self.filename, "sha256":self.sha256,
+            "size":self.size, "fileId":self.file_id, "gameId":key.game_id});
+        if let Some(version) = &self.version {
+            value["version"] = json!(version);
+        }
+        value
     }
 
     /// Read only the normalized receipt emitted by InstallScope after the
@@ -208,19 +334,40 @@ impl StockReceipt {
         }
         let filename = value["filename"].as_str()?;
         crate::download::safe_filename(filename).ok()?;
-        let receipt = Self {
+        let mut receipt = Self {
             filename: filename.into(),
             path: None,
             size: receipt_size(&value["size"])?,
             sha256: hash(&value["sha256"], 64)?,
             file_id,
+            version: value["version"]
+                .as_str()
+                .and_then(clean_version)
+                .map(str::to_owned),
         };
-        (receipt.saved(key) == *value).then_some(receipt)
+        if receipt.saved(key) != *value {
+            return None;
+        }
+        if key.source_id == "thunderstore" {
+            if receipt
+                .version
+                .as_ref()
+                .is_some_and(|version| version != &receipt.file_id)
+            {
+                return None;
+            }
+            // The approved exact version was already part of legacy receipts.
+            receipt.version = Some(receipt.file_id.clone());
+        } else if version_list_tool(&key.source_id).is_none() && receipt.version.is_some() {
+            return None;
+        }
+        Some(receipt)
     }
 
-    pub(super) fn matches_preview(&self, game: &str, value: &Value) -> bool {
+    pub(super) fn matches_preview(&self, key: &WorkKey, value: &Value) -> bool {
         value["receiptFolder"] == "incoming"
-            && value["gameId"] == game
+            && value["gameId"] == key.game_id
+            && value["projectPage"] == json!(key.project_page())
             && value["filename"] == self.filename
             && value["sourceFingerprint"]["size"] == self.size
             && value["sourceFingerprint"]["sha256"]
@@ -362,6 +509,7 @@ pub(super) async fn transfer_receipt(
         path: Some(path.clone()),
         size,
         sha256: String::new(),
+        version: (key.source_id == "thunderstore").then(|| file_id.clone()),
         file_id,
     };
     let prepared = registry
@@ -374,7 +522,7 @@ pub(super) async fn transfer_receipt(
         return Err(unavailable());
     }
     receipt.sha256 = captured_sha;
-    if !receipt.matches_preview(&key.game_id, &prepared.preview)
+    if !receipt.matches_preview(key, &prepared.preview)
         || !prepared.preview["sourcePath"]
             .as_str()
             .is_some_and(|source| same_path(&path, Path::new(source)))

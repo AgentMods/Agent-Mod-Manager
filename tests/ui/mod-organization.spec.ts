@@ -72,6 +72,12 @@ async function installTagFixture(page: Page, assignments: Record<string, string[
         }
         return null;
       }
+      if (command === "update_mod_metadata") {
+        recordCall(command, args);
+        if (args.gameId !== "game-fixture" || args.target?.kind !== "install") throw new Error("unexpected Mod metadata target");
+        state.assignments[args.target.id] = structuredClone(args.patch.tagIds);
+        return null;
+      }
       if (command === "set_mod_tags") {
         recordCall(command, args);
         if (args.gameId !== "game-fixture") throw new Error("unknown game for Mod tags");
@@ -107,6 +113,10 @@ function modTable(page: Page) {
 
 function installedRow(page: Page, name: string) {
   return modTable(page).getByRole("row").filter({ hasText: name });
+}
+
+async function openModMenu(row: ReturnType<typeof installedRow>) {
+  await row.getByRole("button", { name: "更多", exact: true }).click();
 }
 
 function tagFilters(page: Page) {
@@ -244,18 +254,22 @@ test("an installed record can replace its assigned tags using install-scoped IPC
   await openGameDetail(page);
 
   const row = installedRow(page, "星辉优化包");
-  await row.getByRole("button", { name: "编辑 星辉优化包 的标签", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "编辑 Mod 标签", exact: true });
+  await openModMenu(row);
+  await page.getByRole("menuitem", { name: "编辑", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "编辑 Mod", exact: true });
   await expect(dialog).toBeVisible();
   await expect(dialog.getByRole("checkbox", { name: "性能优化", exact: true })).toBeChecked();
   await expect(dialog.getByRole("checkbox", { name: "视觉效果", exact: true })).toBeChecked();
   await dialog.getByRole("checkbox", { name: "性能优化", exact: true }).uncheck();
   await dialog.getByRole("checkbox", { name: "视觉效果", exact: true }).uncheck();
   await dialog.getByRole("checkbox", { name: "稳定性", exact: true }).check();
-  await dialog.getByRole("button", { name: "保存标签", exact: true }).click();
+  await dialog.getByRole("button", { name: "保存", exact: true }).click();
 
-  const assigned = await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "set_mod_tags"));
-  expect(assigned.map((call: any) => call.args)).toEqual([{ gameId, installId: "install-fixture", tagIds: ["tag-stability"] }]);
+  const assigned = await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "update_mod_metadata"));
+  expect(assigned.map((call: any) => call.args)).toEqual([{
+    gameId, target: { kind: "install", id: "install-fixture" },
+    patch: { name: "星辉优化包", tagIds: ["tag-stability"] },
+  }]);
   await expect(row.getByText("稳定性", { exact: true })).toBeVisible();
   await expect(row.getByText("性能优化", { exact: true })).toHaveCount(0);
   await expect(row.getByText("视觉效果", { exact: true })).toHaveCount(0);
@@ -283,9 +297,11 @@ test("tag controls remain usable without horizontal overflow on a narrow screen 
     await expectNoHorizontalOverflow(page);
     await page.keyboard.press("Escape");
 
-    await installedRow(page, "星辉优化包")
-      .getByRole("button", { name: "编辑 星辉优化包 的标签", exact: true }).click();
-    await expect(page.getByRole("dialog", { name: "编辑 Mod 标签", exact: true })).toBeVisible();
+    await openModMenu(installedRow(page, "星辉优化包"));
+    await page.getByRole("menuitem", { name: "编辑", exact: true }).click();
+    const editDialog = page.getByRole("dialog", { name: "编辑 Mod", exact: true });
+    await expect(editDialog).toBeVisible();
+    await expect(editDialog.getByRole("textbox", { name: "显示名称", exact: true })).toBeVisible();
     await expectNoHorizontalOverflow(page);
     await page.keyboard.press("Escape");
   }

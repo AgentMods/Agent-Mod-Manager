@@ -360,6 +360,20 @@ fn absent(engine: &FileEngine, target: &Path) -> AppResult<bool> {
     }
 }
 
+fn skill_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SkillInfo> {
+    Ok(SkillInfo {
+        name: r.get(0)?,
+        description: r.get(1)?,
+        location: PathBuf::from(r.get::<_, String>(2)?),
+        source: r.get(3)?,
+        enabled: r.get(4)?,
+        created_at: r.get(5)?,
+        kind: SkillKind::Unknown,
+        valid: false,
+        issues: vec![],
+    })
+}
+
 fn registry_row(engine: &FileEngine, name: &str) -> AppResult<Option<SkillInfo>> {
     Ok(engine
         .db
@@ -367,19 +381,7 @@ fn registry_row(engine: &FileEngine, name: &str) -> AppResult<Option<SkillInfo>>
         .query_row(
             "SELECT name,description,location,source,enabled,created_at FROM skills WHERE name=?1",
             [name],
-            |r| {
-                Ok(SkillInfo {
-                    name: r.get(0)?,
-                    description: r.get(1)?,
-                    location: PathBuf::from(r.get::<_, String>(2)?),
-                    source: r.get(3)?,
-                    enabled: r.get(4)?,
-                    created_at: r.get(5)?,
-                    kind: SkillKind::Unknown,
-                    valid: false,
-                    issues: vec![],
-                })
-            },
+            skill_from_row,
         )
         .optional()?)
 }
@@ -866,6 +868,26 @@ pub fn plan_uninstall_skill(engine: &FileEngine, name: &str) -> AppResult<SkillP
     )
 }
 
+fn inspect_standalone_document(engine: &FileEngine, info: &mut SkillInfo) -> AppResult<String> {
+    standalone_owner(engine, &info.name)?.ok_or_else(|| AppError::NotFound(info.name.clone()))?;
+    info.kind = SkillKind::Standalone;
+    let disk = read_standalone(engine, &info.name)?;
+    if committed_content(engine, &info.name, &disk)?.is_none() {
+        return Err(AppError::Conflict("独立 Skill 缺少匹配的已提交部署".into()));
+    }
+    if deployment_rows(engine)?.iter().any(|r| {
+        r.name == info.name
+            && matches!(
+                r.status.as_str(),
+                "applying" | "rolling_back" | "recovery_failed"
+            )
+    }) {
+        return Err(AppError::Conflict("Skill 文件事务待恢复".into()));
+    }
+    info.description = disk.validate(&info.name)?.description;
+    Ok(disk.markdown)
+}
+
 fn inspect(engine: &FileEngine, mut info: SkillInfo) -> (SkillInfo, Option<String>) {
     let result = (|| -> AppResult<String> {
         plugins::validate_slug(&info.name)?;
@@ -903,23 +925,7 @@ fn inspect(engine: &FileEngine, mut info: SkillInfo) -> (SkillInfo, Option<Strin
             info.description = package.skill.description;
             Ok(markdown)
         } else {
-            standalone_owner(engine, &info.name)?;
-            info.kind = SkillKind::Standalone;
-            let disk = read_standalone(engine, &info.name)?;
-            if committed_content(engine, &info.name, &disk)?.is_none() {
-                return Err(AppError::Conflict("独立 Skill 缺少匹配的已提交部署".into()));
-            }
-            if deployment_rows(engine)?.iter().any(|r| {
-                r.name == info.name
-                    && matches!(
-                        r.status.as_str(),
-                        "applying" | "rolling_back" | "recovery_failed"
-                    )
-            }) {
-                return Err(AppError::Conflict("Skill 文件事务待恢复".into()));
-            }
-            info.description = disk.validate(&info.name)?.description;
-            Ok(disk.markdown)
+            inspect_standalone_document(engine, &mut info)
         }
     })();
     match result {
@@ -932,6 +938,46 @@ fn inspect(engine: &FileEngine, mut info: SkillInfo) -> (SkillInfo, Option<Strin
             (info, None)
         }
     }
+}
+
+fn system_catalog(db: &Db) -> AppResult<Vec<SkillInfo>> {
+    SYSTEM_SKILLS
+        .iter()
+        .map(|skill| skill.info(skill.enabled(db)?))
+        .collect()
+}
+
+/// Settings only displays embedded and standalone Skills. Inspect the registered
+/// documents read-only; apply/rollback and the Agent catalog own reconciliation.
+pub fn list_settings_skills(engine: &FileEngine) -> AppResult<Vec<SkillInfo>> {
+    let mut catalog = system_catalog(&engine.db)?;
+    let registered = {
+        let conn = engine.db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT name,description,location,source,enabled,created_at FROM skills s
+             WHERE source=?1 AND NOT EXISTS (SELECT 1 FROM plugins p WHERE p.slug=s.name)
+             ORDER BY name",
+        )?;
+        let rows = stmt.query_map([SOURCE], skill_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for mut info in registered {
+        if is_system_skill(&info.name) {
+            continue;
+        }
+        match inspect_standalone_document(engine, &mut info) {
+            Ok(_) => info.valid = true,
+            Err(error) => {
+                // Report effective availability without changing the stored preference.
+                info.enabled = false;
+                info.issues.push(error.to_string());
+            }
+        }
+        if info.kind == SkillKind::Standalone {
+            catalog.push(info);
+        }
+    }
+    Ok(catalog)
 }
 
 /// Enumerates the embedded catalog and registered metadata. Invalid/unowned
@@ -949,10 +995,7 @@ pub fn list_skills(engine: &FileEngine) -> AppResult<Vec<SkillInfo>> {
         let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
-    let mut catalog = Vec::with_capacity(SYSTEM_SKILLS.len() + names.len());
-    for system in SYSTEM_SKILLS {
-        catalog.push(system.info(system.enabled(&engine.db)?)?);
-    }
+    let mut catalog = system_catalog(&engine.db)?;
     // Reserved names always resolve to embedded documents. Legacy registry
     // rows remain in the database with their original ownership and settings.
     for name in names.into_iter().filter(|name| !is_system_skill(name)) {
@@ -962,7 +1005,6 @@ pub fn list_skills(engine: &FileEngine) -> AppResult<Vec<SkillInfo>> {
     Ok(catalog)
 }
 pub fn get_skill(engine: &FileEngine, name: &str) -> AppResult<SkillDetail> {
-    let _lock = lock();
     plugins::validate_slug(name)?;
     if let Some(system) = system_skill(name) {
         return Ok(SkillDetail {
@@ -970,6 +1012,7 @@ pub fn get_skill(engine: &FileEngine, name: &str) -> AppResult<SkillDetail> {
             markdown: system.markdown.into(),
         });
     }
+    let _lock = lock();
     crate::plugin_workflow::reconcile_deployments(engine)?;
     let _files = crate::transaction::write_lock();
     reconcile_locked(engine)?;
@@ -982,7 +1025,6 @@ pub fn get_skill(engine: &FileEngine, name: &str) -> AppResult<SkillDetail> {
 /// Toggles an embedded system Skill or a registered Skill with known ownership.
 /// Enabling requires a currently verified document; disabling cannot load code.
 pub fn set_enabled(engine: &FileEngine, name: &str, enabled: bool) -> AppResult<SkillInfo> {
-    let _lock = lock();
     plugins::validate_slug(name)?;
     if let Some(system) = system_skill(name) {
         let info = system.info(enabled)?;
@@ -993,6 +1035,7 @@ pub fn set_enabled(engine: &FileEngine, name: &str, enabled: bool) -> AppResult<
         )?;
         return Ok(info);
     }
+    let _lock = lock();
     crate::plugin_workflow::reconcile_deployments(engine)?;
     let _files = crate::transaction::write_lock();
     reconcile_locked(engine)?;

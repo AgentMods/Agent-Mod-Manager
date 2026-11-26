@@ -509,14 +509,15 @@ fn parse_item(source: Source, v: &Value, game: &str) -> Option<ProviderItem> {
             if number(&v["game_id"]) != Some(number_string(game)?) {
                 return None;
             }
-            let id = number(&v["id"])?;
+            let id = number(&v["id"])?.to_string();
+            let page = crate::sources::three_dm_project_page(&id);
             (
-                id.to_string(),
+                id,
                 &v["mods_title"],
                 text(&v["mods_author"], 180),
                 &v["mods_desc"],
                 cover(source, v["mods_image_url"].as_str()),
-                Some(format!("https://mod.3dmgame.com/mod/{id}")),
+                page,
                 text(&v["mods_type_name"], 100),
                 tags(&v["mods_key"], None),
             )

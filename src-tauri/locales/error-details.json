@@ -2235,6 +2235,50 @@
     }
   },
   "error.denied": {
+    "原包路径已被重定向": {
+      "en": "The path to the original archive has been redirected.",
+      "ja": "元のアーカイブのパスが別の場所にリダイレクトされています。",
+      "ko": "원본 압축 파일 경로가 다른 위치로 리디렉션되었습니다.",
+      "de": "Der Pfad zum ursprünglichen Archiv wurde umgeleitet.",
+      "fr": "Le chemin de l’archive d’origine a été redirigé.",
+      "es": "Se ha redirigido la ruta del archivo original.",
+      "pt-BR": "O caminho do arquivo original foi redirecionado.",
+      "ru": "Путь к исходному архиву был перенаправлен.",
+      "it": "Il percorso dell’archivio originale è stato reindirizzato."
+    },
+    "原包不是普通文件": {
+      "en": "The original archive is not a regular file.",
+      "ja": "元のアーカイブは通常のファイルではありません。",
+      "ko": "원본 압축 파일은 일반 파일이 아닙니다.",
+      "de": "Das ursprüngliche Archiv ist keine reguläre Datei.",
+      "fr": "L’archive d’origine n’est pas un fichier ordinaire.",
+      "es": "El archivo original no es un archivo regular.",
+      "pt-BR": "O arquivo original não é um arquivo regular.",
+      "ru": "Исходный архив не является обычным файлом.",
+      "it": "L’archivio originale non è un file regolare."
+    },
+    "安装目录不在该游戏的登记范围内": {
+      "en": "The installation folder is outside the directories registered for this game.",
+      "ja": "インストールフォルダは、このゲームに登録されたディレクトリの範囲外です。",
+      "ko": "설치 폴더가 이 게임에 등록된 디렉터리 범위를 벗어납니다.",
+      "de": "Der Installationsordner liegt außerhalb der für dieses Spiel registrierten Verzeichnisse.",
+      "fr": "Le dossier d’installation se trouve en dehors des répertoires enregistrés pour ce jeu.",
+      "es": "La carpeta de instalación está fuera de los directorios registrados para este juego.",
+      "pt-BR": "A pasta de instalação está fora dos diretórios registrados para este jogo.",
+      "ru": "Папка установки находится за пределами каталогов, зарегистрированных для этой игры.",
+      "it": "La cartella di installazione si trova al di fuori delle directory registrate per questo gioco."
+    },
+    "模组归档已被链接或其他文件替换": {
+      "en": "The mod archive has been replaced by a link or another file.",
+      "ja": "Mod のアーカイブがリンクまたは別のファイルに置き換えられています。",
+      "ko": "Mod 압축 파일이 링크 또는 다른 파일로 대체되었습니다.",
+      "de": "Das Mod-Archiv wurde durch einen Link oder eine andere Datei ersetzt.",
+      "fr": "L’archive du mod a été remplacée par un lien ou un autre fichier.",
+      "es": "El archivo del mod se ha reemplazado por un enlace u otro archivo.",
+      "pt-BR": "O arquivo do mod foi substituído por um link ou outro arquivo.",
+      "ru": "Архив мода был заменён ссылкой или другим файлом.",
+      "it": "L’archivio della mod è stato sostituito da un collegamento o da un altro file."
+    },
     "3DM 响应被凭据过滤器拦截": {
       "en": "The credential filter blocked the 3DM response.",
       "ja": "認証フィルターが3DMの応答をブロックしました。",
@@ -3911,6 +3955,28 @@
     }
   },
   "error.invalid": {
+    "此路径是目录，请使用 read_dir 列出目录内容。": {
+      "en": "This path is a directory. Use read_dir to list its contents.",
+      "ja": "このパスはディレクトリです。内容を一覧表示するには read_dir を使用してください。",
+      "ko": "이 경로는 디렉터리입니다. 내용을 나열하려면 read_dir를 사용하세요.",
+      "de": "Dieser Pfad ist ein Verzeichnis. Verwenden Sie read_dir, um den Inhalt aufzulisten.",
+      "fr": "Ce chemin désigne un dossier. Utilisez read_dir pour en afficher le contenu.",
+      "es": "Esta ruta es un directorio. Usa read_dir para listar su contenido.",
+      "pt-BR": "Este caminho é um diretório. Use read_dir para listar o conteúdo.",
+      "ru": "Этот путь указывает на каталог. Используйте read_dir, чтобы просмотреть его содержимое.",
+      "it": "Questo percorso è una cartella. Usa read_dir per elencarne il contenuto."
+    },
+    "模组名称须为 1–200 个字符": {
+      "en": "The mod name must be between 1 and 200 characters long.",
+      "ja": "Mod 名は 1～200 文字で入力してください。",
+      "ko": "Mod 이름은 1자 이상 200자 이하여야 합니다.",
+      "de": "Der Mod-Name muss zwischen 1 und 200 Zeichen lang sein.",
+      "fr": "Le nom du mod doit comporter entre 1 et 200 caractères.",
+      "es": "El nombre del mod debe tener entre 1 y 200 caracteres.",
+      "pt-BR": "O nome do mod deve ter entre 1 e 200 caracteres.",
+      "ru": "Название мода должно содержать от 1 до 200 символов.",
+      "it": "Il nome della mod deve contenere da 1 a 200 caratteri."
+    },
     "3DM 响应字段或关联关系无效": {
       "en": "The 3DM response field or association is invalid.",
       "ja": "3DMの応答フィールドまたは関連性が有効ではありません。",
@@ -6322,6 +6388,17 @@
     }
   },
   "error.not_found": {
+    "模组安装目录": {
+      "en": "Mod installation folder",
+      "ja": "Mod のインストールフォルダ",
+      "ko": "Mod 설치 폴더",
+      "de": "Installationsordner der Mod",
+      "fr": "Dossier d’installation du mod",
+      "es": "Carpeta de instalación del mod",
+      "pt-BR": "Pasta de instalação do mod",
+      "ru": "Папка установки мода",
+      "it": "Cartella di installazione della mod"
+    },
     "3DM 未找到指定资源 ID；不会回退到其他文件": {
       "en": "3DM failed to find the specified resource ID; it will not revert to other files.",
       "ja": "3DM で指定されたリソース IDが見つかりません。他のファイルに戻ることはありません。",

@@ -82,6 +82,7 @@ test("chat draft survives navigating to settings, switching language, and return
   await installMockTauri(page);
   await page.goto("/");
   await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
+  await page.locator("button:has(svg.lucide-message-square)").click();
   const draft = "这段未发送的聊天草稿应在手动切换语言后保留。";
   await page.getByRole("textbox", { name: "告诉 Agent 你想做什么", exact: true }).fill(draft);
 
@@ -103,6 +104,7 @@ test("system language updates keep an open dialog and Agent draft", async ({ pag
   await installMockTauri(page);
   await page.goto("/");
   await expect(page.locator("html")).toHaveAttribute("lang", "zh-CN");
+  await page.locator("button:has(svg.lucide-message-square)").click();
   const draft = "切换系统语言时保留这段草稿";
   await page.getByRole("textbox", { name: "告诉 Agent 你想做什么", exact: true }).fill(draft);
   await page.getByRole("button", { name: "切换工作区：全部游戏", exact: true }).click();

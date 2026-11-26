@@ -18,7 +18,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-const COLUMNS: &str =
+pub(crate) const COLUMNS: &str =
     "id,game_name,game_id,name,filename,archive_relative_path,payload_relative_path,\
  size,sha256,source_id,project_id,version_id,version,created_at,integrity_verified,project_page,author_hint";
 
@@ -38,6 +38,7 @@ pub struct LibraryEntry {
     pub source_id: String,
     pub project_id: Option<String>,
     pub version_id: Option<String>,
+    #[serde(serialize_with = "serialize_version")]
     pub version: String,
     pub created_at: String,
     /// The upstream published a strong hash; local SHA-256 is checked even when false.
@@ -45,6 +46,13 @@ pub struct LibraryEntry {
     pub project_page: Option<String>,
     /// Public display hint from the request; not a provider-authenticated identity.
     pub author_hint: Option<String>,
+}
+
+fn serialize_version<S: serde::Serializer>(
+    version: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    crate::mod_metadata::display_version(version).serialize(serializer)
 }
 
 #[derive(Debug, Clone)]
@@ -625,7 +633,8 @@ fn category_directory(
     Err(AppError::Conflict("无法创建不冲突的模组库游戏目录".into()))
 }
 
-fn read_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryEntry> {
+pub(crate) fn read_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryEntry> {
+    let page: Option<String> = row.get(15)?;
     Ok(LibraryEntry {
         id: row.get(0)?,
         game_name: row.get(1)?,
@@ -642,7 +651,7 @@ fn read_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LibraryEntry> {
         version: row.get(12)?,
         created_at: row.get(13)?,
         integrity_verified: row.get(14)?,
-        project_page: row.get(15)?,
+        project_page: page.as_deref().and_then(artifacts::public_project_page),
         author_hint: row.get(16)?,
     })
 }
@@ -742,7 +751,10 @@ fn ingest_locked(
                 source_id: receipt.source_id.into(),
                 project_id: receipt.project_id.map(str::to_owned),
                 version_id: receipt.version_id.map(str::to_owned),
-                version: receipt.version.into(),
+                version: crate::mod_metadata::display_version(receipt.version)
+                    .map(str::to_owned)
+                    .or_else(|| crate::mod_metadata::filename_version(file.filename))
+                    .unwrap_or_default(),
                 created_at: util::now(),
                 integrity_verified: receipt.integrity_verified,
                 project_page: receipt.project_page.map(str::to_owned),
@@ -792,10 +804,13 @@ fn ingest_locked(
     if let Some(catalog) = receipt.relocate {
         artifacts::relocate_catalog_entry(&tx, catalog, &archive)?;
     }
-    tx.execute(
-        "UPDATE mod_library_entries SET state='ready' WHERE id=?1",
+    let published = tx.execute(
+        "UPDATE mod_library_entries SET state='ready' WHERE id=?1 AND state='pending'",
         [&entry.id],
     )?;
+    if published != 0 {
+        crate::mod_metadata::inherit_archive_name(&tx, &entry, &name_key)?;
+    }
     tx.commit()?;
     Ok(entry)
 }
@@ -829,6 +844,19 @@ fn locations(engine: &FileEngine, entry: &LibraryEntry) -> AppResult<(PathBuf, P
         return Err(AppError::Conflict("模组库相对路径越界".into()));
     }
     Ok((archive, payload))
+}
+
+pub(crate) fn storage_directory(engine: &FileEngine, entry: &LibraryEntry) -> AppResult<PathBuf> {
+    let (archive, _) = locations(engine, entry)?;
+    let parent = archive.parent().expect("validated library layout");
+    engine.paths.stable_directory(parent)?;
+    if !fs::symlink_metadata(&archive)?.file_type().is_file() {
+        return Err(AppError::Denied("模组归档已被链接或其他文件替换".into()));
+    }
+    Ok(parent
+        .parent()
+        .expect("validated library layout")
+        .to_owned())
 }
 
 struct Publication<'a> {
@@ -1069,7 +1097,24 @@ pub fn list_for_game(db: &Db, game_id: &str) -> AppResult<Vec<LibraryEntry>> {
     let query = game_archives_query(COLUMNS, false);
     let mut stmt = conn.prepare(&format!("{query} ORDER BY created_at DESC,id"))?;
     let rows = stmt.query_map(params![game_id, game_key(&game.name)], read_entry)?;
-    Ok(rows.collect::<Result<_, _>>()?)
+    rows.map(|row| {
+        let mut entry = row?;
+        crate::mod_metadata::recover_archive_metadata(&conn, &mut entry)?;
+        Ok(entry)
+    })
+    .collect()
+}
+
+pub(crate) fn visible_entry(conn: &Connection, game_id: &str, id: &str) -> AppResult<LibraryEntry> {
+    let game = games::get_game_from(conn, game_id)?;
+    let query = game_archives_query(COLUMNS, true);
+    conn.query_row(
+        &format!("{query} AND id=?3"),
+        params![game_id, game_key(&game.name), id],
+        read_entry,
+    )
+    .optional()?
+    .ok_or_else(|| AppError::NotFound(format!("模组库归档: {id}")))
 }
 
 pub(crate) fn game_archives_query(columns: &str, include_pending_restores: bool) -> String {
@@ -1197,8 +1242,9 @@ pub fn verify_for_install(
 ) -> AppResult<VerifiedLibraryEntry> {
     let (entry, sha512) = {
         let conn = engine.db.conn();
-        let (entry, key, sha512) = read_ready(&conn, artifact_id)?;
+        let (mut entry, key, sha512) = read_ready(&conn, artifact_id)?;
         require_scope(&conn, game_id, &entry, &key)?;
+        crate::mod_metadata::recover_archive_metadata(&conn, &mut entry)?;
         (entry, sha512)
     };
     let (archive_path, payload_path) = verified_locations(engine, &entry, sha512.as_deref())?;

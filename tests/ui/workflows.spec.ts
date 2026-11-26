@@ -494,6 +494,8 @@ test("Settings separates system and standalone Skills from game Skills", async (
   const panel = page.getByRole("tabpanel", {name: "Skills", exact: true});
   const system = panel.getByRole("region", {name: "系统 Skills", exact: true});
   await expect(system.getByRole("row")).toHaveCount(8);
+  expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls
+    .find((call: any) => call.command === "list_skills")?.args)).toMatchObject({ settingsOnly: true });
   for (const name of ["创建与修改适配包", "联网搜索", "从网站下载 Mod", "定制 Mod 委托", "安装 Mod", "安装后整理 Mod", "卸载 Mod"]) {
     const button = system.getByRole("button", {name, exact: true});
     await expect(button).toBeVisible();

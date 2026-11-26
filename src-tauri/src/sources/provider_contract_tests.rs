@@ -361,6 +361,10 @@ async fn modrinth_resolve_selects_compatible_project_and_primary_file() {
         ("A1b2C3d4", "Version2", "2.0.0")
     );
     assert_eq!(
+        download.homepage_url.as_deref(),
+        Some("https://modrinth.com/mod/A1b2C3d4")
+    );
+    assert_eq!(
         (download.filename.as_str(), download.size),
         ("sample-tools.jar", Some(123456))
     );
@@ -754,6 +758,10 @@ async fn thunderstore_pinned_version_uses_full_version_name_instead_of_latest() 
         ),
         ("1.2.3", "1.2.3", "Team-SampleMod-1.2.3.zip")
     );
+    assert_eq!(
+        d.homepage_url.as_deref(),
+        Some("https://thunderstore.io/c/valheim/p/Team/SampleMod/")
+    );
     assert_eq!(d.size, Some(1234567));
     assert_eq!(d.hashes, FileHashes::default());
     assert_eq!(
@@ -1107,11 +1115,60 @@ async fn curseforge_explicit_file_parses_single_data_object() {
     );
     let mut r = resolve("curseforge", "67217", "432");
     r.version_id = Some("9004".into());
+    let d = p.resolve(&r).await.unwrap().download.unwrap();
+    assert_eq!(d.version_id, "9004");
+    assert_eq!(d.version, "Sample Toolkit 2.0");
     assert_eq!(
-        p.resolve(&r).await.unwrap().download.unwrap().version_id,
-        "9004"
+        d.homepage_url.as_deref(),
+        Some("https://www.curseforge.com/minecraft/mc-mods/sample-toolkit")
     );
     mock.assert_finished(2);
+}
+
+#[tokio::test]
+async fn curseforge_uses_official_project_fallback_without_reporting_transport_urls() {
+    let mut r = resolve("curseforge", "67217", "432");
+    r.version_id = Some("9004".into());
+    let transfer = "https://files.example.org/get?token=transfer-token";
+    let fallback = Some("https://www.curseforge.com/projects/67217");
+    for (website, download_url, expected) in [
+        (None, transfer, fallback),
+        // Different queries do not make an extensionless transport URL a project page.
+        (
+            Some("https://files.example.org/get?token=homepage-token"),
+            transfer,
+            fallback,
+        ),
+        (
+            Some("https://media.forgecdn.net/files/90/04/sample.zip"),
+            transfer,
+            fallback,
+        ),
+        (
+            None,
+            "https://www.curseforge.com/projects/67217?token=transfer-token",
+            None,
+        ),
+    ] {
+        let mut project = value(CF_PROJECT);
+        project["data"]["links"]["websiteUrl"] = json!(website);
+        let mut file = value(CF_FILES)["data"][4].clone();
+        file["downloadUrl"] = json!(download_url);
+        let (p, mock) = provider(
+            "curseforge",
+            vec![
+                Step::ok("/v1/mods/67217", project.to_string()),
+                Step::ok(
+                    "/v1/mods/67217/files/9004",
+                    json!({"data":file}).to_string(),
+                ),
+            ],
+        );
+        let result = p.resolve(&r).await.unwrap();
+        assert_eq!(result.homepage_url.as_deref(), expected);
+        assert_eq!(result.download.unwrap().homepage_url.as_deref(), expected);
+        mock.assert_finished(2);
+    }
 }
 
 #[tokio::test]
@@ -1436,6 +1493,10 @@ async fn nexus_resolve_maps_primary_file_and_uppercase_uri_download_response() {
     );
     assert!(d.download_url.contains("sample-tools-700.zip?expires="));
     assert_eq!(d.project_id, "skyrimspecialedition/123");
+    assert_eq!(
+        d.homepage_url.as_deref(),
+        Some("https://www.nexusmods.com/skyrimspecialedition/mods/123")
+    );
     assert_eq!(d.hashes, FileHashes::default());
     mock.assert_finished(2);
 }

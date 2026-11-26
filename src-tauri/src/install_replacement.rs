@@ -183,6 +183,34 @@ impl Replacement {
         })
     }
 
+    pub fn summary(&self, name: &str, game_name: &str) -> String {
+        let previous = self.previous.download_origin.as_ref().unwrap();
+        format!(
+            "替换 {name}（{}，项目 ID：{}，版本 ID：{} → {}） · {game_name}",
+            self.next.source_id, self.next.project_id, previous.version_id, self.next.version_id
+        )
+    }
+
+    pub fn validate_successor(
+        engine: &FileEngine,
+        plan: &FilePlan,
+        previous_id: &str,
+        next: &InstalledMod,
+    ) -> AppResult<()> {
+        if next.status != "planned" {
+            return Err(conflict("替换计划不再待执行"));
+        }
+        Self::load(
+            engine,
+            previous_id,
+            &next.game_id,
+            &next.install_root,
+            next.metadata["modType"].as_str().unwrap_or_default(),
+            next.download_origin.as_ref(),
+        )?
+        .inspect_plan(engine, plan, Some(&next.id))
+    }
+
     pub fn drafts(&self, engine: &FileEngine, copies: &[FileOp]) -> AppResult<Vec<TrashDraft>> {
         let targets: BTreeSet<_> = copies.iter().map(FileOp::dst).collect();
         let paths = self
@@ -308,18 +336,7 @@ pub(crate) fn validate_apply(engine: &FileEngine, plan: &FilePlan) -> AppResult<
     }
     if let Some((next_id, _, Some(previous_id))) = link {
         let next = get_install(engine, &next_id)?;
-        if next.status != "planned" {
-            return Err(conflict("替换计划不再待执行"));
-        }
-        Replacement::load(
-            engine,
-            &previous_id,
-            &next.game_id,
-            &next.install_root,
-            next.metadata["modType"].as_str().unwrap_or_default(),
-            next.download_origin.as_ref(),
-        )?
-        .inspect_plan(engine, plan, Some(&next_id))?;
+        Replacement::validate_successor(engine, plan, &previous_id, &next)?;
     } else if let Some((id, action, None)) = link {
         match action.as_str() {
             "uninstall" => super::validate_uninstall_apply(engine, plan, &id)?,

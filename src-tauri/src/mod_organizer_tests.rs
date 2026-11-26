@@ -51,6 +51,7 @@ fn plan(engine: &FileEngine) -> install::InstallPreview {
         &LibraryInstallRequest {
             game_id: "g".into(),
             library_entry_id: entry.id,
+            replace_install_id: None,
             mode: LibraryInstallMode::ApprovedMappings {
                 mod_type: None,
                 source_kind: LibrarySourceKind::Archive,

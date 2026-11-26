@@ -11,7 +11,9 @@ async function catalogTab(page: Page) {
   await page.getByRole("tab", {name: "云端插件", exact: true}).click();
   return page.getByRole("tabpanel", {name: "云端插件", exact: true});
 }
-const pluginCard = (scope: Page | Locator) => scope.getByRole("region", {name: "云端插件目录", exact: true}).getByRole("listitem").filter({hasText: "Minecraft Java Edition"});
+// Cards also list the game's aliases, so match the card by its own title rather than any text.
+const pluginCard = (scope: Page | Locator) => scope.getByRole("region", {name: "云端插件目录", exact: true}).getByRole("listitem")
+  .filter({has: ("page" in scope ? scope.page() : scope).getByRole("heading", {name: "Minecraft Java Edition", exact: true})});
 const installButton = (scope: Page | ReturnType<typeof pluginCard>) => scope.getByRole("button", {name: /(?=.*安装)(?=.*Minecraft Java Edition)/});
 const detailButton = (scope: Page | ReturnType<typeof pluginCard>) => scope.getByRole("button", {name: /(?=.*查看详情)(?=.*Minecraft Java Edition)/});
 const plan = (page: Page) => page.getByRole("dialog", { name: "确认文件变更", exact: true });
@@ -184,4 +186,51 @@ test("游戏库中安装后可返回并显式选择适配包", async ({page}) =>
   await chooser.getByRole("button", {name: "应用适配包"}).click();
   await expect(chooser).not.toBeVisible();
   expect(await calls(page, "set_game_adapter")).toEqual([{id: "game-fixture", adapterSlug: "minecraft-java"}]);
+});
+
+test("目录显示紧凑的统计、筛选与卡片/列表视图，且不横向溢出", async ({page}) => {
+  await openCatalogFixture(page, {installed: true});
+  const tab = await catalogTab(page);
+  const items = tab.getByRole("listitem");
+  const noOverflow = () => expect.poll(() => tab.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+  await expect(tab).toContainText("2 个插件 · 1 款游戏");
+  await expect(items).toHaveCount(2);
+  await expect(tab.getByText("游戏库中", {exact: true})).toHaveCount(2);
+  const card = pluginCard(page);
+  await expect(card).toContainText("minecraft-java");
+  await expect(card).toContainText("Steam App ID 413150");
+  await expect(tab.getByText("别名：Minecraft Java Edition / 方块世界", {exact: true})).toHaveCount(1);
+  await noOverflow();
+
+  await tab.getByRole("button", {name: "未安装"}).click();
+  await expect(tab.getByText("没有匹配结果", {exact: true})).toBeVisible();
+  await tab.getByRole("button", {name: "重置筛选"}).first().click();
+  await expect(items).toHaveCount(2);
+  await tab.getByRole("button", {name: "游戏库匹配"}).click();
+  await expect(items).toHaveCount(2);
+  await tab.getByRole("button", {name: "已安装", exact: false}).click();
+  await expect(items).toHaveCount(2);
+
+  await tab.getByRole("button", {name: "macOS", exact: true}).click();
+  await expect(items).toHaveCount(1);
+  await expect(tab).toContainText("显示 1 / 2");
+  await expect(items.first()).toContainText("备用适配包");
+  await tab.getByRole("button", {name: "Windows", exact: true}).click();
+  await expect(items).toHaveCount(1);
+  await expect(card).toHaveCount(1);
+  await tab.getByRole("button", {name: "Windows", exact: true}).click();
+  await expect(items).toHaveCount(2);
+
+  const grid = tab.getByRole("button", {name: "卡片视图"});
+  const list = tab.getByRole("button", {name: "列表视图"});
+  await expect(grid).toHaveAttribute("aria-pressed", "true");
+  await list.click();
+  await expect(list).toHaveAttribute("aria-pressed", "true");
+  await expect(items).toHaveCount(2);
+  await expect(card).toContainText("minecraft-java");
+  await expect(detailButton(card)).toBeVisible();
+  await noOverflow();
+  await tab.getByRole("button", {name: "卡片视图"}).click();
+  await expect(tab.getByRole("button", {name: "卡片视图"})).toHaveAttribute("aria-pressed", "true");
+  await noOverflow();
 });

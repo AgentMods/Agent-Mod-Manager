@@ -8,6 +8,7 @@ test("replays a completed turn while Agent is in the background", async ({page})
   await page.goto("/");
   await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await page.getByRole("button", {name: "检查 Minecraft 模组", exact: true}).click();
+  const agentNav = page.getByRole("button", {name: "Agent", exact: true});
 
   await page.getByRole("textbox", {name: "告诉 Agent 你想做什么"}).fill("检查 Minecraft 模组");
   await page.getByRole("button", {name: "发送消息", exact: true}).click();
@@ -17,10 +18,11 @@ test("replays a completed turn while Agent is in the background", async ({page})
   await expect(page.getByRole("button", {name: "游戏库", exact: true})).toHaveAttribute("aria-current", "page");
 
   await page.evaluate(() => {
-    (window as any).__AMM_TEST__.persistOnly("delta", {content: "第一步已完成", reasoning: ""});
+    (window as any).__AMM_TEST__.persistOnly("delta", {content: "第一步已完成", reasoning: ""}, "conversation-fixture", "interim-reply");
   });
-  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
-  await expect(page.locator('[data-message-id="assistant-fixture"]')).toContainText("第一步已完成");
+  await expect(agentNav).toHaveAttribute("aria-description", /新消息/);
+  await agentNav.click();
+  await expect(page.locator('[data-message-id="interim-reply"]')).toContainText("第一步已完成");
   await expect(page.getByRole("button", {name: "停止生成", exact: true})).toBeVisible();
   await page.getByRole("button", {name: "新建对话", exact: true}).click();
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
@@ -36,8 +38,10 @@ test("replays a completed turn while Agent is in the background", async ({page})
     (window as any).__AMM_TEST__.replayedEvents.some((event: any) => event.seq === doneSeq && event.kind === "done")
   ), done.seq);
   await expect(page.getByRole("button", {name: "游戏库", exact: true})).toHaveAttribute("aria-current", "page");
-  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
-  await page.getByRole("button", {name: "检查 Minecraft 模组", exact: true}).click();
+  await expect(agentNav).toHaveAttribute("aria-description", /新消息/);
+  await agentNav.click();
+  await expect(page.locator(".chat-header h1")).toHaveText("检查 Minecraft 模组");
+  await expect(agentNav).not.toHaveAttribute("aria-description", /新消息/);
   const reply = page.locator('[data-message-id="assistant-fixture"]');
   await expect(reply).toContainText(completion);
   await expect(reply).not.toContainText("正在检查模组文件。");
@@ -47,7 +51,7 @@ test("replays a completed turn while Agent is in the background", async ({page})
   ))).toHaveLength(0);
 });
 
-test("background pending approval shortcut returns to its inline authorization", async ({page}) => {
+test("background pending approval reminder returns to its inline authorization", async ({page}) => {
   await installMockTauri(page, {holdAgentTurn: true});
   await page.goto("/");
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
@@ -70,16 +74,49 @@ test("background pending approval shortcut returns to its inline authorization",
     fixture.emit("approval-request", {approvalId: "approval-fixture", toolCallId: "tool-fixture", title: "apply_file_ops", preview});
   });
 
-  const shortcut = page.getByRole("button", {name: "查看待授权操作", exact: true});
-  await expect(shortcut).toBeVisible();
-  await shortcut.click();
+  const agentNav = page.getByRole("button", {name: "Agent", exact: true});
+  await expect(agentNav).toHaveAttribute("aria-description", /等待授权/);
+  await agentNav.click();
+  await expect(agentNav).toHaveAttribute("aria-description", /等待授权/);
+
+  await page.getByRole("button", {name: "游戏库", exact: true}).click();
+  await page.getByRole("button", {name: "查看待授权操作", exact: true}).click();
   const approval = page.getByRole("group", {name: "操作审批", exact: true});
   await expect(page.getByRole("dialog", {name: "操作审批", exact: true})).toHaveCount(0);
   await expect(approval).toContainText("/sandbox/minecraft/mods/Example.jar");
   await approval.getByRole("button", {name: "批准并执行", exact: true}).click();
   await expect(page.getByRole("button", {name: "apply_file_ops 已执行", exact: true})).toBeVisible();
+  await expect(agentNav).not.toHaveAttribute("aria-description", /等待授权/);
   expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "respond_approval").at(-1)?.args.response))
     .toEqual({approved: true, answer: null});
+});
+
+test("current and background questions keep the Agent reminder until answered", async ({page}) => {
+  await installMockTauri(page, {askUser: {preview: {question: "请输入安装目录。"}, deferResult: true}});
+  await page.goto("/");
+  const agentNav = page.getByRole("button", {name: "Agent", exact: true});
+  await agentNav.click();
+  await page.getByRole("textbox", {name: "告诉 Agent 你想做什么", exact: true}).fill("确认安装目录");
+  await page.getByRole("button", {name: "发送消息", exact: true}).click();
+
+  const question = page.getByRole("region", {name: "Agent 等待你的回答", exact: true});
+  await expect(question).toBeVisible();
+  await expect(agentNav).toHaveAttribute("aria-description", /等待回答/);
+  const title = await page.locator(".chat-header h1").innerText();
+
+  await page.getByRole("button", {name: "游戏库", exact: true}).click();
+  await expect(agentNav).toHaveAttribute("aria-description", /等待回答/);
+  await agentNav.click();
+  await expect(page.locator(".chat-header h1")).toHaveText(title);
+  await expect(question).toBeVisible();
+  await expect(agentNav).toHaveAttribute("aria-description", /等待回答/);
+
+  await question.getByRole("textbox", {name: "填写回答", exact: true}).fill("D:/Games/Test");
+  await question.getByRole("button", {name: "提交回答", exact: true}).click();
+  await expect(agentNav).not.toHaveAttribute("aria-description", /等待回答/);
+  await expect.poll(() => page.evaluate(() => (window as any).__AMM_TEST__.calls
+    .filter((call: any) => call.command === "respond_approval").at(-1)?.args.response))
+    .toEqual({approved: true, answer: "D:/Games/Test"});
 });
 
 test("returning to a running turn shows its backend permission instead of the Full Trust composer preference", async ({page}) => {

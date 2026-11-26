@@ -4,7 +4,7 @@ use crate::{
     error::{AppError, AppResult},
     util,
 };
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -164,22 +164,32 @@ pub fn set_mod_tags(db: &Db, game_id: &str, install_id: &str, tag_ids: &[String]
     let mut conn = db.conn();
     let tx = conn.transaction()?;
     require_install(&tx, game_id, install_id)?;
-    tx.execute(
+    set_install_tags(&tx, game_id, install_id, tag_ids)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub(crate) fn set_install_tags(
+    conn: &Connection,
+    game_id: &str,
+    install_id: &str,
+    tag_ids: &[String],
+) -> AppResult<()> {
+    conn.execute(
         "INSERT INTO install_organizations(install_id,tags_edited) VALUES (?1,1)
         ON CONFLICT(install_id) DO UPDATE SET tags_edited=1",
         [install_id],
     )?;
-    tx.execute(
+    conn.execute(
         "DELETE FROM install_mod_tags WHERE install_id=?1",
         [install_id],
     )?;
     for id in tag_ids.iter().collect::<BTreeSet<_>>() {
-        if tx.execute("INSERT INTO install_mod_tags(install_id,tag_id) SELECT ?1,id FROM mod_tags WHERE game_id=?2 AND id=?3",
+        if conn.execute("INSERT INTO install_mod_tags(install_id,tag_id) SELECT ?1,id FROM mod_tags WHERE game_id=?2 AND id=?3",
             params![install_id,game_id,id])? == 0 {
             return Err(AppError::NotFound(id.clone()));
         }
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -259,6 +269,7 @@ pub fn finalize(tx: &Transaction<'_>, transaction_id: &str) -> AppResult<bool> {
         return Ok(false);
     };
     let metadata: Value = serde_json::from_str(&metadata).unwrap_or(Value::Null);
+    crate::mod_metadata::inherit_install_name(tx, &game_id, &id, transaction_id, &metadata)?;
     let stable = |field: &str| metadata[field].as_str().filter(|value| !value.is_empty());
     // An explicit replacement wins; otherwise use catalog/library identity or an
     // exact local artifact digest. Names and paths are never identity keys.

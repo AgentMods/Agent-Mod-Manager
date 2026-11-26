@@ -28,6 +28,8 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { findPendingModSwitch, retryModSwitchReadback, useModSwitch, type ModSwitchTarget } from '@/lib/mod-switch-store';
 import { batchLabels, startModTurn, type AgentModItem, type BatchResult } from '@/lib/mod-agent-actions';
 import { api, backendAvailable, errorText, useBackendQuery } from '@/lib/api';
+import { useParams } from "react-router";
+import { currentRoute } from "@/router";
 import { useUI } from '@/lib/store';
 import type { FilePlan, Game } from '@/lib/types';
 
@@ -106,7 +108,7 @@ function DetailEmptyState({ title, action, loading = false }: { title: string; a
 }
 
 export default function GameDetailPage() {
-  const gameId = useUI(s => s.gameId);
+  const { gameId } = useParams<"gameId">();
   const navigate = useUI(s => s.navigate);
   if (!gameId) return <Page><PageHeader title={tr("游戏详情")} /><DetailEmptyState title={tr("尚未选择游戏")} action={<Button onClick={() => navigate('library')}><ArrowLeftIcon data-icon="inline-start" />{tr("返回游戏库")}</Button>} /></Page>;
   return <GameDetails key={gameId} gameId={gameId} />;
@@ -245,7 +247,7 @@ function GameDetails({ gameId }: { gameId: string }) {
         [{ key: 'artifactId' in action ? action.artifactId : action.installId, action, target }], false);
       if (result.failures.length) {
         const message = result.failures.join('；');
-        const state = useUI.getState();
+        const state = currentRoute();
         if (state.view === 'detail' && state.gameId === gameId) setModActionError(message);
         else notify(message);
       }

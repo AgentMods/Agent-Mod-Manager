@@ -22,6 +22,100 @@ fn canonical_tempdir() -> (tempfile::TempDir, PathBuf) {
 }
 
 #[test]
+fn ordinary_storage_files_and_registered_games_share_transactional_access() {
+    use super::{tests::setup, FileOp};
+    let (dir, engine, _) = setup();
+    let game = dir.path().join("Another game");
+    let source = game.join("config/settings.txt");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, "fixture").unwrap();
+    assert!(crate::filesystem::read_file(&engine, &source).is_err());
+    crate::games::register_game(&engine.db, &game, None).unwrap();
+    assert!(crate::filesystem::read_dir(&engine, &game).is_ok());
+    assert!(crate::filesystem::read_file(&engine, &source).is_ok());
+
+    let root = &engine.paths.root;
+    for dst in [root.join("notes.txt"), root.join("custom/nested/notes.txt")] {
+        let plan = engine
+            .plan_file_ops(
+                vec![FileOp::Copy {
+                    src: source.clone(),
+                    dst: dst.clone(),
+                }],
+                "Copy into storage".into(),
+            )
+            .unwrap();
+        assert!(!dst.exists());
+        assert!(!engine.has_external_paths(&plan).unwrap());
+        engine.approve_plan(&plan.id).unwrap();
+        engine.apply_file_ops(&plan.id).unwrap();
+        assert_eq!(
+            crate::filesystem::read_file(&engine, &dst).unwrap().lines[0].text,
+            "fixture"
+        );
+        engine.rollback_transaction(&plan.id).unwrap();
+        assert!(!dst.exists());
+    }
+}
+
+#[test]
+fn generic_storage_access_preserves_manager_state_and_credentials() {
+    use super::{tests::setup, FileOp};
+    let (_dir, engine, game) = setup();
+    let src = game.join("note.txt");
+    fs::write(&src, "fixture").unwrap();
+    let root = &engine.paths.root;
+    for engine in [&engine, &engine.for_local_agent()] {
+        for relative in [
+            "",
+            "manager.db",
+            "manager.db-wal",
+            "manager.db-shm",
+            "manager.db-journal",
+            "backups/saved",
+            "trash/item",
+            "logs/manager.log",
+            "gta-rpf-private/blob",
+            "Mods/package",
+            "private/credentials",
+            "custom/.env.local",
+            "downloads",
+            "skills",
+            "plugins",
+            "staging",
+        ] {
+            let dst = root.join(relative);
+            assert!(
+                matches!(
+                    engine.plan_file_ops(
+                        vec![FileOp::Copy {
+                            src: src.clone(),
+                            dst
+                        }],
+                        "protected".into()
+                    ),
+                    Err(crate::error::AppError::Denied(_))
+                ),
+                "{relative}"
+            );
+        }
+    }
+    let folder = root.join("custom");
+    fs::create_dir(&folder).unwrap();
+    fs::write(folder.join(".env"), "secret").unwrap();
+    assert!(matches!(
+        engine.plan_file_ops(
+            vec![FileOp::Move {
+                src: folder,
+                dst: game.join("moved")
+            }],
+            "protected descendant".into()
+        ),
+        Err(crate::error::AppError::Denied(_))
+    ));
+}
+
+#[test]
 #[cfg(unix)]
 fn rollback_refuses_an_in_root_symlink_and_retries_after_restoring_the_file() {
     let (_temp, engine, game) = setup();

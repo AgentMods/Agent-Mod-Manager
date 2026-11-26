@@ -734,6 +734,7 @@ pub(crate) struct TrustedWork {
     pub provider_game_id: String,
     pub game_id: String,
     pub title: String,
+    pub project_page: Option<String>,
     game_scope: GameScope,
 }
 
@@ -760,6 +761,7 @@ pub(crate) async fn resolve_work(
         provider_game_id: provider_game_id.clone(),
         game_id: game_id.to_owned(),
         title: item.title,
+        project_page: item.page_url,
         game_scope: search
             .pairs
             .iter()

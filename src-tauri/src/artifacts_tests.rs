@@ -43,6 +43,50 @@ fn fixture() -> (tempfile::TempDir, FileEngine, DownloadArtifact, ResolvedMod) {
 }
 
 #[test]
+fn three_dm_download_persists_the_public_work_page_and_reads_legacy_receipts() {
+    let (_temp, engine, artifact, mut source) = fixture();
+    source.source_id = "3dm".into();
+    source.project_id = "261498".into();
+    source.version_id = "378349".into();
+    source.version = "1".into();
+    source.homepage_url = Some(source.download_url.clone());
+    record(&engine, &artifact, &source).unwrap();
+    let page = "https://mod.3dmgame.com/mod/261498";
+    let stored: String = engine
+        .db
+        .conn()
+        .query_row(
+            "SELECT artifact_json FROM download_artifacts WHERE id=?1",
+            [&artifact.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<CatalogArtifact>(&stored)
+            .unwrap()
+            .project_page
+            .as_deref(),
+        Some(page)
+    );
+    assert!(!stored.contains("private-download"));
+    // Receipts written before the work page was captured held only the artifact JSON.
+    engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE download_artifacts SET artifact_json=?2 WHERE id=?1",
+            params![artifact.id, serde_json::to_string(&artifact).unwrap()],
+        )
+        .unwrap();
+    let recovered = by_id_from(&engine.db.conn(), &artifact.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.project_page.as_deref(), Some(page));
+    assert_eq!(recovered.version, "1");
+    assert_eq!(recovered.version_id, "378349");
+}
+
+#[test]
 fn downloads_include_records_older_than_the_first_thousand() {
     let (_temp, engine, artifact, source) = fixture();
     record(&engine, &artifact, &source).unwrap();

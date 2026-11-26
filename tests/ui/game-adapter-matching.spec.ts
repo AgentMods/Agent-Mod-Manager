@@ -34,14 +34,13 @@ async function continueToGameScan(page: Page) {
 
 async function finishOnboardingToLibrary(page: Page) {
   await continueToGameScan(page);
-  await page.getByRole("button", { name: "稍后再扫", exact: true }).click();
+  await page.getByRole("button", { name: "下一步", exact: true }).click();
   await page.getByRole("button", { name: "完成并进入游戏库", exact: true }).click();
   await expect(page.getByTestId("library-page")).toBeVisible();
 }
 
 async function startOnboardingScan(page: Page) {
   await continueToGameScan(page);
-  await page.getByRole("button", { name: "扫描已安装游戏", exact: true }).click();
   await expect(page.getByRole("list", { name: "扫描候选游戏", exact: true })).toBeVisible();
 }
 
@@ -235,13 +234,18 @@ test("首次设置等待云目录后以 release.gameName 显示并注册", async
   const waitingButton = row.getByRole("button", { name: "正在匹配…", exact: true });
   await expect(waitingButton).toBeVisible();
   await expect(waitingButton).toBeDisabled();
-  await expect(row.getByRole("button", { name: "仅添加本地", exact: true })).toBeEnabled();
+  await openCandidateMenu(page, row);
+  await expect(page.getByRole("menuitem", { name: "仅添加本地", exact: true })).toBeEnabled();
+  await page.keyboard.press("Escape");
   await page.evaluate(() => (window as any).__AMM_TEST__.releaseManagerPluginCatalog());
 
   await expect(row.getByText(scannedName, { exact: true })).toHaveCount(0);
   await expect(row.getByText(gameName, { exact: true })).toBeVisible();
   await expect(row.locator("p").filter({ hasText: pluginTitle })).toBeVisible();
   await expect(row.getByText("云端已匹配", { exact: true })).toBeVisible();
+  await openCandidateMenu(page, row);
+  await expect(page.getByRole("menuitem", { name: "仅添加本地", exact: true })).toHaveCount(0);
+  await page.keyboard.press("Escape");
 
   await expect(row.getByRole("button", { name: "添加", exact: true })).toBeEnabled();
   await row.getByRole("button", { name: "添加", exact: true }).click();
@@ -317,7 +321,9 @@ test("首次设置的云适配包添加失败后可重试，成功仍按 Game �
   await add.click();
   await expect(row.getByRole("alert")).toContainText("模拟云端适配包安装失败");
   await expect(row.getByRole("button", { name: "添加", exact: true })).toBeEnabled();
-  await expect(row.getByRole("button", { name: "仅添加本地", exact: true })).toBeEnabled();
+  await openCandidateMenu(page, row);
+  await expect(page.getByRole("menuitem", { name: "仅添加本地", exact: true })).toBeEnabled();
+  await page.keyboard.press("Escape");
 
   await row.getByRole("button", { name: "添加", exact: true }).click();
   await expect(row.getByText("管理中", { exact: true })).toBeVisible();
@@ -334,6 +340,42 @@ test("首次设置的云适配包添加失败后可重试，成功仍按 Game �
   expect(await commandArgs(page, "start_onboarding")).toEqual([{}]);
   const game = await page.evaluate(() => (window as any).__AMM_TEST__.registerResults.at(-1));
   expect(game).toMatchObject({ id: expect.any(String), name: matchedGameName, rootPath: steam.rootPath, adapterSlug: "minecraft-java" });
+});
+
+test("首次设置的云添加失败后可从卡片菜单仅添加本地", async ({ page }) => {
+  const steam = candidate({
+    rootPath: "/sandbox/steam/onboarding-local-fallback",
+    name: "引导页本地回退候选",
+    sources: [{ kind: "steam", steamAppId: "413150" }],
+  });
+  const cloudCatalog = await openGameAdapterMatchingFixture(page, {
+    onboarding: true,
+    candidates: [steam],
+    failCloudRegistrationOnce: true,
+  });
+  const cloudGameName = cloudCatalog.games.find((game) => game.plugins.some(
+    (plugin) => plugin.id === release.pluginId && plugin.releaseId === release.releaseId,
+  ))!.name;
+  await startOnboardingScan(page);
+  const row = page.getByRole("listitem").filter({ has: page.getByText(steam.rootPath, { exact: true }) });
+  await row.getByRole("button", { name: "添加", exact: true }).click();
+  await expect(row.getByRole("alert")).toContainText("模拟云端适配包安装失败");
+
+  await openCandidateMenu(page, row);
+  await page.getByRole("menuitem", { name: "仅添加本地", exact: true }).click();
+  await expect(row.getByRole("button", { name: "管理中", exact: true })).toBeDisabled();
+
+  expect(await commandArgs(page, "register_game")).toEqual([
+    {
+      directory: steam.rootPath,
+      adapterSlug: null,
+      fromDiscovery: true,
+      cloudAdapter: { pluginId: release.pluginId, releaseId: release.releaseId },
+      discoveryName: cloudGameName,
+    },
+    { directory: steam.rootPath, adapterSlug: null, fromDiscovery: true },
+  ]);
+  expect(await commandArgs(page, "start_onboarding")).toEqual([{}]);
 });
 
 test("云目录离线时首次设置仍保留本地添加", async ({ page }) => {

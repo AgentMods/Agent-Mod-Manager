@@ -236,6 +236,13 @@ fn curseforge_hashes(file: &Value) -> AppResult<FileHashes> {
 fn opt_url(v: &Value, key: &str) -> Option<String> {
     opt(v, key).filter(|url| validate_download_url(url).is_ok())
 }
+fn curseforge_project_page(project_id: &str, links: &Value) -> Option<String> {
+    crate::artifacts::catalog_project_page(
+        "curseforge",
+        Some(project_id),
+        links["websiteUrl"].as_str(),
+    )
+}
 fn array(v: &Value) -> AppResult<&Vec<Value>> {
     v.as_array()
         .ok_or_else(|| AppError::Other("来源列表格式无效".into()))
@@ -298,9 +305,18 @@ impl Provider {
     fn resolved(&self, mut download: ResolvedMod) -> AppResult<ResolveResult> {
         download.hashes.validate()?;
         validate_download_url(&download.download_url)?;
-        download.homepage_url = download
+        let distinct_from_transport =
+            |page: &str| !crate::artifacts::same_public_endpoint(page, &download.download_url);
+        let recorded = download
             .homepage_url
-            .filter(|url| validate_download_url(url).is_ok());
+            .as_deref()
+            .filter(|page| distinct_from_transport(page));
+        download.homepage_url = crate::artifacts::catalog_project_page(
+            &download.source_id,
+            Some(&download.project_id),
+            recorded,
+        )
+        .filter(|page| distinct_from_transport(page));
         Ok(ResolveResult {
             status: self.status(),
             homepage_url: download.homepage_url.clone(),
@@ -408,7 +424,7 @@ impl Provider {
             download_url: s(f, "url")?,
             size: f["size"].as_u64(),
             hashes: modrinth_hashes(f)?,
-            homepage_url: Some(format!("https://modrinth.com/mod/{project}")),
+            homepage_url: known_project_page(self.id, project),
             warnings: Vec::new(),
         })?;
         result.dependencies = modrinth_dependencies(v);
@@ -736,9 +752,11 @@ impl Provider {
         let mods = array(&v["data"])?
             .iter()
             .map(|v| {
+                let project_id = num(v, "id")?;
                 Ok(ModSummary {
                     source_id: self.id.into(),
-                    project_id: num(v, "id")?,
+                    homepage_url: curseforge_project_page(&project_id, &v["links"]),
+                    project_id,
                     game_id: Some(game.clone()),
                     name: s(v, "name")?,
                     summary: opt(v, "summary").unwrap_or_default(),
@@ -746,7 +764,6 @@ impl Provider {
                         .as_array()
                         .and_then(|a| a.first())
                         .and_then(|a| opt(a, "name")),
-                    homepage_url: opt_url(&v["links"], "websiteUrl"),
                     icon_url: opt_url(&v["logo"], "thumbnailUrl"),
                     downloads: v["downloadCount"].as_u64(),
                 })
@@ -774,7 +791,7 @@ impl Provider {
                 "CurseForge 返回的项目 ID 与请求不符".into(),
             ));
         }
-        let home = opt_url(&project["data"]["links"], "websiteUrl");
+        let home = curseforge_project_page(id, &project["data"]["links"]);
         if project["data"]["allowModDistribution"] == false {
             return Ok(self.unresolved(
                 SourceState::ManualDownload,
@@ -949,7 +966,8 @@ impl Provider {
         };
         let game = segment(game)?.to_ascii_lowercase();
         let id = positive_id(id)?.trim_start_matches('0');
-        let home = Some(format!("https://www.nexusmods.com/{game}/mods/{id}"));
+        let project_id = format!("{game}/{id}");
+        let home = known_project_page(self.id, &project_id);
         let files: Value = self
             .fetch_json(self.get(format!(
                 "https://api.nexusmods.com/v1/games/{game}/mods/{id}/files.json"
@@ -1012,7 +1030,7 @@ impl Provider {
         };
         self.resolved(ResolvedMod {
             source_id: self.id.into(),
-            project_id: format!("{game}/{id}"),
+            project_id,
             version_id: fid,
             name: s(file, "name")?,
             version: s(file, "version")?,

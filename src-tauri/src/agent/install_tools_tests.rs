@@ -42,6 +42,13 @@ fn library_install_tool_definitions_explain_archive_mapping_and_conflict_workflo
     assert!(install.description.contains("sourceKind=archive"));
     assert!(install.description.contains("sourceKind=singleFile"));
     assert!(install.description.contains("inspect_install"));
+    assert!(install.description.contains("replaceInstallId"));
+    let request = &install.parameters["properties"]["request"];
+    assert_eq!(request["properties"]["replaceInstallId"]["type"], "string");
+    assert!(!request["required"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("replaceInstallId")));
     let mapping = &install.parameters["properties"]["request"]["properties"]["mappings"]["items"]
         ["properties"];
     assert!(mapping["source"]["description"]
@@ -52,6 +59,85 @@ fn library_install_tool_definitions_explain_archive_mapping_and_conflict_workflo
         .as_str()
         .unwrap()
         .contains("相对文件路径"));
+}
+
+#[tokio::test]
+async fn library_replacement_tool_uses_the_old_install_id_and_counts_only_deployed_files() {
+    use crate::agent::mod_library_flow_tests::{catalog_archive, ingest_library_fixture};
+    use crate::{artifacts, mod_library};
+
+    let (_dir, engine, game) = setup();
+    let (_, old) =
+        ingest_library_fixture(&engine, "g", "Game", "old.zip", &[("Retired.pak", b"old")]);
+    let download = catalog_archive(&engine, "next.zip", &[("Fresh.pak", b"new")]);
+    // The shared fixture registers v1; record this separate download as v2.
+    engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE download_artifacts SET version_id='offline-library-fixture-v2' WHERE id=?1",
+            [&download.artifact_id],
+        )
+        .unwrap();
+    let record = artifacts::for_path(&engine.db, &download.path)
+        .unwrap()
+        .unwrap();
+    let next = mod_library::ingest_download(&engine, &record, "Game", Some("g")).unwrap();
+    let context = ToolContext {
+        engine,
+        cancel: CancellationToken::new(),
+        progress: None,
+        resolution_scope: crate::sources::resolutions::ResolutionScope::Desktop,
+    };
+    let registry = ToolRegistry::default();
+    register(&registry).unwrap();
+    let tool = registry.get("install_library_mod").unwrap();
+    let args = json!({"request":{
+        "gameId":"g", "artifactId":old.id, "mode":"approvedMappings", "sourceKind":"archive",
+        "mappings":[{"source":"Retired.pak", "destination":"Retired.pak"}]
+    }});
+    let prepared = tool.prepare(&context, &args).await.unwrap();
+    let installed = tool.execute(&context, args, prepared).await.unwrap();
+    let args = json!({"request":{
+        "gameId":"g", "artifactId":next.id, "mode":"approvedMappings", "sourceKind":"archive",
+        "replaceInstallId":installed["installId"],
+        "mappings":[{"source":"Fresh.pak", "destination":"Fresh.pak"}]
+    }});
+    let db = &context.engine.db;
+    crate::browse::install::init(db).unwrap();
+    let history = crate::history::History::new(db.clone());
+    let browse = history.create_conversation("Browse", Some("g")).unwrap();
+    db.conn().execute(
+        "INSERT INTO browse_install_tasks(id,conversation_id,game_id,source_id,project_id,provider_game_id)
+         VALUES('browse-task',?1,'g','modrinth','offline-library-fixture','game')",
+        [&browse.id],
+    ).unwrap();
+    let mut context = context;
+    context.resolution_scope = crate::sources::resolutions::ResolutionScope::Agent(browse.id);
+    assert!(
+        matches!(tool.prepare(&context, &args).await, Err(AppError::Denied(message)) if message.contains("版本替换"))
+    );
+    let desktop = history.create_conversation("Desktop", Some("g")).unwrap();
+    context.resolution_scope = crate::sources::resolutions::ResolutionScope::Agent(desktop.id);
+    let prepared = tool.prepare(&context, &args).await.unwrap();
+    let plan = prepared.plan.as_ref().unwrap();
+    assert!(plan.requires_review);
+    assert_eq!(plan.entries.len(), 2);
+    assert!(plan
+        .summary
+        .contains("offline-library-fixture-v1 → offline-library-fixture-v2"));
+    let result = tool.execute(&context, args, prepared).await.unwrap();
+    assert_eq!(result["status"], "committed");
+    assert_eq!(result["fileCount"], 1);
+    assert_ne!(result["installId"], installed["installId"]);
+    assert!(!game.join("Retired.pak").exists());
+    assert_eq!(std::fs::read(game.join("Fresh.pak")).unwrap(), b"new");
+    context
+        .engine
+        .rollback_transaction(result["transactionId"].as_str().unwrap())
+        .unwrap();
+    assert_eq!(std::fs::read(game.join("Retired.pak")).unwrap(), b"old");
+    assert!(!game.join("Fresh.pak").exists());
 }
 
 #[tokio::test]

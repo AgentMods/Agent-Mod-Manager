@@ -13,6 +13,31 @@ fn request() -> ResolveRequest {
     resolve("3dm", "1001", "2")
 }
 
+#[test]
+fn project_page_accepts_only_canonical_native_ids() {
+    for id in ["1", "1001", "9007199254740991"] {
+        assert_eq!(
+            crate::sources::three_dm_project_page(id).unwrap(),
+            format!("https://mod.3dmgame.com/mod/{id}")
+        );
+    }
+    for id in [
+        "",
+        "0",
+        "01",
+        "+1",
+        "-1",
+        "1 ",
+        " 1",
+        "１",
+        "1/2",
+        "1?key=x",
+        "9007199254740992",
+    ] {
+        assert_eq!(crate::sources::three_dm_project_page(id), None, "{id:?}");
+    }
+}
+
 fn page(number: u32, ids: &[u64]) -> Step {
     let mut response = value(SEARCH);
     let template = response["data"]["data"][0].clone();
@@ -128,7 +153,7 @@ async fn denied_envelopes_and_echoed_keys_are_isolated_from_other_providers() {
 #[tokio::test]
 async fn invalid_ids_and_unverifiable_filters_never_send_requests() {
     let (p, mock) = provider("3dm", vec![]);
-    for id in ["0", "../1001", "9007199254740992"] {
+    for id in ["0", "01001", "../1001", "9007199254740992"] {
         assert!(p.resolve(&resolve("3dm", id, "2")).await.is_err());
         assert!(p.search(&query("3dm", id)).await.is_err());
     }
@@ -159,9 +184,16 @@ async fn invalid_ids_and_unverifiable_filters_never_send_requests() {
 
 #[tokio::test]
 async fn latest_direct_resource_can_ignore_matching_mirror_without_guessing_integrity() {
-    let (p, mock) = detail(value(DETAIL));
+    let mut body = value(DETAIL);
+    body["data"]["mods_version"] = json!("9.9");
+    body["data"]["mods_original_url"] = json!("https://untrusted.example/download?token=opaque");
+    let (p, mock) = detail(body);
     let result = p.resolve(&request()).await.unwrap();
     assert_eq!(result.status.state, SourceState::Limited);
+    assert_eq!(
+        result.homepage_url.as_deref(),
+        Some("https://mod.3dmgame.com/mod/1001")
+    );
     let file = result.download.unwrap();
     assert_eq!(
         (
@@ -173,12 +205,78 @@ async fn latest_direct_resource_can_ignore_matching_mirror_without_guessing_inte
         ("3dm", "1001", "2001", "2.0")
     );
     assert_eq!(file.filename, "Fixture.zip");
+    assert_eq!(file.homepage_url, result.homepage_url);
     assert!(file.download_url.ends_with("/resource2/202611/fixture.zip"));
     assert_eq!(file.size, None);
     assert_eq!(file.hashes, FileHashes::default());
     assert_eq!(file.warnings.len(), 2);
     assert!(mock.params(0).is_empty());
     mock.assert_finished(1);
+}
+
+#[tokio::test]
+async fn absent_version_falls_back_only_for_latest_with_matching_identity() {
+    let mut body = value(DETAIL);
+    body["data"]["mods_resource"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("mods_resource_version");
+    let (p, mock) = detail(body.clone());
+    let file = p.resolve(&request()).await.unwrap().download.unwrap();
+    assert_eq!(
+        (file.version_id.as_str(), file.version.as_str()),
+        ("2001", "2.0")
+    );
+    mock.assert_finished(1);
+
+    // The fallback doesn't make an explicitly different mirror equivalent.
+    body["data"]["mods_resource"][1]["mods_resource_version"] = json!("2.1");
+    let (p, mock) = detail(body.clone());
+    let result = p.resolve(&request()).await.unwrap();
+    assert_eq!(result.status.state, SourceState::ManualDownload);
+    assert!(result.download.is_none());
+    mock.assert_finished(1);
+
+    body["data"]["mods_resource"][2]["mods_resource_version"] = Value::Null;
+    let (p, mock) = detail(body);
+    let historical = ResolveRequest {
+        version_id: Some("2003".into()),
+        ..request()
+    };
+    assert!(matches!(
+        p.resolve(&historical).await,
+        Err(AppError::Invalid(_))
+    ));
+    mock.assert_finished(1);
+}
+
+#[tokio::test]
+async fn latest_without_valid_version_and_invalid_mirror_are_not_admitted() {
+    for (path, replacement) in [
+        ("/data/mods_version", Value::Null),
+        ("/data/mods_version", json!("2.0\ninvalid")),
+        ("/data/mods_version", json!(128u32)),
+        ("/data/mods_resource/0/mods_resource_version", json!(false)),
+        (
+            "/data/mods_resource/0/mods_resource_version",
+            json!("2.0\ninvalid"),
+        ),
+        ("/data/mods_resource/1/mods_resource_version", json!(" ")),
+        (
+            "/data/mods_resource/1/mods_resource_version",
+            json!("v".repeat(129)),
+        ),
+    ] {
+        let mut body = value(DETAIL);
+        body["data"]["mods_resource"][0]["mods_resource_version"] = Value::Null;
+        *body.pointer_mut(path).unwrap() = replacement;
+        let (p, mock) = detail(body);
+        assert!(
+            matches!(p.resolve(&request()).await, Err(AppError::Invalid(_))),
+            "{path}"
+        );
+        mock.assert_finished(1);
+    }
 }
 
 #[tokio::test]
@@ -272,6 +370,10 @@ async fn inconsistent_project_game_resource_ids_and_unsafe_names_are_rejected() 
         (
             "/data/mods_resource/0/mods_resource_name",
             json!("../Fixture.zip"),
+        ),
+        (
+            "/data/mods_resource/0/mods_resource_name",
+            json!(format!("{}.zip", "x".repeat(177))),
         ),
     ] {
         let mut body = value(DETAIL);

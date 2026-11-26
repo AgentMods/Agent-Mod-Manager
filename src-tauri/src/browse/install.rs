@@ -7,11 +7,11 @@ use crate::{
     db::Db,
     error::{AppError, AppResult},
     history::History,
-    util,
+    mod_library, util,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use std::{borrow::Cow, sync::Mutex};
+use std::{borrow::Cow, collections::BTreeSet, sync::Mutex};
 use tauri::{Runtime, State, WebviewWindow};
 
 mod scope;
@@ -24,7 +24,8 @@ pub(crate) use scope::InstallScope;
 static START: Mutex<()> = Mutex::new(());
 
 pub(crate) fn init(db: &Db) -> AppResult<()> {
-    db.conn().execute_batch(
+    let conn = db.conn();
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS browse_install_tasks (
            id TEXT PRIMARY KEY,
            conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -44,11 +45,18 @@ pub(crate) fn init(db: &Db) -> AppResult<()> {
            artifact_id TEXT NOT NULL,
            file_id TEXT NOT NULL,
            sha256 TEXT NOT NULL,
+           version TEXT,
            PRIMARY KEY(task_id,artifact_id)
          );
+         CREATE INDEX IF NOT EXISTS idx_browse_install_download_archive
+           ON browse_install_downloads(artifact_id,sha256);
          CREATE TABLE IF NOT EXISTS browse_install_titles (
            task_id TEXT PRIMARY KEY REFERENCES browse_install_tasks(id) ON DELETE CASCADE,
            title TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS browse_install_project_pages (
+           task_id TEXT PRIMARY KEY REFERENCES browse_install_tasks(id) ON DELETE CASCADE,
+           project_page TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS browse_install_handles (
            window_label TEXT NOT NULL,
@@ -61,6 +69,17 @@ pub(crate) fn init(db: &Db) -> AppResult<()> {
            PRIMARY KEY(window_label,search_id,item_id,game_id)
          );",
     )?;
+    let has_version = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('browse_install_downloads') WHERE name='version')",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_version {
+        conn.execute(
+            "ALTER TABLE browse_install_downloads ADD COLUMN version TEXT",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -71,8 +90,9 @@ pub(crate) fn conversation_scope(
 ) -> AppResult<Option<InstallScope>> {
     let task = conn
         .query_row(
-            "SELECT id,game_id,source_id,project_id,provider_game_id
-             FROM browse_install_tasks WHERE conversation_id=?1",
+            "SELECT b.id,b.game_id,b.source_id,b.project_id,b.provider_game_id,p.project_page
+             FROM browse_install_tasks b LEFT JOIN browse_install_project_pages p ON p.task_id=b.id
+             WHERE b.conversation_id=?1",
             [conversation],
             |row| {
                 Ok((
@@ -82,6 +102,7 @@ pub(crate) fn conversation_scope(
                         source_id: row.get(2)?,
                         project_id: row.get(3)?,
                         provider_game_id: row.get(4)?,
+                        project_page: row.get(5)?,
                     },
                 ))
             },
@@ -129,12 +150,138 @@ enum TaskStatus {
     Failed,
 }
 
+fn has_table(conn: &Connection, name: &str) -> AppResult<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name=?1)",
+        [name],
+        |row| row.get(0),
+    )?)
+}
+
+/// Recover display metadata only from a stock archive association. Inbox
+/// imports stay local (this is not a DownloadOrigin or update capability).
+pub(crate) fn stock_archive_metadata(
+    conn: &Connection,
+    entry: &mod_library::LibraryEntry,
+) -> AppResult<(Option<String>, Option<String>)> {
+    let Some(game) = entry.game_id.as_deref() else {
+        return Ok((None, None));
+    };
+    let is_digest =
+        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if entry.source_id != "local"
+        || !entry.id.strip_prefix("received-").is_some_and(is_digest)
+        || !is_digest(&entry.sha256)
+        || !has_table(conn, "browse_install_downloads")?
+        || !has_table(conn, "browse_install_tasks")?
+    {
+        return Ok((None, None));
+    }
+
+    // Browse tables are initialized by AgentRuntime, not the core migrations.
+    // Read legacy associations even if the column and page table do not exist.
+    let version_column: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('browse_install_downloads','main') WHERE name='version')",
+        [],
+        |row| row.get(0),
+    )?;
+    let (page, join) = if has_table(conn, "browse_install_project_pages")? {
+        (
+            "p.project_page",
+            "LEFT JOIN main.browse_install_project_pages p ON p.task_id=b.id",
+        )
+    } else {
+        ("NULL", "")
+    };
+    let version = if version_column { "d.version" } else { "NULL" };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT b.source_id,b.project_id,b.provider_game_id,d.file_id,b.conversation_id,{version},{page}
+         FROM main.browse_install_downloads d JOIN main.browse_install_tasks b ON b.id=d.task_id {join}
+         WHERE b.game_id=?1 AND d.artifact_id=?2 AND d.sha256=?3",
+    ))?;
+    let mut rows = stmt.query(params![game, entry.id, entry.sha256])?;
+    let mut identity = None;
+    let mut work = None;
+    let mut conversations = BTreeSet::new();
+    let mut versions = BTreeSet::new();
+    let mut pages = BTreeSet::new();
+    while let Some(row) = rows.next()? {
+        let key = WorkKey {
+            game_id: game.to_owned(),
+            source_id: row.get(0)?,
+            project_id: row.get(1)?,
+            provider_game_id: row.get(2)?,
+            project_page: row.get(6)?,
+        };
+        let file: String = row.get(3)?;
+        if !key.valid_stock_identity(&file) {
+            return Ok((None, None));
+        }
+        let candidate = (
+            key.source_id.clone(),
+            key.origin_project().into_owned(),
+            key.provider_game_id.clone(),
+            file,
+        );
+        if identity.as_ref().is_some_and(|id| id != &candidate) {
+            return Ok((None, None));
+        }
+        identity = Some(candidate);
+        if let Some(page) = key.project_page() {
+            pages.insert(page);
+        }
+        if let Some(label) = row
+            .get::<_, Option<String>>(5)?
+            .as_deref()
+            .and_then(stock::clean_version)
+        {
+            versions.insert(label.to_owned());
+        }
+        conversations.insert(row.get::<_, String>(4)?);
+        work = Some(key);
+    }
+    let (Some(key), Some((_, _, _, file))) = (work, identity) else {
+        return Ok((None, None));
+    };
+    let website = if pages.is_empty() {
+        key.legacy_stock_project_page()
+    } else {
+        unique_value(pages)
+    };
+    let version = if key.source_id == "thunderstore" {
+        Some(file)
+    } else if stock::version_list_tool(&key.source_id).is_none() {
+        None
+    } else {
+        if versions.is_empty() && has_table(conn, "tool_calls")? {
+            for conversation in conversations {
+                match stock::history_file_version(conn, &key, &conversation, &file, None)? {
+                    stock::FileVersionEvidence::Exact(label) => {
+                        versions.insert(label);
+                    }
+                    stock::FileVersionEvidence::Unknown => {}
+                    stock::FileVersionEvidence::Ambiguous => return Ok((None, website)),
+                }
+            }
+        }
+        unique_value(versions)
+    };
+    Ok((version, website))
+}
+
+fn unique_value(values: BTreeSet<String>) -> Option<String> {
+    (values.len() == 1)
+        .then(|| values.into_iter().next())
+        .flatten()
+}
+
 #[derive(Clone)]
 struct WorkKey {
     game_id: String,
     source_id: String,
     project_id: String,
     provider_game_id: String,
+    project_page: Option<String>,
 }
 
 impl From<&TrustedWork> for WorkKey {
@@ -144,11 +291,74 @@ impl From<&TrustedWork> for WorkKey {
             source_id: work.source_id.clone(),
             project_id: work.project_id.clone(),
             provider_game_id: work.provider_game_id.clone(),
+            project_page: work.project_page.clone(),
         }
     }
 }
 
 impl WorkKey {
+    fn project_page(&self) -> Option<String> {
+        super::links::project(
+            &self.source_id,
+            &self.provider_game_id,
+            self.origin_project().as_ref(),
+            self.project_page.as_deref()?,
+        )
+    }
+
+    fn valid_stock_identity(&self, file: &str) -> bool {
+        if self.source_id == "thunderstore" {
+            return self.project_id.split_once('/').is_some_and(|(team, name)| {
+                [team, name, &self.provider_game_id]
+                    .into_iter()
+                    .all(|part| {
+                        !part.contains(['/', '~', ':']) && super::links::valid_provider_id(part)
+                    })
+            }) && stock::valid_version(file);
+        }
+        if stock::download_tool(&self.source_id).is_none() || stock::number(file).is_err() {
+            return false;
+        }
+        let project = self.origin_project();
+        if self.source_id == "nexusmods" {
+            return project.split_once('/').is_some_and(|(game, id)| {
+                game == self.provider_game_id
+                    && !game.contains(['/', '~', ':'])
+                    && super::links::valid_provider_id(game)
+                    && stock::number(id).is_ok()
+            });
+        }
+        stock::number(&project).is_ok() && stock::number(&self.provider_game_id).is_ok()
+    }
+
+    fn legacy_stock_project_page(&self) -> Option<String> {
+        let project = self.origin_project();
+        let page = match self.source_id.as_str() {
+            "gamebanana" => format!(
+                "https://gamebanana.com/mods/{}",
+                stock::number(&project).ok()?
+            ),
+            "nexusmods" => {
+                let (game, id) = project.split_once('/')?;
+                format!(
+                    "https://www.nexusmods.com/{game}/mods/{}",
+                    stock::number(id).ok()?
+                )
+            }
+            "thunderstore" => {
+                let (team, name) = project.split_once('/')?;
+                format!(
+                    "https://thunderstore.io/c/{}/p/{team}/{name}",
+                    self.provider_game_id
+                )
+            }
+            "curseforge" => return crate::sources::known_project_page("curseforge", &project),
+            // A numeric mod.io ID does not encode its work or game slug.
+            _ => return None,
+        };
+        super::links::project(&self.source_id, &self.provider_game_id, &project, &page)
+    }
+
     fn catalog_id(&self) -> Option<&str> {
         match self.source_id.as_str() {
             "glossmod_3dm" => Some("3dm"),
@@ -291,6 +501,8 @@ fn known_work(
                     source_id: row.get(0)?,
                     project_id: row.get(1)?,
                     provider_game_id: row.get(2)?,
+                    // The handle identifies an existing task, not its metadata.
+                    project_page: None,
                 })
             },
         )
@@ -438,6 +650,12 @@ fn start(
         "INSERT INTO browse_install_titles(task_id,title) VALUES(?1,?2)",
         params![id, work.title],
     )?;
+    if let Some(page) = key.project_page() {
+        db.conn().execute(
+            "INSERT INTO browse_install_project_pages(task_id,project_page) VALUES(?1,?2)",
+            params![id, page],
+        )?;
+    }
     let scope = InstallScope::new(id, key.clone(), game);
     let request = TurnRequest {
         conversation_id: conversation.id.clone(),

@@ -126,6 +126,120 @@ async fn download_cannot_swap_resolutions_after_preview() {
         .is_empty());
 }
 
+#[tokio::test]
+async fn three_dm_mcp_download_hands_approved_metadata_to_the_library_or_legacy_receipt() {
+    use crate::{
+        artifacts, mod_library,
+        sources::{FileHashes, ResolveResult, SourceState, SourceStatus},
+    };
+    use sha2::{Digest, Sha256, Sha512};
+
+    let (_dir, settings, mut context, _) = fixture();
+    context.resolution_scope = ResolutionScope::Mcp("fixture".into());
+    let resolutions = Resolutions::default();
+    let tool = SourceTool {
+        name: "download_mod".into(),
+        settings,
+        resolutions: resolutions.clone(),
+    };
+    let homepage = "https://mod.3dmgame.com/mod/1001";
+    let cache = context.engine.paths.downloads().join("0".repeat(64));
+    std::fs::create_dir(&cache).unwrap();
+    let bytes = b"fixture transport bytes";
+    for classify in [true, false] {
+        let resolved = ResolvedMod {
+            source_id: "3dm".into(),
+            project_id: "1001".into(),
+            version_id: "2003".into(),
+            name: "Fixture Mod".into(),
+            version: "1.0".into(),
+            filename: "fixture.zip".into(),
+            download_url: "https://dmod.3dmgame.com/static/upload/resource/fixture.zip".into(),
+            size: None,
+            hashes: FileHashes::default(),
+            homepage_url: Some(homepage.into()),
+            warnings: Vec::new(),
+        };
+        let id = resolutions
+            .publish(
+                context.resolution_scope.clone(),
+                ResolveResult {
+                    status: SourceStatus::new("3dm", SourceState::Limited, ""),
+                    homepage_url: resolved.homepage_url.clone(),
+                    download: Some(resolved),
+                    dependencies: None,
+                },
+            )
+            .unwrap()
+            .download
+            .unwrap()
+            .resolution_id;
+        let mut args = json!({"resolution_id":id});
+        if classify {
+            args["gameId"] = json!("g");
+        }
+        let (approved_id, classification, preview) =
+            tool.download_request(&context, &args).unwrap();
+        assert_eq!(preview["homepage_url"], homepage);
+        assert_eq!(preview["version"], "1.0");
+        assert_eq!(preview["version_id"], "2003");
+        assert!(preview.get("download_url").is_none());
+        for (field, value) in [
+            ("projectPage", "https://example.org/wrong"),
+            ("version", "wrong"),
+        ] {
+            let mut tampered = args.clone();
+            tampered[field] = json!(value);
+            assert!(tool.download_request(&context, &tampered).is_err());
+        }
+        let resolved = resolutions
+            .take(&context.resolution_scope, approved_id)
+            .unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let path = cache.join(format!("{id}-{}", resolved.filename));
+        std::fs::write(&path, bytes).unwrap();
+        let artifact = DownloadArtifact {
+            id: id.clone(),
+            path,
+            filename: resolved.filename.clone(),
+            size: bytes.len() as u64,
+            sha256: hex::encode(Sha256::digest(bytes)),
+            sha512: hex::encode(Sha512::digest(bytes)),
+            integrity_verified: false,
+            requires_review: true,
+            auto_install_allowed: false,
+            warnings: Vec::new(),
+        };
+        let completed = complete_catalog_download(&context, classification, artifact, &resolved)
+            .await
+            .unwrap();
+        let record = artifacts::for_id(&context.engine.db, &id).unwrap().unwrap();
+        assert_eq!(record.project_page.as_deref(), Some(homepage));
+        assert_eq!(
+            (record.version_id.as_str(), record.version.as_str()),
+            ("2003", "1.0")
+        );
+        assert_eq!(record.native_library_intent().is_some(), classify);
+        if classify {
+            assert_eq!(completed["projectPage"], homepage);
+            let entries = mod_library::list_for_game(&context.engine.db, "g").unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].version, "1.0");
+            assert_eq!(entries[0].version_id.as_deref(), Some("2003"));
+            assert_eq!(entries[0].project_page.as_deref(), Some(homepage));
+        } else {
+            assert_eq!(completed["id"], id);
+            assert!(completed.get("projectPage").is_none());
+            assert_eq!(
+                mod_library::list_for_game(&context.engine.db, "g")
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+}
+
 #[test]
 fn source_keys_reload_and_never_borrow_mcp_credentials() {
     use crate::sources::SourceState;

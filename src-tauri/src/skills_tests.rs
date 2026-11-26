@@ -1,5 +1,6 @@
 use super::*;
 use crate::storage::AppPaths;
+use std::{sync::mpsc, thread, time::Duration};
 
 const NAME: &str = "load-order-notes";
 struct Fixture {
@@ -52,6 +53,26 @@ fn apply(engine: &FileEngine, plan: &FilePlan) {
     engine.approve_plan(&plan.id).unwrap();
     engine.apply_file_ops(&plan.id).unwrap();
 }
+
+/// Run a Skill read while both global mutation locks are held by this thread.
+/// A broken implementation may wait on either lock, so bound the wait and
+/// release both locks before allowing that worker to finish.
+fn while_skill_mutation_locks_held<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let skills = lock();
+    let files = crate::transaction::write_lock();
+    let (send, receive) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        let _ = send.send(f());
+    });
+
+    let result = receive.recv_timeout(Duration::from_secs(2));
+    drop(files);
+    drop(skills);
+    let value = result.expect("Skill operation did not return while both mutation locks were held");
+    worker.join().expect("Skill lock probe worker panicked");
+    value
+}
+
 fn write(path: &Path, content: impl AsRef<[u8]>) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, content).unwrap();
@@ -107,6 +128,68 @@ fn game_package_skill_is_readable_but_cannot_be_taken_over_and_tampering_is_dete
     assert!(set_enabled(&f.engine, NAME, true).is_err());
     assert!(!set_enabled(&f.engine, NAME, false).unwrap().enabled);
     assert_eq!(f.count("skills_deployments"), 0);
+}
+
+#[test]
+fn settings_skill_listing_and_system_skill_access_do_not_wait_on_mutation_locks() {
+    const SYSTEM_NAME: &str = "system-mod-uninstall";
+
+    let f = Fixture::new();
+    let installed = f.install("settings-list-lock-probe");
+    set_enabled(&f.engine, NAME, false).unwrap();
+
+    let engine = f.engine.clone();
+    let listed = while_skill_mutation_locks_held(move || list_settings_skills(&engine));
+    let listed = listed.expect("settings Skill listing failed");
+    let system = listed
+        .iter()
+        .find(|skill| skill.name == SYSTEM_NAME)
+        .expect("embedded Skill missing from settings list");
+    assert_eq!(system.kind, SkillKind::System);
+    let manual = listed
+        .iter()
+        .find(|skill| skill.name == NAME)
+        .expect("installed manual Skill missing from settings list");
+    assert_eq!(manual.kind, SkillKind::Standalone);
+    assert!(manual.valid);
+    assert!(
+        !manual.enabled,
+        "disabled state should be listed as disabled"
+    );
+
+    set_enabled(&f.engine, NAME, true).unwrap();
+    write(
+        &installed.location,
+        markdown(NAME, "tampered-settings-list-lock-probe"),
+    );
+    let engine = f.engine.clone();
+    let listed = while_skill_mutation_locks_held(move || list_settings_skills(&engine))
+        .expect("settings Skill listing failed after tampering");
+    let manual = listed
+        .iter()
+        .find(|skill| skill.name == NAME)
+        .expect("tampered manual Skill should remain visible in settings");
+    assert!(!manual.valid, "tampered manual Skill must be unavailable");
+    assert!(
+        !manual.enabled,
+        "tampered Skill must be listed as unavailable"
+    );
+    assert!(
+        f.flag(),
+        "listing a tampered Skill must preserve enabled preference"
+    );
+
+    let engine = f.engine.clone();
+    let (detail, disabled) = while_skill_mutation_locks_held(move || {
+        let detail = get_skill(&engine, SYSTEM_NAME)?;
+        let disabled = set_enabled(&engine, SYSTEM_NAME, false)?;
+        Ok::<_, AppError>((detail, disabled))
+    })
+    .expect("embedded Skill operations failed");
+    assert_eq!(detail.skill.kind, SkillKind::System);
+    assert!(detail.skill.valid);
+    assert!(!detail.markdown.is_empty());
+    assert!(!disabled.enabled);
 }
 
 fn assert_effective_plugin_skill_preference(f: &Fixture, name: &str, preference: bool) {

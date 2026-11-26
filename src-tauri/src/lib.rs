@@ -10,8 +10,6 @@ pub mod artifacts;
 pub(crate) mod browse;
 pub mod commands;
 mod dashboard;
-#[cfg(not(test))]
-mod dashboard_sponsors;
 pub mod db;
 pub mod diagnostics;
 pub mod download;
@@ -39,6 +37,7 @@ pub mod mcp_server;
 pub mod mod_language;
 pub mod mod_library;
 mod mod_management;
+mod mod_metadata;
 pub mod mod_organization;
 mod mod_organization_fallback;
 mod mod_organization_jobs;
@@ -119,6 +118,8 @@ pub fn run() {
             commands::register_imported_mod,
             commands::list_mod_library,
             commands::remove_managed_mod,
+            commands::update_mod_metadata,
+            commands::open_mod_storage_directory,
             commands::bind_mod_library_entry,
             commands::preview_fomod,
             commands::set_plugin_enabled,
@@ -158,7 +159,6 @@ pub fn run() {
             commands::restore_snapshot,
             commands::list_games,
             commands::get_dashboard_stats,
-            dashboard_sponsors::list_dashboard_sponsors,
             commands::get_game,
             commands::update_game,
             commands::set_game_adapter,

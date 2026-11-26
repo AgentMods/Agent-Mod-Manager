@@ -1,6 +1,6 @@
 mod tool_definitions;
 
-use super::{stock, three_dm, verified_install, GameScope, WorkKey};
+use super::{stock, stock_archive_metadata, three_dm, verified_install, GameScope, WorkKey};
 use crate::{
     agent::{
         policy::Effect,
@@ -9,7 +9,8 @@ use crate::{
     artifacts::DownloadOrigin,
     db::Db,
     error::{AppError, AppResult},
-    sources::resolutions::Resolutions,
+    mod_library,
+    sources::resolutions::{ResolutionScope, Resolutions},
 };
 use rusqlite::params;
 use serde_json::{json, Value};
@@ -145,7 +146,7 @@ impl InstallScope {
         let namespaced = crate::mcp::client::namespaced_tool_name(&self.key.source_id, remote);
         let connection = db.conn();
         let mut stmt = connection.prepare(
-            "SELECT t.arguments_json, t.result_json, t.status
+            "SELECT t.arguments_json, t.result_json, t.status, b.conversation_id, t.rowid
              FROM browse_install_tasks b JOIN tool_calls t ON t.conversation_id=b.conversation_id
              WHERE b.game_id=?1 AND b.source_id=?2 AND b.provider_game_id=?3
                AND CASE WHEN b.source_id='nexusmods' AND instr(b.project_id,'/')=0
@@ -176,7 +177,22 @@ impl InstallScope {
         let Ok(value) = serde_json::from_str::<Value>(&raw_result) else {
             return Ok(None);
         };
-        Ok(stock::StockReceipt::from_saved(&self.key, &args, &value))
+        let Some(mut receipt) = stock::StockReceipt::from_saved(&self.key, &args, &value) else {
+            return Ok(None);
+        };
+        if receipt.version.is_none() && stock::version_list_tool(&self.key.source_id).is_some() {
+            let conversation = row.get::<_, String>(3)?;
+            let download_rowid = row.get(4)?;
+            receipt.version = stock::history_file_version(
+                &connection,
+                &self.key,
+                &conversation,
+                &receipt.file_id,
+                Some(download_rowid),
+            )?
+            .exact();
+        }
+        Ok(Some(receipt))
     }
 
     fn pending_receipt(&self, db: &Db) -> AppResult<stock::StockReceipt> {
@@ -194,14 +210,17 @@ impl InstallScope {
         }) {
             return Ok(false);
         }
-        let changed = db.conn().execute(
-            "INSERT INTO browse_install_downloads(task_id,artifact_id,file_id,sha256)
-             SELECT b.id,l.id,?3,l.sha256 FROM mod_library_entries l
+        let mut conn = db.conn();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
+            "INSERT INTO browse_install_downloads(task_id,artifact_id,file_id,sha256,version)
+             SELECT b.id,l.id,?3,l.sha256,?11 FROM mod_library_entries l
              JOIN browse_install_tasks b ON b.id=?1 AND b.game_id=l.game_id
              WHERE l.id=?2 AND l.sha256=?4 AND l.filename=?5 AND l.size=?6
                AND l.state='ready' AND l.source_id='local'
                AND b.game_id=?7 AND b.source_id=?8 AND b.project_id=?9 AND b.provider_game_id=?10
-             ON CONFLICT(task_id,artifact_id) DO UPDATE SET file_id=excluded.file_id
+             ON CONFLICT(task_id,artifact_id) DO UPDATE SET version=
+               COALESCE(browse_install_downloads.version,excluded.version)
                WHERE browse_install_downloads.sha256=excluded.sha256
                  AND browse_install_downloads.file_id=excluded.file_id",
             params![
@@ -214,9 +233,23 @@ impl InstallScope {
                 self.key.game_id,
                 self.key.source_id,
                 self.key.project_id,
-                self.key.provider_game_id
+                self.key.provider_game_id,
+                receipt.version,
             ],
         )?;
+        if changed == 1 {
+            let (version, website) = stock_archive_metadata(&tx, &stock_entry(&tx, id)?)?;
+            // Keep the local archive identity. Exact provider labels supersede
+            // filename-derived versions, not the archive's source identity.
+            if version.is_some() || website.is_some() {
+                tx.execute(
+                    "UPDATE mod_library_entries SET version=COALESCE(?2,version),
+                      project_page=COALESCE(project_page,?3) WHERE id=?1",
+                    params![id, version, website],
+                )?;
+            }
+        }
+        tx.commit()?;
         Ok(changed == 1)
     }
 
@@ -251,7 +284,12 @@ impl InstallScope {
                 bind(&mut args, "game_id", json!(self.key.provider_game_id))?;
             }
             "download_mod" | "retry_mod_library_download" => {
-                bind_classification(&mut args, game)?;
+                let page = if name == "download_mod" {
+                    self.key.project_page()
+                } else {
+                    None
+                };
+                bind_classification(&mut args, game, page)?;
                 if name == "retry_mod_library_download"
                     && !self
                         .artifact_matches(db, args["artifactId"].as_str().ok_or_else(boundary)?)?
@@ -311,7 +349,7 @@ impl InstallScope {
                     .map_err(|_| boundary())?;
                 bind(&mut args, "work_id", json!(work))?;
                 if kind == Some(MOD_INN_DOWNLOAD) {
-                    bind_classification(&mut args, game)?;
+                    bind_classification(&mut args, game, self.key.project_page())?;
                 } else if args.as_object().is_none_or(|obj| obj.len() != 1) {
                     // Do not relay model-controlled URL, file paths, headers, or other fields.
                     return Err(boundary());
@@ -382,9 +420,7 @@ impl InstallScope {
             "file_received_mod"
                 if prepared.effect != Effect::UncatalogedDownload
                     || prepared.plan.is_some()
-                    || !self
-                        .pending_receipt(db)?
-                        .matches_preview(&self.key.game_id, view) =>
+                    || !self.pending_receipt(db)?.matches_preview(&self.key, view) =>
             {
                 return Err(boundary());
             }
@@ -443,7 +479,7 @@ impl InstallScope {
         context: &ToolContext,
         invocation: (&str, Option<(&str, &str)>),
         args: &Value,
-        value: Value,
+        mut value: Value,
     ) -> AppResult<Value> {
         let db = &context.engine.db;
         let (name, stock) = invocation;
@@ -451,8 +487,29 @@ impl InstallScope {
             if source == self.key.source_id && stock::permits(source, remote) {
                 self.check_game(db)?;
                 if stock::downloading(remote) {
-                    let receipt =
+                    let mut receipt =
                         stock::transfer_receipt(&self.key, args, &value, context, registry).await?;
+                    if receipt.version.is_none()
+                        && stock::version_list_tool(&self.key.source_id).is_some()
+                    {
+                        if let ResolutionScope::Agent(conversation) = &context.resolution_scope {
+                            let conn = db.conn();
+                            let bound: bool = conn.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM browse_install_tasks WHERE id=?1 AND conversation_id=?2)",
+                                params![self.id, conversation], |row| row.get(0),
+                            )?;
+                            if bound {
+                                receipt.version = stock::history_file_version(
+                                    &conn,
+                                    &self.key,
+                                    conversation,
+                                    &receipt.file_id,
+                                    None,
+                                )?
+                                .exact();
+                            }
+                        }
+                    }
                     let payload = receipt.saved(&self.key);
                     *self.receipt.lock().unwrap_or_else(|e| e.into_inner()) = Some(receipt);
                     return Ok(payload);
@@ -483,6 +540,10 @@ impl InstallScope {
             if !self.record_stock_archive(db, id, &receipt)? {
                 return Err(boundary());
             }
+            // The inbox result predates the stock link. Return the actual library metadata.
+            let entry = stock_entry(&db.conn(), id)?;
+            value["version"] = json!(crate::mod_metadata::display_version(&entry.version));
+            value["projectPage"] = json!(entry.project_page);
             *self.receipt.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         if name == "list_mod_library" {
@@ -517,11 +578,29 @@ pub(super) fn bind(args: &mut Value, key: &str, expected: Value) -> AppResult<()
     Ok(())
 }
 
-fn bind_classification(args: &mut Value, game: Value) -> AppResult<()> {
+fn stock_entry(conn: &rusqlite::Connection, id: &str) -> AppResult<mod_library::LibraryEntry> {
+    Ok(conn.query_row(
+        &format!(
+            "SELECT {} FROM mod_library_entries WHERE id=?1 AND state='ready'",
+            mod_library::COLUMNS
+        ),
+        [id],
+        mod_library::read_entry,
+    )?)
+}
+
+fn bind_classification(
+    args: &mut Value,
+    game: Value,
+    project_page: Option<String>,
+) -> AppResult<()> {
     let obj = args.as_object_mut().ok_or_else(boundary)?;
     // Never persist a model-authored page/author as evidence of the identity.
     for key in ["gameName", "author", "projectPage"] {
         obj.remove(key);
+    }
+    if let Some(page) = project_page {
+        obj.insert("projectPage".into(), json!(page));
     }
     bind(args, "gameId", game)
 }

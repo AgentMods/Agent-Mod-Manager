@@ -88,7 +88,7 @@ async function openChat(page: Page, replayOnly: boolean) {
       };
     }, { once: true });
   }, { kept, replaced, newStart, newDelta, newDone, conversationId, otherTitle, replayOnly });
-  await page.goto("/");
+  await page.goto("/#/agent");
   await page.getByRole("button", { name: title, exact: true }).click();
   await expect(page.getByText("原始用户请求", { exact: true })).toBeVisible();
 }

@@ -384,6 +384,17 @@ fn cannot_open_another_work_or_non_project_link_or_expose_cover_tokens() {
         .as_deref(),
         Some("https://mod.3dmgame.com/mod/42")
     );
+    for (id, page) in [
+        ("42", "https://mod.3dmgame.com/mod/43"),
+        ("042", "https://mod.3dmgame.com/mod/042"),
+        ("42", "https://mod.3dmgame.com/mod/42?token=secret"),
+        (
+            "42",
+            "https://dmod.3dmgame.com/static/upload/resource/42.zip",
+        ),
+    ] {
+        assert!(project("glossmod_3dm", "game", id, page).is_none());
+    }
     for malicious in [
         "http://www.nexusmods.com/example/mods/42",
         "https://evil.example/example/mods/42",

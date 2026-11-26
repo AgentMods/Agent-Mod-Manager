@@ -868,37 +868,38 @@ pub async fn open_game_location(
     blocking(state.engine.clone(), move |e| {
         let _guard = crate::transaction::write_lock();
         let directory = crate::game_actions::resolve_location(&e, &id, &target)?;
-        #[cfg(target_os = "macos")]
-        if directory
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
-        {
-            // Launch Services opens an .app as a program. Reveal it in Finder instead.
-            return app
-                .opener()
-                .reveal_item_in_dir(&directory)
-                .map_err(|error| {
-                    AppError::Presented(crate::error::NativeMessage::new(
-                        "game.open_folder_failed",
-                        [("detail", error.to_string())],
-                    ))
-                });
-        }
-        let directory = user_path(&directory)
-            .into_owned()
-            .into_os_string()
-            .into_string()
-            .map_err(|_| AppError::Invalid("目录路径包含无法表示的字符".into()))?;
-        app.opener()
-            .open_path(directory, None::<&str>)
-            .map_err(|error| {
-                AppError::Presented(crate::error::NativeMessage::new(
-                    "game.open_folder_failed",
-                    [("detail", error.to_string())],
-                ))
-            })
+        open_directory(&app, &directory)
     })
     .await
+}
+
+fn open_directory(app: &AppHandle, directory: &std::path::Path) -> AppResult<()> {
+    #[cfg(target_os = "macos")]
+    if directory
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+    {
+        // Launch Services opens an .app as a program. Reveal it in Finder instead.
+        return app.opener().reveal_item_in_dir(directory).map_err(|error| {
+            AppError::Presented(crate::error::NativeMessage::new(
+                "game.open_folder_failed",
+                [("detail", error.to_string())],
+            ))
+        });
+    }
+    let directory = user_path(directory)
+        .into_owned()
+        .into_os_string()
+        .into_string()
+        .map_err(|_| AppError::Invalid("目录路径包含无法表示的字符".into()))?;
+    app.opener()
+        .open_path(directory, None::<&str>)
+        .map_err(|error| {
+            AppError::Presented(crate::error::NativeMessage::new(
+                "game.open_folder_failed",
+                [("detail", error.to_string())],
+            ))
+        })
 }
 
 #[tauri::command]
@@ -1289,9 +1290,14 @@ pub async fn publish_manager_publication(
 #[tauri::command]
 pub async fn list_skills(
     state: State<'_, AppServices>,
+    settings_only: Option<bool>,
 ) -> AppResult<Vec<crate::skills::SkillInfo>> {
-    blocking(state.engine.clone(), |engine| {
-        crate::skills::list_skills(&engine)
+    blocking(state.engine.clone(), move |engine| {
+        if settings_only == Some(true) {
+            crate::skills::list_settings_skills(&engine)
+        } else {
+            crate::skills::list_skills(&engine)
+        }
     })
     .await
 }
@@ -1381,9 +1387,38 @@ pub async fn remove_managed_mod(
 pub async fn list_mod_library(
     state: State<'_, AppServices>,
     game_id: String,
-) -> AppResult<Vec<crate::mod_library::LibraryEntry>> {
+) -> AppResult<Vec<crate::mod_metadata::ArchiveDisplay>> {
     blocking(state.engine.clone(), move |engine| {
-        crate::mod_library::list_for_game(&engine.db, &game_id)
+        let entries = crate::mod_library::list_for_game(&engine.db, &game_id)?;
+        crate::mod_metadata::archive_display(&engine.db, &game_id, entries)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn update_mod_metadata(
+    state: State<'_, AppServices>,
+    game_id: String,
+    target: crate::mod_metadata::Target,
+    patch: crate::mod_metadata::Patch,
+) -> AppResult<()> {
+    blocking(state.engine.clone(), move |engine| {
+        crate::mod_metadata::update(&engine, &game_id, &target, patch)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn open_mod_storage_directory(
+    app: AppHandle,
+    state: State<'_, AppServices>,
+    game_id: String,
+    target: crate::mod_metadata::Target,
+) -> AppResult<()> {
+    blocking(state.engine.clone(), move |engine| {
+        let _guard = crate::transaction::write_lock();
+        let directory = crate::mod_metadata::resolve_storage_directory(&engine, &game_id, &target)?;
+        open_directory(&app, &directory)
     })
     .await
 }

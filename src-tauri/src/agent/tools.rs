@@ -179,6 +179,7 @@ impl ToolRegistry {
         let registry = Self::default();
         for name in [
             "scan_games",
+            "get_storage_directory",
             "read_dir",
             "read_file",
             "extract_preview",
@@ -237,6 +238,11 @@ fn preview_archive(
         )));
     }
     let path = engine.resolve_file_path(&request.path)?;
+    if std::fs::metadata(&path)?.is_dir() {
+        return Err(AppError::Invalid(
+            "此路径是目录，请使用 read_dir 列出目录内容。".into(),
+        ));
+    }
     let mut listing = crate::archive::list_archive_cancellable(&path, cancel)?;
     if request.offset.is_none() && request.limit.is_none() {
         return Ok(json!(listing));
@@ -268,6 +274,11 @@ impl Builtin {
                 schema(json!({"options":{"type":"object"}}), &[]),
                 Effect::Read,
             ),
+            "get_storage_directory" => (
+                "只读查询当前运行的管理器存储目录，返回绝对路径 path。登记的游戏目录请用 list_games 查询。不会授予额外文件访问权限。",
+                schema(json!({}), &[]),
+                Effect::Read,
+            ),
             "read_dir" => (
                 if local { "列出指定目录的直接子项，无需先登记游戏目录。仅传 path 且目录能一次读完时返回条目数组；有后续条目或显式传 offset/limit 时返回目录页，按 next_offset 继续。页按名称排序；多页间目录变动时请重新开始。" } else { "列出受管理目录的直接子项" },
                 if local {
@@ -297,8 +308,11 @@ impl Builtin {
                 Effect::Read,
             ),
             "extract_preview" => (
-                "只读检查归档并列出内部条目；RAR 仅支持非加密单卷。分析 Mod 样本时传 limit 分页，按 next_offset 继续；省略分页参数返回完整目录。",
-                schema(json!({"path":string,"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":MAX_ARCHIVE_PAGE}}), &["path"]),
+                "只读检查归档文件并列出内部条目；path 必须是归档文件路径，不能是文件夹。如果 path 指向文件夹，请改用 read_dir 列出内容。RAR 仅支持非加密单卷。分析 Mod 样本时传 limit 分页，按 next_offset 继续；省略分页参数返回完整目录。",
+                schema(
+                    json!({"path":string,"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":MAX_ARCHIVE_PAGE}}),
+                    &["path"],
+                ),
                 Effect::Read,
             ),
             "preview_fomod" => (
@@ -479,6 +493,15 @@ impl AgentTool for Builtin {
                     &page_scope,
                     &cancel,
                 )?)),
+                "get_storage_directory" => {
+                    if !args.as_object().is_some_and(|args| args.is_empty()) {
+                        return Err(AppError::Invalid("存储目录查询不接受参数".into()));
+                    }
+                    // Use the live engine, not a pending location that needs a restart.
+                    let paths = &engine.paths;
+                    paths.stable_directory(&paths.root)?;
+                    Ok(json!({"path": crate::paths::display_path(&paths.root)}))
+                }
                 "read_dir" if local_agent => {
                     let request: filesystem::AgentDirectoryRequest = serde_json::from_value(args)
                         .map_err(|error| AppError::Invalid(format!("目录读取参数无效: {error}")))?;

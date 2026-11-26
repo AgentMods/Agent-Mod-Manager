@@ -7,6 +7,8 @@ interface AgentState {
   streams: Record<string, AgentEvent[]>;
   // Turn status, approvals and tool traces don't change with each text delta.
   milestones: Record<string, AgentEvent[]>;
+  // First visible text of a message and the final outcome of a watched turn.
+  replyActivity: Record<string, AgentEvent>;
   merge: (events: AgentEvent[]) => void;
 }
 
@@ -91,6 +93,7 @@ function dropInterval(events: AgentEvent[], through: number, start: number) {
 export const useAgent = create<AgentState>((set) => ({
   streams: {},
   milestones: {},
+  replyActivity: {},
   merge: (events) => set((state) => {
     const groups = new Map<string, Map<number, AgentEvent>>();
     for (const event of events) {
@@ -101,6 +104,7 @@ export const useAgent = create<AgentState>((set) => ({
     }
     let streams: AgentState["streams"] | undefined;
     let milestones = state.milestones;
+    let replyActivity = state.replyActivity;
     for (const [id, group] of groups) {
       let additions = [...group.values()].sort((a, b) => a.seq - b.seq);
       const cached = state.streams[id] ?? [];
@@ -143,8 +147,26 @@ export const useAgent = create<AgentState>((set) => ({
           }
         }
       }
+      // Cold replay also loads finished chats. Only watched turns can announce new replies.
+      let reply: AgentEvent | undefined = replyActivity[id];
+      if (reply && previous !== cached && ranges && isDiscarded(ranges, reply.seq)) reply = undefined;
+      if (watched.has(id)) {
+        const turnId = watched.get(id) ?? latestTurnStart(mergedMilestones)?.turnId;
+        for (const event of additions) {
+          if (event.turnId !== turnId || event.seq <= (reply?.seq ?? 0)) continue;
+          const newMessage = event.kind === "delta" && typeof event.payload.content === "string" && event.payload.content.length > 0
+            && (reply?.turnId !== turnId || reply?.messageId !== event.messageId);
+          const finished = event.kind === "done" && (event.payload.status === "done" || event.payload.status === "error");
+          if (newMessage || finished) reply = event;
+        }
+      }
+      if (reply !== replyActivity[id]) {
+        if (replyActivity === state.replyActivity) replyActivity = { ...replyActivity };
+        if (reply) replyActivity[id] = reply;
+        else delete replyActivity[id];
+      }
     }
-    return streams ? { streams, milestones } : state;
+    return streams ? { streams, milestones, replyActivity } : state;
   }),
 }));
 

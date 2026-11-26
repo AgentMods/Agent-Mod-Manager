@@ -180,6 +180,12 @@ const templates: Record<string, Template> = {
     "pt-BR": ["{value1} plugin instalado", "{value1} plugins instalados"], it: ["{value1} plugin installato", "{value1} plugin installati"],
     ru: ["{value1} установленный плагин", "{value1} установленных плагина", "{value1} установленных плагинов", "{value1} установленного плагина"],
   }),
+  "{length} 个插件": countBy("length", {
+    en: ["{length} plugin", "{length} plugins"], de: ["{length} Plugin", "{length} Plugins"],
+    fr: ["{length} extension", "{length} extensions"], es: ["{length} complemento", "{length} complementos"],
+    "pt-BR": ["{length} plugin", "{length} plugins"], it: "{length} plugin",
+    ru: ["{length} плагин", "{length} плагина", "{length} плагинов"],
+  }),
   "草稿 {value1}": countBy("value1", {
     en: ["{value1} draft", "{value1} drafts"], de: ["{value1} Entwurf", "{value1} Entwürfe"],
     fr: ["{value1} brouillon", "{value1} brouillons"], es: ["{value1} borrador", "{value1} borradores"],

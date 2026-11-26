@@ -140,23 +140,27 @@ fn record_resolved(
 }
 
 /// These IDs come from the approved call to the official Mod Inn MCP endpoint.
+/// `version` is an optional attachment label, never the file ID.
 pub(crate) fn record_glossmod_file_with_library_intent(
     engine: &FileEngine,
     artifact: &DownloadArtifact,
     work_id: u64,
     file_id: u64,
+    version: Option<&str>,
     intent: &NativeDownloadIntent,
 ) -> AppResult<()> {
+    let project_id = work_id.to_string();
+    let project_page = crate::sources::known_project_page("glossmod_http", &project_id);
     record_with_metadata(
         engine,
         artifact,
         CatalogMetadata {
             source_id: "glossmod_http",
-            project_id: &work_id.to_string(),
+            project_id: &project_id,
             version_id: &file_id.to_string(),
             name: &artifact.filename,
-            version: "",
-            project_page: None,
+            version: version.unwrap_or_default(),
+            project_page: project_page.as_deref(),
             native_library_intent: Some(intent),
         },
     )
@@ -291,6 +295,33 @@ pub(crate) fn public_project_page(raw: &str) -> Option<String> {
     (url.as_str().len() <= 2048).then(|| url.into())
 }
 
+/// Keep a validated public page (including community/game-specific routes). Only
+/// reconstruct a missing page for a provider with an unambiguous project identity.
+pub(crate) fn catalog_project_page(
+    source_id: &str,
+    project_id: Option<&str>,
+    recorded: Option<&str>,
+) -> Option<String> {
+    recorded
+        .and_then(public_project_page)
+        .or_else(|| project_id.and_then(|id| crate::sources::known_project_page(source_id, id)))
+}
+
+fn receipt_project_page(
+    source: &str,
+    project: &str,
+    page: Option<&str>,
+    intent: Option<&NativeDownloadIntent>,
+) -> Option<String> {
+    page.and_then(public_project_page).or_else(|| {
+        catalog_project_page(
+            source,
+            Some(project),
+            intent.and_then(|intent| intent.project_page.as_deref()),
+        )
+    })
+}
+
 pub(crate) fn explicit_project_page(raw: &str) -> AppResult<String> {
     project_page_url(raw)
         .filter(|url| url.query().is_none() && url.as_str().len() <= 2048)
@@ -329,7 +360,7 @@ fn record_with_metadata(
             artifact.filename,
             serde_json::to_string(&CatalogArtifact {
                 artifact: artifact.clone(),
-                project_page: metadata.project_page.and_then(public_project_page),
+                project_page: receipt_project_page(metadata.source_id, metadata.project_id, metadata.project_page, native_library_intent.as_ref()),
                 transport_path: None,
                 native_library_intent: native_library_intent.clone(),
             })?,
@@ -383,15 +414,23 @@ fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ArtifactRecord> {
     } = serde_json::from_str(&value).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })?;
+    let source_id: String = row.get(1)?;
+    let project_id: String = row.get(2)?;
+    let project_page = receipt_project_page(
+        &source_id,
+        &project_id,
+        project_page.as_deref(),
+        native_library_intent.as_ref(),
+    );
     Ok(ArtifactRecord {
         artifact,
-        source_id: row.get(1)?,
-        project_id: row.get(2)?,
+        source_id,
+        project_id,
         version_id: row.get(3)?,
         name: row.get(4)?,
         version: row.get(5)?,
         created_at: row.get(6)?,
-        project_page: project_page.as_deref().and_then(public_project_page),
+        project_page,
         transport_path,
         native_library_intent,
     })
@@ -407,7 +446,14 @@ pub fn for_path(db: &Db, path: &Path) -> AppResult<Option<ArtifactRecord>> {
 }
 
 pub(crate) fn for_id(db: &Db, id: &str) -> AppResult<Option<ArtifactRecord>> {
-    Ok(db.conn().query_row("SELECT artifact_json,source_id,project_id,version_id,name,version,created_at FROM download_artifacts WHERE id=?1", [id], from_row).optional()?)
+    by_id_from(&db.conn(), id)
+}
+
+pub(crate) fn by_id_from(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> AppResult<Option<ArtifactRecord>> {
+    Ok(conn.query_row("SELECT artifact_json,source_id,project_id,version_id,name,version,created_at FROM download_artifacts WHERE id=?1", [id], from_row).optional()?)
 }
 
 /// Bind a supplied catalog entry back to the current database by both keys.

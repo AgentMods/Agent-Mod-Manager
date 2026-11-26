@@ -174,6 +174,7 @@ pub(crate) enum CompletedSource<'a> {
     ModInn {
         work_id: u64,
         file_id: u64,
+        version: Option<&'a str>,
         url: &'a str,
     },
 }
@@ -239,12 +240,14 @@ impl DownloadTarget {
             CompletedSource::ModInn {
                 work_id,
                 file_id,
+                version,
                 url,
             } => artifacts::record_glossmod_file_with_library_intent(
                 engine,
                 &artifact,
                 work_id,
                 file_id,
+                version,
                 &intent.without_transport_page(url),
             ),
         };

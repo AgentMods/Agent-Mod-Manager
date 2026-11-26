@@ -136,7 +136,6 @@ test("新手引导合并别名并保持原始注册路径", async ({ page }) => 
   await expect(page.getByRole("heading", { name: "启用可用工具", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "下一步", exact: true }).click();
   await expect(page.getByRole("heading", { name: "扫描游戏列表", exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "扫描已安装游戏", exact: true }).click();
   const candidates = page.getByRole("list", { name: "扫描候选游戏", exact: true });
   const row = (text: string) => candidates.getByRole("listitem").filter({ has: page.getByText(text, { exact: true }) });
   const existing = row(ordinaryUnc);
@@ -152,6 +151,19 @@ test("新手引导合并别名并保持原始注册路径", async ({ page }) => 
   const trailingSpace = row("保留尾空格");
   await expect(trailingSpace.getByRole("button", { name: "添加", exact: true })).toBeEnabled();
   await expect(trailingSpace.getByText("管理中", { exact: true })).toHaveCount(0);
+
+  await page.evaluate(() => {
+    const mock = (window as any).__AMM_TEST__;
+    Object.defineProperty(navigator.clipboard, "writeText", {
+      configurable: true,
+      value: async (text: string) => { mock.copiedPath = text; },
+    });
+  });
+  await picked.getByRole("button", { name: "更多操作", exact: true }).click();
+  await page.getByRole("menuitem", { name: "复制游戏目录", exact: true }).click();
+  await expect(page.getByText("已复制", { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (window as any).__AMM_TEST__.copiedPath)).toBe(ordinaryDrive);
+
   await picked.getByRole("button", { name: "添加", exact: true }).click();
   await expect(picked.getByText("管理中", { exact: true })).toBeVisible();
   await expect(picked.getByText("Fixture", { exact: true })).toBeVisible();

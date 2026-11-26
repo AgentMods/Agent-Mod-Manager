@@ -143,6 +143,37 @@ impl AppPaths {
         Ok(resolved)
     }
 
+    /// Ordinary files in active storage are managed working files. Reserve the manager's
+    /// state and the directory anchors its services need. `target` is already resolved.
+    pub(crate) fn protected_storage_target(&self, target: &Path) -> bool {
+        let Ok(relative) = target.strip_prefix(&self.root) else {
+            return false;
+        };
+        let mut components = relative.components();
+        let Some(first) = components.next() else {
+            return true; // Never replace the storage root itself.
+        };
+        let name = first.as_os_str();
+        let matches = |names: &[&str]| {
+            names
+                .iter()
+                .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        };
+        matches(&[
+            "manager.db",
+            "manager.db-wal",
+            "manager.db-shm",
+            "manager.db-journal",
+            "private",
+            "backups",
+            "trash",
+            "logs",
+            "Mods",
+            "gta-rpf-private",
+        ]) || (components.next().is_none()
+            && matches(&["downloads", "staging", "skills", "plugins"]))
+    }
+
     pub(crate) fn env_name(name: &std::ffi::OsStr) -> bool {
         name.to_str().is_some_and(|name| {
             let name = name.to_ascii_lowercase();

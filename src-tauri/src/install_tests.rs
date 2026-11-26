@@ -140,6 +140,7 @@ fn ordinary_and_library_install_previews_cannot_claim_each_others_paths() {
         let library = LibraryInstallRequest {
             game_id: game.id.clone(),
             library_entry_id: entry.id,
+            replace_install_id: None,
             mode: LibraryInstallMode::Adapter {
                 mod_type: "smapi-mod".into(),
                 folder_name: None,
@@ -381,6 +382,13 @@ fn replacement_commits_and_rolls_back_move_overwrite_and_add_as_one_version_chan
     )
     .unwrap();
     apply(&engine, &v1.plan);
+    crate::mod_metadata::update(
+        &engine,
+        &game.id,
+        &crate::mod_metadata::Target::Install(v1.install_id.clone()),
+        serde_json::from_value(serde_json::json!({"name":"Manual title"})).unwrap(),
+    )
+    .unwrap();
     let folder = Path::new(&game.root_path).join("Mods/Example");
     std::fs::write(folder.join("user.cfg"), b"preserve").unwrap();
     let stale_uninstall = plan_uninstall(&engine, &v1.install_id).unwrap();
@@ -414,6 +422,8 @@ fn replacement_commits_and_rolls_back_move_overwrite_and_add_as_one_version_chan
         1
     );
     assert_eq!(new.metadata["replacesInstallId"], v1.install_id);
+    assert_eq!(new.name, "Manual title");
+    assert_eq!(new.version.as_deref(), Some("v2"));
     assert_eq!(new.files.len(), 2);
     assert!(new.files.iter().all(|file| file.before.is_none()));
     let replacement_review = inspect_install(&reopened, &v2.install_id).unwrap();

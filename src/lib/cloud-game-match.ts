@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { tr } from "@/lib/i18n";
 import { useMutation, useIsMutating, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, backendAvailable } from './api';
@@ -59,6 +60,9 @@ export function useCloudGameMatch(enabled: boolean) {
     queryKey: ['plugins'], queryFn: () => api('list_plugins'), enabled: backendAvailable && enabled,
     networkMode: 'always', retry: false, staleTime,
   });
+  const coversByAdapter = useMemo(() => new Map((plugins.data ?? [])
+    .filter(plugin => plugin.enabled && plugin.validated)
+    .map(plugin => [plugin.slug, plugin.coverUrl])), [plugins.data]);
   const pending = useIsMutating({ mutationKey: pluginChangeKey }) > 0;
   const waiting = (c: GameCandidate) => enabled && eligible(c) && (catalog.isLoading || plugins.isLoading);
   const match = (c: GameCandidate) => catalog.data && plugins.data && matchRelease(c, catalog.data, plugins.data);
@@ -86,5 +90,5 @@ export function useCloudGameMatch(enabled: boolean) {
     if (client.isMutating({ mutationKey: pluginChangeKey })) throw new Error(tr("适配包操作正在进行，请稍后重试。"));
     return (await mutation.mutateAsync({ action: 'register-game', candidate, localOnly })).game;
   }
-  return { match, register, waiting, pending };
+  return { match, register, waiting, pending, coversByAdapter };
 }

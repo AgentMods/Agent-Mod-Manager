@@ -324,7 +324,7 @@ fn deploy(
     super::super::require_install_space(&plan, &j.binding.root, c)?;
     let mod_type = format!("rpf-{}", j.item.contribution.kind());
     let warn = vec!["此计划只验证归档与文件，不代表已在游戏内成功加载".to_owned()];
-    let mut meta = json!({"gtaRpf":true,"adapterSlug":j.binding.slug,"adapterVersion":j.binding.version,"libraryEntryId":j.item.artifact,"artifactSha256":j.item.digest,"artifactPath":artifact.archive_path,"downloadOrigin":artifact.origin,"sourceModId":artifact.entry.project_id,"modType":mod_type,"transactionId":plan.id,"rpfJobId":job,"warnings":warn});
+    let mut meta = json!({"gtaRpf":true,"adapterSlug":j.binding.slug,"adapterVersion":j.binding.version,"libraryEntryId":j.item.artifact,"artifactSha256":j.item.digest,"artifactPath":artifact.archive_path,"downloadOrigin":artifact.origin,"sourceModId":artifact.entry.project_id,"modType":mod_type,"transactionId":plan.id,"rpfJobId":job,"warnings":warn,"archiveFilename":artifact.entry.filename,"projectPage":artifact.entry.project_page});
     if install {
         crate::mod_organization::stage(&e.db, &mut meta, organization);
     }
@@ -335,7 +335,11 @@ fn deploy(
     let now = util::now();
     if install {
         let name = &artifact.entry.name;
-        tx.execute("INSERT INTO installs(id,game_id,name,version,source,status,install_root,files_json,metadata_json,installed_at,updated_at) VALUES(?1,?2,?3,?4,?5,'planned',?6,'[]',?7,?8,?8)",params![j.item.id,game,name,artifact.entry.version,artifact.entry.source_id,j.binding.root.to_string_lossy(),meta.to_string(),now])?;
+        let version = crate::mod_metadata::display_version(&artifact.entry.version)
+            .map(str::to_owned)
+            .or_else(|| crate::mod_metadata::filename_version(&artifact.entry.filename));
+        tx.execute("INSERT INTO installs(id,game_id,name,version,source,status,install_root,files_json,metadata_json,installed_at,updated_at) VALUES(?1,?2,?3,?4,?5,'planned',?6,'[]',?7,?8,?8)",params![j.item.id,game,name,version,artifact.entry.source_id,j.binding.root.to_string_lossy(),meta.to_string(),now])?;
+        crate::mod_metadata::inherit_archive_edit(&tx, game, &artifact.entry.id, &j.item.id)?;
     }
     tx.execute("INSERT INTO install_transactions(install_id,transaction_id,action,created_at) VALUES(?1,?2,?3,?4)",params![j.item.id,plan.id,action,now])?;
     tx.execute(

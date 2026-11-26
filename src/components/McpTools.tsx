@@ -4,13 +4,13 @@ import { startMcpConnection, type McpConfig } from "@/lib/mcp-connection";
 import { Fragment, useEffect, useId, useState } from "react";
 import { useMutation, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ChevronDownIcon, CircleCheckIcon, CircleHelpIcon, CircleIcon, ExternalLinkIcon, KeyRoundIcon, PencilIcon, PlayIcon, PlusIcon, SaveIcon, ServerIcon, SquareIcon, Trash2Icon } from "lucide-react";
+import { ChevronDownIcon, CircleCheckIcon, CircleHelpIcon, CircleIcon, ExternalLinkIcon, KeyRoundIcon, PencilIcon, PlayIcon, PlugIcon, PlusIcon, SaveIcon, ServerIcon, SquareIcon, Trash2Icon } from "lucide-react";
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { useUI } from "@/lib/store";
 import { McpToolListButton, type McpConnection } from "@/components/McpToolList";
 import { Badge, EmptyState, ErrorState, IconButton, Modal, PathText } from "@/components/ui";
 import { Button } from "@/components/ui/button";
-import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardAction, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
@@ -234,13 +234,13 @@ export function McpTools({ onboarding = false, onBusyChange }: { onboarding?: bo
   const primaryAction = bulkAction ?? (!onboarding && allRunning ? "disable" : "enable");
   const enable = primaryAction === "enable";
   const bulkControls = <div className="inline-flex" role="group" aria-label={tr("批量管理 MCP 工具")}>
-    <Button size="sm" variant="outline" className={cn(!onboarding && "rounded-r-none")} disabled={enable ? !canEnable : !canDisable}
+    <Button size="sm" variant="outline" className={cn("bg-background/65 hover:bg-muted/60", !onboarding && "rounded-r-none")} disabled={enable ? !canEnable : !canDisable}
       onClick={() => changeConnections(primaryAction, enable ? toEnable : toDisable)}>
       {bulkAction ? <Spinner /> : enable ? <PlayIcon /> : <SquareIcon />}
       {bulkAction ? (enable ? tr("正在启用…") : tr("正在禁用…")) : (enable ? tr("全部启用") : tr("全部禁用"))}
     </Button>
     {!onboarding && <DropdownMenu>
-      <DropdownMenuTrigger asChild><Button size="icon-sm" variant="outline" className="rounded-l-none border-l-0" aria-label={tr("选择批量操作")} disabled={!canEnable && !canDisable}><ChevronDownIcon /></Button></DropdownMenuTrigger>
+      <DropdownMenuTrigger asChild><Button size="icon-sm" variant="outline" className="rounded-l-none border-l-0 bg-background/65 hover:bg-muted/60" aria-label={tr("选择批量操作")} disabled={!canEnable && !canDisable}><ChevronDownIcon /></Button></DropdownMenuTrigger>
       <DropdownMenuContent align="end"><DropdownMenuGroup>
         <DropdownMenuItem disabled={!canEnable} onSelect={() => changeConnections("enable", toEnable)}><PlayIcon />{tr("全部启用")}</DropdownMenuItem>
         <DropdownMenuItem disabled={!canDisable} onSelect={() => changeConnections("disable", toDisable)}><SquareIcon />{tr("全部禁用")}</DropdownMenuItem>
@@ -251,7 +251,7 @@ export function McpTools({ onboarding = false, onBusyChange }: { onboarding?: bo
     <ErrorState error={configs.error || startup.error || connections.error || (!onboarding && local.error) || error} />
     {configs.isLoading && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><Spinner />{tr("正在读取 MCP 工具…")}</p>}
     {!externalConfigs.length && !configs.isLoading && !configs.error && <EmptyState icon={<ServerIcon />} title={tr("尚未配置外部 MCP 连接")} />}
-    {!!externalConfigs.length && <ItemGroup className="rounded-md border" aria-label={tr("外部 MCP 连接")}>
+    {!!externalConfigs.length && <ItemGroup className="overflow-hidden rounded-xl border bg-background/60" aria-label={tr("外部 MCP 连接")}>
       {externalConfigs.map((config, index) => {
         const active = connections.data?.find((connection) => connection.serverId === config.id);
         const failure = failures[config.id];
@@ -264,9 +264,9 @@ export function McpTools({ onboarding = false, onBusyChange }: { onboarding?: bo
         const hasCredentials = Boolean(config.bearer_secret_ref || Object.values(config.env_secret_refs).some(Boolean));
         return <Fragment key={config.id}>
           {index > 0 && <ItemSeparator />}
-          <Item role="listitem" size="sm" className="flex-nowrap gap-2 border-0 px-2 py-2 sm:gap-3 sm:px-3">
-            <ItemMedia variant="icon" aria-hidden="true" className="size-6 sm:size-8">
-              {logo ? <img src={logo} alt="" className="size-4 object-contain sm:size-6" /> : <ServerIcon />}
+          <Item role="listitem" size="sm" className="group/mcp flex-nowrap gap-2 border-0 px-2.5 py-2 transition-colors duration-150 hover:bg-muted/35 sm:gap-3 sm:px-3.5">
+            <ItemMedia variant="icon" aria-hidden="true" className="size-7 rounded-lg border bg-card/85 shadow-2xs motion-safe:transition-transform motion-safe:duration-200 group-hover/mcp:scale-105 sm:size-8">
+              {logo ? <img src={logo} alt="" className="size-4 object-contain sm:size-4.5" /> : <ServerIcon className="text-muted-foreground" />}
             </ItemMedia>
             <ItemContent className="min-w-0 gap-0.5">
               <ItemTitle className="w-full">
@@ -286,8 +286,8 @@ export function McpTools({ onboarding = false, onBusyChange }: { onboarding?: bo
               {failure && (!active || failure.action === "disable") && <p className="truncate text-xs text-destructive" title={failure.message}>{failure.action === "disable" && tr("禁用失败：")}{failure.message}</p>}
             </ItemContent>
             <ItemActions className={cn("grid shrink-0 gap-0.5 [&_[data-size=icon-sm]]:size-7 sm:[&_[data-size=icon-sm]]:size-8", onboarding
-                ? "grid-cols-[auto_repeat(2,1.75rem)] sm:grid-cols-[auto_repeat(2,2rem)]"
-                : "grid-cols-[auto_repeat(3,1.75rem)] sm:grid-cols-[auto_repeat(3,2rem)]")}>
+              ? "grid-cols-[auto_repeat(2,1.75rem)] sm:grid-cols-[auto_repeat(2,2rem)]"
+              : "grid-cols-[auto_repeat(3,1.75rem)] sm:grid-cols-[auto_repeat(3,2rem)]")}>
               {active && !stopping ? <McpToolListButton name={config.name} connection={active} /> :
                 <Badge className="mr-1 whitespace-nowrap" tone={stopping ? "success" : failure ? "danger" : "neutral"}>
                   {stopping ? tr("停止中") : starting ? tr("启动中") : failure?.action === "enable" ? tr("启动失败") : tr("未启动")}
@@ -303,34 +303,43 @@ export function McpTools({ onboarding = false, onBusyChange }: { onboarding?: bo
       })}
     </ItemGroup>}
   </>;
-  return <div className="flex flex-col gap-6">
-    {onboarding ? <div className="flex flex-col gap-3"><div className="self-end">{bulkControls}</div>{connectionsList}</div> : <Card className="gap-4 py-4">
-      <CardHeader className="flex flex-row flex-wrap items-center justify-between px-3 sm:px-5">
-        <CardTitle>{tr("可用工具")}</CardTitle>
-        <CardAction className="flex flex-wrap items-center gap-2">{bulkControls}<Button size="sm" variant="outline" disabled={!backendAvailable || busy} onClick={() => { setFresh(true); setEdit({ id: `custom_${Date.now()}`, name: tr("自定义 MCP"), transport: "streamable_http", command: null, args: [], url: "https://", env_secret_refs: {}, bearer_secret_ref: null, credential_url: null, enabled: false, builtin: false }); }}><PlusIcon data-icon="inline-start" />{tr("添加连接")}</Button></CardAction>
+  return <div className="flex flex-col gap-3">
+
+    {!onboarding && <Card className="surface-panel-card group/card gap-0 rounded-2xl px-3.5 py-3 shadow-xs sm:px-5">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+          <span aria-hidden="true" className="flex size-7 shrink-0 items-center justify-center rounded-lg border bg-muted/60 text-foreground/85 motion-safe:transition-transform motion-safe:duration-300 group-hover/card:scale-105 sm:size-8">
+            <ServerIcon className="size-4" />
+          </span>
+          <CardTitle className="text-sm sm:text-base">{tr("本地工具")}</CardTitle>
+          {local.data?.running && !local.data.stopping && localConnection ? <McpToolListButton name="Agent Mod Manager" connection={localConnection} /> :
+            <Badge tone={local.data?.running ? "success" : "neutral"}>{local.data?.stopping ? tr("正在等待事务完成") : local.data?.running ? tr("运行中") : tr("未开启")}</Badge>}
+          {local.data?.endpoint && <div className="min-w-0 max-w-full rounded-md border bg-muted/35 px-2.5 py-1"><PathText className="block truncate">{local.data.endpoint}</PathText></div>}
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {local.data?.startupRequested && !local.data.running && <Button variant="link" size="sm" className="h-auto px-1 text-xs" disabled={busy} onClick={() => { void runLocal(() => api("mcp_server_stop"), tr("已取消本地工具自动启动")); }}>{tr("取消本地工具自动启动")}</Button>}
+          {local.data?.running
+            ? <Button size="sm" variant="outline" className="bg-background/65 hover:bg-muted/60" disabled={busy} onClick={() => { void runLocal(() => api("mcp_server_stop"), tr("本地工具已停止")); }}><SquareIcon data-icon="inline-start" />{tr("停止工具")}</Button>
+            : <Button size="sm" variant="outline" className="bg-background/65 hover:bg-muted/60" disabled={!backendAvailable || busy || local.data?.stopping} onClick={() => setConfirmLocalStart(true)}><PlayIcon data-icon="inline-start" />{tr("开启工具")}</Button>}
+        </div>
+      </div>
+    </Card>}
+
+    {onboarding ? <div className="flex flex-col gap-3"><div className="self-end">{bulkControls}</div>{connectionsList}</div> : <Card className="surface-panel-card group/card gap-2.5 rounded-2xl py-3.5 shadow-xs">
+      <CardHeader className="flex flex-row flex-wrap items-center justify-between gap-2 px-3.5 sm:px-5">
+        <CardTitle className="flex items-center gap-2.5 text-sm sm:text-base">
+          <span aria-hidden="true" className="flex size-7 shrink-0 items-center justify-center rounded-lg border bg-muted/60 text-foreground/85 motion-safe:transition-transform motion-safe:duration-300 group-hover/card:scale-105 sm:size-8">
+            <PlugIcon className="size-4" />
+          </span>
+          {tr("可用工具")}
+        </CardTitle>
+        <CardAction className="flex flex-wrap items-center gap-2">{bulkControls}<Button size="sm" variant="outline" className="bg-background/65 hover:bg-muted/60" disabled={!backendAvailable || busy} onClick={() => { setFresh(true); setEdit({ id: `custom_${Date.now()}`, name: tr("自定义 MCP"), transport: "streamable_http", command: null, args: [], url: "https://", env_secret_refs: {}, bearer_secret_ref: null, credential_url: null, enabled: false, builtin: false }); }}><PlusIcon data-icon="inline-start" />{tr("添加连接")}</Button></CardAction>
       </CardHeader>
-      <CardContent className="flex flex-col gap-3 px-3 sm:px-5">
+      <CardContent className="flex flex-col gap-2.5 px-3.5 sm:px-5">
         {connectionsList}
       </CardContent>
     </Card>}
 
-    {!onboarding && <Card>
-      <CardHeader>
-        <CardTitle>{tr("本地工具")}</CardTitle>
-        <CardDescription>{tr("让外部 Agent 通过受控工具使用本机的 Agent Mod Manager。开启后会随应用启动，手动停止即可取消。")}</CardDescription>
-        <CardAction>
-          {local.data?.running && !local.data.stopping && localConnection ? <McpToolListButton name="Agent Mod Manager" connection={localConnection} /> :
-            <Badge tone={local.data?.running ? "success" : "neutral"}>{local.data?.stopping ? tr("正在等待事务完成") : local.data?.running ? tr("运行中") : tr("未开启")}</Badge>}
-        </CardAction>
-      </CardHeader>
-      <CardContent className="flex flex-col items-start gap-3">
-        {local.data?.startupRequested && !local.data.running && <Button variant="link" size="sm" disabled={busy} onClick={() => { void runLocal(() => api("mcp_server_stop"), tr("已取消本地工具自动启动")); }}>{tr("取消本地工具自动启动")}</Button>}
-        {local.data?.endpoint && <PathText>{local.data.endpoint}</PathText>}
-        {local.data?.running
-          ? <Button variant="outline" disabled={busy} onClick={() => { void runLocal(() => api("mcp_server_stop"), tr("本地工具已停止")); }}><SquareIcon data-icon="inline-start" />{tr("停止工具")}</Button>
-          : <Button variant="outline" disabled={!backendAvailable || busy || local.data?.stopping} onClick={() => setConfirmLocalStart(true)}><PlayIcon data-icon="inline-start" />{tr("开启工具")}</Button>}
-      </CardContent>
-    </Card>}
 
     {credentials && <McpCredentialDialog {...credentials} onClose={() => setCredentials(null)} />}
     {edit && <McpEditor config={edit} fresh={fresh} onClose={() => setEdit(null)} onSaved={async () => { forget(edit.id); setEdit(null); await refresh(); }} />}

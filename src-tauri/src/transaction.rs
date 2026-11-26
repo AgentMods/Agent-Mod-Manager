@@ -527,22 +527,11 @@ impl FileEngine {
                 paths::display_path(&target)
             )));
         }
-        if !internal && target.starts_with(&self.paths.root) {
-            let allowed = [
-                self.paths.staging(),
-                self.paths.downloads(),
-                self.paths.plugins(),
-                self.paths.skills(),
-            ];
-            if !allowed
-                .iter()
-                .any(|r| target.starts_with(r) && target != *r)
-            {
-                return Err(AppError::Denied(format!(
-                    "管理器内部路径不可由文件工具修改: {}",
-                    paths::display_path(&target)
-                )));
-            }
+        if !internal && self.paths.protected_storage_target(&target) {
+            return Err(AppError::Denied(format!(
+                "管理器内部路径不可由文件工具修改: {}",
+                paths::display_path(&target)
+            )));
         }
         if !internal
             && roots
@@ -606,8 +595,8 @@ impl FileEngine {
         self.build_plan_with_sources(ops, summary, internal, None)
     }
 
-    /// Only the library installer can authorize its verified copy sources. Its
-    /// destinations always use the ordinary, managed-only file policy.
+    /// Library plans can copy verified sources and move superseded game files
+    /// to the trash. Apply checks the replacement link and previous manifest.
     pub(crate) fn build_locked_library_plan(
         &self,
         _guard: &MutexGuard<'static, ()>,
@@ -617,6 +606,10 @@ impl FileEngine {
     ) -> AppResult<FilePlan> {
         let engine = self.for_transaction(crate::install::LIBRARY_INSTALL_KIND)?;
         engine.build_plan_with_sources(ops, summary, false, Some(sources))
+    }
+
+    fn is_library_trash_move(&self, operation: &FileOp) -> bool {
+        matches!(operation, FileOp::Move { dst, .. } if dst.starts_with(self.paths.trash()))
     }
 
     fn build_plan_with_sources(
@@ -663,8 +656,12 @@ impl FileEngine {
             } else {
                 None
             };
-            let dst = self.guard_with_roots(op.dst(), internal, &roots)?;
-            let src = if let Some(sources) = library_sources {
+            let library_trash_move = library_sources.is_some() && self.is_library_trash_move(&op);
+            let dst = self.guard_with_roots(op.dst(), internal || library_trash_move, &roots)?;
+            if library_trash_move && dst.as_path() != op.dst() {
+                return Err(AppError::Denied("模组库替换的回收站目标路径已变化".into()));
+            }
+            let src = if let Some(sources) = library_sources.filter(|_| !library_trash_move) {
                 let FileOp::Copy { src, .. } = &op else {
                     return Err(AppError::Denied("模组库安装仅支持复制已验证文件".into()));
                 };
@@ -692,7 +689,7 @@ impl FileEngine {
                     if op.is_archive() {
                         return archive_ops::source_fingerprint(&self.paths, &op, s, &dst, true);
                     }
-                    fingerprint_checked(s, self.local_agent_files && !internal)?
+                    fingerprint_checked(s, !internal)?
                         .ok_or_else(|| AppError::NotFound(paths::display_path(s)))
                 })
                 .transpose()?
@@ -917,7 +914,8 @@ impl FileEngine {
         crate::plugin_workflow::validate_deployment_source(self, &plan)?;
         let mut evidence = Vec::with_capacity(plan.entries.len());
         for e in &plan.entries {
-            self.stable_path(e.operation.dst(), internal)?;
+            let library_trash_move = library_install && self.is_library_trash_move(&e.operation);
+            self.stable_path(e.operation.dst(), internal || library_trash_move)?;
             if e.operation.is_archive() {
                 if !self.local_agent_files || internal || e.before.is_some() {
                     return Err(AppError::Denied("归档操作只支持桌面 Agent 的新目标".into()));
@@ -955,7 +953,7 @@ impl FileEngine {
             }
             let mut source = None;
             if let Some(src) = e.operation.src() {
-                self.stable_path(src, internal || library_install)?;
+                self.stable_path(src, internal || (library_install && !library_trash_move))?;
                 if gta_rpf || library_install || matches!(e.operation, FileOp::Move { .. }) {
                     source = Some(require_identity(src)?);
                 }

@@ -13,7 +13,6 @@ export const PLUGIN_UPDATED_AT_FIXTURE = "2026-11-20T16:45:00Z";
 // Test-only IPC transport. It is never imported by the shipped application.
 export async function installMockTauri(page: Page, {
   modLibrary = [], onboarding = false, onboardingStarted = false, failRegistration = false, emptyLibrary = false,
-  dashboardSponsors = ["Fixture Sponsor"],
   dashboardStats,
   gameRootPath = "/sandbox/minecraft", gameLaunchPath, gameSteamAppId = null, gameModLauncher, gameLaunchOptions, failGameLaunchOptions = false, failGameLaunchMethods = [], gameWithoutAdapter = false, gameWithoutMods = false, adapterDisabled = false, withExternalAdapter = false, holdAgentTurn = false,
   gamePlanConflicts = [],
@@ -36,7 +35,6 @@ export async function installMockTauri(page: Page, {
   onboarding?: boolean;
   onboardingStarted?: boolean;
   emptyLibrary?: boolean;
-  dashboardSponsors?: string[];
   dashboardStats?: {managedGameCount: number; installedModCount: number; totalModCount: number};
   failRegistration?: boolean;
   gameRootPath?: string;
@@ -86,9 +84,12 @@ export async function installMockTauri(page: Page, {
     nextBootstrap?: {dataRoot?: string; storageMigrationError?: string | null};
   };
 } = {}) {
+  // Keep ordinary desktop-mock tests offline; page-specific fixtures take precedence.
+  await page.context().route("https://cdn.gh-proxy.org/https://raw.githubusercontent.com/AgentMods/Agent-Mod-Manager/refs/heads/main/Sponsors.json",
+    route => route.fulfill({json: []}));
   // The public-looking manifest image is served offline in browser tests.
   await page.route("https://covers.example.org/minecraft-java.jpg", route => route.fulfill({contentType: "image/png", path: "public/favicon.png"}));
-  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, emptyLibrary, dashboardSponsors, dashboardStats, gameRootPath, gameLaunchPath, gameSteamAppId, gameModLauncher, gameLaunchOptions, failGameLaunchOptions, failGameLaunchMethods, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, pendingGameTools, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus}) => {
+  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, emptyLibrary, dashboardStats, gameRootPath, gameLaunchPath, gameSteamAppId, gameModLauncher, gameLaunchOptions, failGameLaunchOptions, failGameLaunchMethods, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, pendingGameTools, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus}) => {
     type Args = Record<string, any>;
     const now = "2026-11-18T00:00:00Z";
     const draftUpdatedAtField = pluginDateFixture === "valid" ? {updatedAt: pluginUpdatedAt} : {};
@@ -407,7 +408,6 @@ export async function installMockTauri(page: Page, {
           return ++directoryPickCount === 1 ? "/sandbox/new-game" : null;
         }
         case "list_games": return structuredClone(games);
-        case "list_dashboard_sponsors": return structuredClone(dashboardSponsors);
         case "get_dashboard_stats": return structuredClone(dashboardStats ?? {
           managedGameCount: games.length,
           installedModCount: games.reduce((count, game) => count + Number(game.installedModCount ?? 0), 0),
@@ -964,5 +964,5 @@ export async function installMockTauri(page: Page, {
         seq = Math.max(seq, ...values.map((event) => event.seq).filter(Number.isSafeInteger));
       },
     };
-  }, {modLibrary, onboarding, onboardingStarted, failRegistration, emptyLibrary, dashboardSponsors, dashboardStats, gameRootPath, gameLaunchPath, gameSteamAppId, gameModLauncher, gameLaunchOptions, failGameLaunchOptions, failGameLaunchMethods, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, pendingGameTools, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus});
+  }, {modLibrary, onboarding, onboardingStarted, failRegistration, emptyLibrary, dashboardStats, gameRootPath, gameLaunchPath, gameSteamAppId, gameModLauncher, gameLaunchOptions, failGameLaunchOptions, failGameLaunchMethods, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, pendingGameTools, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus});
 }

@@ -35,6 +35,15 @@ fn only_the_official_mod_inn_endpoint_accepts_guest_access_for_a_configured_key(
 
 #[tokio::test]
 async fn approved_mod_inn_file_is_signed_once_and_saved_without_exposing_the_url() {
+    assert_approved_mod_inn_file(None).await;
+}
+
+#[tokio::test]
+async fn approved_mod_inn_file_keeps_an_explicit_attachment_version_separate_from_file_id() {
+    assert_approved_mod_inn_file(Some("1.7.0-beta.1")).await;
+}
+
+async fn assert_approved_mod_inn_file(attachment_version: Option<&'static str>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let signed = format!("{origin}/asset?signature=private-fixture-ticket");
@@ -53,7 +62,8 @@ async fn approved_mod_inn_file_is_signed_once_and_saved_without_exposing_the_url
                     assert_eq!(req["params"]["name"], TOOL);
                     assert_eq!(req["params"]["arguments"], json!({"work_id":42,"file_id":103}));
                     calls.fetch_add(1,Ordering::SeqCst);
-                    let file=json!({"url":signed,"name":"selected.zip","download_count":1,"file_download_count":1});
+                    let mut file=json!({"url":signed,"name":"selected.zip","download_count":1,"file_download_count":1});
+                    if let Some(version) = attachment_version { file["version"] = json!(version); }
                     json!({"structuredContent":file,"content":[{"type":"text","text":file.to_string()}]})
                 },
                 _ => panic!("unexpected method"),
@@ -117,6 +127,9 @@ async fn approved_mod_inn_file_is_signed_once_and_saved_without_exposing_the_url
         .prepare(&ctx, &json!({"work_id":42,"file_id":103,"url":"forged"}))
         .await
         .is_err());
+    let mut forged_version = args.clone();
+    forged_version["version"] = json!("forged-version");
+    assert!(tool.prepare(&ctx, &forged_version).await.is_err());
     let cancelled = tool.prepare(&ctx, &args).await.unwrap();
     let mut cancelled_ctx = ctx.clone();
     cancelled_ctx.cancel = CancellationToken::new();
@@ -150,7 +163,15 @@ async fn approved_mod_inn_file_is_signed_once_and_saved_without_exposing_the_url
     let library_path = std::path::Path::new(receipt["artifact"]["path"].as_str().unwrap());
     assert_eq!(
         receipt["artifact"]["projectPage"],
-        "https://example.com/project"
+        "https://www.glossmod.com/mods/42"
+    );
+    assert_eq!(
+        receipt["artifact"].get("version").and_then(Value::as_str),
+        attachment_version
+    );
+    assert_eq!(
+        receipt["artifact"].get("version").is_some(),
+        attachment_version.is_some()
     );
     assert_eq!(receipt["artifact"]["authorHint"], "Public Author");
     assert!(library_path.canonicalize().unwrap().starts_with(root));
@@ -165,15 +186,21 @@ async fn approved_mod_inn_file_is_signed_once_and_saved_without_exposing_the_url
         Some("https://example.com/project")
     );
     assert_eq!(persisted.author_hint.as_deref(), Some("Public Author"));
-    let (page, author): (String, String) = ctx.engine.db.conn().query_row(
-        "SELECT project_page,author_hint FROM mod_library_entries WHERE id=?1 AND state='ready'",
-        [&record.artifact.id], |row| Ok((row.get(0)?, row.get(1)?)),
+    let (page, author, version): (String, String, String) = ctx.engine.db.conn().query_row(
+        "SELECT project_page,author_hint,version FROM mod_library_entries WHERE id=?1 AND state='ready'",
+        [&record.artifact.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).unwrap();
-    assert_eq!(page, "https://example.com/project");
+    assert_eq!(page, "https://www.glossmod.com/mods/42");
+    assert_eq!(version, attachment_version.unwrap_or_default());
     assert_eq!(author, "Public Author");
     assert_eq!(record.source_id, "glossmod_http");
     assert_eq!(record.project_id, "42");
     assert_eq!(record.version_id, "103");
+    assert_eq!(record.version, attachment_version.unwrap_or_default());
+    assert_eq!(
+        record.project_page.as_deref(),
+        Some("https://www.glossmod.com/mods/42")
+    );
     for value in [receipt.to_string(), serde_json::to_string(record).unwrap()] {
         assert!(!value.contains("private-fixture-ticket") && !value.contains("test-service-key"));
     }

@@ -21,12 +21,20 @@ fn id(value: &Value) -> AppResult<u64> {
 }
 
 fn request_id(value: &str) -> AppResult<u64> {
-    positive_id(value)?;
+    if value.starts_with('0') || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
     value
         .parse::<u64>()
         .ok()
         .filter(|n| *n <= MAX_ID)
         .ok_or_else(invalid)
+}
+
+/// The public provider page, not a source-supplied original URL or download link.
+pub(crate) fn three_dm_project_page(project_id: &str) -> Option<String> {
+    let project = request_id(project_id).ok()?;
+    Some(format!("{SITE}/mod/{project}"))
 }
 
 fn text(value: &Value, field: &str, max: usize) -> AppResult<String> {
@@ -95,11 +103,40 @@ fn direct_url(raw: &str) -> Option<String> {
     Some(url.to_string())
 }
 
+pub(crate) struct SelectedResource<'a> {
+    pub id: u64,
+    pub filename: String,
+    pub url: String,
+    pub version: &'a str,
+}
+
+fn version_label(value: &Value) -> Option<&str> {
+    let label = value.as_str()?;
+    (!label.trim().is_empty()
+        && label.chars().count() <= 128
+        && !label.chars().any(char::is_control))
+    .then_some(label)
+}
+
+fn resource_version<'a>(details: &'a Value, row: &'a Value, latest: bool) -> AppResult<&'a str> {
+    let label = &row["mods_resource_version"];
+    // The project label can fill a missing version only for a resource marked
+    // latest. Never override an invalid label or relabel a historical file.
+    if latest && (label.is_null() || label.as_str() == Some("")) {
+        return version_label(&details["mods_version"]).ok_or_else(invalid);
+    }
+    version_label(label).ok_or_else(invalid)
+}
+
 pub(crate) fn select_resource(
-    rows: &[Value],
+    details: &Value,
     project: u64,
     resource: Option<u64>,
-) -> AppResult<Option<(&Value, u64, String)>> {
+) -> AppResult<Option<SelectedResource<'_>>> {
+    let rows = match details.get("mods_resource") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(rows) => array(rows)?,
+    };
     if rows.len() > 1024 {
         return Err(invalid());
     }
@@ -116,13 +153,17 @@ pub(crate) fn select_resource(
             Some(v) => v.as_bool().ok_or_else(invalid)?,
         };
         if resource.map_or(latest, |selected| selected == file) {
-            identities.insert((
-                text(row, "mods_resource_name", 512)?,
-                text(row, "mods_resource_version", 128)?,
-            ));
+            let filename = text(row, "mods_resource_name", 512)?;
+            let version = resource_version(details, row, latest)?;
+            identities.insert((filename.clone(), version));
             let url = text(row, "mods_resource_url", 8192)?;
             if let Some(url) = direct_url(&url) {
-                candidates.push((row, file, url));
+                candidates.push(SelectedResource {
+                    id: file,
+                    filename,
+                    url,
+                    version,
+                });
             }
         }
     }
@@ -131,11 +172,17 @@ pub(crate) fn select_resource(
             "3DM 未找到指定资源 ID；不会回退到其他文件".into(),
         ));
     }
-    if candidates.len() == 1 && identities.len() == 1 {
-        Ok(candidates.pop())
-    } else {
-        Ok(None)
+    if candidates.len() != 1 || identities.len() != 1 {
+        return Ok(None);
     }
+    let selected = candidates.pop();
+    if let Some(file) = &selected {
+        if file.filename.chars().any(char::is_control) {
+            return Err(invalid());
+        }
+        crate::download::safe_filename(&file.filename).map_err(|_| invalid())?;
+    }
+    Ok(selected)
 }
 
 impl Provider {
@@ -200,7 +247,7 @@ impl Provider {
                     name: text(row, "mods_title", 512)?,
                     summary: optional_text(row, "mods_desc", 4096)?.unwrap_or_default(),
                     author: optional_text(row, "mods_author", 256)?,
-                    homepage_url: Some(format!("{SITE}/mod/{project}")),
+                    homepage_url: three_dm_project_page(&project.to_string()),
                     icon_url: icon(optional_text(row, "mods_image_url", 2048)?),
                     downloads: match row.get("mods_download_cnt") {
                         None | Some(Value::Null) => None,
@@ -247,7 +294,7 @@ impl Provider {
         let project = request_id(&r.project_id)?;
         let game = r.game_id.as_deref().map(request_id).transpose()?;
         let resource = r.version_id.as_deref().map(request_id).transpose()?;
-        let home = Some(format!("{SITE}/mod/{project}"));
+        let home = three_dm_project_page(&r.project_id);
         if r.game_version.is_some() || r.loader.is_some() {
             return Ok(self.unresolved(
                 SourceState::ManualDownload,
@@ -264,33 +311,28 @@ impl Provider {
         }
         id(&data["game_id"])?;
         let name = text(&data, "mods_title", 512)?;
-        let rows = match data.get("mods_resource") {
-            None | Some(Value::Null) => {
-                return Ok(self.unresolved(
-                    SourceState::ManualDownload,
-                    "来源未提供资源，请在原始页面选择",
-                    home,
-                ))
-            }
-            Some(rows) => array(rows)?,
-        };
-        let Some((row, file, url)) = select_resource(rows, project, resource)? else {
+        if data["mods_resource"].is_null() {
+            return Ok(self.unresolved(
+                SourceState::ManualDownload,
+                "来源未提供资源，请在原始页面选择",
+                home,
+            ));
+        }
+        let Some(file) = select_resource(&data, project, resource)? else {
             return Ok(self.unresolved(
                 SourceState::ManualDownload,
                 "没有唯一可核验的直链资源，可能是网盘或多个可选文件；请在原始页面选择",
                 home,
             ));
         };
-        let filename = text(row, "mods_resource_name", 180)?;
-        crate::download::safe_filename(&filename).map_err(|_| invalid())?;
         self.resolved(ResolvedMod {
             source_id: "3dm".into(),
             project_id: project.to_string(),
-            version_id: file.to_string(),
+            version_id: file.id.to_string(),
             name,
-            version: text(row, "mods_resource_version", 128)?,
-            download_url: url,
-            filename,
+            version: file.version.trim().into(),
+            download_url: file.url,
+            filename: file.filename,
             // mods_resource_size is rounded prose, not an exact byte count.
             size: None,
             hashes: FileHashes::default(),

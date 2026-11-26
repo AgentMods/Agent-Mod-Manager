@@ -370,6 +370,15 @@ CREATE TABLE IF NOT EXISTS installs (
   updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_installs_game ON installs(game_id);
+-- Display names preserve source metadata.
+CREATE TABLE IF NOT EXISTS mod_display_names (
+  game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL CHECK(kind IN ('archive','install')),
+  item_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  archive_seeded INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(game_id,kind,item_id)
+);
 CREATE TABLE IF NOT EXISTS mod_tags (
   id TEXT PRIMARY KEY,
   game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
@@ -378,6 +387,19 @@ CREATE TABLE IF NOT EXISTS mod_tags (
   color TEXT NOT NULL,
   UNIQUE(game_id,name_key)
 );
+CREATE TABLE IF NOT EXISTS archive_mod_tag_sets (
+  game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+  archive_id TEXT NOT NULL REFERENCES mod_library_entries(id) ON DELETE CASCADE,
+  PRIMARY KEY(game_id,archive_id)
+);
+CREATE TABLE IF NOT EXISTS archive_mod_tags (
+  game_id TEXT NOT NULL,
+  archive_id TEXT NOT NULL,
+  tag_id TEXT NOT NULL REFERENCES mod_tags(id) ON DELETE CASCADE,
+  PRIMARY KEY(game_id,archive_id,tag_id),
+  FOREIGN KEY(game_id,archive_id) REFERENCES archive_mod_tag_sets(game_id,archive_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_archive_mod_tags_tag ON archive_mod_tags(tag_id);
 CREATE TABLE IF NOT EXISTS install_organizations (
   install_id TEXT PRIMARY KEY REFERENCES installs(id) ON DELETE CASCADE,
   display_name TEXT,

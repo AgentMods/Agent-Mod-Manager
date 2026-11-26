@@ -54,6 +54,7 @@ fn auto(
     LibraryInstallRequest {
         game_id: game.id.clone(),
         library_entry_id: entry.id.clone(),
+        replace_install_id: None,
         mode: LibraryInstallMode::Adapter {
             mod_type: ty.into(),
             folder_name: None,
@@ -72,6 +73,7 @@ fn manual(
     LibraryInstallRequest {
         game_id: game.id.clone(),
         library_entry_id: entry.id.clone(),
+        replace_install_id: None,
         mode: LibraryInstallMode::ApprovedMappings {
             mod_type: None,
             source_kind,
@@ -104,6 +106,15 @@ fn typed_requests_use_artifact_id_and_reject_hidden_legacy_path_fields() {
     let serialized = serde_json::to_value(request).unwrap();
     assert_eq!(serialized["artifactId"], "artifact-id");
     assert!(serialized.get("libraryEntryId").is_none());
+    assert!(serialized.get("replaceInstallId").is_none());
+    let mut replacement = json.clone();
+    replacement["replaceInstallId"] = serde_json::json!("old-install");
+    let request: LibraryInstallRequest = serde_json::from_value(replacement).unwrap();
+    assert_eq!(request.replace_install_id.as_deref(), Some("old-install"));
+    assert_eq!(
+        serde_json::to_value(request).unwrap()["replaceInstallId"],
+        "old-install"
+    );
     let mut polluted = json;
     polluted["artifactPath"] = serde_json::json!("not an allowed source");
     assert!(serde_json::from_value::<LibraryInstallRequest>(polluted).is_err());
@@ -115,6 +126,230 @@ fn typed_requests_use_artifact_id_and_reject_hidden_legacy_path_fields() {
         serde_json::to_value(alias).unwrap()["artifactId"],
         "artifact-id"
     );
+}
+
+fn replacement_release(
+    engine: &FileEngine,
+    game: &games::Game,
+    project: &str,
+    version: &str,
+    files: &[(&str, &[u8])],
+) -> mod_library::LibraryEntry {
+    let release = legacy::release(engine, game, project, version, files);
+    let catalog = crate::artifacts::for_path(&engine.db, &release.artifact_path)
+        .unwrap()
+        .unwrap();
+    let entry = mod_library::ingest_download(engine, &catalog, &game.name, Some(&game.id)).unwrap();
+    if release.artifact_path.exists() {
+        fs::remove_file(&release.artifact_path).unwrap();
+    }
+    entry
+}
+
+const PRIOR_FILES: &[(&str, &[u8])] = &[
+    ("Example/manifest.json", b"old"),
+    ("Example/retired.txt", b"retired"),
+];
+const NEXT_FILES: &[(&str, &[u8])] = &[
+    ("Example/manifest.json", b"next"),
+    ("Example/new.txt", b"new"),
+];
+
+#[test]
+fn library_replacement_reuses_vetted_sources_and_rolls_back_move_overwrite_and_add() {
+    let (_temp, engine, game) = legacy::fixture("stardew-valley");
+    let old = replacement_release(&engine, &game, "example", "v1", PRIOR_FILES);
+    crate::mod_metadata::update(
+        &engine,
+        &game.id,
+        &crate::mod_metadata::Target::Archive(old.id.clone()),
+        serde_json::from_value(serde_json::json!({"name":"Archive title"})).unwrap(),
+    )
+    .unwrap();
+    let old = plan_library_install(&engine, &auto(&game, &old, "smapi-mod", false)).unwrap();
+    legacy::apply(&engine, &old.plan);
+    crate::mod_metadata::update(
+        &engine,
+        &game.id,
+        &crate::mod_metadata::Target::Install(old.install_id.clone()),
+        serde_json::from_value(serde_json::json!({"name":"Install title"})).unwrap(),
+    )
+    .unwrap();
+    let next = replacement_release(&engine, &game, "example", "v2", NEXT_FILES);
+    let archives =
+        crate::mod_metadata::archive_display(&engine.db, &game.id, vec![next.clone()]).unwrap();
+    assert_eq!(
+        serde_json::to_value(archives).unwrap()[0]["name"],
+        "Archive title"
+    );
+    let (archive, _) = paths_for(&engine, &next);
+    let folder = Path::new(&game.root_path).join("Mods/Example");
+    fs::write(folder.join("user.txt"), b"preserve").unwrap();
+    let mut request = auto(&game, &next, "smapi-mod", false);
+    assert!(matches!(
+        plan_library_install(&engine, &request),
+        Err(AppError::Conflict(_))
+    ));
+    request.replace_install_id = Some(old.install_id.clone());
+    let preview = plan_library_install(&engine, &request).unwrap();
+    assert!(preview.requires_review && preview.plan.requires_review);
+    assert!(preview.plan.summary.contains("v1 → v2"));
+    assert_eq!(preview.download_origin.unwrap().artifact_id, next.id);
+    assert_eq!(preview.plan.entries.len(), 3);
+    for impact in ["move", "overwrite", "add"] {
+        assert!(preview
+            .plan
+            .entries
+            .iter()
+            .any(|entry| entry.impact == impact));
+    }
+    assert!(engine.apply_file_ops(&preview.plan.id).is_err());
+    assert_eq!(fs::read(folder.join("manifest.json")).unwrap(), b"old");
+    assert!(trash::list_trash(&engine.db, false).unwrap().is_empty());
+    legacy::apply(&engine, &preview.plan);
+
+    let reopened = FileEngine::new(
+        crate::db::Db::open(&engine.paths.db_file()).unwrap(),
+        (*engine.paths).clone(),
+    );
+    let prior = install::get_install(&reopened, &old.install_id).unwrap();
+    let installed = install::get_install(&reopened, &preview.install_id).unwrap();
+    assert_eq!(prior.status, "superseded");
+    assert_eq!(installed.status, "enabled");
+    assert_eq!(installed.name, "Install title");
+    assert_eq!(installed.metadata["replacesInstallId"], old.install_id);
+    assert_eq!(installed.files.len(), 2);
+    assert!(installed.files.iter().all(|file| file.before.is_none()));
+    assert_eq!(fs::read(folder.join("manifest.json")).unwrap(), b"next");
+    assert_eq!(fs::read(folder.join("new.txt")).unwrap(), b"new");
+    assert!(!folder.join("retired.txt").exists());
+    let trashed = trash::list_trash(&reopened.db, false).unwrap();
+    assert_eq!(trashed.len(), 1);
+    assert!(trashed[0].restore_requires_rollback);
+    assert!(reopened.rollback_transaction(&old.plan.id).is_err());
+    reopened.rollback_transaction(&preview.plan.id).unwrap();
+    assert_eq!(
+        install::get_install(&reopened, &old.install_id)
+            .unwrap()
+            .status,
+        "enabled"
+    );
+    assert_eq!(fs::read(folder.join("manifest.json")).unwrap(), b"old");
+    assert_eq!(fs::read(folder.join("retired.txt")).unwrap(), b"retired");
+    assert_eq!(fs::read(folder.join("user.txt")).unwrap(), b"preserve");
+    assert!(!folder.join("new.txt").exists());
+    assert!(archive.exists());
+}
+
+#[test]
+fn library_replacement_rejects_wrong_project_same_version_and_unverified_origin() {
+    let (_temp, engine, game) = legacy::fixture("stardew-valley");
+    let old = legacy::release(&engine, &game, "example", "v1", PRIOR_FILES);
+    let old = install::plan_install(&engine, &old).unwrap();
+    legacy::apply(&engine, &old.plan);
+    let unverified = import(
+        &engine,
+        &game,
+        "unverified.zip",
+        &legacy::zip(&engine, NEXT_FILES),
+    );
+    for next in [
+        replacement_release(&engine, &game, "other", "v2", NEXT_FILES),
+        replacement_release(&engine, &game, "example", "v1", NEXT_FILES),
+        unverified,
+    ] {
+        let mut request = auto(&game, &next, "smapi-mod", false);
+        request.replace_install_id = Some(old.install_id.clone());
+        assert!(matches!(
+            plan_library_install(&engine, &request),
+            Err(AppError::Conflict(_))
+        ));
+    }
+    let mut rpf = auto(
+        &game,
+        &replacement_release(&engine, &game, "example", "v2", NEXT_FILES),
+        "smapi-mod",
+        false,
+    );
+    rpf.mode = LibraryInstallMode::GtaRpf {
+        job_id: "not-consumed".into(),
+    };
+    rpf.replace_install_id = Some(old.install_id);
+    assert!(
+        matches!(plan_library_install(&engine, &rpf), Err(AppError::Invalid(message)) if message.contains("replaceInstallId"))
+    );
+}
+
+#[test]
+fn library_replacement_preserves_a_changed_old_file_and_recovers_an_interrupted_apply() {
+    let (_temp, engine, game) = legacy::fixture("stardew-valley");
+    let old = legacy::release(&engine, &game, "example", "v1", PRIOR_FILES);
+    let old = install::plan_install(&engine, &old).unwrap();
+    legacy::apply(&engine, &old.plan);
+    let next = replacement_release(&engine, &game, "example", "v2", NEXT_FILES);
+    let mut request = auto(&game, &next, "smapi-mod", false);
+    request.replace_install_id = Some(old.install_id.clone());
+    let folder = Path::new(&game.root_path).join("Mods/Example");
+    let retired = folder.join("retired.txt");
+    let stale_identity = plan_library_install(&engine, &request).unwrap();
+    engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE mod_library_entries SET version_id='rebound' WHERE id=?1",
+            [&next.id],
+        )
+        .unwrap();
+    engine.approve_plan(&stale_identity.plan.id).unwrap();
+    assert!(
+        matches!(engine.apply_file_ops(&stale_identity.plan.id), Err(AppError::Conflict(message)) if message.contains("精确版本"))
+    );
+    engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE mod_library_entries SET version_id='v2' WHERE id=?1",
+            [&next.id],
+        )
+        .unwrap();
+    let stale = plan_library_install(&engine, &request).unwrap();
+    fs::write(&retired, b"player edit").unwrap();
+    engine.approve_plan(&stale.plan.id).unwrap();
+    assert!(matches!(
+        engine.apply_file_ops(&stale.plan.id),
+        Err(AppError::Conflict(_))
+    ));
+    assert!(matches!(
+        plan_library_install(&engine, &request),
+        Err(AppError::Conflict(_))
+    ));
+    assert_eq!(fs::read(&retired).unwrap(), b"player edit");
+    assert_eq!(fs::read(folder.join("manifest.json")).unwrap(), b"old");
+    assert!(trash::list_trash(&engine.db, false).unwrap().is_empty());
+    fs::write(&retired, b"retired").unwrap();
+
+    let fresh = plan_library_install(&engine, &request).unwrap();
+    assert!(matches!(
+        fresh.plan.entries[0].operation,
+        FileOp::Move { .. }
+    ));
+    assert_eq!(fresh.plan.entries[1].impact, "overwrite");
+    engine.approve_plan(&fresh.plan.id).unwrap();
+    engine.inject_failure_before(2);
+    assert!(matches!(
+        engine.apply_file_ops(&fresh.plan.id),
+        Err(AppError::Io(_))
+    ));
+    assert_eq!(fs::read(&retired).unwrap(), b"retired");
+    assert_eq!(fs::read(folder.join("manifest.json")).unwrap(), b"old");
+    assert!(!folder.join("new.txt").exists());
+    assert_eq!(
+        install::get_install(&engine, &old.install_id)
+            .unwrap()
+            .status,
+        "enabled"
+    );
+    assert!(trash::list_trash(&engine.db, false).unwrap().is_empty());
 }
 
 #[test]
@@ -213,6 +448,90 @@ fn verified_single_file_uses_library_archive_and_manifests_origin_without_downlo
     engine.rollback_transaction(&preview.plan.id).unwrap();
     assert!(!dst.exists());
     assert!(archive.exists());
+}
+
+#[test]
+fn three_dm_download_without_project_page_preserves_official_metadata_through_install() {
+    let (_temp, engine, game) = legacy::fixture("stardew-valley");
+    let id = uuid::Uuid::new_v4().to_string();
+    let filename = "Example-v9.8.7.zip";
+    let path = engine.paths.downloads().join(format!("{id}-{filename}"));
+    fs::rename(legacy::zip(&engine, &[("asset.txt", b"fixture")]), &path).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let artifact = crate::download::DownloadArtifact {
+        id,
+        path,
+        filename: filename.into(),
+        size: bytes.len() as u64,
+        sha256: hex::encode(Sha256::digest(&bytes)),
+        sha512: hex::encode(sha2::Sha512::digest(&bytes)),
+        integrity_verified: false,
+        requires_review: true,
+        auto_install_allowed: false,
+        warnings: vec![],
+    };
+    let resolved = crate::sources::ResolvedMod {
+        source_id: "3dm".into(),
+        project_id: "1001".into(),
+        version_id: "2001".into(),
+        name: "Example".into(),
+        version: "1".into(),
+        download_url: format!("https://dmod.3dmgame.com/static/upload/resource/{filename}"),
+        filename: artifact.filename.clone(),
+        size: Some(artifact.size),
+        hashes: Default::default(),
+        homepage_url: None,
+        warnings: vec![],
+    };
+    crate::artifacts::record(&engine, &artifact, &resolved).unwrap();
+    let receipt = crate::artifacts::for_id(&engine.db, &artifact.id)
+        .unwrap()
+        .unwrap();
+    let entry =
+        mod_library::ingest_new_download(&engine, &receipt, &game.name, Some(&game.id)).unwrap();
+    assert!(!artifact.path.exists());
+    let preview = plan_library_install(
+        &engine,
+        &manual(
+            &game,
+            &entry,
+            LibrarySourceKind::Archive,
+            "asset.txt",
+            "Mods/asset.txt",
+        ),
+    )
+    .unwrap();
+    legacy::apply(&engine, &preview.plan);
+    assert_eq!(
+        fs::read(Path::new(&game.root_path).join("Mods/asset.txt")).unwrap(),
+        b"fixture"
+    );
+
+    install::reconcile(&engine.db).unwrap();
+    let db = engine.db.conn();
+    let (version, page): (String, Option<String>) = db
+        .query_row(
+            "SELECT version,project_page FROM mod_library_entries WHERE id=?1 AND state='ready'",
+            [&entry.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    // The real version wins over the filename, and the page uses the project ID.
+    let official_page = "https://mod.3dmgame.com/mod/1001";
+    assert_eq!(version, "1");
+    assert_eq!(page.as_deref(), Some(official_page));
+    let (version, metadata): (Option<String>, String) = db
+        .query_row(
+            "SELECT version,metadata_json FROM installs WHERE id=?1 AND status='enabled'",
+            [&preview.install_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let metadata: serde_json::Value = serde_json::from_str(&metadata).unwrap();
+    assert_eq!(version.as_deref(), Some("1"));
+    assert_eq!(metadata["projectPage"], official_page);
+    assert_eq!(metadata["downloadOrigin"]["projectId"], "1001");
+    assert_eq!(metadata["downloadOrigin"]["versionId"], "2001");
 }
 
 #[test]
@@ -1026,4 +1345,57 @@ fn library_organization_survives_reopen_and_reuses_user_tags() {
     let installed = install::get_install(&engine, &second.install_id).unwrap();
     assert_eq!(installed.tag_ids, [custom.id]);
     assert_ne!(installed.name, "Organized name");
+}
+
+#[test]
+fn pending_archive_metadata_becomes_install_metadata_without_changing_source() {
+    let (_temp, engine, game) = legacy::fixture("stardew-valley");
+    let source = legacy::zip(&engine, &[("file.bin", b"inert")]);
+    let entry = import(&engine, &game, "MyMod-v1.2.3.zip", &source);
+    engine
+        .db
+        .conn()
+        .execute(
+            "UPDATE mod_library_entries SET project_page='https://example.org/project' WHERE id=?1",
+            [&entry.id],
+        )
+        .unwrap();
+    let target = crate::mod_metadata::Target::Archive(entry.id.clone());
+    let tag = crate::mod_organization::save_mod_tag(&engine.db, &game.id, None, "Keep", "#ABCDEF")
+        .unwrap();
+    crate::mod_metadata::update(
+        &engine,
+        &game.id,
+        &target,
+        serde_json::from_value(serde_json::json!({"name":"My title","tagIds":[tag.id]})).unwrap(),
+    )
+    .unwrap();
+    let preview = plan_library_install(
+        &engine,
+        &manual(
+            &game,
+            &entry,
+            LibrarySourceKind::SingleFile,
+            &entry.filename,
+            "Mods/intact.zip",
+        ),
+    )
+    .unwrap();
+    let planned = install::get_install(&engine, &preview.install_id).unwrap();
+    assert_eq!(planned.status, "planned");
+    assert_eq!(planned.name, "My title");
+    assert_eq!(planned.tag_ids, vec![tag.id.clone()]);
+    assert_eq!(planned.version.as_deref(), Some("1.2.3"));
+    assert_eq!(
+        planned.website.as_deref(),
+        Some("https://example.org/project")
+    );
+    assert!(planned.download_origin.is_none());
+    legacy::apply(&engine, &preview.plan);
+    let installed = install::get_install(&engine, &preview.install_id).unwrap();
+    assert_eq!(installed.status, "enabled");
+    assert_eq!(installed.name, planned.name);
+    assert_eq!(installed.tag_ids, planned.tag_ids);
+    assert_eq!(installed.version, planned.version);
+    assert_eq!(installed.website, planned.website);
 }

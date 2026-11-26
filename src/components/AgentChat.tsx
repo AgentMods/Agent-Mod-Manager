@@ -23,6 +23,7 @@ import {
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { composerPreferencesQuery, rememberComposerPreferences, resolveComposerPermission, turnPermission } from "@/lib/composer-preferences";
 import { activeTurnStart, describeAgentTools, isQuestionRequest, latestHistoryRewrite, pendingToolApproval, replayConversation, trackAgentTurn, useAgent, type AgentToolActivity } from "../lib/agent-store";
+import { currentRoute } from "../router";
 import { emptyDraft, useUI } from "../lib/store";
 import type { AgentAttachment, AgentEvent, AppSettings, ComposerPreferences, Conversation, Game, GameWorkspace, Message as ChatMessage, PromptOrigin, ReasoningEffort } from "../lib/types";
 import { readyAttachment, usePrepareAttachments, type DraftAttachment } from "@/lib/agent-attachments";
@@ -295,7 +296,7 @@ export function AgentChat() {
       await client.invalidateQueries({ queryKey: ["conversations"] });
     } catch (failure) {
       if (questionnaire && !started) throw failure; // Keep the form and its answers available for retry.
-      if (useUI.getState().view === "agent" && stillSelected()) setError(failure);
+      if (currentRoute().view === "agent" && stillSelected()) setError(failure);
       else useUI.getState().notify(String(failure));
     }
     finally { submittingRef.current = false; setSubmitting(null); }

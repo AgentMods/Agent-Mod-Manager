@@ -4,7 +4,7 @@ use crate::{
     settings::{SecretStore, Settings},
     transaction::tests::setup,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 fn key(game_id: &str) -> WorkKey {
@@ -13,6 +13,7 @@ fn key(game_id: &str) -> WorkKey {
         source_id: "curseforge".into(),
         project_id: "45".into(),
         provider_game_id: "7".into(),
+        project_page: None,
     }
 }
 
@@ -232,6 +233,7 @@ async fn card_install_starts_with_saved_default_permission() {
         source_id: "curseforge".into(),
         project_id: "45".into(),
         provider_game_id: "7".into(),
+        project_page: None,
     };
     let task = start(&runtime, "main", "search", "item", &work).unwrap();
     let events = runtime.events.replay(&task.conversation_id, 0, 20).unwrap();
@@ -465,7 +467,10 @@ async fn three_dm_detail_with_matching_mirror_prepares_scoped_download() {
         progress: None,
         resolution_scope: ResolutionScope::Agent(conversation),
     };
-    let detail = include_str!("../../sources/fixtures/three-dm-detail.json");
+    let mut detail: Value =
+        serde_json::from_str(include_str!("../../sources/fixtures/three-dm-detail.json")).unwrap();
+    detail["data"]["mods_resource"][0]["mods_resource_version"] = Value::Null;
+    detail["data"]["mods_original_url"] = json!("https://untrusted.example/opaque");
     let result = scope
         .finish_tool(
             &runtime.registry,
@@ -473,12 +478,15 @@ async fn three_dm_detail_with_matching_mirror_prepares_scoped_download() {
             &context,
             ("stock-detail", Some(("glossmod_3dm", "get-mod-detail"))),
             &json!({"id":1001}),
-            json!({"content":[{"type":"text","text":detail}]}),
+            json!({"content":[{"type":"text","text":detail.to_string()}]}),
         )
         .await
         .unwrap();
     let download = &result["download"];
     assert_eq!(download["version_id"], "2001");
+    assert_eq!(download["version"], "2.0");
+    assert_eq!(download["homepage_url"], "https://mod.3dmgame.com/mod/1001");
+    assert_eq!(result["homepage_url"], download["homepage_url"]);
     assert!(download.get("download_url").is_none());
     let tool = runtime.registry.get("download_mod").unwrap();
     let args = scope
@@ -490,6 +498,8 @@ async fn three_dm_detail_with_matching_mirror_prepares_scoped_download() {
         )
         .unwrap();
     let preview = tool.prepare(&context, &args).await.unwrap();
+    assert_eq!(preview.preview["homepage_url"], download["homepage_url"]);
+    assert_eq!(preview.preview["version"], download["version"]);
     scope
         .validate_prepared(db, "download_mod", tool.as_ref(), &args, &preview)
         .unwrap();
@@ -534,6 +544,14 @@ fn stock_arguments_and_3dm_contract_fail_closed() {
         (
             "/structuredContent/result/data/mods_resource/0/mods_resource_url",
             json!("https://drive.google.com/example.zip"),
+        ),
+        (
+            "/structuredContent/result/data/mods_resource/0/mods_resource_version",
+            Value::Null,
+        ),
+        (
+            "/structuredContent/result/data/mods_resource/0/mods_resource_name",
+            json!(format!("{}.zip", "x".repeat(177))),
         ),
     ] {
         let mut bad = fixture.clone();
@@ -829,4 +847,137 @@ fn install_scope_tool_definitions_keep_only_allowed_stock_tools() {
             .unwrap()
             .contains("browser"));
     }
+}
+
+#[test]
+fn stock_file_labels_are_selected_per_attachment_not_from_latest_or_compatibility() {
+    let curseforge = key("g");
+    let rows = json!({"version":"work-latest", "data":[
+        {"id":90,"modId":45,"displayName":" Release 2.1 ","gameVersions":["1.20.1"]},
+        {"id":91,"modId":45,"displayName":"Release 9.0"},
+        {"id":92,"modId":45,"gameVersions":["1.21"]}
+    ]});
+    assert_eq!(
+        stock::listed_file_version(&curseforge, "90", &rows),
+        Ok(Some("Release 2.1"))
+    );
+    assert_eq!(
+        stock::listed_file_version(&curseforge, "92", &rows),
+        Ok(None)
+    );
+    assert_eq!(
+        stock::listed_file_version(&curseforge, "93", &rows),
+        Ok(None)
+    );
+    let wrong = json!({"data":[{"id":90,"modId":46,"displayName":"wrong mod"}]});
+    assert!(stock::listed_file_version(&curseforge, "90", &wrong).is_err());
+    let duplicate = json!({"data":[{"id":90,"displayName":"A"},{"id":90,"displayName":"B"}]});
+    assert!(stock::listed_file_version(&curseforge, "90", &duplicate).is_err());
+    let modio = WorkKey {
+        source_id: "modio".into(),
+        ..curseforge.clone()
+    };
+    let modio_files = json!({"version":"newest", "data":[
+        {"id":90,"mod_id":45,"version":"2.1"},{"id":91,"version":"9.0"},
+    ]});
+    assert_eq!(
+        stock::listed_file_version(&modio, "90", &modio_files),
+        Ok(Some("2.1"))
+    );
+    let gamebanana = WorkKey {
+        source_id: "gamebanana".into(),
+        ..curseforge
+    };
+    assert_eq!(
+        stock::listed_file_version(&gamebanana, "90", &rows),
+        Ok(None)
+    );
+}
+
+#[test]
+fn stock_archive_metadata_uses_only_exact_unambiguous_legacy_associations() {
+    let conn = Connection::open_in_memory().unwrap();
+    let mut entry = mod_library::LibraryEntry {
+        id: format!("received-{}", "a".repeat(64)),
+        game_id: Some("g".into()),
+        game_name: "Game".into(),
+        name: "Name".into(),
+        filename: "Archive.zip".into(),
+        archive_relative_path: String::new(),
+        payload_relative_path: String::new(),
+        size: 1,
+        sha256: "b".repeat(64),
+        source_id: "local".into(),
+        project_id: None,
+        version_id: None,
+        version: String::new(),
+        created_at: String::new(),
+        integrity_verified: false,
+        project_page: None,
+        author_hint: None,
+    };
+    let none = (None, None);
+    assert_eq!(stock_archive_metadata(&conn, &entry).unwrap(), none);
+    conn.execute_batch(
+        "CREATE TABLE browse_install_tasks(id TEXT,conversation_id TEXT,game_id TEXT,source_id TEXT,project_id TEXT,provider_game_id TEXT);
+         CREATE TABLE browse_install_downloads(task_id TEXT,artifact_id TEXT,file_id TEXT,sha256 TEXT);
+         INSERT INTO browse_install_tasks VALUES('one','old','g','curseforge','45','7'),
+           ('retry','old-2','g','curseforge','45','7'),('foreign','foreign','other','gamebanana','50','7');",
+    ).unwrap();
+    let link = |task: &str, file: &str, artifact: &str, hash: &str| {
+        conn.execute(
+            "INSERT INTO browse_install_downloads VALUES(?1,?2,?3,?4)",
+            params![task, artifact, file, hash],
+        )
+        .unwrap();
+    };
+    link("one", "91", &entry.id, &"c".repeat(64));
+    link("foreign", "90", &entry.id, &entry.sha256);
+    link(
+        "one",
+        "90",
+        &format!("received-{}", "d".repeat(64)),
+        &entry.sha256,
+    );
+    assert_eq!(stock_archive_metadata(&conn, &entry).unwrap(), none);
+    link("one", "90", &entry.id, &entry.sha256);
+    link("retry", "90", &entry.id, &entry.sha256);
+    conn.execute_batch("PRAGMA query_only=ON").unwrap();
+    let site = "https://www.curseforge.com/projects/45";
+    assert_eq!(
+        stock_archive_metadata(&conn, &entry).unwrap(),
+        (None, Some(site.into()))
+    );
+    conn.execute_batch("PRAGMA query_only=OFF").unwrap();
+    conn.execute_batch("CREATE TABLE tool_calls(conversation_id TEXT,name TEXT,arguments_json TEXT,result_json TEXT,status TEXT)").unwrap();
+    let tool = crate::mcp::client::namespaced_tool_name("curseforge", "list_mod_files");
+    conn.execute(
+        "INSERT INTO tool_calls VALUES('old',?1,'{}',?2,'done')",
+        params![
+            tool,
+            json!({"data":[{"id":90,"modId":45,"displayName":"2.1"}]}).to_string()
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        stock_archive_metadata(&conn, &entry).unwrap(),
+        (Some("2.1".into()), Some(site.into()))
+    );
+    conn.execute(
+        "INSERT INTO tool_calls VALUES('old-2',?1,'{}',?2,'done')",
+        params![
+            tool,
+            json!({"data":[{"id":90,"modId":45,"displayName":"conflicting"}]}).to_string()
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        stock_archive_metadata(&conn, &entry).unwrap(),
+        (None, Some(site.into()))
+    );
+    entry.source_id = "manual".into();
+    assert_eq!(stock_archive_metadata(&conn, &entry).unwrap(), none);
+    entry.source_id = "local".into();
+    link("retry", "91", &entry.id, &entry.sha256);
+    assert_eq!(stock_archive_metadata(&conn, &entry).unwrap(), none);
 }

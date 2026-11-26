@@ -15,7 +15,7 @@ import { GameConflictPanel, useGameConflicts } from "@/components/GameConflictPa
 import { GameLaunchButton, type LaunchMethod } from "@/components/GameLaunchButton";
 import { chooseGameProgram } from "@/lib/game-launch";
 import { GameCover } from "@/components/GameCover";
-import { ScanGameCard } from "@/components/ScanGameCard";
+import { ScanGameCard, ScanGameGrid } from "@/components/ScanGameCard";
 import { ManagerPluginCatalog } from "@/components/ManagerPluginCatalog";
 import { GameIdentityDialog } from "@/components/GameIdentityDialog";
 import { AlertDialog, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
@@ -24,7 +24,6 @@ import { Card, CardDescription, CardFooter, CardHeader, CardTitle } from "@/comp
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Field, FieldDescription, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from "@/components/ui/input-group";
-import { ItemGroup } from "@/components/ui/item";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -316,7 +315,6 @@ export default function LibraryPage() {
 
   const discoveryRows = reconcileCandidates(candidates, games.data);
   const rows = (games.data ?? []).filter((game) => game.name.toLowerCase().includes(search.toLowerCase()));
-  const coversByAdapter = new Map((plugins.data ?? []).filter(plugin => plugin.enabled && plugin.validated).map(plugin => [plugin.slug, plugin.coverUrl]));
   const actionsDisabled = !backendAvailable || !!actionBusy;
   return <Page data-testid="library-page">
     <PageHeader title={tr("游戏库")} subtitle={backendAvailable ? tr("{value1} 个管理中的游戏", { value1: games.data?.length ?? 0 }) : tr("桌面能力未连接")}
@@ -332,7 +330,7 @@ export default function LibraryPage() {
     {error != null && <ErrorState error={error} />}
     {rows.length > 0 && <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,17rem),1fr))] gap-4">
       {rows.map((game, index) => <GameCard key={game.id} game={game} index={index} disabled={actionsDisabled} busy={actionBusy} writable={writable}
-        coverUrl={game.adapterSlug ? coversByAdapter.get(game.adapterSlug) ?? null : null}
+        coverUrl={game.adapterSlug ? cloud.coversByAdapter.get(game.adapterSlug) ?? null : null}
         onCreateAdapter={() => startAdapterChat({ name: game.name, gameId: game.id })}
         onChooseAdapter={() => setChoosingAdapter(game)}
         onOpen={() => selectGame(game.id)}
@@ -372,13 +370,13 @@ export default function LibraryPage() {
           {report.warnings.map((warning, index) => <li key={index}><PathText className="text-warning">{displayPath(warning.path)}：{errorText(warning)}</PathText></li>)}
         </ul>
       </details>}
-      {discoveryRows.length > 0 && <ItemGroup aria-label={tr("扫描候选游戏")} className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,17rem),1fr))] gap-4">
+      {discoveryRows.length > 0 && <ScanGameGrid>
         {discoveryRows.map((candidate, index) => <ScanGameCard key={gameDirectoryKey(candidate.rootPath)} candidate={candidate} index={index}
-          coverUrl={candidate.suggestedAdapterSlug ? coversByAdapter.get(candidate.suggestedAdapterSlug) : null}
+          coverUrl={candidate.suggestedAdapterSlug ? cloud.coversByAdapter.get(candidate.suggestedAdapterSlug) : null}
           matched={cloud.match(candidate)} waiting={cloud.waiting(candidate)} failed={!!failedRegistrations[candidate.rootPath]}
           disableRegister={!writable || busy || cloud.pending || games.isLoading} disableIdentify={!backendAvailable || busy || games.isLoading}
           onRegister={localOnly => void register(candidate, localOnly)} onIdentify={trigger => setIdentity({ directory: candidate.rootPath, trigger })} />)}
-      </ItemGroup>}
+      </ScanGameGrid>}
       {identity && <GameIdentityDialog key={identity.directory} directory={identity.directory} writable={writable} onClose={() => setIdentity(null)}
         onCloseAutoFocus={(event) => {
           event.preventDefault();

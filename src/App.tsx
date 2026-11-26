@@ -1,11 +1,12 @@
 import { version } from "../package.json";
 import { tr, useLocale } from "@/lib/i18n";
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { CompassIcon, Gamepad2Icon, HeartIcon, HouseIcon, HistoryIcon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
 import { SponsorLink } from "./components/SponsorLink";
-import HomePage from "./pages/HomePage";
+import { Outlet, useMatches } from "react-router";
+import { currentRoute, navigatePage, type ShellContext } from "./router";
 import { backendAvailable, errorText, useBackendQuery } from "./lib/api";
 import { subscribeAgentToolResults, syncAgentEvents } from "./lib/agent-store";
 import { invalidateAgentModQueries } from "./lib/agent-mod-cache";
@@ -16,9 +17,10 @@ import { refreshBrowseInstallTasks } from "./lib/browse-install";
 import { refreshMcpQueries } from "./lib/mcp-connection";
 import { McpGameToolApproval } from "./components/McpGameToolApproval";
 import { useLanguageSync } from "./lib/app-language";
-import type { BootstrapState, PageName } from "./lib/types";
+import type { BootstrapState } from "./lib/types";
 import { BackgroundApprovalLink } from "./components/AgentConfirmation";
 import { PlanDialog } from "./components/PlanDialog";
+import { AgentNavigationButton } from "./components/AgentNavigationButton";
 import { AppLogo } from "./components/AppLogo";
 import { ErrorState, IconButton } from "./components/ui";
 import { Breadcrumb, BreadcrumbItem, BreadcrumbList, BreadcrumbPage, BreadcrumbSeparator } from "@/components/ui/breadcrumb";
@@ -28,16 +30,6 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 import { stagger } from "@/lib/motion";
-
-const LibraryPage = lazy(() => import("./pages/LibraryPage"));
-const BrowsePage = lazy(() => import("./pages/BrowsePage"));
-const GameDetailPage = lazy(() => import("./pages/GameDetailPage"));
-const AgentPage = lazy(() => import("./pages/AgentPage"));
-const PluginsPage = lazy(() => import("./pages/PluginsPage"));
-const TrashPage = lazy(() => import("./pages/TrashPage"));
-const HistoryPage = lazy(() => import("./pages/HistoryPage"));
-const SettingsPage = lazy(() => import("./pages/SettingsPage"));
-const OnboardingPage = lazy(() => import("./pages/OnboardingPage"));
 
 const navigation = [
     { id: "home", get label() { return tr("首页"); }, icon: HouseIcon },
@@ -50,7 +42,6 @@ const navigation = [
 ] as const;
 const settingsItem = { id: "settings", get label() { return tr("设置"); }, icon: SettingsIcon } as const;
 const APP_VERSION = `v${version}`;
-const pages = { browse: BrowsePage, library: LibraryPage, detail: GameDetailPage, agent: AgentPage, plugins: PluginsPage, trash: TrashPage, history: HistoryPage, settings: SettingsPage };
 
 /** The navigation rail collapses to icons below this width so content keeps its room. */
 const WIDE_QUERY = "(min-width: 1100px)";
@@ -88,12 +79,11 @@ function invalidateOrganizedModQueries(client: ReturnType<typeof useQueryClient>
 export default function App() {
     useLocale();
     useLanguageSync();
-    const view = useUI((state) => state.view);
-    const navigate = useUI((state) => state.navigate);
+    const view = useMatches().at(-1)?.id;
     const theme = useUI((state) => state.theme);
     const toggleTheme = useUI((state) => state.toggleTheme);
     const notify = useUI((state) => state.notify);
-    const visibleConversation = useUI((state) => state.view === "agent" ? state.conversationId : null);
+    const visibleConversation = useUI((state) => view === "agent" ? state.conversationId : null);
     const client = useQueryClient();
     const bootstrap = useBackendQuery<BootstrapState>(["bootstrap"], "get_bootstrap_state");
     const shownTheme = useRef<string | null>(null);
@@ -115,9 +105,9 @@ export default function App() {
         if (gameMutations.length) {
             const removedGameIds = new Set(gameMutations.flatMap(({ name, gameId }) =>
                 name === "remove_game" ? [gameId] : []));
-            const current = useUI.getState();
+            const current = currentRoute();
             if (current.view === "detail" && current.gameId && removedGameIds.has(current.gameId)) {
-                current.navigate("library");
+                navigatePage("library");
             }
             void invalidateGameQueries(client, {
                 gameIds: gameMutations.map(({ gameId }) => gameId),
@@ -183,7 +173,7 @@ export default function App() {
             unlisten = stop;
             // A query may have completed before Tauri finished registering this listener.
             // Refresh the currently open game once registration is ready to cover that gap.
-            const current = useUI.getState();
+            const current = currentRoute();
             if (current.view === "detail" && current.gameId) {
                 invalidateOrganizedModQueries(client, current.gameId);
             }
@@ -221,20 +211,19 @@ export default function App() {
     const changeRail = (open: boolean) => { setRailOpen(open); storeRail(open); };
 
     if (backendAvailable && bootstrap.isLoading && !bootstrap.data) return <div className="flex min-h-dvh items-center justify-center bg-background"><Loading>{tr("正在准备桌面服务…")}</Loading></div>;
-    const automaticOnboarding = !!(bootstrap.data?.isFirstRun || bootstrap.data?.resumeOnboarding);
+    const outlet = <Outlet context={{ bootstrap: bootstrap.data, version: APP_VERSION } satisfies ShellContext} />;
     if (backendAvailable && bootstrap.data && view === "onboarding") {
         return <div className="flex h-dvh flex-col">
             <McpGameToolApproval />
             <div className="min-h-0 flex-1 overflow-auto">
                 <Suspense fallback={<main className="flex min-h-dvh items-center justify-center bg-background"><Loading>{tr("正在加载引导…")}</Loading></main>}>
-                    <OnboardingPage automatic={automaticOnboarding} bootstrap={bootstrap.data} />
+                    {outlet}
                 </Suspense>
             </div>
         </div>;
     }
 
     const shellView = view === "onboarding" ? "settings" : view;
-    const Page = shellView === "home" ? null : pages[shellView];
     const current = shellView === "detail" ? tr("游戏详情") : [...navigation, settingsItem].find((item) => item.id === shellView)?.label;
     const macos = backendAvailable && navigator.platform.startsWith("Mac");
     return <SidebarProvider open={railOpen ?? wide} onOpenChange={changeRail} className="h-dvh min-h-0 overflow-hidden" style={{ "--sidebar-width": "13.5rem" } as React.CSSProperties}>
@@ -242,7 +231,7 @@ export default function App() {
             <SidebarHeader className={cn("gap-0 p-3", macos && "pt-10")}>
                 <SidebarMenu>
                     <SidebarMenuItem>
-                        <SidebarMenuButton size="lg" tooltip={appName} aria-label={appName} onClick={() => navigate("home")}>
+                        <SidebarMenuButton size="lg" tooltip={appName} aria-label={appName} onClick={() => navigatePage("home")}>
                             <AppLogo />
                             <span className="truncate text-sm font-semibold">{appName}</span>
                         </SidebarMenuButton>
@@ -257,9 +246,10 @@ export default function App() {
                                 {navigation.map(({ id, label, icon: Icon }, index) => {
                                     const active = view === id || (id === "library" && view === "detail");
                                     return <SidebarMenuItem key={id} className="motion-safe:animate-slide-in-left" style={stagger(index, 50)}>
-                                        <SidebarMenuButton tooltip={label} isActive={active} aria-current={view === id ? "page" : undefined} onClick={() => navigate(id as PageName)}>
+                                        {id === "agent" ? <AgentNavigationButton visibleConversation={visibleConversation} active={active} /> :
+                                        <SidebarMenuButton tooltip={label} isActive={active} aria-current={view === id ? "page" : undefined} onClick={() => navigatePage(id)}>
                                             <Icon /><span>{label}</span>
-                                        </SidebarMenuButton>
+                                        </SidebarMenuButton>}
                                     </SidebarMenuItem>;
                                 })}
                             </SidebarMenu>
@@ -269,7 +259,7 @@ export default function App() {
             </SidebarContent>
             <SidebarFooter className="p-3">
                 <div className="flex items-center justify-between gap-2 group-data-[collapsible=icon]:flex-col">
-                    <IconButton title={settingsItem.label} variant={view === "settings" ? "secondary" : "ghost"} aria-current={view === "settings" ? "page" : undefined} onClick={() => navigate("settings")}><settingsItem.icon /></IconButton>
+                    <IconButton title={settingsItem.label} variant={view === "settings" ? "secondary" : "ghost"} aria-current={view === "settings" ? "page" : undefined} onClick={() => navigatePage("settings")}><settingsItem.icon /></IconButton>
                     <div className="flex items-center group-data-[collapsible=icon]:flex-col">
                         <IconButton asChild title={tr("赞助")}>
                             <SponsorLink><HeartIcon aria-hidden="true" /></SponsorLink>
@@ -300,7 +290,7 @@ export default function App() {
             {bootstrap.data?.recoveryError && <ErrorState className="rounded-none border-x-0 border-t-0" error={tr("文件事务恢复需要处理：{recoveryError}", { recoveryError: bootstrap.data.recoveryError })} />}
             <ErrorState className="rounded-none border-x-0 border-t-0" error={bootstrap.error} />
             <main className="min-h-0 min-w-0 flex-1 overflow-auto">
-                <Suspense fallback={<Loading>{tr("正在加载...")}</Loading>}>{Page ? <Page /> : <HomePage bootstrap={bootstrap.data} version={APP_VERSION} />}</Suspense>
+                <Suspense fallback={<Loading>{tr("正在加载...")}</Loading>}>{outlet}</Suspense>
             </main>
         </SidebarInset>
         <PlanDialog />

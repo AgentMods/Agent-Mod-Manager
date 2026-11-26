@@ -1,12 +1,16 @@
 //! Read-only provider integration. Secrets enter through SourceKeys, never DTOs.
 //! API references and provider-specific restrictions live beside each adapter.
 mod http;
+mod project_pages;
 mod providers;
 pub mod resolutions;
 pub(crate) mod web_download;
 pub mod web_search;
+pub(crate) use project_pages::known_project_page;
 pub use providers::dependency_graph::{DependencyGraph, DependencyGraphRequest};
-pub(crate) use providers::three_dm::select_resource as select_three_dm_resource;
+pub(crate) use providers::three_dm::{
+    select_resource as select_three_dm_resource, three_dm_project_page,
+};
 
 #[cfg(test)]
 mod live_provider_tests;

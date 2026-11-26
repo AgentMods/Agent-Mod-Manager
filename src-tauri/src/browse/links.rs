@@ -70,7 +70,9 @@ pub(super) fn project(
         ("glossmod_http", "www.glossmod.com" | "glossmod.com", ["mods", id]) => {
             numeric(id) && project_id == *id
         }
-        ("glossmod_3dm", "mod.3dmgame.com", ["mod", id]) => numeric(id) && project_id == *id,
+        ("glossmod_3dm", "mod.3dmgame.com", ["mod", id]) if project_id == *id => {
+            return crate::sources::three_dm_project_page(project_id);
+        }
         ("modio", "mod.io" | "www.mod.io", ["g", _, "m", _]) => true,
         (
             "curseforge",

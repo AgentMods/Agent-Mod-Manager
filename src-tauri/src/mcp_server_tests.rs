@@ -58,6 +58,10 @@ fn fixture() -> Fixture {
 fn fixture_with_native_tools(names: &[&str]) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let paths = AppPaths::new(dir.path().join("data")).unwrap();
+    fixture_with_paths(names, dir, paths)
+}
+
+fn fixture_with_paths(names: &[&str], dir: tempfile::TempDir, paths: AppPaths) -> Fixture {
     let db = Db::open(&paths.db_file()).unwrap();
     let settings = Settings::with_secret_store(db.clone(), Arc::new(MockSecrets::default()));
     let (tx, events) = mpsc::unbounded_channel();
@@ -424,6 +428,100 @@ async fn tools_are_allowlisted_and_real_reads_reuse_desktop_file_guards() {
             .is_error,
         Some(true)
     );
+    client.cancel().await.unwrap();
+    server.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn storage_directory_discovery_and_file_ops_use_current_engine_and_desktop_approval() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_root = dir.path().join("old-storage");
+    std::fs::create_dir(&old_root).unwrap();
+    let old_root = old_root.canonicalize().unwrap();
+    let old_file = old_root.join("old.txt");
+    std::fs::write(&old_file, "old storage").unwrap();
+    let paths = AppPaths::new(dir.path().join("relocated-storage"))
+        .unwrap()
+        .with_control_root(&old_root);
+    let root = paths.root.clone();
+    let mut fixture = fixture_with_paths(
+        &[STORAGE_TOOL, "read_file", "plan_file_ops", "apply_file_ops"],
+        dir,
+        paths,
+    );
+    set_mode(&fixture.runtime, "auto_approve");
+    let source = root.join("notes.txt");
+    std::fs::write(&source, "ordinary work file").unwrap();
+    let server = LocalMcpServer::new(fixture.runtime.clone());
+    server.start().await.unwrap();
+    let client = connect(&server, &fixture.runtime).await;
+
+    let listed = client.peer().list_tools(None).await.unwrap();
+    let storage = listed.tools.iter().find(|t| t.name == STORAGE_TOOL).unwrap();
+    assert_eq!(storage.input_schema["additionalProperties"], false);
+    assert_eq!(storage.input_schema["properties"], json!({}));
+    let response = call(&client, STORAGE_TOOL, json!({})).await;
+    assert_eq!(response.is_error, Some(false), "{response:?}");
+    let payload = response.structured_content.unwrap();
+    let result = &payload["result"];
+    assert_eq!(*result, json!({"path":crate::paths::display_path(&root)}));
+    let reported = std::path::PathBuf::from(result["path"].as_str().unwrap());
+    assert_eq!(reported.canonicalize().unwrap(), root);
+    assert_eq!(
+        call(&client, STORAGE_TOOL, json!({"path":old_root}))
+            .await
+            .is_error,
+        Some(true)
+    );
+    let response = call(&client, "read_file", json!({"path":reported.join("notes.txt")})).await;
+    assert_eq!(response.is_error, Some(false), "{response:?}");
+    assert!(response.structured_content.unwrap()["result"].to_string().contains("ordinary work file"));
+    assert_eq!(
+        call(&client, "read_file", json!({"path":old_file})).await.is_error,
+        Some(true)
+    );
+
+    let destination = reported.join("notes copy.txt");
+    let response = call(&client, "plan_file_ops", json!({
+        "summary":"Copy a work file in active storage",
+        "operations":[{"op":"copy","src":reported.join("notes.txt"),"dst":destination}]
+    })).await;
+    assert_eq!(response.is_error, Some(false), "{response:?}");
+    let plan_id = response.structured_content.unwrap()["result"]["id"]
+        .as_str().unwrap().to_owned();
+    assert!(!destination.exists());
+    let peer = client.peer().clone();
+    let apply = tokio::spawn(async move {
+        peer.call_tool(CallToolRequestParams::new("apply_file_ops").with_arguments(
+            json!({"plan_id":plan_id,"approved":true}).as_object().unwrap().clone(),
+        )).await.unwrap()
+    });
+    let approval = next_event(&mut fixture.events, "approval-request").await;
+    assert_eq!(approval.payload["title"], "apply_file_ops");
+    assert!(!apply.is_finished());
+    assert!(!destination.exists());
+    fixture.runtime.respond_approval(
+        &approval.conversation_id,
+        approval.payload["approvalId"].as_str().unwrap(),
+        ApprovalResponse { approved: true, answer: Value::Null },
+    ).unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(5), apply)
+        .await.unwrap().unwrap();
+    assert_eq!(response.is_error, Some(false), "{response:?}");
+    assert_eq!(std::fs::read_to_string(&destination).unwrap(), "ordinary work file");
+
+    set_mode(&fixture.runtime, "full_trust");
+    for operation in [
+        json!({"op":"write_text","dst":destination,"content":"local Agent only"}),
+        json!({"op":"copy","src":source,"dst":root.join("private/probe.txt")}),
+        json!({"op":"copy","src":source,"dst":root.join("manager.db")}),
+        json!({"op":"copy","src":source,"dst":old_root.join("probe.txt")}),
+    ] {
+        let response = call(&client, "plan_file_ops", json!({
+            "summary":"Out of file scope", "operations":[operation]
+        })).await;
+        assert_eq!(response.is_error, Some(true), "{operation}: {response:?}");
+    }
     client.cancel().await.unwrap();
     server.stop().await.unwrap();
 }

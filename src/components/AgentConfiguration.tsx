@@ -2,7 +2,7 @@ import { tr } from "@/lib/i18n";
 import { useId, useMemo, useRef, useState, type FormEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ChevronDownIcon, ChevronLeftIcon, ChevronRightIcon, DownloadIcon, ExternalLinkIcon, GripVerticalIcon, PlusIcon, SaveIcon, Trash2Icon, TriangleAlertIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronLeftIcon, ChevronRightIcon, DownloadIcon, ExternalLinkIcon, GripVerticalIcon, PlusIcon, SaveIcon, ShieldCheckIcon, Trash2Icon, TriangleAlertIcon } from "lucide-react";
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { REASONING_LEVELS, reasoningEffortLabel } from "../lib/reasoning-effort";
 import { useUI } from "../lib/store";
@@ -23,8 +23,8 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 
 const KEY_URL = "https://one.gloscai.com/keys";
 const MODEL_CANDIDATES_PER_PAGE = 100;
-const modelColumnHead = "h-8 px-1 text-xs text-muted-foreground";
-const modelTableCell = "min-w-0 p-0 @min-[37rem]:p-1";
+const modelColumnHead = "h-7 px-1 text-xs text-muted-foreground";
+const modelTableCell = "min-w-0 p-0 @min-[37rem]:px-1 @min-[37rem]:py-0.5";
 const modelInput = "h-8 px-2 text-sm";
 const compactFieldLabel = "mb-1 block text-xs text-muted-foreground @min-[37rem]:hidden";
 const modelMetadataQuery = "get_agent_model_metadata";
@@ -234,22 +234,22 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
     }
   }
 
-  return <form className="flex flex-col gap-6" onSubmit={(event) => {void save(event);}}>
-    <FieldGroup className={navigation ? "px-6" : undefined}>
+  return <form className={cn("flex flex-col", navigation ? "gap-4" : "gap-3")} onSubmit={(event) => {void save(event);}}>
+    <FieldGroup className={cn("gap-3", navigation && "px-6")}>
       {(error || settings.error) && <Alert variant="destructive"><AlertDescription>{error || errorText(settings.error)}</AlertDescription></Alert>}
-      <div className="grid gap-4 sm:grid-cols-2">
-        <Field>
-          <FieldLabel htmlFor={`${id}-url`}>{tr("API 地址")}</FieldLabel>
+      <div className="grid gap-3 rounded-xl border bg-muted/25 p-3 transition-colors duration-200 hover:border-foreground/20 sm:grid-cols-2">
+        <Field className="gap-1.5">
+          <FieldLabel htmlFor={`${id}-url`} className="min-h-5.5 items-center">{tr("API 地址")}</FieldLabel>
           <Input id={`${id}-url`} type="url" value={draft?.base_url ?? ""} disabled={disabled || listing} required
             placeholder="https://api.example.com/v1" onChange={(event) => {
               if (draft) setEdited({...draft, base_url: event.target.value});
               resetModelList();
             }}/>
         </Field>
-        <Field>
-          <div className="flex flex-wrap items-center justify-between gap-2">
+        <Field className="gap-1.5">
+          <div className="flex min-h-5.5 flex-wrap items-center justify-between gap-2">
             <FieldLabel htmlFor={`${id}-key`}>{tr("API 密钥")}</FieldLabel>
-            <a className="inline-flex items-center gap-1 text-xs text-primary underline-offset-4 hover:underline" href={KEY_URL} target="_blank" rel="noreferrer" onClick={(event) => {
+            <a className="inline-flex items-center gap-1 rounded-full border bg-background/80 px-2.5 py-0.5 text-xs font-medium text-foreground transition-colors hover:bg-muted" href={KEY_URL} target="_blank" rel="noreferrer" onClick={(event) => {
               if (!backendAvailable) return;
               event.preventDefault();
               void openUrl(KEY_URL).catch((failure) => setError(errorText(failure)));
@@ -261,35 +261,35 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
         </Field>
       </div>
 
-      {draft && <section aria-labelledby={`${id}-models`} className="@container flex min-w-0 flex-col gap-3">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="flex min-w-0 flex-col gap-1">
+      {draft && <section aria-labelledby={`${id}-models`} className="@container flex min-w-0 flex-col gap-2.5 rounded-xl border bg-muted/25 p-3 transition-colors duration-200 hover:border-foreground/20">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex min-w-0 flex-wrap items-baseline gap-x-2.5 gap-y-0.5">
             <h3 id={`${id}-models`} className="text-sm font-semibold">{tr("模型列表")}</h3>
-            <FieldDescription role="status" className={metadata.isError ? "text-warning" : undefined}>
+            <FieldDescription role="status" className={cn("text-xs", metadata.isError && "text-warning")}>
               {waitingForDefaults ? tr("正在读取模型元数据…") : metadata.isError ? tr("暂时无法读取 BaseLLM 元数据") : tr("保存后应用到新的 Agent 请求。")}
             </FieldDescription>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Button type="button" variant="outline" size="sm" disabled={disabled || listing || !baseUrl} onClick={() => {void listModels();}}>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Button type="button" variant="outline" size="sm" className="bg-background/80 hover:bg-muted/60" disabled={disabled || listing || !baseUrl} onClick={() => {void listModels();}}>
               {listing ? <Spinner data-icon="inline-start"/> : <DownloadIcon data-icon="inline-start"/>}
               {listing ? tr("获取中…") : tr("获取模型列表")}
             </Button>
-            <Button type="button" variant="outline" size="sm" disabled={disabled} onClick={() => appendModels([""], true)}>
+            <Button type="button" variant="outline" size="sm" className="bg-background/80 hover:bg-muted/60" disabled={disabled} onClick={() => appendModels([""], true)}>
               <PlusIcon data-icon="inline-start"/>{tr("手动添加")}
             </Button>
           </div>
         </div>
 
         {listError && <p className="text-sm text-warning" role="status">{tr("{listError}。也可以手动添加模型 ID。", { listError })}</p>}
-        {available && <FieldSet disabled={disabled} className="gap-3 rounded-lg border p-4">
-          <FieldLegend variant="label">{tr("服务商模型（可多选）")}</FieldLegend>
+        {available && <FieldSet disabled={disabled} className="gap-2.5 rounded-xl border bg-card/75 p-3">
+          <FieldLegend variant="label" className="mb-0">{tr("服务商模型（可多选）")}</FieldLegend>
           <Label htmlFor={`${id}-filter`} className="sr-only">{tr("搜索服务商模型")}</Label>
           <Input id={`${id}-filter`} type="search" value={filter} onChange={(event) => {
             setFilter(event.target.value);
             showCandidatePage(0);
           }} placeholder={tr("搜索模型 ID")}/>
-          <ScrollArea className="min-w-0 rounded-md border [&_[data-slot=scroll-area-viewport]]:max-h-48 [&_[data-slot=scroll-area-viewport]>div]:block!">
-            <div ref={candidateList} className="flex flex-col gap-2 p-3">
+          <ScrollArea className="min-w-0 rounded-lg border bg-background/60 [&_[data-slot=scroll-area-viewport]]:max-h-40 [&_[data-slot=scroll-area-viewport]>div]:block!">
+            <div ref={candidateList} className="flex flex-col gap-2 p-2.5">
               {available.slice(pageStart, pageStart + MODEL_CANDIDATES_PER_PAGE).map((name) => <Label key={name} className="font-normal break-all">
                 <Checkbox checked={selectedIds.has(name)} onCheckedChange={(checked) => setSelection((current) => checked === true ? [...current, name] : current.filter((item) => item !== name))}/>
                 <span>{name}</span>
@@ -308,15 +308,15 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
           </div>
         </FieldSet>}
 
-        {draft.models.length ? <div className="min-w-0 rounded-lg border">
+        {draft.models.length ? <div className="min-w-0 overflow-hidden rounded-xl border bg-card/75">
           <Table aria-label={tr("模型列表")} role="table" className="block @min-[37rem]:table @min-[37rem]:table-fixed">
             <TableHeader role="rowgroup" className="sr-only @min-[37rem]:not-sr-only @min-[37rem]:table-header-group">
-              <TableRow role="row">
-                <TableHead role="columnheader" scope="col" className="h-8 w-9" aria-label={tr("排序")}/>
+              <TableRow role="row" className="bg-muted/45 hover:bg-muted/45">
+                <TableHead role="columnheader" scope="col" className="h-7 w-9" aria-label={tr("排序")}/>
                 <TableHead role="columnheader" scope="col" className={modelColumnHead}>{tr("菜单显示名")}</TableHead>
                 <TableHead role="columnheader" scope="col" className={modelColumnHead}>{tr("实际请求模型")}</TableHead>
                 <TableHead role="columnheader" scope="col" className={cn(modelColumnHead, "w-[24%]")}>{tr("思考等级")}</TableHead>
-                <TableHead role="columnheader" scope="col" className="h-8 w-9" aria-label={tr("删除")}/>
+                <TableHead role="columnheader" scope="col" className="h-7 w-9" aria-label={tr("删除")}/>
               </TableRow>
             </TableHeader>
             <TableBody role="rowgroup" className="block @min-[37rem]:table-row-group">
@@ -328,7 +328,7 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
                 const rowName = displayName || fieldName;
                 const enabledLevels = levelsFor(model);
                 return <TableRow key={rowKey} role="row" data-state={draggingRow === rowKey ? "selected" : undefined}
-                  className="grid grid-cols-2 gap-x-2 gap-y-1.5 p-2 @min-[37rem]:table-row @min-[37rem]:p-0"
+                  className="grid grid-cols-2 gap-x-2 gap-y-1.5 p-2 transition-colors hover:bg-muted/35 @min-[37rem]:table-row @min-[37rem]:p-0"
                   onDragOver={(event) => {
                     if (draggingRow === undefined || disabled) return;
                     event.preventDefault();
@@ -340,7 +340,7 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
                     moveModel(draggingRow, index);
                     setDraggingRow(undefined);
                   }}>
-                  <TableCell role="cell" className="min-w-0 p-0 @min-[37rem]:px-1">
+                  <TableCell role="cell" className="min-w-0 p-0 @min-[37rem]:px-1 @min-[37rem]:py-0.5">
                     <Button type="button" variant="ghost" size="icon-sm" aria-label={tr("移动 {rowName}", { rowName })}
                       title={tr("拖动排序，或按 ↑ / ↓ 移动")} aria-keyshortcuts="ArrowUp ArrowDown"
                       disabled={disabled || draft.models.length < 2} draggable={!disabled && draft.models.length > 1}
@@ -402,7 +402,7 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
                       </DropdownMenuContent>
                     </DropdownMenu>
                   </TableCell>
-                  <TableCell role="cell" className="col-start-2 row-start-1 justify-self-end p-0 text-right @min-[37rem]:px-1">
+                  <TableCell role="cell" className="col-start-2 row-start-1 justify-self-end p-0 text-right @min-[37rem]:px-1 @min-[37rem]:py-0.5">
                     <Button type="button" variant="ghost" size="icon-sm" aria-label={tr("删除 {rowName}", { rowName })} disabled={disabled}
                       title={tr("删除模型")} onClick={() => removeModel(rowKey)}>
                       <Trash2Icon aria-hidden="true"/>
@@ -412,15 +412,18 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
               })}
             </TableBody>
           </Table>
-        </div> : <Empty className="border p-5 md:p-5">
+        </div> : <Empty className="rounded-xl border bg-card/60 p-3.5 md:p-3.5">
           <EmptyHeader><EmptyTitle>{tr("暂无模型")}</EmptyTitle><EmptyDescription>{tr("从服务商获取模型列表，或手动添加。")}</EmptyDescription></EmptyHeader>
         </Empty>}
 
         {modelIds.some((modelId) => !!modelId && !validModelText(modelId)) || invalidNames
-          ? <FieldDescription role="status">{tr("模型名称最多 256 字节，且不能包含控制字符。")}</FieldDescription> : null}
-        {duplicateIds.size > 0 && <FieldDescription role="status">{tr("实际请求模型 ID 不能重复。")}</FieldDescription>}
-        {draft.models.length > 1 && <Field className="@min-[37rem]:max-w-xs">
-          <FieldLabel htmlFor={`${id}-default`}>{tr("默认模型")}</FieldLabel>
+          ? <FieldDescription role="status" className="text-xs">{tr("模型名称最多 256 字节，且不能包含控制字符。")}</FieldDescription> : null}
+        {duplicateIds.size > 0 && <FieldDescription role="status" className="text-xs">{tr("实际请求模型 ID 不能重复。")}</FieldDescription>}
+      </section>}
+
+      {draft && draft.models.length > 1 ? <div className="grid gap-3 rounded-xl border bg-muted/25 p-3 transition-colors duration-200 hover:border-foreground/20 sm:grid-cols-2">
+        <Field className="gap-1.5">
+          <FieldLabel htmlFor={`${id}-default`} className="min-h-5 items-center">{tr("默认模型")}</FieldLabel>
           <NativeSelect id={`${id}-default`} className="w-full" value={defaultModel?.id ?? ""} disabled={disabled}
             onChange={(event) => {
               const model = draft.models.find((candidate) => candidate.id === event.target.value);
@@ -430,27 +433,49 @@ export function AgentConfiguration({onSaved, onSavingChange, navigation}: Props)
               {model.display_name.trim() || model.id || tr("新模型")}
             </NativeSelectOption>)}
           </NativeSelect>
-        </Field>}
-      </section>}
-
-      <Field>
-        <FieldLabel htmlFor={`${id}-permission`}>{tr("默认权限策略")}</FieldLabel>
-        <NativeSelect id={`${id}-permission`} className="w-full" value={draft?.permission_mode ?? "request_approval"} disabled={disabled} onChange={(event) => {
-          if (draft) setEdited({...draft, permission_mode: event.target.value as AppSettings["permission_mode"]});
-        }}>
-          <NativeSelectOption value="request_approval">{tr("逐次审批（推荐）")}</NativeSelectOption>
-          <NativeSelectOption value="auto_approve">{tr("管理中的游戏目录内自动批准")}</NativeSelectOption>
-          <NativeSelectOption value="full_trust">{tr("完全信任")}</NativeSelectOption>
-        </NativeSelect>
-      </Field>
+        </Field>
+        <Field className="gap-1.5">
+          <FieldLabel htmlFor={`${id}-permission`} className="min-h-5 items-center gap-1.5">
+            <ShieldCheckIcon aria-hidden="true" className="size-4 text-muted-foreground"/>
+            {tr("默认权限策略")}
+          </FieldLabel>
+          <NativeSelect id={`${id}-permission`} className="w-full" value={draft.permission_mode} disabled={disabled} onChange={(event) => {
+            setEdited({...draft, permission_mode: event.target.value as AppSettings["permission_mode"]});
+          }}>
+            <NativeSelectOption value="request_approval">{tr("逐次审批（推荐）")}</NativeSelectOption>
+            <NativeSelectOption value="auto_approve">{tr("管理中的游戏目录内自动批准")}</NativeSelectOption>
+            <NativeSelectOption value="full_trust">{tr("完全信任")}</NativeSelectOption>
+          </NativeSelect>
+        </Field>
+      </div> : <div className="rounded-xl border bg-muted/25 px-3 py-2.5 transition-colors duration-200 hover:border-foreground/20">
+        <Field orientation="responsive" className="gap-2">
+          <FieldLabel htmlFor={`${id}-permission`} className="flex items-center gap-2 whitespace-nowrap">
+            <ShieldCheckIcon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground"/>
+            {tr("默认权限策略")}
+          </FieldLabel>
+          <NativeSelect id={`${id}-permission`} className="w-full @md/field-group:min-w-64" value={draft?.permission_mode ?? "request_approval"} disabled={disabled} onChange={(event) => {
+            if (draft) setEdited({...draft, permission_mode: event.target.value as AppSettings["permission_mode"]});
+          }}>
+            <NativeSelectOption value="request_approval">{tr("逐次审批（推荐）")}</NativeSelectOption>
+            <NativeSelectOption value="auto_approve">{tr("管理中的游戏目录内自动批准")}</NativeSelectOption>
+            <NativeSelectOption value="full_trust">{tr("完全信任")}</NativeSelectOption>
+          </NativeSelect>
+        </Field>
+      </div>}
       {draft?.permission_mode === "full_trust" && <Alert variant="warning"><TriangleAlertIcon/><AlertDescription>{tr("完全信任会跳过工具确认，包括外部服务写入与发布。第三方 stdio 进程使用当前用户权限。")}</AlertDescription></Alert>}
     </FieldGroup>
 
-    <div className={navigation ? "flex flex-wrap items-center gap-2 border-t p-6" : "flex flex-wrap items-center gap-2"}>
-      {navigation && <><Button variant="ghost" type="button" disabled={saving} onClick={navigation.onBack}><ChevronLeftIcon data-icon="inline-start"/>{tr("上一步")}</Button>
-        <span className="flex-1"/><Button type="button" variant="ghost" disabled={saving} onClick={navigation.onSkip}>{tr("跳过配置")}</Button></>}
-      <Button type="submit" disabled={!canSubmit}>
-        {saving ? <Spinner data-icon="inline-start"/> : !navigation && <SaveIcon data-icon="inline-start"/>}{saving ? tr("保存中…") : navigation ? tr("保存并继续") : tr("保存设置")}{navigation && !saving && <ChevronRightIcon data-icon="inline-end"/>}
+    <div className={navigation ? "flex flex-wrap items-center gap-2 border-t bg-muted/20 p-6" : "flex flex-wrap items-center justify-end gap-2"}>
+      {navigation && <><Button variant="ghost" type="button" className="group/back" disabled={saving} onClick={navigation.onBack}>
+        <ChevronLeftIcon data-icon="inline-start" className="motion-safe:transition-transform motion-safe:duration-200 group-hover/back:-translate-x-0.5"/>
+        {tr("上一步")}
+      </Button>
+      <span className="flex-1"/>
+      <Button type="button" variant="ghost" disabled={saving} onClick={navigation.onSkip}>{tr("跳过配置")}</Button></>}
+      <Button type="submit" className="group/save shadow-xs motion-safe:transition-shadow hover:shadow-md" disabled={!canSubmit}>
+        {saving ? <Spinner data-icon="inline-start"/> : !navigation && <SaveIcon data-icon="inline-start"/>}
+        {saving ? tr("保存中…") : navigation ? tr("保存并继续") : tr("保存设置")}
+        {navigation && !saving && <ChevronRightIcon data-icon="inline-end" className="motion-safe:transition-transform motion-safe:duration-200 group-hover/save:translate-x-0.5"/>}
       </Button>
     </div>
   </form>;

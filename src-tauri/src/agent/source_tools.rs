@@ -3,7 +3,7 @@ use super::{
     tools::{AgentTool, PreparedTool, ToolContext, ToolDefinition, ToolRegistry},
 };
 use crate::{
-    download::DownloadManager,
+    download::{DownloadArtifact, DownloadManager},
     download_tasks::{
         agent_download_schema, agent_retry_schema, valid_retry_artifact_id, AgentDownloadArgs,
         ClassificationInput, CompletedSource, DownloadTarget,
@@ -15,7 +15,7 @@ use crate::{
             inbound_download_request, resolution_id, AgentResolutionId, ResolutionScope,
             Resolutions,
         },
-        DependencyGraphRequest, ResolveRequest, SearchQuery, SourceKeys, Sources,
+        DependencyGraphRequest, ResolveRequest, ResolvedMod, SearchQuery, SourceKeys, Sources,
         VersionListRequest,
     },
 };
@@ -138,6 +138,31 @@ impl SourceTool {
             preview["classification"] = serde_json::to_value(classification)?;
         }
         Ok((id, classification, preview))
+    }
+}
+
+async fn complete_catalog_download(
+    context: &ToolContext,
+    classification: Option<DownloadTarget>,
+    artifact: DownloadArtifact,
+    resolved: &ResolvedMod,
+) -> AppResult<Value> {
+    if let Some(classification) = classification {
+        // Use the approved resolution, not caller-supplied source metadata, to
+        // preserve the exact provider version and project page during ingestion.
+        Ok(json!(classification
+            .finish(
+                &context.engine,
+                artifact,
+                CompletedSource::Catalog(resolved)
+            )
+            .await?
+            .into_user_paths()))
+    } else {
+        // Preserve the exact legacy MCP receipt when no game was supplied; it
+        // must not become eligible for native retry.
+        crate::artifacts::record(&context.engine, &artifact, resolved)?;
+        Ok(json!(artifact.into_user_paths()))
     }
 }
 
@@ -329,21 +354,7 @@ impl AgentTool for SourceTool {
                         }),
                     )
                     .await?;
-                if let Some(classification) = classification {
-                    Ok(json!(classification
-                        .finish(
-                            &context.engine,
-                            artifact,
-                            CompletedSource::Catalog(&resolved)
-                        )
-                        .await?
-                        .into_user_paths()))
-                } else {
-                    // Preserve the exact legacy MCP receipt when no game was
-                    // supplied; it must not become eligible for native retry.
-                    crate::artifacts::record(&context.engine, &artifact, &resolved)?;
-                    Ok(json!(artifact.into_user_paths()))
-                }
+                complete_catalog_download(context, classification, artifact, &resolved).await
             }
             RETRY => {
                 let (target, saved, preview) = retry_request(context, &args)?;

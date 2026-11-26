@@ -3,10 +3,26 @@ import { createRequire } from "node:module";
 import { installMockTauri } from "./mock-tauri";
 
 const {version} = createRequire(import.meta.url)("../../package.json") as {version: string};
+const sponsorsUrl = "https://cdn.gh-proxy.org/https://raw.githubusercontent.com/AgentMods/Agent-Mod-Manager/refs/heads/main/Sponsors.json";
 const home = (page: Page) => page.getByTestId("home-page");
 const homeHeader = (page: Page) => home(page).locator("header");
 const homeAction = (page: Page, name: string) => homeHeader(page).getByRole("button", {name: name === "开始使用" ? name : `前往${name}`, exact: true});
 const sidebar = (page: Page) => page.getByRole("navigation", {name: "主导航", exact: true});
+
+async function mockSponsors(page: Page, body: unknown, status = 200) {
+  let requests = 0;
+  await page.route(sponsorsUrl, async route => {
+    requests++;
+    await route.fulfill({status, contentType: "application/json", body: JSON.stringify(body)});
+  });
+  return () => requests;
+}
+
+async function expectNoSponsorIpc(page: Page) {
+  await expect.poll(() => page.evaluate(() => (window as any).__AMM_TEST__.calls.filter(
+    (call: any) => call.command === "list_dashboard_sponsors",
+  ).length)).toBe(0);
+}
 
 async function returnHome(page: Page) {
   await sidebar(page).getByRole("button", {name: "首页", exact: true}).click();
@@ -52,7 +68,9 @@ async function expectSponsorBlock(page: Page, names: string[]) {
   await expect(main.getByRole("heading", {name: "赞助我", exact: true})).toHaveCount(0);
   const card = main.locator('[data-slot="card"]').filter({has: page.getByRole("heading", {name: "赞助商", exact: true})});
   const list = card.getByRole("list", {name: "赞助商", exact: true});
-  for (const name of names) await expect(list.getByRole("listitem").filter({hasText: name})).toBeVisible();
+  await expect(list.getByRole("listitem")).toHaveCount(names.length);
+  await expect(list.locator('[data-slot="sponsor-card"]')).toHaveCount(names.length);
+  await expect(list.getByRole("listitem")).toHaveText(names);
 
   const sponsor = card.getByRole("link", {name: "去赞助", exact: true});
   await expect(sponsor).toHaveAttribute("href", "https://sponsor.aoe.top/");
@@ -70,8 +88,15 @@ async function expectSponsorBlock(page: Page, names: string[]) {
   await expect(main.getByRole("link", {name: "去赞助", exact: true})).toHaveCount(1);
 }
 
+const sponsorManifest = [
+  {name: "Fixture Sponsor", tier: "supporter"},
+  {name: "Second Fixture"},
+  {name: "Fixture Sponsor", tier: "supporter"},
+];
+
 test.describe("首页", () => {
   test("首次运行展示首页统计和四个主入口，设置引导是独立次要入口", async ({page}) => {
+    const sponsorRequests = await mockSponsors(page, sponsorManifest);
     await installMockTauri(page, {onboarding: true, dashboardStats: {managedGameCount: 0, installedModCount: 0, totalModCount: 0}});
     await page.goto("/");
 
@@ -82,6 +107,9 @@ test.describe("首页", () => {
     await expect(homeHeader(page)).toContainText("0");
     await expect(home(page).locator("header img")).toHaveCount(0);
     await expectHomeActions(page);
+    await expectSponsorBlock(page, ["Fixture Sponsor", "Second Fixture"]);
+    expect(sponsorRequests()).toBe(1);
+    await expectNoSponsorIpc(page);
 
     const setup = home(page).getByRole("button", {name: "开始设置", exact: true});
     await expect(setup).toBeVisible();
@@ -101,9 +129,9 @@ test.describe("首页", () => {
   });
 
   test("无游戏时显示统计和赞助名单，所有主入口均可导航", async ({page}) => {
+    const sponsorRequests = await mockSponsors(page, sponsorManifest);
     await installMockTauri(page, {
       emptyLibrary: true,
-      dashboardSponsors: ["Fixture Sponsor", "Second Fixture"],
       dashboardStats: {managedGameCount: 0, installedModCount: 0, totalModCount: 0},
     });
     await page.goto("/");
@@ -115,12 +143,14 @@ test.describe("首页", () => {
     await expectHomeActions(page);
     await expect(home(page).getByRole("button", {name: "开始设置", exact: true})).toHaveCount(0);
     await expectSponsorBlock(page, ["Fixture Sponsor", "Second Fixture"]);
+    expect(sponsorRequests()).toBe(1);
+    await expectNoSponsorIpc(page);
     await verifyNavigation(page);
   });
 
   test("有游戏时显示统计和游戏快捷入口，所有主入口均可导航", async ({page}) => {
+    const sponsorRequests = await mockSponsors(page, sponsorManifest);
     await installMockTauri(page, {
-      dashboardSponsors: ["Fixture Sponsor", "Second Fixture"],
       dashboardStats: {managedGameCount: 1, installedModCount: 2, totalModCount: 5},
     });
     await page.goto("/");
@@ -135,10 +165,85 @@ test.describe("首页", () => {
     await expect(page.locator("main").getByText(new RegExp(`当前版本\\s*v${version}`))).toBeVisible();
     await expectHomeActions(page);
     await expectSponsorBlock(page, ["Fixture Sponsor", "Second Fixture"]);
+    expect(sponsorRequests()).toBe(1);
+    await expectNoSponsorIpc(page);
 
     await game.click();
     await expect(page.getByTestId("game-detail-page")).toBeVisible();
     await returnHome(page);
     await verifyNavigation(page);
+  });
+
+  test("浏览器预览无桌面后端时仍可读取赞助 JSON", async ({page}) => {
+    const sponsorRequests = await mockSponsors(page, sponsorManifest);
+    await page.goto("/");
+
+    await expectSponsorBlock(page, ["Fixture Sponsor", "Second Fixture"]);
+    expect(sponsorRequests()).toBe(1);
+  });
+
+  test("赞助 JSON 空名单显示空状态", async ({page}) => {
+    const sponsorRequests = await mockSponsors(page, []);
+    await installMockTauri(page);
+    await page.goto("/");
+
+    await expect(home(page).getByText("暂无公开的赞助者。", {exact: true})).toBeVisible();
+    await expect(home(page).getByRole("link", {name: "去赞助", exact: true})).toHaveAttribute("href", "https://sponsor.aoe.top/");
+    expect(sponsorRequests()).toBe(1);
+    await expectNoSponsorIpc(page);
+  });
+
+  test("赞助 JSON 请求错误显示错误状态但保留去赞助入口", async ({page}) => {
+    const sponsorRequests = await mockSponsors(page, {error: "fixture unavailable"}, 503);
+    await installMockTauri(page);
+    await page.goto("/");
+
+    await expect(home(page).getByText("暂时无法加载赞助商名单。", {exact: true})).toBeVisible();
+    await expect(home(page).getByRole("link", {name: "去赞助", exact: true})).toHaveAttribute("href", "https://sponsor.aoe.top/");
+    expect(sponsorRequests()).toBe(1);
+    await expectNoSponsorIpc(page);
+  });
+
+  test("赞助商卡片展示图标与外链动态效果，并在图片加载失败或减弱动态时平稳降级", async ({page}) => {
+    await page.emulateMedia({reducedMotion: "no-preference"});
+    await page.route("https://covers.example.org/broken-sponsor.png", route => route.abort());
+    await mockSponsors(page, [
+      {name: "Glosc AI", logo: "https://covers.example.org/minecraft-java.jpg", url: "https://one.gloscai.com"},
+      {name: "Broken Logo Sponsor", logo: "https://covers.example.org/broken-sponsor.png", url: "https://example.org/sponsor"},
+      {name: "Plain Supporter", url: "http://insecure.example.org"},
+    ]);
+    await installMockTauri(page);
+    await page.goto("/");
+
+    await expectSponsorBlock(page, ["Glosc AI", "Broken Logo Sponsor", "Plain Supporter"]);
+    const glosc = home(page).getByRole("link", {name: "Glosc AI", exact: true});
+    await expect(glosc).toHaveAttribute("href", "https://one.gloscai.com");
+    await expect(glosc).toHaveAttribute("target", "_blank");
+    await expect.poll(() => glosc.locator("img").evaluate((img: HTMLImageElement) => img.complete && img.naturalWidth > 0)).toBe(true);
+
+    const box = (await glosc.boundingBox())!;
+    await page.mouse.move(box.x + box.width * 0.8, box.y + box.height * 0.25);
+    await expect.poll(() => glosc.evaluate(el => (el as HTMLElement).style.getPropertyValue("--tilt-y"))).not.toBe("");
+    expect(await glosc.evaluate(el => (el as HTMLElement).style.getPropertyValue("--tilt-y"))).not.toBe("0deg");
+    await page.mouse.move(0, 0);
+    await expect.poll(() => glosc.evaluate(el => (el as HTMLElement).style.getPropertyValue("--tilt-y"))).toBe("0deg");
+
+    await glosc.click();
+    expect(await page.evaluate(() => (window as any).__AMM_TEST__.calls)).toContainEqual({
+      command: "plugin:opener|open_url", args: {url: "https://one.gloscai.com"},
+    });
+
+    const broken = home(page).getByRole("link", {name: "Broken Logo Sponsor", exact: true});
+    await expect(broken.locator("img")).toHaveCount(0);
+    await expect(broken.locator('[data-monogram="BL"]')).toHaveCount(1);
+
+    const plainItem = home(page).getByRole("listitem").filter({hasText: "Plain Supporter"});
+    await expect(plainItem.getByRole("link")).toHaveCount(0);
+    await expect(plainItem.locator('[data-monogram="PS"]')).toHaveCount(1);
+
+    await page.emulateMedia({reducedMotion: "reduce"});
+    await page.mouse.move(box.x + box.width * 0.85, box.y + box.height * 0.2);
+    expect(await glosc.evaluate(el => (el as HTMLElement).style.getPropertyValue("--tilt-y"))).toBe("0deg");
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1)).toBe(true);
   });
 });

@@ -13,6 +13,7 @@ fn nexus(game_id: &str) -> WorkKey {
         source_id: "nexusmods".into(),
         project_id: "45".into(),
         provider_game_id: "stardewvalley".into(),
+        project_page: None,
     }
 }
 
@@ -65,10 +66,45 @@ async fn nexus_download_survives_rebuilt_scope_and_commits_real_install_receipt(
     let (_dir, engine, game_root) = setup();
     let runtime = runtime(engine.clone());
     let db = &engine.db;
-    let work = nexus("g");
+    let page = "https://www.nexusmods.com/stardewvalley/mods/45";
+    let work = WorkKey {
+        project_page: Some(page.into()),
+        ..nexus("g")
+    };
     let game = GameScope::new(crate::games::get_game(db, "g").unwrap());
     let conversation = create_task(db, &work, "task", "running");
-    let ctx = context(&engine, conversation);
+    db.conn()
+        .execute(
+            "INSERT INTO browse_install_project_pages(task_id,project_page) VALUES('task',?1)",
+            [page],
+        )
+        .unwrap();
+    let ctx = context(&engine, conversation.clone());
+    let listing = namespaced_tool_name("nexusmods", "list_files");
+    save_call(
+        db,
+        &ctx,
+        "listing",
+        &listing,
+        &json!({}),
+        "done",
+        &json!({
+            "version":"work-current",
+            "files":[{"fileId":91,"modId":45,"version":"9.0"},
+                     {"fileId":90,"modId":45,"version":"2.1"}]
+        }),
+    );
+    save_call(
+        db,
+        &ctx,
+        "other-project",
+        &listing,
+        &json!({"mod_id":46}),
+        "done",
+        &json!({
+            "files":[{"fileId":90,"modId":46,"version":"8.1"}]
+        }),
+    );
     let scope = InstallScope::new("task".into(), work.clone(), game.clone());
     let (path, size, hash) = archive(&engine, b"nexus fixture");
     let mut args = json!({"file_id":90});
@@ -101,9 +137,12 @@ async fn nexus_download_survives_rebuilt_scope_and_commits_real_install_receipt(
         )
         .await
         .unwrap();
+    assert_eq!(saved["version"], "2.1");
     save_call(db, &ctx, "download", &download, &args, "done", &saved);
     drop(scope);
-    let scope = InstallScope::new("task".into(), work, game.clone());
+    let scope = conversation_scope(&db.conn(), &conversation)
+        .unwrap()
+        .unwrap();
     let receive = runtime.registry.get("file_received_mod").unwrap();
     let bind = |args| scope.arguments(db, receive.as_ref(), "file_received_mod", args);
     for invalid in [
@@ -119,7 +158,10 @@ async fn nexus_download_survives_rebuilt_scope_and_commits_real_install_receipt(
         "modName":"model label", "projectPage":"https://example.invalid/fake",
     }))
     .unwrap();
-    assert_eq!(args, json!({"filename":saved["filename"], "gameId":"g"}));
+    assert_eq!(
+        args,
+        json!({"filename":saved["filename"], "gameId":"g", "projectPage":page})
+    );
     let prepared = receive.prepare(&ctx, &args).await.unwrap();
     scope
         .validate_prepared(db, "file_received_mod", receive.as_ref(), &args, &prepared)
@@ -138,7 +180,30 @@ async fn nexus_download_survives_rebuilt_scope_and_commits_real_install_receipt(
         .unwrap();
     assert_eq!(artifact["sha256"], hash);
     assert_eq!(artifact["gameId"], "g");
-    assert!(artifact["projectPage"].is_null());
+    assert_eq!(artifact["projectPage"], page);
+    assert_eq!(artifact["version"], "2.1");
+    assert_eq!(artifact["sourceId"], "local");
+    assert!(artifact["projectId"].is_null());
+    assert!(artifact["versionId"].is_null());
+    {
+        let conn = db.conn();
+        let entry = conn
+            .query_row(
+                &format!(
+                    "SELECT {} FROM mod_library_entries WHERE id=?1",
+                    mod_library::COLUMNS
+                ),
+                [artifact["artifactId"].as_str().unwrap()],
+                mod_library::read_entry,
+            )
+            .unwrap();
+        assert_eq!(entry.version, "2.1");
+        assert_eq!(entry.project_page.as_deref(), Some(page));
+        assert_eq!(
+            stock_archive_metadata(&conn, &entry).unwrap(),
+            (Some("2.1".into()), Some(page.into()))
+        );
+    }
     assert!(!scope.verified(db).unwrap());
 
     let matcher = runtime.registry.get("match_mod_install").unwrap();

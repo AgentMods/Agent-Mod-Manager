@@ -8,7 +8,7 @@ import type { AgentEvent } from "./types";
 
 export type ModSwitchTarget = { gameId: string; artifactId?: string | null; installId?: string | null };
 export type ModSwitchAction = ModSwitchTarget & { name: string } & (
-    | { kind: "install"; artifactId: string }
+    | { kind: "install"; artifactId: string; replaceInstallId?: string }
     | { kind: "uninstall"; installId: string }
     | { kind: "remove"; installId: string }
 );
@@ -133,7 +133,8 @@ function matchingCall(entry: ModSwitchAction, event: AgentEvent): MatchingCall |
     if (entry.kind === "install") {
         if (name === "install_library_mod") {
             const request = record(args.request);
-            if (request.gameId === entry.gameId && (request.artifactId ?? request.libraryEntryId) === entry.artifactId) return { name, mutation: true };
+            if (request.gameId === entry.gameId && (request.artifactId ?? request.libraryEntryId) === entry.artifactId &&
+                (request.replaceInstallId ?? undefined) === entry.replaceInstallId) return { name, mutation: true };
         }
         if (name === "match_mod_install" && args.game_id === entry.gameId && args.artifact_id === entry.artifactId) {
             return { name, mutation: false };
@@ -262,7 +263,7 @@ export function withoutModSwitchWrites(events: AgentEvent[]) {
 type InstallRecord = {
     id: string; gameId: string; status: string;
     downloadOrigin?: { artifactId?: string } | null;
-    metadata?: { libraryEntryId?: string; transactionId?: string | null } | null;
+    metadata?: { libraryEntryId?: string; replacesInstallId?: string | null; transactionId?: string | null } | null;
 };
 
 function isVerified(entry: Exclude<PendingModSwitch, { kind: "remove" }>, settlement: Committed, rows: InstallRecord[]) {
@@ -275,7 +276,10 @@ function isVerified(entry: Exclude<PendingModSwitch, { kind: "remove" }>, settle
     const matches = rows.filter(row => row.gameId === entry.gameId && ["installed", "enabled"].includes(row.status) &&
         (row.metadata?.libraryEntryId ?? row.downloadOrigin?.artifactId) === entry.artifactId &&
         row.id === settlement.installId && row.metadata?.transactionId === settlement.transactionId);
-    return matches.length === 1;
+    if (matches.length !== 1) return false;
+    if (!entry.replaceInstallId) return true;
+    return matches[0].metadata?.replacesInstallId === entry.replaceInstallId &&
+        rows.some(old => old.gameId === entry.gameId && old.id === entry.replaceInstallId && old.status === 'superseded');
 }
 
 function removalFeedback(entry: Extract<ModSwitchAction, { kind: "remove" }>, settlement: Settlement, rows: InstallRecord[]) {
@@ -301,7 +305,7 @@ function removalFeedback(entry: Extract<ModSwitchAction, { kind: "remove" }>, se
 
 function feedback(entry: PendingModSwitch, settlement: Settlement, rows: InstallRecord[]) {
     if (entry.kind === "remove") return removalFeedback(entry, settlement, rows);
-    const action = entry.kind === "install" ? tr("安装") : tr("卸载");
+    const action = entry.kind === "install" ? (entry.replaceInstallId ? tr("更新") : tr("安装")) : tr("卸载");
     const target = `「${entry.name}」`;
     switch (settlement.outcome) {
         case "committed":

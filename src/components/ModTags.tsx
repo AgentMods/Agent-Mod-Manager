@@ -6,12 +6,12 @@ import { ErrorState, IconButton, Modal } from '@/components/ui';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Field, FieldGroup, FieldLabel } from '@/components/ui/field';
+import { Field, FieldGroup, FieldLabel, FieldLegend, FieldSet } from '@/components/ui/field';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { api } from '@/lib/api';
-import type { Installed } from '@/lib/mod-management';
+import { modMetadataTarget, type ModRow } from '@/lib/mod-management';
 
 export type ModTag = { id: string; name: string; color: string };
 
@@ -53,7 +53,8 @@ export function ManageModTags({ gameId, tags, onClose }: { gameId: string; tags:
       setDeleting(null);
       await Promise.all([
         client.invalidateQueries({ queryKey: ['mod-tags', gameId] }),
-        ...(action === 'delete' ? [client.invalidateQueries({ queryKey: ['installs', gameId] })] : []),
+        ...(action === 'delete' ? [client.invalidateQueries({ queryKey: ['installs', gameId] }),
+          client.invalidateQueries({ queryKey: ['mod-library', gameId] })] : []),
       ]);
     },
   });
@@ -89,27 +90,45 @@ export function ManageModTags({ gameId, tags, onClose }: { gameId: string; tags:
   </Modal>;
 }
 
-export function EditModTags({ gameId, record, tags, onClose }: { gameId: string; record: Installed; tags: ModTag[]; onClose: () => void }) {
-  const [selected, setSelected] = useState(() => new Set(record.tagIds ?? []));
+export function EditModDetails({ gameId, row, tags, disabled, onClose }: {
+  gameId: string; row: ModRow; tags: ModTag[]; disabled: boolean; onClose: () => void;
+}) {
+  const [name, setName] = useState(row.item.name);
+  const [selected, setSelected] = useState(() => new Set(row.item.tagIds ?? []));
   const [managing, setManaging] = useState(false);
   const client = useQueryClient();
   const mutation = useMutation({
-    mutationFn: () => api('set_mod_tags', { gameId, installId: record.id, tagIds: tags.filter(tag => selected.has(tag.id)).map(tag => tag.id) }),
-    onSuccess: async () => { await client.invalidateQueries({ queryKey: ['installs', gameId] }); onClose(); },
+    mutationFn: () => api('update_mod_metadata', { gameId, target: modMetadataTarget(row),
+      patch: { name: name.trim(), tagIds: tags.filter(tag => selected.has(tag.id)).map(tag => tag.id) } }),
+    onSuccess: async () => {
+      await Promise.all([client.invalidateQueries({ queryKey: ['installs', gameId] }),
+        client.invalidateQueries({ queryKey: ['mod-library', gameId] })]);
+      onClose();
+    },
   });
+  const busy = mutation.isPending;
   if (managing) return <ManageModTags gameId={gameId} tags={tags} onClose={() => setManaging(false)} />;
-  return <Modal title={tr("编辑 Mod 标签")} description={record.name} className="sm:max-w-md" onClose={() => { if (!mutation.isPending) onClose(); }} actions={<>
-    <Button variant="outline" disabled={mutation.isPending} onClick={onClose}>{tr("取消")}</Button>
-    <Button disabled={mutation.isPending} onClick={() => mutation.mutate()}>{tr("保存标签")}</Button>
+  return <Modal title={tr("编辑 Mod")} className="sm:max-w-md" onClose={() => { if (!busy) onClose(); }} actions={<>
+    <Button variant="outline" disabled={busy} onClick={onClose}>{tr("取消")}</Button>
+    <Button type="submit" form="edit-mod-details" disabled={disabled || busy || !name.trim()}>{tr("保存")}</Button>
   </>}>
-    {tags.length ? <div className="flex flex-col gap-1">{tags.map(tag => <Label key={tag.id} className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-2 hover:bg-accent">
-      <Checkbox checked={selected.has(tag.id)} disabled={mutation.isPending} onCheckedChange={value => setSelected(previous => {
-        const next = new Set(previous);
-        if (value === true) next.add(tag.id); else next.delete(tag.id);
-        return next;
-      })} /><ModTagBadge tag={tag} />
-    </Label>)}</div> : <p className="text-muted-foreground">{tr("这个游戏还没有标签，可在「管理标签」中创建。")}</p>}
-    <Button size="sm" variant="outline" className="self-start" disabled={mutation.isPending} onClick={() => setManaging(true)}><TagsIcon />{tr("管理标签")}</Button>
+    <form id="edit-mod-details" onSubmit={event => { event.preventDefault(); if (!disabled && !busy && name.trim()) mutation.mutate(); }}>
+      <FieldGroup>
+        <Field><FieldLabel htmlFor="mod-display-name">{tr("显示名称")}</FieldLabel>
+          <Input id="mod-display-name" required maxLength={200} value={name} disabled={busy} onChange={event => setName(event.target.value)} />
+        </Field>
+        <FieldSet className="gap-2"><FieldLegend>{tr("标签")}</FieldLegend>
+          {tags.length ? <div className="flex flex-col gap-1">{tags.map(tag => <Label key={tag.id} className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-2 hover:bg-accent">
+            <Checkbox checked={selected.has(tag.id)} disabled={busy} onCheckedChange={value => setSelected(previous => {
+              const next = new Set(previous);
+              if (value === true) next.add(tag.id); else next.delete(tag.id);
+              return next;
+            })} /><ModTagBadge tag={tag} />
+          </Label>)}</div> : <p className="text-muted-foreground">{tr("这个游戏还没有标签，可在「管理标签」中创建。")}</p>}
+          <Button type="button" size="sm" variant="outline" className="self-start" disabled={disabled || busy} onClick={() => setManaging(true)}><TagsIcon />{tr("管理标签")}</Button>
+        </FieldSet>
+      </FieldGroup>
+    </form>
     <ErrorState error={mutation.error} />
   </Modal>;
 }

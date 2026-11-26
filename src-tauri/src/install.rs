@@ -108,6 +108,7 @@ pub struct InstalledMod {
     pub game_id: String,
     pub name: String,
     pub version: Option<String>,
+    pub website: Option<String>,
     pub source: String,
     /// Exact coordinates recorded at deployment, not proof of authorship.
     pub download_origin: Option<DownloadOrigin>,
@@ -479,10 +480,7 @@ pub fn plan_install_with_organization(
             (
                 origin.source_id.as_str(),
                 Some(origin.project_id.as_str()),
-                (!version.trim().is_empty()
-                    && version.len() <= 256
-                    && !version.chars().any(char::is_control))
-                .then_some(version.as_str()),
+                crate::mod_metadata::display_version(version),
             )
         }
         _ if request.source == artifacts::WEB_SOURCE => {
@@ -771,8 +769,13 @@ pub fn plan_install_with_organization(
     let id = util::new_id("install");
     let mut metadata = serde_json::json!({"transactionId":plan.id,"artifactPath":artifact,"artifactSha256":artifact_sha256,
         "adapterSlug":adapter.slug,"adapterVersion":adapter.version,"modType":request.mod_type,"rootId":ty.root,
-        "sourceModId":project_id,"downloadOrigin":download_origin,"replacesInstallId":request.replace_install_id,"warnings":warnings,"ignoredFiles":ignored_files});
+        "sourceModId":project_id,"downloadOrigin":download_origin,"replacesInstallId":request.replace_install_id,"warnings":warnings,"ignoredFiles":ignored_files,
+        "archiveFilename":request.filename,"projectPage":catalog.as_ref().and_then(|record| record.project_page.as_ref())});
     mod_organization::stage(&engine.db, &mut metadata, organization);
+    let filename_version = crate::mod_metadata::filename_version(&request.filename);
+    let version = version
+        .and_then(crate::mod_metadata::display_version)
+        .or(filename_version.as_deref());
     let mut conn = engine.db.conn();
     let tx = conn.transaction()?;
     FileEngine::persist_plan(&tx, &plan, internal)?;
@@ -916,8 +919,11 @@ fn read_installs(
     };
     let conn = engine.db.conn();
     let mut stmt = conn.prepare(&format!(
-        "SELECT id,game_id,coalesce((SELECT display_name FROM install_organizations WHERE install_id=installs.id),name),version,source,{state} AS status,install_root,files_json,metadata_json,installed_at,
-        (SELECT json_group_array(tag_id ORDER BY tag_id) FROM install_mod_tags WHERE install_id=installs.id)
+        "SELECT id,game_id,coalesce(
+            (SELECT name FROM mod_display_names WHERE game_id=installs.game_id AND kind='install' AND item_id=installs.id),
+            (SELECT display_name FROM install_organizations WHERE install_id=installs.id),name
+        ),version,source,{state} AS status,install_root,files_json,metadata_json,installed_at,
+        (SELECT json_group_array(tag_id ORDER BY tag_id) FROM install_mod_tags WHERE install_id=installs.id),name
         FROM installs WHERE game_id=?1{other_owners} ORDER BY installed_at DESC,rowid DESC"
     ))?;
     let rows = stmt.query_map([game_id], |r| {
@@ -928,28 +934,50 @@ fn read_installs(
             r.get::<_, Option<String>>(3)?,
             r.get::<_, String>(4)?,
             r.get::<_, String>(5)?,
-            r.get::<_, String>(6)?,
+            r.get::<_, Option<String>>(6)?,
             r.get::<_, String>(7)?,
             r.get::<_, String>(8)?,
             r.get::<_, String>(9)?,
             r.get::<_, String>(10)?,
+            r.get::<_, String>(11)?,
         ))
     })?;
     rows.map(|row| {
-        let (id, game_id, name, version, source, status, root, files, meta, installed_at, tags) =
-            row?;
+        let (
+            id,
+            game_id,
+            name,
+            version,
+            source,
+            status,
+            root,
+            files,
+            meta,
+            installed_at,
+            tags,
+            original_name,
+        ) = row?;
         let metadata: serde_json::Value = serde_json::from_str(&meta)?;
         let download_origin = recorded_download_origin(&metadata);
+        let (version, website) = crate::mod_metadata::recorded_fields(
+            &conn,
+            &game_id,
+            &metadata,
+            download_origin.as_ref(),
+            version,
+            &original_name,
+        )?;
         Ok(InstalledMod {
             tag_ids: serde_json::from_str(&tags)?,
             id,
             game_id,
             name,
             version,
+            website,
             source,
             download_origin,
             status,
-            install_root: root.into(),
+            install_root: root.unwrap_or_default().into(),
             files: serde_json::from_str(&files)?,
             metadata,
             installed_at,

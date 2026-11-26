@@ -16,7 +16,7 @@ const groupButton = (page: Page, name: string) => page.getByRole("button", {name
 
 test("operation groups start collapsed, support keyboard control, and preserve a selected conversation when closed", async ({page}) => {
   await installConversationCategoryFixture(page);
-  await page.goto("/");
+  await page.goto("/#/agent");
 
   for (const category of categories) {
     const button = groupButton(page, category);
@@ -60,7 +60,7 @@ test("category expansion preferences persist and empty categories stay hidden", 
   await installConversationCategoryFixture(page, [
     {id: "conversation-adapter-only", title: "适配包任务", category: "adapter"},
   ]);
-  await page.goto("/");
+  await page.goto("/#/agent");
 
   for (const category of categories.filter(name => name !== "适配包")) {
     await expect(groupButton(page, category)).toHaveCount(0);
@@ -81,7 +81,7 @@ test("category expansion preferences persist and empty categories stay hidden", 
 
 test("ordinary and pinned conversations remain directly available in their existing lists", async ({page}) => {
   await installConversationCategoryFixture(page, categoryConversationFixtures);
-  await page.goto("/");
+  await page.goto("/#/agent");
 
   const recent = page.getByRole("list", {name: "最近对话", exact: true});
   const pinned = page.getByRole("list", {name: "置顶对话", exact: true});
@@ -97,7 +97,7 @@ test("ordinary and pinned conversations remain directly available in their exist
 
 test("ordinary conversation creation defaults to all games in the workspace", async ({page}) => {
   await installMockTauri(page);
-  await page.goto("/");
+  await page.goto("/#/agent");
 
   await page.getByRole("textbox", {name: "告诉 Agent 你想做什么", exact: true}).fill("普通对话创建检查");
   await page.getByRole("button", {name: "发送消息", exact: true}).click();

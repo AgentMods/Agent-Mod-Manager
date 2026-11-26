@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { type ReactNode, useRef } from "react";
 import { CopyIcon, EllipsisIcon, FolderIcon, GlobeIcon, PlusIcon } from "lucide-react";
 import type { CloudGameMatch } from "@/lib/cloud-game-match";
 import { candidateWarnings } from "@/lib/game-discovery";
@@ -13,15 +13,22 @@ import { GameMatchBadge } from "@/components/GameMatchBadge";
 import { PathText } from "@/components/ui";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuGroup, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { Item, ItemActions, ItemFooter } from "@/components/ui/item";
+import { Item, ItemActions, ItemFooter, ItemGroup } from "@/components/ui/item";
+
+export function ScanGameGrid({ children }: { children: ReactNode }) {
+  return <ItemGroup aria-label={tr("扫描候选游戏")} className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,17rem),1fr))] gap-4">
+    {children}
+  </ItemGroup>;
+}
 
 type Props = {
   candidate: GameCandidate; index: number; coverUrl?: string | null; matched?: CloudGameMatch;
-  waiting: boolean; failed: boolean; disableRegister: boolean; disableIdentify: boolean;
-  onRegister: (localOnly?: boolean) => void; onIdentify: (trigger: HTMLButtonElement) => void;
+  waiting: boolean; failed: boolean; disableRegister: boolean; disableIdentify?: boolean;
+  onRegister: (localOnly?: boolean) => void; onIdentify?: (trigger: HTMLButtonElement) => void;
+  children?: ReactNode;
 };
 
-export function ScanGameCard({ candidate, index, coverUrl, matched, waiting, failed, disableRegister, disableIdentify, onRegister, onIdentify }: Props) {
+export function ScanGameCard({ candidate, index, coverUrl, matched, waiting, failed, disableRegister, disableIdentify, onRegister, onIdentify, children }: Props) {
   const notify = useUI(state => state.notify);
   const more = useRef<HTMLButtonElement>(null);
   const openingIdentity = useRef(false);
@@ -40,6 +47,7 @@ export function ScanGameCard({ candidate, index, coverUrl, matched, waiting, fai
         <FolderIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />
         <PathText dir="ltr" title={path} className="min-w-0 wrap-anywhere break-normal">{path}</PathText>
       </div>
+      {children}
       {matched && <p className="text-xs leading-relaxed wrap-anywhere text-muted-foreground">{matched.pluginName} · {matched.reusable ? tr("将校验并复用已安装适配包") : tr("适配包将随添加安装")}</p>}
       {candidateWarnings(candidate).map(warning => <p key={warning} className="text-xs wrap-anywhere text-warning">{warning}</p>)}
     </div>
@@ -56,7 +64,7 @@ export function ScanGameCard({ candidate, index, coverUrl, matched, waiting, fai
           }}>
             <DropdownMenuGroup>
               <DropdownMenuItem onSelect={() => void copyDirectory()}><CopyIcon />{tr("复制游戏目录")}</DropdownMenuItem>
-              {!managed && !matched && !waiting && !candidate.suggestedAdapterSlug && <DropdownMenuItem disabled={disableIdentify} onSelect={() => {
+              {onIdentify && !managed && !matched && !waiting && !candidate.suggestedAdapterSlug && <DropdownMenuItem disabled={disableIdentify} onSelect={() => {
                 if (more.current) { openingIdentity.current = true; onIdentify(more.current); }
               }}><GlobeIcon />{tr("联网识别")}</DropdownMenuItem>}
               {!managed && (waiting || failed) && <DropdownMenuItem disabled={disableRegister} onSelect={() => onRegister(true)}><PlusIcon />{tr("仅添加本地")}</DropdownMenuItem>}

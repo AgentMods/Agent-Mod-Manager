@@ -1,17 +1,24 @@
 # Agent Mod Manager implementation status
 
-Updated: 2026-11-26. The desktop release target is `1.0.3`. See the
+Updated: 2026-11-27. The desktop release target is `1.0.3`. See the
 [Chinese release notes](releases/1.0.3.md) for user-facing features and
 installation limitations. This page records implementation and verification
 evidence; it does not establish that the release workflow or CI has passed.
 The broader project scope remains active.
 
-**Home dashboard (2026-11-26).** Every launch opens Home. The welcome panel shows library counts above
-four shortcuts: Get started (Agent), Library, Browse and Settings. First-run and
-migration setup remain available separately. Registered games have direct links to their detail pages. The local
-SQLite summary counts managed games, installed Mods and all visible Mod rows
-across the game libraries. The sponsor panel reads up to six distinct public
-display names, followed by one Sponsor link that opens the site in the system browser.
+**Agent sidebar reminders (2026-11-27).** The Agent navigation item counts conversations with pending questions, approvals or new background replies. The expanded rail displays a badge and the collapsed rail displays a dot. Selecting the item opens a conversation, prioritizing pending actions. Viewing a reply clears its unread indicator. Questions and approvals stay visible until resolved. Active conversation checkpoints restore outstanding actions when the WebView reloads.
+
+**Mod source metadata (2026-11-27).** Source downloads retain the selected file's display version separately from its resource ID and store a public work page in the library and install record when available. This covers native providers and Browse/MCP downloads, not just 3DM. The archive list and installation planner can recover missing fields offline from an exact download receipt. Public project routes can also be reconstructed for 3DM, Mod Inn, Modrinth, Nexus (game domain and project ID), CurseForge and GameBanana. Community/slug-dependent pages use recorded source metadata; ambiguous IDs, generic local imports and file IDs alone are not enough to identify the work or invent its version.
+Verification: 310 distinct focused Rust tests passed, including SQLite installation/receipt checks, plus nine Playwright checks for versions, Mod information and the website menu across three viewports. `cargo fmt --check` and all-target Clippy with warnings denied passed. No real game installation was used.
+
+**Mod list actions (2026-11-27).** The More menu opens the managed Mod folder, shows recorded details, opens a public project site, edits the display name and game tags, or checks for an update. Archive edits do not rename files. The version column uses saved metadata and exact historical archive/download records, then recognizes explicitly versioned or Nexus-style archive filenames; ambiguous names show an unknown version. For Modrinth and Thunderstore, the check compares releases for the bound project without downloading. Downloading a pending update adds the new archive to the game library. For an enabled Mod with verified provenance, the user can request an Agent-reviewed replacement transaction; the old-only files, overwrites and additions roll back together. Other sources can be checked against a known project page or imported manually. The special GTA RPF deployment flow does not support automatic replacement.
+Verification: production build and all 168 Mod actions, organization and update Playwright cases passed across the three configured viewports (mocked IPC). The Rust library suite reported 1,314 passed and 18 ignored; 103 focused Rust cases passed on the final metadata changes. No live provider download or real game installation was used for these checks.
+
+**Skills settings (2026-11-27).** The settings list reads embedded guidance and inspects registered standalone documents without acquiring the file transaction or Skills mutex. System Skill details and preferences remain available during long-running Mod transactions. The Agent catalog and standalone mutations continue to reconcile deployments.
+
+**Navigation (2026-11-26).** React Router owns desktop and browser-preview navigation. Static pages use hash paths (for example `#/library` and `#/settings`); game detail uses `#/games/:gameId`. Refresh and browser history restore the matched page. The migration restart still offers Continue setup on Home. Agent conversation selection and unsent drafts remain in memory, not in URLs. The production frontend build and 120 distinct Playwright checks across three viewports passed for routing, onboarding, sidebar behavior and Agent conversations.
+
+**Home dashboard (2026-11-26).** Launching without a page URL opens Home. The welcome panel shows library counts in neutral stat cards with an install-ratio bar above four shortcuts: Get started (Agent), Library, Browse and Settings. First-run and migration setup remain available separately. Registered games have direct pill links to their detail pages. The local SQLite summary counts managed games, installed Mods and all visible Mod rows across the game libraries. The sponsor panel loads sponsor entries (`name`, optional validated `https://` `logo` and `url`) from `Sponsors.json` on the repository’s `main` branch via `cdn.gh-proxy.org` in both the desktop app and browser preview, rendering each sponsor as an interactive card with neutral elevation and micro-tilt effects that respect `prefers-reduced-motion`, monogram fallback on missing/broken logos, and system-browser navigation via `openUrl`. It preserves manifest order, skips duplicate names, and keeps the donation link available even when the mirror is offline. Settings and the five-step Onboarding guide use matching neutral card and sub-panel styling across light and dark themes.
 The production frontend build and 102 Home, sidebar, onboarding and plugin catalog
 UI checks passed across the three configured viewports.
 
@@ -1830,13 +1837,15 @@ All requirements in the original approved plan remain in scope.
 
 ### Resumable discovery and diagnosis
 
-- In the library scan dialog, candidates appear in a responsive grid. Each card
-  shows the game cover above its name and directory, with the match status,
-  Add/Managed button and More menu in the footer. More can copy the path and,
-  when eligible, identify the game online or add it without a cloud adapter.
-  Artwork comes from an enabled, validated local adapter or the matched cloud
-  release (loaded only when visible). A missing or failed cover does not block
-  registration. The onboarding workflow is unchanged.
+- The library scan dialog and the onboarding scan step share a responsive
+  candidate grid. Each card places the cover above the game name and directory,
+  with match status, Add/Managed and More in its footer. Both screens offer
+  path copying and a local-only fallback during cloud matching or after a
+  registration failure. The library menu also supports online identification.
+  Onboarding cards display the platform, suggested adapter and registration
+  errors for the individual game. Artwork comes from an enabled, validated
+  local adapter or a matched cloud release loaded when its card is visible.
+  Games without artwork use a placeholder.
 
 - Installed-game discovery has no fixed depth/directory/entry ceiling for
   explicitly selected trees; `maxDepth`, `maxDirectories`, and `maxEntries`

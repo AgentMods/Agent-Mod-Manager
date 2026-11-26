@@ -1,7 +1,8 @@
 import { tr } from "@/lib/i18n";
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { DownloadIcon, MinusIcon, PackageMinusIcon, TagIcon, Trash2Icon, Undo2Icon } from 'lucide-react';
-import { EditModTags, ManageModTags, ModTagBadge, ModTagFilters, type ModTag } from '@/components/ModTags';
+import { DownloadIcon, MinusIcon, PackageMinusIcon, Trash2Icon, Undo2Icon } from 'lucide-react';
+import { ManageModTags, ModTagBadge, ModTagFilters, type ModTag } from '@/components/ModTags';
+import { ModMoreMenu } from '@/components/ModMoreMenu';
 import { ModStatusSwitch } from '@/components/ModStatusSwitch';
 import { ErrorState, IconButton, Modal, PathText, date } from '@/components/ui';
 import { Button } from '@/components/ui/button';
@@ -9,7 +10,7 @@ import { Card } from '@/components/ui/card';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { errorText, useBackendQuery } from '@/lib/api';
-import { batchIntent, modStatusLabels, replacementTransaction, type BatchAction, type Installed, type ModAction, type ModRow, type Removal } from '@/lib/mod-management';
+import { batchIntent, modSource, modVersion, modStatusLabels, replacementTransaction, type BatchAction, type Installed, type ModAction, type ModRow, type Removal } from '@/lib/mod-management';
 import { findPendingModSwitch, useModSwitch, type ModSwitchTarget } from '@/lib/mod-switch-store';
 import { batchLabels as labels, type BatchResult } from '@/lib/mod-agent-actions';
 import { useUI } from '@/lib/store';
@@ -44,10 +45,8 @@ export function ModManagementTable({ gameId, rows: allRows, batchMode, disabled,
   const tagsById = useMemo(() => new Map(tags.data?.map(tag => [tag.id, tag])), [tags.data]);
   const [filter, setFilter] = useState('');
   const [manageTags, setManageTags] = useState(false);
-  const [editId, setEditId] = useState<string | null>(null);
-  const editing = allRows.find(row => row.target.installId === editId)?.item;
   const activeFilter = tagsById.has(filter) ? filter : '';
-  const rows = useMemo(() => activeFilter ? allRows.filter(({ item }) => 'id' in item && item.tagIds?.includes(activeFilter)) : allRows, [allRows, activeFilter]);
+  const rows = useMemo(() => activeFilter ? allRows.filter(({ item }) => item.tagIds?.includes(activeFilter)) : allRows, [allRows, activeFilter]);
   const [selected, setSelected] = useState<Set<string>>(() => new Set());
   const [review, setReview] = useState<BatchRequest | null>(null);
   const [progress, setProgress] = useState('');
@@ -122,7 +121,7 @@ export function ModManagementTable({ gameId, rows: allRows, batchMode, disabled,
           const record = 'id' in item ? item : undefined;
           const archive = 'filename' in item ? item : undefined;
           const origin = record?.downloadOrigin;
-          const source = origin?.sourceId ?? record?.source ?? archive?.sourceId;
+          const source = modSource(row);
           const task = findPendingModSwitch(pending, target);
           const canSelect = !task && !!(installed || install || removal);
           const isSelected = batchMode && canSelect && selected.has(row.key);
@@ -130,12 +129,12 @@ export function ModManagementTable({ gameId, rows: allRows, batchMode, disabled,
             {batchMode && <TableCell className="pl-3"><Checkbox aria-label={tr("选择 {name}", { name: item.name })} checked={isSelected} disabled={disabled || !canSelect}
               onCheckedChange={value => setSelected(prev => { const next = new Set(prev); if (value === true) next.add(row.key); else next.delete(row.key); return next; })} /></TableCell>}
             <TableCell className="min-w-28 whitespace-normal"><div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-              {record?.tagIds?.map(id => { const tag = tagsById.get(id); return tag && <ModTagBadge key={id} tag={tag} />; })}
+              {item.tagIds?.map(id => { const tag = tagsById.get(id); return tag && <ModTagBadge key={id} tag={tag} />; })}
               <strong className="wrap-anywhere">{item.name}</strong>
             </div><small className="block wrap-anywhere text-muted-foreground">{record ? tr("{length} 个文件", { length: record.files.length }) : archive?.filename}</small></TableCell>
-            <TableCell className={cn('min-w-24 wrap-anywhere whitespace-normal', secondaryColumn)}>{item.version || '—'}{origin && <PathText className="block">{tr("版本 ID：{versionId}", { versionId: origin.versionId })}</PathText>}</TableCell>
-            <TableCell className={cn('min-w-28 wrap-anywhere whitespace-normal', secondaryColumn)}>{source === 'local' ? tr("本地归档") : source || '—'}
-              {origin ? <PathText className="block">{tr("项目 ID：{projectId}", { projectId: origin.projectId })}</PathText> : record && source !== 'local' && <small className="block text-muted-foreground">{tr("未绑定下载记录")}</small>}
+            <TableCell className={cn('min-w-24 wrap-anywhere whitespace-normal', secondaryColumn)}>{modVersion(row) || tr("未知版本")}{origin && <PathText className="block">{tr("版本 ID：{versionId}", { versionId: origin.versionId })}</PathText>}</TableCell>
+            <TableCell className={cn('min-w-28 wrap-anywhere whitespace-normal', secondaryColumn)}>{source || '—'}
+              {origin ? <PathText className="block">{tr("项目 ID：{projectId}", { projectId: origin.projectId })}</PathText> : record && (row.archive?.sourceId ?? record.source) !== 'local' && <small className="block text-muted-foreground">{tr("未绑定下载记录")}</small>}
             </TableCell>
             <TableCell><ModStatusSwitch checked={installed} action={installed ? tr("使用 Agent 卸载") : record && install ? tr("使用 Agent 重新安装") : tr("使用 Agent 安装")}
               status={record ? modStatusLabels[record.status] ?? record.status : tr("待安装")} pending={task} disabled={disabled || batchMode || (!installed && !install)}
@@ -143,9 +142,10 @@ export function ModManagementTable({ gameId, rows: allRows, batchMode, disabled,
               onToggle={() => { if (installed && record) onStart({ installId: record.id, name: item.name }, target); else if (install) onStart(install, target); }} /></TableCell>
             <TableCell className={secondaryColumn}>{record ? date(record.installedAt) : '—'}</TableCell>
             {!batchMode && <TableCell><div className="flex justify-end gap-2">
-              {record && !['planned', 'rolled_back'].includes(record.status) && <IconButton title={tr("编辑 {name} 的标签", { name: item.name })} disabled={disabled || !!task || !tags.isSuccess} onClick={() => setEditId(record.id)}><TagIcon /></IconButton>}
               {removal && <IconButton title={removal.kind === 'plan' ? tr("取消安装计划") : tr("从管理列表删除")} disabled={disabled || !!task} onClick={() => onRemove(removal)}><Trash2Icon data-icon="inline-start" /></IconButton>}
               {record && replacementTransaction(record) && <IconButton title={tr("预览回滚替换")} disabled={disabled || !!task || fetching} onClick={() => onRollback(record)}><Undo2Icon data-icon="inline-start" /></IconButton>}
+              <ModMoreMenu gameId={gameId} row={row} tags={tags.data ?? []} canEdit={tags.isSuccess}
+                disabled={disabled || !!task || fetching} />
             </div></TableCell>}
           </TableRow>;
         })}</TableBody>
@@ -153,7 +153,6 @@ export function ModManagementTable({ gameId, rows: allRows, batchMode, disabled,
     </Card>
     {activeFilter && !rows.length && <p className="py-4 text-center text-sm text-muted-foreground">{tr("没有使用此标签的 Mod")}</p>}
     {manageTags && <ManageModTags gameId={gameId} tags={tags.data ?? []} onClose={() => setManageTags(false)} />}
-    {editing && 'id' in editing && <EditModTags key={editing.id} gameId={gameId} record={editing} tags={tags.data ?? []} onClose={() => setEditId(null)} />}
     {review && <Modal title={tr("批量删除 Mod")} description={tr("将从此游戏的管理列表删除 {length} 项。", { length: review.rows.length })} onClose={() => setReview(null)} actions={<>
       <Button variant="outline" onClick={() => setReview(null)}>{tr("取消")}</Button>
       <Button variant="destructive" disabled={disabled} onClick={() => void dispatch(review)}>{tr("确认删除")}</Button>

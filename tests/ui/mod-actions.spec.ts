@@ -14,6 +14,21 @@ async function gameDetails(page: Page) {
   await expect(page.getByTestId("game-detail-page")).toBeVisible();
 }
 
+async function mockModMetadataCommands(page: Page) {
+  await page.addInitScript(() => {
+    const target = window as any;
+    const transport = target.__TAURI_INTERNALS__;
+    const originalInvoke = transport.invoke;
+    transport.invoke = async (command: string, args: Record<string, unknown> = {}, options?: unknown) => {
+      if (["open_mod_storage_directory", "update_mod_metadata"].includes(command)) {
+        target.__AMM_TEST__.calls.push({command, args});
+        return null;
+      }
+      return originalInvoke(command, args, options);
+    };
+  });
+}
+
 function calls(page: Page, ...commands: string[]) {
   return page.evaluate(names => (window as any).__AMM_TEST__.calls.filter((call: any) => names.includes(call.command)), commands);
 }
@@ -28,6 +43,18 @@ function archiveRow(page: Page, filename: string) {
 
 function installedRow(page: Page, name: string) {
   return modTable(page).getByRole("row").filter({hasText: name});
+}
+
+function exactNameRow(page: Page, name: string) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return modTable(page).getByRole("row", {name: new RegExp(`^${escaped} \\d+ 个文件`)});
+}
+
+async function expectModMenu(row: ReturnType<typeof installedRow>) {
+  await row.getByRole("button", {name: "更多", exact: true}).click();
+  for (const name of ["目录", "信息", "网站", "编辑", "更新"]) {
+    await expect(row.page().getByRole("menuitem", {name, exact: true})).toBeVisible();
+  }
 }
 
 function detailApproval(page: Page) {
@@ -117,6 +144,124 @@ test("unlinked archives appear as pending rows and keep the chosen exact archive
   await expectNotice(page, /拒绝|未执行|未能|失败/);
   expect((await calls(page, "respond_approval")).map(call => call.args.response)).toEqual([{approved: false, answer: null}]);
   expect(await calls(page, "apply_plan", ...unavailableWrites)).toEqual([]);
+});
+
+test("installed and pending Mod rows expose the same menu and open the Mod editor", async ({page}, testInfo) => {
+  await installMockTauri(page, {modLibrary: [archive]});
+  await mockModMetadataCommands(page);
+  await page.goto("/");
+  await gameDetails(page);
+
+  const installed = exactNameRow(page, "Example");
+  await expect(installed).toContainText("1.0.0");
+  await expectModMenu(installed);
+  if (testInfo.project.name === "desktop-1440") {
+    await page.screenshot({path: "output/playwright/mod-more-menu.png", fullPage: true});
+  }
+  await page.getByRole("menuitem", {name: "编辑", exact: true}).click();
+  const installedEditor = page.getByRole("dialog", {name: "编辑 Mod", exact: true});
+  const installedName = installedEditor.getByRole("textbox", {name: "显示名称", exact: true});
+  await expect(installedName).toBeVisible();
+  await expect(installedEditor.getByRole("button", {name: "保存", exact: true})).toBeVisible();
+  await installedName.fill("Example 改名");
+  await installedEditor.getByRole("button", {name: "保存", exact: true}).click();
+  await expect.poll(async () => calls(page, "update_mod_metadata")).toHaveLength(1);
+  expect((await calls(page, "update_mod_metadata"))[0].args).toEqual({
+    gameId, target: {kind: "install", id: "install-fixture"}, patch: {name: "Example 改名", tagIds: []},
+  });
+  await page.keyboard.press("Escape");
+
+  const pending = archiveRow(page, archive.filename);
+  await expect(pending).toContainText("2.0");
+  await expectModMenu(pending);
+  await page.getByRole("menuitem", {name: "编辑", exact: true}).click();
+  const pendingEditor = page.getByRole("dialog", {name: "编辑 Mod", exact: true});
+  const pendingName = pendingEditor.getByRole("textbox", {name: "显示名称", exact: true});
+  await expect(pendingName).toBeVisible();
+  await expect(pendingEditor.getByRole("button", {name: "保存", exact: true})).toBeVisible();
+  await pendingName.fill("未安装改名");
+  await pendingEditor.getByRole("button", {name: "保存", exact: true}).click();
+  await expect.poll(async () => calls(page, "update_mod_metadata")).toHaveLength(2);
+  expect((await calls(page, "update_mod_metadata"))[1].args).toEqual({
+    gameId, target: {kind: "archive", id: archive.artifactId}, patch: {name: "未安装改名", tagIds: []},
+  });
+});
+
+test("the directory menu sends install and archive targets to the storage command", async ({page}) => {
+  await installMockTauri(page, {modLibrary: [archive]});
+  await mockModMetadataCommands(page);
+  await page.goto("/");
+  await gameDetails(page);
+
+  await expectModMenu(exactNameRow(page, "Example"));
+  await page.getByRole("menuitem", {name: "目录", exact: true}).click();
+  await expect.poll(async () => calls(page, "open_mod_storage_directory")).toHaveLength(1);
+  expect((await calls(page, "open_mod_storage_directory"))[0].args).toEqual({
+    gameId, target: {kind: "install", id: "install-fixture"},
+  });
+
+  await expectModMenu(archiveRow(page, archive.filename));
+  await page.getByRole("menuitem", {name: "目录", exact: true}).click();
+  await expect.poll(async () => calls(page, "open_mod_storage_directory")).toHaveLength(2);
+  expect((await calls(page, "open_mod_storage_directory"))[1].args).toEqual({
+    gameId, target: {kind: "archive", id: archive.artifactId},
+  });
+});
+
+test("Mod information shows all available metadata and disables the website action without a source page", async ({page}) => {
+  const documented = {
+    ...archive, artifactId: "artifact-documented", name: "Documented Mod", filename: "Documented.jar",
+    version: "3.2.1", authorHint: "Author Example", sourceId: "modrinth", projectId: "DocumentedProject",
+    projectPage: "https://modrinth.com/mod/DocumentedProject",
+  };
+  const local = {
+    ...archive, artifactId: "artifact-local-no-source", name: "Local Mod", filename: "Local.jar",
+    version: null, authorHint: null, sourceId: "local", projectId: null, projectPage: null,
+  };
+  await installMockTauri(page, {modLibrary: [documented, local]});
+  await page.goto("/");
+  await gameDetails(page);
+
+  const documentedRow = archiveRow(page, documented.filename);
+  await documentedRow.getByRole("button", {name: "更多", exact: true}).click();
+  await page.getByRole("menuitem", {name: "信息", exact: true}).click();
+  const info = page.getByRole("dialog", {name: "Mod 信息", exact: true});
+  await expect(info).toBeVisible();
+  await expect(info.locator("dt")).toHaveText(["名称", "版本", "作者", "来源", "网址"]);
+  await expect(info.locator("dd")).toHaveText([
+    "Documented Mod", "3.2.1", "Author Example", "modrinth", documented.projectPage,
+  ]);
+  await expect(info.getByRole("link", {name: documented.projectPage, exact: true})).toHaveAttribute("href", documented.projectPage);
+  await page.keyboard.press("Escape");
+
+  const localRow = archiveRow(page, local.filename);
+  await localRow.getByRole("button", {name: "更多", exact: true}).click();
+  await expect(page.getByRole("menuitem", {name: "网站", exact: true})).toBeDisabled();
+});
+
+test("the version column falls back to its linked archive and labels missing versions", async ({page}) => {
+  const linkedArchive = {...archive, artifactId: "artifact-linked-version", version: "2.4.1"};
+  const unknownArchive = {...archive, artifactId: "artifact-unknown-version", filename: "Unknown.jar", version: null};
+  await installMockTauri(page, {modLibrary: [linkedArchive, unknownArchive]});
+  await page.addInitScript(() => {
+    const transport = (window as any).__TAURI_INTERNALS__;
+    const originalInvoke = transport.invoke;
+    transport.invoke = async (command: string, args: Record<string, unknown> = {}, options?: unknown) => {
+      const result = await originalInvoke(command, args, options);
+      if (command !== "list_installs" || args.gameId !== "game-fixture") return result;
+      const records = result as any[];
+      return [
+        {...records[0], version: null, metadata: {libraryEntryId: "artifact-linked-version"}},
+        {...records[0], id: "install-unknown-version", name: "Unknown Installed Mod", version: null, metadata: {}},
+      ];
+    };
+  });
+  await page.goto("/");
+  await gameDetails(page);
+
+  await expect(exactNameRow(page, "Example")).toContainText("2.4.1");
+  await expect(installedRow(page, "Unknown Installed Mod")).toContainText("未知版本");
+  await expect(archiveRow(page, unknownArchive.filename)).toContainText("未知版本");
 });
 
 test("each pending archive switch reports progress without blocking another row", async ({page}) => {
@@ -267,7 +412,9 @@ test("a failed status readback can be retried without replaying the Agent action
   await expectNotice(page, /无法读取.*最新安装状态/);
   const readsBeforeRetry = (await calls(page, "list_installs")).length;
 
-  await page.getByRole("button", {name: "重新读取状态", exact: true}).click();
+  const retry = page.getByRole("button", {name: "重新读取状态", exact: true});
+  await retry.focus();
+  await retry.press("Enter");
   const installed = installedRow(page, archive.name);
   await expect(installed).toContainText("已安装");
   await expect(installed.getByRole("switch", {name: "使用 Agent 卸载", exact: true})).toBeChecked();
@@ -687,7 +834,7 @@ test("explicit game action can run if preferences cannot be read without overwri
       return invoke(command, args);
     };
   });
-  await page.goto("/");
+  await page.goto("/#/agent");
   await page.getByRole("button", {name: "本轮权限策略", exact: true}).click();
   await page.getByRole("menuitemradio", {name: "完全信任", exact: true}).click();
   await gameDetails(page);

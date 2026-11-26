@@ -118,6 +118,7 @@ async fn save_attachment(
     result: &Value,
 ) -> AppResult<Value> {
     let (url, name) = signed_archive(result)?;
+    let version = signed_version(&result["structuredContent"], attachment);
     let progress = context.progress.as_ref().map(|notify| {
         let notify = notify.clone();
         Arc::new(move |progress| notify(json!({"download": progress}))) as ProgressCallback
@@ -139,13 +140,18 @@ async fn save_attachment(
             CompletedSource::ModInn {
                 work_id: attachment.work_id.get(),
                 file_id: attachment.file_id.get(),
+                version,
                 url,
             },
         )
         .await?;
     let id = artifact.artifact_id.clone();
+    let mut artifact = serde_json::to_value(artifact.into_user_paths())?;
+    if let Some(version) = version {
+        artifact["version"] = json!(version);
+    }
     Ok(
-        json!({"artifactId":id,"artifact":artifact.into_user_paths(),"cataloged":true,"work_id":attachment.work_id,"file_id":attachment.file_id}),
+        json!({"artifactId":id,"artifact":artifact,"cataloged":true,"work_id":attachment.work_id,"file_id":attachment.file_id}),
     )
 }
 
@@ -176,6 +182,32 @@ fn signed_archive(result: &Value) -> AppResult<(&str, &str)> {
         return Err(AppError::Invalid("Mod 客栈未返回可下载的附件信息".into()));
     };
     Ok((url, name))
+}
+
+/// A successful signing response describes the one approved attachment. The
+/// official schemas currently supply no display version: the list's
+/// version_type (latest/history) and file_id are not substitutes. Consume only
+/// an explicit attachment label if the existing signing response supplies one.
+fn signed_version<'a>(file: &'a Value, attachment: &Attachment) -> Option<&'a str> {
+    if file
+        .get("work_id")
+        .is_some_and(|id| id.as_u64() != Some(attachment.work_id.get()))
+        || file
+            .get("file_id")
+            .is_some_and(|id| id.as_u64() != Some(attachment.file_id.get()))
+    {
+        return None;
+    }
+    file["version"]
+        .as_str()
+        .and_then(crate::mod_metadata::display_version)
+        .filter(|label| {
+            !label.contains(['/', '\\', '?'])
+                && !label.contains("[REDACTED]")
+                && !["latest", "history"]
+                    .iter()
+                    .any(|kind| label.eq_ignore_ascii_case(kind))
+        })
 }
 
 #[cfg(test)]
@@ -229,6 +261,30 @@ mod tests {
             assert_eq!(std::mem::discriminant(&mapped), original_variant);
             assert_eq!(mapped.to_string(), original_message);
         }
+    }
+
+    #[test]
+    fn signed_version_requires_a_safe_explicit_label_for_the_approved_attachment() {
+        let attachment = serde_json::from_value(json!({"work_id":42,"file_id":103})).unwrap();
+        for missing in [
+            json!({"file_id":103,"version_id":"103","version_type":"history","mod_version":"2.0"}),
+            json!({"file_id":103,"version":103}),
+            json!({"version":"history"}),
+            json!({"file_id":104,"version":"1.2.3"}),
+            json!({"work_id":43,"version":"1.2.3"}),
+            json!({"version":" "}),
+            json!({"version":"https://cdn.example.test/a?signature=private-ticket"}),
+            json!({"version":"[REDACTED]"}),
+        ] {
+            assert_eq!(signed_version(&missing, &attachment), None);
+        }
+        assert_eq!(
+            signed_version(
+                &json!({"work_id":42,"file_id":103,"version":" 1.2.3 "}),
+                &attachment
+            ),
+            Some("1.2.3")
+        );
     }
 
     #[test]

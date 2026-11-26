@@ -69,9 +69,24 @@ async function installConversationStates(page: Page) {
 
 test("侧栏用有色状态图标展示未打开会话，Tooltip 与标题按钮名称保持独立", async ({ page }) => {
   await installConversationStates(page);
-  await page.goto("/");
-  await page.getByRole("button", { name: "游戏库", exact: true }).click();
-  await page.getByRole("button", { name: /^Agent( 对话)?$/ }).click();
+  // Enter the route directly to inspect the list before selecting a conversation.
+  await page.goto("/#/agent");
+  const agent = page.getByRole("navigation").getByRole("button", { name: "Agent", exact: true });
+  await expect(agent).toHaveAttribute("aria-description", "等待授权 (1)、等待回答 (2)");
+  const badge = agent.locator("span[aria-hidden=true]");
+  await expect(badge).toBeVisible();
+  await expect(badge).toHaveText("3");
+  const rail = page.locator('[data-slot="sidebar"]').first();
+  const expanded = await rail.getAttribute("data-state") === "expanded";
+  const number = badge.getByText("3", { exact: true });
+  if (expanded) await expect(number).toBeVisible();
+  else await expect(number).toBeHidden();
+  await page.getByRole("button", {name: "切换侧边栏"}).first().click();
+  await expect(badge).toBeVisible();
+  if (expanded) await expect(number).toBeHidden();
+  else await expect(number).toBeVisible();
+
+  await page.getByRole("button", {name: "切换侧边栏"}).first().click();
 
   const rows = [
     { title: "空白会话", id: "conversation-empty", status: "等待输入" },
