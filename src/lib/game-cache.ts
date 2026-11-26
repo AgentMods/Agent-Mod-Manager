@@ -1,4 +1,5 @@
 import type { QueryClient } from "@tanstack/react-query";
+import { dashboardStatsKey } from "./dashboard-stats";
 import type { AgentEvent } from "./types";
 
 const GAME_MUTATIONS = new Set(["register_game", "update_game", "remove_game", "set_game_adapter"]);
@@ -24,7 +25,10 @@ export async function invalidateGameQueries(
   client: QueryClient,
   { gameIds = [], workspaceChanged = false }: { gameIds?: Iterable<string>; workspaceChanged?: boolean } = {},
 ) {
-  const invalidations = [client.invalidateQueries({ queryKey: ["games"] })];
+  const invalidations = [
+    client.invalidateQueries({ queryKey: ["games"] }),
+    client.invalidateQueries({ queryKey: dashboardStatsKey }),
+  ];
   for (const id of new Set(gameIds)) {
     invalidations.push(client.invalidateQueries({ queryKey: ["game", id] }));
     invalidations.push(client.invalidateQueries({ queryKey: ["mod-library", id] }));

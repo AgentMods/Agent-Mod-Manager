@@ -16,7 +16,7 @@ const SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS browse_enrichment_recency
     ON browse_enrichment_cache(written_at DESC, fingerprint DESC);";
 
-fn fingerprint(
+pub(super) fn fingerprint(
     kind: &str,
     rules: &str,
     fields: impl IntoIterator<Item = impl AsRef<str>>,
@@ -38,6 +38,14 @@ fn fingerprint(
 }
 
 pub(super) fn item_key(input: &EnrichmentInput<'_>, locale: &str) -> String {
+    metadata_key(input, locale, "item", ITEM_RULES)
+}
+
+pub(super) fn category_key(input: &EnrichmentInput<'_>, rules: &str) -> String {
+    metadata_key(input, "", "primary-type", rules)
+}
+
+fn metadata_key(input: &EnrichmentInput<'_>, locale: &str, kind: &str, rules: &str) -> String {
     // Preserve absence vs empty, and hash full originals even if only an excerpt
     // will be sent to the model.
     let fields = [
@@ -51,8 +59,8 @@ pub(super) fn item_key(input: &EnrichmentInput<'_>, locale: &str) -> String {
         input.kind.unwrap_or_default(),
     ];
     fingerprint(
-        "item",
-        ITEM_RULES,
+        kind,
+        rules,
         fields
             .into_iter()
             .chain(input.tags.iter().map(String::as_str)),

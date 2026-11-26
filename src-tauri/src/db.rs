@@ -224,7 +224,7 @@ impl Db {
     }
 }
 
-pub const SCHEMA_VERSION: i64 = 26;
+pub const SCHEMA_VERSION: i64 = 27;
 
 // SQLite appends rowid to the index key: these indexes bound scans to the
 // conversation's insertion-order suffix and the most recent retained user.
@@ -620,6 +620,14 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
   startup_digest BLOB,
   created_at TEXT NOT NULL
 );
+
+-- Keep explicit launch consent separate from effective game-bound enablement.
+CREATE TABLE IF NOT EXISTS game_tool_state (
+  server_id TEXT PRIMARY KEY REFERENCES mcp_servers(id) ON DELETE CASCADE,
+  digest BLOB NOT NULL CHECK(length(digest)=32),
+  decision INTEGER NOT NULL CHECK(decision IN (1,2,3))
+);
+CREATE INDEX IF NOT EXISTS idx_games_adapter_slug ON games(adapter_slug) WHERE adapter_slug IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS conversations (
   id TEXT PRIMARY KEY,

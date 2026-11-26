@@ -19,11 +19,15 @@ application's reqwest 0.12 dependency.
 
 ## Integration
 
-Desktop setup restores the local service from its own saved opt-in, then starts
-previously connected external servers in the background. SQLite stores a nullable
-`startup_digest` of the exact confirmed external configuration, not resolved
-credentials. Existing rows migrate without consent. The following low-level client
-example connects once; only the desktop lifecycle records startup intent.
+Desktop setup restores the local service from its own saved opt-in, then restores
+eligible external connections in the background. Manual connections retain a
+configuration-specific startup receipt. Adapter-owned connections additionally
+require an enabled, validated package and at least one registered game bound to
+that package. SQLite stores a nullable `startup_digest` for manually authorized
+configurations, not resolved credentials; adapter auto-start eligibility and
+manual connection permission are separate. Existing rows migrate without consent.
+The following low-level client example connects once; only trusted desktop lifecycle
+code records startup intent.
 
 ```rust,ignore
 let servers = mcp::McpServers::new(db.clone());
@@ -32,7 +36,8 @@ servers.seed_presets()?;
 servers.write_secret(&settings, "mcp.glossmod_http.api_key", &token)?;
 servers.set_enabled("glossmod_http", true)?;
 let config = servers.get("glossmod_http")?;
-// The desktop Start action authorizes the displayed configuration.
+// A manual Start action authorizes the displayed configuration.
+// Adapter-owned auto-start uses a separate policy and receipt.
 // Pass false here because this example uses HTTP.
 let consent = mcp::ConnectionConsent::after_user_confirmation(&config, false)?;
 let runtime = mcp::McpRuntime::default(); // HTTP does not need a bundled launcher.
@@ -106,11 +111,20 @@ Schema v9 migrates the stock 3DM stdio preset to the remote endpoint and revokes
   Converts documents to Markdown via stdio, without an API key. Its `file:`
   URIs can read files available to the OS user, outside the manager's game roots.
 
-Click Start on a service in Settings to connect immediately. A stdio command runs with the current OS user’s permissions. Bare `npx`, `npx.cmd`, `npx.exe`, `uvx` and `uvx.exe` (case-insensitive) use
+Click Start on a manual service in Settings to connect immediately and authorize
+that exact configuration for restoration. Adapter-owned services can also start
+automatically while their owner package is enabled and validated and at least one
+registered game is bound. A stdio command runs with the current OS user’s
+permissions. Bare `npx`, `npx.cmd`, `npx.exe`, `uvx` and `uvx.exe` (case-insensitive) use
 application-owned launchers. The bundled npx uses npmmirror (`npm_config_registry`).
 The bundled uvx uses the Tsinghua PyPI mirror for packages (`UV_DEFAULT_INDEX`)
 and the npmmirror `python-build-standalone` archive for managed CPython downloads
 (`UV_PYTHON_INSTALL_MIRROR`). Explicit CLI index options take precedence.
+The exact recognized Windows GTA RPF declarations (`uvx gta-rpf-mcp@latest`)
+override the package index to official PyPI (`https://pypi.org/simple`) because
+the Tsinghua mirror does not yet carry this package. AMM also passes its own
+`LOCALAPPDATA` to that child so the MCP and AMM use the same RPF job directory,
+`%LOCALAPPDATA%\\GlossMod\\AMM\\gta-rpf-jobs`.
 Schema v26 removes the official PyPI override from the stock Thunderstore command.
 If the preset was previously authorized for automatic startup, click Start once
 in Settings → 工具 to approve its updated command. Custom arguments are preserved.
@@ -129,6 +143,21 @@ Schema v3 switches only an unmodified built-in Windows Playwright preset to Edge
 If it was set to start automatically, start it manually once to confirm the new
 command. Custom browser arguments and other edited configurations are preserved.
 
+For adapter-owned services, first use requests authorization tied to the exact
+configuration when the stdio command is not explicitly trusted, credentials are
+configured, or HTTP targets a local address. AMM's credential-free Windows GTA
+Legacy and Enhanced `rpf` declarations (`uvx gta-rpf-mcp@latest`) are the stdio
+exception. Only the exact AMM public HTTPS URLs `https://www.glossmod.com/api/v1/mcp`
+and `https://mod.3dmgame.com/mcp` can connect without network consent, and only
+when the configuration has no credential references or credential URL. Every
+other network endpoint requires one-time consent bound to its exact configuration.
+A previous approval applies only to that configuration; after any change,
+re-evaluate the policy and prompt again if the changed configuration requires consent.
+Manual Stop suppresses automatic reconnection, even while a game remains bound.
+Disabling or invalidating the owner package revokes its adapter-owned startup state.
+Removing the last game binding also revokes adapter-owned auto-start; a manual
+connection receipt remains a separate choice.
+
 For a first `uvx` launch the app allows up to ten minutes for dependencies and
 MCP initialization, with up to four concurrent downloads and a 120-second uv
 HTTP timeout in the child environment. A failed start can be retried from Settings. The app does not log child stderr.
@@ -142,18 +171,25 @@ HTTP timeout in the child environment. A failed start can be retried from Settin
 - `ConnectionConsent` is single-use, bound to exact config, non-serializable and
   intended for trusted UI/IPC code only. Do not expose it, configuration mutation,
   process startup or `write_secret` as model-callable tools. Enabling alone never
-  authorizes spawning. Desktop startup may issue fresh single-use consent when
-  the current config matches a receipt saved after successful manual connection
-  and registration. Stop, edit, disable or remove revokes the receipt. A failed
-  restore leaves it available for the next launch, until explicitly cancelled.
-  Agent registry registration never starts a process.
+  authorizes spawning: adapter-owned startup also requires an enabled, validated
+  owner package and at least one registered game bound to it. For eligible
+  adapter-owned services, trusted desktop policy may authorize the exact
+  credential-free GTA Windows `rpf` declaration or an exact AMM built-in fixed
+  public HTTPS URL without credential references or a credential URL; other
+  first-use stdio, credential-bearing, local HTTP, or non-built-in network
+  configurations require a configuration-specific user decision. Manual Start
+  permission remains separate. Manual Stop suppresses automatic reconnect, and the
+  last game unbind revokes adapter-owned startup. Agent registry registration never
+  starts a process.
 - The official Mod 客栈 `get_work_file_download` has a desktop-only adapter. The approval
   names the work and file IDs and covers signing and transferring that one archive.
   `Effect::UncatalogedDownload` requires approval unless the desktop Agent uses Full Trust. Only the adapter consumes the
   signed URL, using the bounded public HTTPS downloader with no MCP authorization header.
   The model and download catalog receive the resulting local artifact.
 - **stdio is NOT sandboxed.** Its command and descendants have the user's OS
-  filesystem/network permissions. The user authorizes the selected connection with Start. A malicious
+  filesystem/network permissions. The user must authorize an untrusted stdio
+  configuration; the trusted automatic-start stdio exception is the exact
+  credential-free Windows GTA Legacy/Enhanced `rpf` declaration. A malicious
   server can directly delete or alter local files outside FileEngine; per-tool
   approval cannot contain that process. Use only trusted executables/packages,
   or keep stdio disabled. A real OS sandbox/container is required for stronger

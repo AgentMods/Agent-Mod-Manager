@@ -1,4 +1,40 @@
 {
+  "gta.rpf.enhanced_unsupported": {
+    "zh-CN": "GTA V Enhanced 的 RPF 任务仅支持 gameconfig 和独立 DLC。散装载具、行人模型和 Menyoo 登记尚未验证。",
+    "en": "GTA V Enhanced RPF jobs support only gameconfig and standalone DLC. Loose vehicles, ped models, and Menyoo registration are unverified.",
+    "de": "RPF-Aufträge für GTA V Enhanced unterstützen nur gameconfig und eigenständige DLCs. Lose Fahrzeuge, Fußgängermodelle und Menyoo-Einträge sind ungeprüft.",
+    "es": "Las tareas RPF de GTA V Enhanced solo admiten gameconfig y DLC independientes. Los vehículos sueltos, los modelos de peatones y el registro de Menyoo aún no se han verificado.",
+    "fr": "Les tâches RPF de GTA V Enhanced prennent uniquement en charge gameconfig et les DLC autonomes. Les véhicules séparés, les modèles de piétons et l’enregistrement Menyoo restent à vérifier.",
+    "it": "Le operazioni RPF di GTA V Enhanced supportano solo gameconfig e i DLC autonomi. I veicoli sfusi, i modelli pedonali e la registrazione Menyoo sono ancora da verificare.",
+    "ja": "GTA V Enhanced の RPF ジョブで使えるのは gameconfig と独立した DLC のみです。単体の車両や歩行者モデル、Menyoo への登録は未検証です。",
+    "ko": "GTA V Enhanced의 RPF 작업은 gameconfig와 독립 DLC만 지원합니다. 개별 차량, 보행자 모델 및 Menyoo 등록은 아직 검증되지 않았습니다.",
+    "pt-BR": "As tarefas RPF do GTA V Enhanced são compatíveis apenas com gameconfig e DLCs independentes. Veículos avulsos, modelos de pedestres e registros do Menyoo ainda não foram verificados.",
+    "ru": "Задания RPF для GTA V Enhanced поддерживают только gameconfig и самостоятельные DLC. Отдельные машины, модели пешеходов и регистрация в Menyoo не проверены."
+  },
+  "gta.rpf.marker_missing": {
+    "zh-CN": "未找到游戏标记 {marker}。",
+    "en": "Game marker {marker} is missing.",
+    "de": "Die Spieldatei {marker} fehlt.",
+    "es": "Falta el archivo de identificación del juego {marker}.",
+    "fr": "Le fichier d’identification du jeu {marker} est introuvable.",
+    "it": "Manca il file identificativo del gioco {marker}.",
+    "ja": "ゲームを識別するファイル {marker} が見つかりません。",
+    "ko": "게임을 식별하는 파일 {marker}이(가) 없습니다.",
+    "pt-BR": "O arquivo de identificação do jogo {marker} está ausente.",
+    "ru": "Файл для определения игры {marker} отсутствует."
+  },
+  "gta.rpf.invalid_rpf7": {
+    "zh-CN": "文件缺少有效的 RPF7 标头或完整的目录表。",
+    "en": "The file lacks a valid RPF7 header or a complete directory table.",
+    "de": "Der Datei fehlt ein gültiger RPF7-Header oder eine vollständige Verzeichnistabelle.",
+    "es": "El archivo carece de una cabecera RPF7 válida o de una tabla de directorios completa.",
+    "fr": "Le fichier ne contient pas d’en-tête RPF7 valide ou de table de répertoires complète.",
+    "it": "Il file non contiene un’intestazione RPF7 valida o una tabella delle directory completa.",
+    "ja": "ファイルに有効な RPF7 ヘッダーまたは完全なディレクトリテーブルがありません。",
+    "ko": "파일에 유효한 RPF7 헤더 또는 완전한 디렉터리 테이블이 없습니다.",
+    "pt-BR": "O arquivo não tem um cabeçalho RPF7 válido ou uma tabela de diretórios completa.",
+    "ru": "В файле отсутствует допустимый заголовок RPF7 или полная таблица каталогов."
+  },
   "gta.rpf.workflow_required": {
     "zh-CN": "GTA 归档不可作为普通文件部署；请使用该适配包的 RPF MCP 暂存并提交更改。",
     "en": "GTA archives cannot be deployed as loose files. Stage changes with the adapter’s RPF MCP before committing them.",
@@ -10,6 +46,18 @@
     "ko": "GTA 아카이브를 일반 파일처럼 설치할 수 없습니다. 어댑터의 RPF MCP로 변경 사항을 준비하세요.",
     "pt-BR": "Não instale arquivos RPF do GTA como arquivos avulsos. Prepare as alterações com o MCP RPF do adaptador.",
     "ru": "Архивы GTA нельзя устанавливать как отдельные файлы. Подготовьте изменения через RPF MCP адаптера."
+  },
+  "browse.install_tool_unavailable": {
+    "zh-CN": "本轮页内安装未提供此工具。请从本轮可用工具中选择：{tools}。",
+    "en": "This tool is unavailable for this Browse install. Choose one of the tools available this turn: {tools}.",
+    "de": "Dieses Werkzeug ist für diese Installation nicht verfügbar. Wähle eines der verfügbaren Werkzeuge: {tools}.",
+    "es": "Esta herramienta no está disponible para esta instalación. Elige una de las herramientas disponibles: {tools}.",
+    "fr": "Cet outil est indisponible pour cette installation. Choisissez un outil disponible pour ce tour : {tools}.",
+    "it": "Questo strumento non è disponibile per questa installazione. Scegli uno degli strumenti disponibili: {tools}.",
+    "ja": "このインストールでは、このツールは使用できません。今回使用できるツールから選択してください：{tools}。",
+    "ko": "이 설치에서는 해당 도구를 사용할 수 없습니다. 이번에 사용할 수 있는 도구 중에서 선택하세요: {tools}.",
+    "pt-BR": "Esta ferramenta está indisponível para esta instalação. Escolha uma das ferramentas disponíveis: {tools}.",
+    "ru": "Этот инструмент недоступен для данной установки. Выберите один из доступных инструментов: {tools}."
   },
   "browse.authorization_changed": {
     "zh-CN": "游览授权已失效，请重新确认要访问的来源。",

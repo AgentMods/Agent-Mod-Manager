@@ -12,7 +12,9 @@ export const PLUGIN_UPDATED_AT_FIXTURE = "2026-11-20T16:45:00Z";
 
 // Test-only IPC transport. It is never imported by the shipped application.
 export async function installMockTauri(page: Page, {
-  modLibrary = [], onboarding = false, onboardingStarted = false, failRegistration = false,
+  modLibrary = [], onboarding = false, onboardingStarted = false, failRegistration = false, emptyLibrary = false,
+  dashboardSponsors = ["Fixture Sponsor"],
+  dashboardStats,
   gameRootPath = "/sandbox/minecraft", gameLaunchPath, gameSteamAppId = null, gameModLauncher, gameLaunchOptions, failGameLaunchOptions = false, failGameLaunchMethods = [], gameWithoutAdapter = false, gameWithoutMods = false, adapterDisabled = false, withExternalAdapter = false, holdAgentTurn = false,
   gamePlanConflicts = [],
   pluginDateFixture = "valid",
@@ -28,11 +30,14 @@ export async function installMockTauri(page: Page, {
   conversationFixtures,
   appUpdate,
   failAppUpdateRoute = false,
-  mcpCredentialStatuses = {}, failMcpCredentialStatusIds = [], failFirstMcpSecretWrites = [], holdNextMcpCredentialStatus = false,
+  pendingGameTools = [], mcpCredentialStatuses = {}, failMcpCredentialStatusIds = [], failFirstMcpSecretWrites = [], holdNextMcpCredentialStatus = false,
 }: {
   modLibrary?: Array<{artifactId: string; gameId: string | null; gameName: string; name: string; filename: string; version: string | null; sha256: string; projectPage?: string | null}>;
   onboarding?: boolean;
   onboardingStarted?: boolean;
+  emptyLibrary?: boolean;
+  dashboardSponsors?: string[];
+  dashboardStats?: {managedGameCount: number; installedModCount: number; totalModCount: number};
   failRegistration?: boolean;
   gameRootPath?: string;
   gameLaunchPath?: string;
@@ -59,6 +64,7 @@ export async function installMockTauri(page: Page, {
   askUser?: {preview: AskUserPreviewFixture; approvalId?: string; toolCallId?: string; deferResult?: boolean};
   workspaceGames?: WorkspaceGameFixture[];
   conversationFixtures?: Array<Record<string, unknown>>;
+  pendingGameTools?: import("../../src/lib/mcp-connection").McpConfig[];
   mcpCredentialStatuses?: Record<string, Record<string, boolean>>;
   failMcpCredentialStatusIds?: string[];
   failFirstMcpSecretWrites?: string[];
@@ -82,7 +88,7 @@ export async function installMockTauri(page: Page, {
 } = {}) {
   // The public-looking manifest image is served offline in browser tests.
   await page.route("https://covers.example.org/minecraft-java.jpg", route => route.fulfill({contentType: "image/png", path: "public/favicon.png"}));
-  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameSteamAppId, gameModLauncher, gameLaunchOptions, failGameLaunchOptions, failGameLaunchMethods, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus}) => {
+  await page.addInitScript(({modLibrary, onboarding, onboardingStarted, failRegistration, emptyLibrary, dashboardSponsors, dashboardStats, gameRootPath, gameLaunchPath, gameSteamAppId, gameModLauncher, gameLaunchOptions, failGameLaunchOptions, failGameLaunchMethods, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt, pluginUpdatedAt, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, pendingGameTools, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus}) => {
     type Args = Record<string, any>;
     const now = "2026-11-18T00:00:00Z";
     const draftUpdatedAtField = pluginDateFixture === "valid" ? {updatedAt: pluginUpdatedAt} : {};
@@ -117,7 +123,7 @@ export async function installMockTauri(page: Page, {
       metadata: {...(gameLaunchPath === undefined ? {} : {launchPath: gameLaunchPath}), ...(gameModLauncher ? {modLauncher: gameModLauncher} : {})},
       steamAppId: gameSteamAppId, createdAt: now, updatedAt: now,
     };
-    const games: Args[] = onboarding && !onboardingStarted ? [] : [
+    const games: Args[] = emptyLibrary || (onboarding && !onboardingStarted) ? [] : [
       gameWithoutAdapter ? {...initialGame, adapterSlug: null, adapterVersion: null} : initialGame,
     ];
     if (games.length > 0) games.push(...workspaceGames.map((game: WorkspaceGameFixture) => ({
@@ -401,6 +407,12 @@ export async function installMockTauri(page: Page, {
           return ++directoryPickCount === 1 ? "/sandbox/new-game" : null;
         }
         case "list_games": return structuredClone(games);
+        case "list_dashboard_sponsors": return structuredClone(dashboardSponsors);
+        case "get_dashboard_stats": return structuredClone(dashboardStats ?? {
+          managedGameCount: games.length,
+          installedModCount: games.reduce((count, game) => count + Number(game.installedModCount ?? 0), 0),
+          totalModCount: games.reduce((count, game) => count + Number(game.installedModCount ?? 0), 0),
+        });
         case "list_game_conflicts": return structuredClone(pendingGameConflicts
           .filter((conflict: any) => !Array.isArray(conflict.blockedChanges) || conflict.blockedChanges.includes(args.change))
           .map((conflict: any) => {
@@ -660,6 +672,7 @@ export async function installMockTauri(page: Page, {
           importedEntry = {artifactId: "artifact-import-fixture", gameId: args.gameId, gameName: initialGame.name, name: "Fixture", filename: "Fixture.jar", version: null, sha256: "b".repeat(64), projectPage: null};
           return importedEntry;
         }
+        case "mcp_pending_game_tools": return structuredClone(pendingGameTools);
         case "mcp_list": return [];
         case "mcp_credential_status": {
           if (failedCredentialStatusIds.has(args.id)) throw new Error("模拟读取配置状态失败");
@@ -951,5 +964,5 @@ export async function installMockTauri(page: Page, {
         seq = Math.max(seq, ...values.map((event) => event.seq).filter(Number.isSafeInteger));
       },
     };
-  }, {modLibrary, onboarding, onboardingStarted, failRegistration, gameRootPath, gameLaunchPath, gameSteamAppId, gameModLauncher, gameLaunchOptions, failGameLaunchOptions, failGameLaunchMethods, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus});
+  }, {modLibrary, onboarding, onboardingStarted, failRegistration, emptyLibrary, dashboardSponsors, dashboardStats, gameRootPath, gameLaunchPath, gameSteamAppId, gameModLauncher, gameLaunchOptions, failGameLaunchOptions, failGameLaunchMethods, gameWithoutAdapter, gameWithoutMods, adapterDisabled, withExternalAdapter, holdAgentTurn, gamePlanConflicts, pluginDateFixture, pluginCreatedAt: PLUGIN_CREATED_AT_FIXTURE, pluginUpdatedAt: PLUGIN_UPDATED_AT_FIXTURE, failInstalledPluginRemoval, duplicatePluginDraftSlug, failPluginDraftDeletion, seedPublishedPluginRecord, providerModels, configuredModels, appLocale, systemLocale, askUser, storage, workspaceGames, conversationFixtures, appUpdate, failAppUpdateRoute, pendingGameTools, mcpCredentialStatuses, failMcpCredentialStatusIds, failFirstMcpSecretWrites, holdNextMcpCredentialStatus});
 }

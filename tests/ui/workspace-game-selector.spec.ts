@@ -30,6 +30,7 @@ const gameCheckbox = (page: Page, name: string) =>
   workspaceDialog(page).getByRole("checkbox", {name, exact: true});
 
 async function openConversation(page: Page, title: string) {
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await page.getByRole("button", {name: title, exact: true}).click();
   await expect(page.locator(".chat-header h1")).toHaveText(title);
 }
@@ -43,6 +44,7 @@ async function recordedCalls(page: Page, command: string) {
 test("new conversations start with every game selected and send an explicit multi-game workspace", async ({page}) => {
   await installMockTauri(page, {workspaceGames});
   await page.goto("/");
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await page.getByRole("button", {name: "新建对话", exact: true}).click();
 
   const button = workspaceButton(page);
@@ -177,6 +179,7 @@ test("workspace picker opens from the visible control at desktop and narrow view
 test("new conversation preserves gameId only when exactly one game is selected", async ({page}) => {
   await installMockTauri(page, {workspaceGames});
   await page.goto("/");
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await page.getByRole("button", {name: "新建对话", exact: true}).click();
   await workspaceButton(page).click();
   await page.getByRole("button", {name: "清空", exact: true}).click();

@@ -202,6 +202,48 @@ pub async fn mcp_connect(
         .await
 }
 #[tauri::command]
+pub async fn mcp_pending_game_tools(
+    state: State<'_, AppServices>,
+) -> AppResult<Vec<crate::mcp::ServerConfig>> {
+    blocking(state.engine.clone(), |e| {
+        crate::mcp::McpServers::new(e.db).pending_game_tools()
+    })
+    .await
+}
+
+async fn decide_game_tool(
+    state: State<'_, AppServices>,
+    expected_config: crate::mcp::ServerConfig,
+    allowed: bool,
+) -> AppResult<()> {
+    blocking(state.engine.clone(), move |e| {
+        crate::plugin_workflow::reconcile_deployments(&e)?;
+        let _guard = crate::transaction::write_lock();
+        crate::mcp::McpServers::new(e.db.clone())
+            .set_game_tool_consent(&expected_config, allowed)?;
+        e.notify_plugin_mcp_changed();
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mcp_approve_game_tool(
+    state: State<'_, AppServices>,
+    expected_config: crate::mcp::ServerConfig,
+) -> AppResult<()> {
+    decide_game_tool(state, expected_config, true).await
+}
+
+#[tauri::command]
+pub async fn mcp_decline_game_tool(
+    state: State<'_, AppServices>,
+    expected_config: crate::mcp::ServerConfig,
+) -> AppResult<()> {
+    decide_game_tool(state, expected_config, false).await
+}
+
+#[tauri::command]
 pub async fn mcp_disconnect(
     state: State<'_, AppServices>,
     agent: State<'_, AgentRuntime>,
@@ -585,6 +627,16 @@ pub async fn list_games(state: State<'_, AppServices>) -> AppResult<Vec<games::G
     blocking(state.engine.clone(), |e| {
         crate::install::reconcile(&e.db)?;
         games::list_games(&e.db)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_dashboard_stats(
+    state: State<'_, AppServices>,
+) -> AppResult<crate::dashboard::DashboardStats> {
+    blocking(state.engine.clone(), |engine| {
+        crate::dashboard::read_stats(&engine.db)
     })
     .await
 }

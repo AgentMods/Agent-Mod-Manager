@@ -1,11 +1,18 @@
 ---
 name: gta5-legacy
-description: "为 GTA V Legacy 故事模式核对版本、逐文件安装普通模组，并在能力验证通过时通过暂存任务管理 RPF。"
+description: "为 GTA5 传承版（Grand Theft Auto V Legacy）故事模式核对版本、逐文件安装普通模组，并在能力验证通过时通过暂存任务管理 RPF。"
 ---
 
-# Grand Theft Auto V · Windows 故事模式
+# GTA5 传承版（Grand Theft Auto V Legacy）· Windows 故事模式
 
-只绑定已登记、含真实 `GTA5.exe` 文件的目录（Steam 271590）。`PlayGTAV.exe`、`update/` 和另一版的主程序不是标记。不要创建标记、修改启动参数或安全设置，不用于 GTA Online。2026-11-25 本机只读观察主程序 1.0.3889.0；本机 build 与下列 Script Hook V 发布标签的 Legacy build 相符，但未启动游戏、未测试插件加载。指定 RPF 服务、工具或输入缺失时停止；声明不是运行证明。
+只绑定已登记、含真实 `GTA5.exe` 文件的目录（Steam 271590；Steam 清单 `name` 为 `Grand Theft Auto V Legacy`，`installdir` 为 `Grand Theft Auto V`）。`PlayGTAV.exe`、`update/` 和另一版的主程序不是标记。不要创建标记、修改启动参数或安全设置，不用于 GTA Online。2026-11-25 只读核对：`versioninfo.txt` 记录 `GTA5.exe 1.0.3889.0`（SHA-256 `677E4E355CFBDB13273B1D992407E3C261B3A108DC4DD5C8A0C4C1DA651802E5`），根目录 `version.txt` 为 `1.0.231.0`，两者含义不同，版本判断以主程序为准。本机 build 与下列 Script Hook V 发布标签的 Legacy build 相符，但未启动游戏、未测试插件加载。指定 RPF 服务、工具或输入缺失时停止；声明不是运行证明。
+
+## Steam 适配
+
+- 识别：`steamAppId` 为 `271590`，必需标记是 `GTA5.exe`；同目录 `GTA5_BE.exe`、`PlayGTAV.exe` 属 Steam/BattlEye 启动链，不是模组目标。另一版的 `GTA5_Enhanced.exe` 与本包无关，两个安装目录不得混用。
+- 启动与更新：按 Steam App ID 启动；不改 Steam 启动选项或启动参数，不接管 `PlayGTAV.exe`/`GTAVLauncher.exe`。Steam 自动更新会替换主程序与 `update/`，更新后须重新核对 ScriptHookV 与脚本 API 的 build 支持范围。
+- Steam「验证文件完整性」可能还原被替换的原版文件或删除模组文件，只是修复手段，不等于卸载记录；不要用它代替本包的卸载流程。
+- `BattlEye/` 属在线反作弊组件，不修改、不删除、不作为安装目标；本包只服务故事模式。
 
 ## 普通文件：不依赖 RPF MCP
 
@@ -29,8 +36,18 @@ description: "为 GTA V Legacy 故事模式核对版本、逐文件安装普通�
 
 ### 任务和卸载
 
-1. 普通文件不请求此服务。需要 RPF 时先确认本版能力、指定 3DM 205014 发行的工具/DLL、键数据与模板已经核验，并能对该版暂存副本读写回读。Windows 服务的只读 `gta_rpf_status({})` 可在人工授权连接后查询；1.0.0 规定 Python 3.11+、Windows PowerShell 5.1、.NET Framework 4.8，单独的 205014 / 356110 原 ZIP 由用户提供。缺失则报告，不代为下载/安装。不得从 Mod 中加载同名 DLL；任何验证不通过，报告缺口，不退回普通映射。不开启工具或自动同意非沙箱 stdio；由用户在已安装适配包的工具设置中选择。只使用本游戏绑定包的 `rpf` 服务。
-2. 安装先调用 native `prepare_gta_rpf_job({game_id,artifact_id,kind,options})`。`kind` 如上，`sourceDir` 可选、仅原包内相对目录。行人必须显式给 `modelName`、`sex`（`Male` / `Female`）和 `streamed` 布尔值；车辆/DLC 仅在已有 Menyoo 列表、模型匹配且用户选中时才用 `menyoo`，不创建前置。
-3. 取返回的 `jobId` 调用此包 `gta_rpf_prepare({jobId})`；它只负责私有暂存，不写游戏、不登记安装。**DLC 未知 packName**：第一次 `options:{}`（需要时含 sourceDir 等）为探测；`status:'inspected'` 和 `packName` 不是成品。用同 game/artifact/kind 重做 native 准备，`options.inspectJobId` 取探测 jobId，保留原 sourceDir / menyoo，再用正式 jobId 调 MCP。明确核验过的 `options.packName` 可以直接准备，工具仍须核对 nameHash。
+1. 绑定游戏和已启用的适配包后，AMM 自动连接本包 `rpf` 服务。运行 RPF 任务前查询 `gta_rpf_status({})`，确认 `ready` 为真、`backend` 为 `python-rpf7`。请按 `legacyJobs` 核对具体任务。 `uvx gta-rpf-mcp@latest` 提供 Python 归档后端、格式表和模板。若用户已手动停用服务，尊重该设置。
+2. 安装先调用 native `prepare_gta_rpf_job({game_id,artifact_id,kind,options})`。`kind` 如上，`sourceDir` 可选、仅原包内相对目录。行人必须显式给 `modelName`、`sex`（`Male` / `Female`）和 `streamed` 布尔值；车辆/DLC 仅在已有 Menyoo 列表、模型匹配且用户选中时才用 `menyoo`，不创建前置。选中的 Menyoo 列表随同一任务的冻结目标一起处理。
+3. 按 native 返回的完整 `mcpTool` 名称调用，只传 `{jobId}`。DLC 探测用 `gta_rpf_inspect_dlc`，正式 DLC 用 `gta_rpf_register_dlc`，gameconfig 用 `gta_rpf_replace_gameconfig`，散装车辆和行人分别用 `gta_rpf_build_vehicle_pack` 和 `gta_rpf_build_ped_pack`。服务未提供对应专用工具时，native 自动返回同包的 `gta_rpf_prepare`。MCP 只写入私有暂存目录。
+   - **DLC 的 `packName` 未知时**，先省略 `options.packName` 做探测。收到 `status:'inspected'` 后，用相同的 `game_id`、`artifact_id` 和 `kind` 再准备正式任务，把探测的 `jobId` 传给 `options.inspectJobId`，保留原 `sourceDir` 和 `menyoo` 选项。用正式任务返回的 `mcpTool` 和 `jobId` 继续。已核验的 `options.packName` 可直接用来准备正式任务，MCP 仍会核对 `nameHash`。
+   - 要检查本次安装任务的归档时，调用 `gta_rpf_describe_job({jobId})` 分页查看 `inputs`，优先将对应行的 `archive` 对象传给列出或读取工具。服务仅返回 `path` 和 `archiveName` 时，分别用作 `archive.path` 和 `archive.name`。对现有游戏归档的独立检查与编辑见下节。
 4. 仅正式任务成功时调用 `install_library_mod({request:{gameId,artifactId,mode:'gtaRpf',jobId}})`。由 native 重新核对游戏版、库原包、job 身份、目标白名单、基线和产物指纹；不信任 MCP 自报目标。以文件计划预览、审批、提交和已安装列表回读为准。游戏根 `update/update.rpf` 永远不写；磁盘产物不是游戏加载成功。
-5. 卸载从已安装记录取 ID：`prepare_gta_rpf_job({game_id,install_id})` → 用本次 jobId 调同包 `gta_rpf_prepare({jobId})` → `uninstall_mod({game_id,install_id,rpf_job_id})`（rpf_job_id 就是本次 jobId）。从基线和其余 Mod 贡献重建共享归档，最后一份才恢复基线/撤销 AMM 首创副本。冲突、外部修改、版本不符、权限拒绝或回读失败均停止；不删除整个 mods/、加载器、Menyoo 列表、存档或玩家自留条目。
+5. 卸载从已安装记录取 ID：`prepare_gta_rpf_job({game_id,install_id})` → 用本次 `jobId` 调返回的 `mcpTool`（同包 `gta_rpf_prepare`） → `uninstall_mod({game_id,install_id,rpf_job_id})`（rpf_job_id 就是本次 jobId）。从基线和其余 Mod 贡献重建共享归档，最后一份才恢复基线/撤销 AMM 首创副本。冲突、外部修改、版本不符、权限拒绝或回读失败均停止；不删除整个 mods/、加载器、Menyoo 列表、存档或玩家自留条目。
+
+### 独立读取和编辑游戏归档
+
+1. 确认当前工作区的 GTA 游戏和本包的 `rpf` 工具已连接。调用 native `prepare_gta_rpf_archive_job({game_id,archive_path,source_paths?})`。例如用户给出 `mods/update/update.rpf/common/data/dlclist.xml` 时，传 `archive_path: "mods/update/update.rpf"`，将 `common/data/dlclist.xml` 作为后续 MCP 调用的 `entry`。跨嵌套归档时，`entry` 包含内部归档名，例如 `x64/models.rpf/car.yft`。
+2. 准备任务使用实际存在的游戏相对 `.rpf` 外层文件，保留磁盘上的文件名。指定的 `mods` 副本缺失时，报告该路径缺失并停在此处。读取、列出和删除可省略 `source_paths`。添加或替换时，`source_paths` 只接受用户明确指定或授权的同一游戏安装根下的相对普通文件。准备任务依据 AMM 的管理器写入审批策略生成私有快照。
+3. 把返回的 `jobId` 和 `archive` 原样传给 `gta_rpf_list_entries` 或 `gta_rpf_read_entry`。也可用返回的完整 `mcpTool` 调用 `gta_rpf_describe_job({jobId})`，按 `nextOffset` 分页，获取 `inputs[].archive` 和载荷引用。读取 XML 可传 `encoding: "utf8"`，较大的条目按工具分页读取。
+4. 添加调用 `gta_rpf_add_entry`（`{jobId,archive,entry,sourcePath}`），替换调用 `gta_rpf_write_entry`（`{jobId,archive,entry,sourcePath}`）。`sourcePath` 使用 native 返回的 `payloads[].sourcePath` 或任务清单中对应载荷的 `inputs[].path`。删除现有文件调用 `gta_rpf_delete_entry`（`{jobId,archive,entry}`）。按需使用 `gta_rpf_create_archive` 和载荷生成新归档。每次修改后使用返回的完整 `archive` 引用继续编辑或重新打开并读取验证，删除可列目录或确认目标条目缺失。
+5. 独立任务的产物仅在私有暂存目录中，游戏文件保持原样。正式安装和卸载只能使用上节的安装或卸载任务 ID。

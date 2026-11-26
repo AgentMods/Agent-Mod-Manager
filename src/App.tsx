@@ -1,16 +1,20 @@
 import { version } from "../package.json";
 import { tr, useLocale } from "@/lib/i18n";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
-import { CompassIcon, Gamepad2Icon, HeartIcon, HistoryIcon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
+import { CompassIcon, Gamepad2Icon, HeartIcon, HouseIcon, HistoryIcon, LibraryIcon, MessageSquareIcon, MoonIcon, PuzzleIcon, SettingsIcon, SunIcon, Trash2Icon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { listen } from "@tauri-apps/api/event";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { SponsorLink } from "./components/SponsorLink";
+import HomePage from "./pages/HomePage";
 import { backendAvailable, errorText, useBackendQuery } from "./lib/api";
 import { subscribeAgentToolResults, syncAgentEvents } from "./lib/agent-store";
 import { invalidateAgentModQueries } from "./lib/agent-mod-cache";
 import { gameMutationsFromResults, invalidateGameQueries } from "./lib/game-cache";
 import { syncModSwitches, withoutModSwitchWrites } from "./lib/mod-switch-store";
 import { useUI } from "./lib/store";
+import { refreshBrowseInstallTasks } from "./lib/browse-install";
+import { refreshMcpQueries } from "./lib/mcp-connection";
+import { McpGameToolApproval } from "./components/McpGameToolApproval";
 import { useLanguageSync } from "./lib/app-language";
 import type { BootstrapState, PageName } from "./lib/types";
 import { BackgroundApprovalLink } from "./components/AgentConfirmation";
@@ -36,6 +40,7 @@ const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 const OnboardingPage = lazy(() => import("./pages/OnboardingPage"));
 
 const navigation = [
+    { id: "home", get label() { return tr("首页"); }, icon: HouseIcon },
     { id: "agent", label: "Agent", icon: MessageSquareIcon },
     { id: "library", get label() { return tr("游戏库"); }, icon: LibraryIcon },
     { id: "browse", get label() { return tr("游览"); }, icon: CompassIcon },
@@ -44,7 +49,6 @@ const navigation = [
     { id: "history", get label() { return tr("历史对话"); }, icon: HistoryIcon },
 ] as const;
 const settingsItem = { id: "settings", get label() { return tr("设置"); }, icon: SettingsIcon } as const;
-const SPONSOR_URL = "https://sponsor.aoe.top/";
 const APP_VERSION = `v${version}`;
 const pages = { browse: BrowsePage, library: LibraryPage, detail: GameDetailPage, agent: AgentPage, plugins: PluginsPage, trash: TrashPage, history: HistoryPage, settings: SettingsPage };
 
@@ -136,9 +140,10 @@ export default function App() {
     useEffect(() => {
         if (!backendAvailable) return;
         const refresh = () => {
-            for (const key of ["plugins", "skills", "mcp", "games", "game", "mod-library", "manager-plugin-preview"]) {
+            for (const key of ["plugins", "skills", "games", "game", "mod-library", "manager-plugin-preview"]) {
                 void client.invalidateQueries({ queryKey: [key] });
             }
+            void refreshMcpQueries(client);
         };
         let disposed = false;
         const subscription = listen<string>("plugin://catalog-updated", refresh).then(stop => {
@@ -146,6 +151,18 @@ export default function App() {
             return stop;
         }).catch(error => {
             if (!disposed) notify(tr("无法订阅适配包更新：{value1}", { value1: String(error) }));
+        });
+        return () => { disposed = true; void subscription.then(stop => stop?.()); };
+    }, [client, notify]);
+    useEffect(() => {
+        if (!backendAvailable) return;
+        let disposed = false;
+        const refresh = () => { if (!disposed) void refreshMcpQueries(client); };
+        const subscription = listen("mcp://restore-progress", refresh).then(stop => {
+            refresh(); // Cover native work that finished before the listener was ready.
+            return stop;
+        }).catch(error => {
+            if (!disposed) notify(errorText(error));
         });
         return () => { disposed = true; void subscription.then(stop => stop?.()); };
     }, [client, notify]);
@@ -181,6 +198,7 @@ export default function App() {
     useEffect(() => syncAgentEvents(visibleConversation, (id, events) => {
         void client.invalidateQueries({ queryKey: ["conversation", id] });
         void client.invalidateQueries({ queryKey: ["conversations"] });
+        refreshBrowseInstallTasks(client, id);
         const successfulTools = new Set(events.filter(event => event.kind === "tool-result" && event.payload.status === "done")
             .map(event => event.payload.name));
         const createdDraft = successfulTools.has("write_plugin_draft") || successfulTools.has("import_cloud_plugin");
@@ -204,14 +222,19 @@ export default function App() {
 
     if (backendAvailable && bootstrap.isLoading && !bootstrap.data) return <div className="flex min-h-dvh items-center justify-center bg-background"><Loading>{tr("正在准备桌面服务…")}</Loading></div>;
     const automaticOnboarding = !!(bootstrap.data?.isFirstRun || bootstrap.data?.resumeOnboarding);
-    if (backendAvailable && bootstrap.data && (view === "onboarding" || automaticOnboarding)) {
-        return <Suspense fallback={<main className="flex min-h-dvh items-center justify-center bg-background"><Loading>{tr("正在加载引导…")}</Loading></main>}>
-            <OnboardingPage automatic={automaticOnboarding} bootstrap={bootstrap.data} />
-        </Suspense>;
+    if (backendAvailable && bootstrap.data && view === "onboarding") {
+        return <div className="flex h-dvh flex-col">
+            <McpGameToolApproval />
+            <div className="min-h-0 flex-1 overflow-auto">
+                <Suspense fallback={<main className="flex min-h-dvh items-center justify-center bg-background"><Loading>{tr("正在加载引导…")}</Loading></main>}>
+                    <OnboardingPage automatic={automaticOnboarding} bootstrap={bootstrap.data} />
+                </Suspense>
+            </div>
+        </div>;
     }
 
     const shellView = view === "onboarding" ? "settings" : view;
-    const Page = pages[shellView];
+    const Page = shellView === "home" ? null : pages[shellView];
     const current = shellView === "detail" ? tr("游戏详情") : [...navigation, settingsItem].find((item) => item.id === shellView)?.label;
     const macos = backendAvailable && navigator.platform.startsWith("Mac");
     return <SidebarProvider open={railOpen ?? wide} onOpenChange={changeRail} className="h-dvh min-h-0 overflow-hidden" style={{ "--sidebar-width": "13.5rem" } as React.CSSProperties}>
@@ -219,7 +242,7 @@ export default function App() {
             <SidebarHeader className={cn("gap-0 p-3", macos && "pt-10")}>
                 <SidebarMenu>
                     <SidebarMenuItem>
-                        <SidebarMenuButton size="lg" tooltip={appName} aria-label={appName} onClick={() => navigate("agent")}>
+                        <SidebarMenuButton size="lg" tooltip={appName} aria-label={appName} onClick={() => navigate("home")}>
                             <AppLogo />
                             <span className="truncate text-sm font-semibold">{appName}</span>
                         </SidebarMenuButton>
@@ -249,13 +272,7 @@ export default function App() {
                     <IconButton title={settingsItem.label} variant={view === "settings" ? "secondary" : "ghost"} aria-current={view === "settings" ? "page" : undefined} onClick={() => navigate("settings")}><settingsItem.icon /></IconButton>
                     <div className="flex items-center group-data-[collapsible=icon]:flex-col">
                         <IconButton asChild title={tr("赞助")}>
-                            <a href={SPONSOR_URL} target="_blank" rel="noreferrer" onClick={(event) => {
-                                if (!backendAvailable) return;
-                                event.preventDefault();
-                                void openUrl(SPONSOR_URL).catch((error) => notify(tr("无法打开赞助页面：{value1}", { value1: errorText(error) })));
-                            }}>
-                                <HeartIcon aria-hidden="true" />
-                            </a>
+                            <SponsorLink><HeartIcon aria-hidden="true" /></SponsorLink>
                         </IconButton>
                         <IconButton title={theme === "light" ? tr("切换暗色主题") : tr("切换亮色主题")} onClick={toggleTheme}>{theme === "light" ? <MoonIcon className="motion-safe:animate-icon-swap" /> : <SunIcon className="motion-safe:animate-icon-swap" />}</IconButton>
                     </div>
@@ -278,11 +295,12 @@ export default function App() {
                 </div>
                 <BackgroundApprovalLink visibleConversation={visibleConversation} />
             </header>
+            <McpGameToolApproval />
             {!backendAvailable && <Alert role="status" className="rounded-none border-x-0 border-t-0 bg-muted/50"><AlertDescription>{tr("未连接桌面服务，游戏目录与文件操作不可用。")}</AlertDescription></Alert>}
             {bootstrap.data?.recoveryError && <ErrorState className="rounded-none border-x-0 border-t-0" error={tr("文件事务恢复需要处理：{recoveryError}", { recoveryError: bootstrap.data.recoveryError })} />}
             <ErrorState className="rounded-none border-x-0 border-t-0" error={bootstrap.error} />
             <main className="min-h-0 min-w-0 flex-1 overflow-auto">
-                <Suspense fallback={<Loading>{tr("正在加载...")}</Loading>}><Page /></Suspense>
+                <Suspense fallback={<Loading>{tr("正在加载...")}</Loading>}>{Page ? <Page /> : <HomePage bootstrap={bootstrap.data} version={APP_VERSION} />}</Suspense>
             </main>
         </SidebarInset>
         <PlanDialog />

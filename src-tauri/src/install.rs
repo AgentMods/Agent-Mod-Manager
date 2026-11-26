@@ -879,6 +879,12 @@ pub(crate) fn effective_install_state() -> String {
     format!("CASE WHEN EXISTS(SELECT 1 FROM install_transactions a WHERE a.install_id=installs.id) THEN ({INSTALL_STATE}) ELSE status END")
 }
 
+pub(crate) fn recorded_download_origin(metadata: &serde_json::Value) -> Option<DownloadOrigin> {
+    metadata
+        .get("downloadOrigin")
+        .and_then(|origin| DownloadOrigin::deserialize(origin).ok())
+}
+
 /// Derived from durable transaction states, not a success flag set by the UI.
 /// Safe after both normal execution and startup journal recovery.
 pub fn reconcile(db: &Db) -> AppResult<()> {
@@ -933,9 +939,7 @@ fn read_installs(
         let (id, game_id, name, version, source, status, root, files, meta, installed_at, tags) =
             row?;
         let metadata: serde_json::Value = serde_json::from_str(&meta)?;
-        let download_origin = metadata
-            .get("downloadOrigin")
-            .and_then(|origin| DownloadOrigin::deserialize(origin).ok());
+        let download_origin = recorded_download_origin(&metadata);
         Ok(InstalledMod {
             tag_ids: serde_json::from_str(&tags)?,
             id,

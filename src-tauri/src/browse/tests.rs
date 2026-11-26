@@ -1,3 +1,6 @@
+mod agent_match_ipc;
+mod nexus_live;
+
 use super::*;
 use crate::games::get_game;
 use aggregation::{Fetch, MatchedPair, Mixer};
@@ -6,7 +9,7 @@ use serde_json::{json, Value};
 use std::future;
 use tauri::test::MockRuntime;
 
-fn game_db(path: &std::path::Path) -> Db {
+pub(super) fn game_db(path: &std::path::Path) -> Db {
     let db = Db::open(path).unwrap();
     db.conn()
         .execute(
@@ -19,11 +22,11 @@ fn game_db(path: &std::path::Path) -> Db {
     db
 }
 
-fn game(db: &Db, id: &str) -> GameScope {
+pub(super) fn game(db: &Db, id: &str) -> GameScope {
     GameScope::new(get_game(db, id).unwrap())
 }
 
-fn provider_game(id: &str, name: &str) -> ProviderGame {
+pub(super) fn provider_game(id: &str, name: &str) -> ProviderGame {
     ProviderGame {
         id: id.into(),
         name: name.into(),
@@ -446,6 +449,7 @@ fn expired_mismatched_and_cancelled_windows_do_not_resolve_searches() {
     let make = |expires| {
         let (_, translations) = watch::channel(None);
         Arc::new(Search {
+            catalogs: Arc::default(),
             id: uuid::Uuid::new_v4().to_string(),
             db: db.clone(),
             expires,

@@ -69,7 +69,10 @@ fn icon(raw: Option<String>) -> Option<String> {
 // Only the observed first-party file service is a verified direct-download
 // contract. HTTPS alone does not make a cloud-share or HTML page an archive.
 fn direct_url(raw: &str) -> Option<String> {
-    if raw.contains(['\\', '%']) || raw.split('/').any(|part| matches!(part, "." | "..")) {
+    if raw.chars().any(char::is_control)
+        || raw.contains(['\\', '%'])
+        || raw.split('/').any(|part| matches!(part, "." | ".."))
+    {
         return None;
     }
     let url = validate_download_url(raw).ok()?;
@@ -90,6 +93,49 @@ fn direct_url(raw: &str) -> Option<String> {
         return None;
     }
     Some(url.to_string())
+}
+
+pub(crate) fn select_resource(
+    rows: &[Value],
+    project: u64,
+    resource: Option<u64>,
+) -> AppResult<Option<(&Value, u64, String)>> {
+    if rows.len() > 1024 {
+        return Err(invalid());
+    }
+    let mut ids = BTreeSet::new();
+    let mut candidates = Vec::new();
+    let mut identities = BTreeSet::new();
+    for row in rows {
+        let file = id(&row["id"])?;
+        if id(&row["mods_id"])? != project || !ids.insert(file) {
+            return Err(invalid());
+        }
+        let latest = match row.get("mods_resource_latest_version") {
+            None | Some(Value::Null) => false,
+            Some(v) => v.as_bool().ok_or_else(invalid)?,
+        };
+        if resource.map_or(latest, |selected| selected == file) {
+            identities.insert((
+                text(row, "mods_resource_name", 512)?,
+                text(row, "mods_resource_version", 128)?,
+            ));
+            let url = text(row, "mods_resource_url", 8192)?;
+            if let Some(url) = direct_url(&url) {
+                candidates.push((row, file, url));
+            }
+        }
+    }
+    if resource.is_some_and(|selected| !ids.contains(&selected)) {
+        return Err(AppError::NotFound(
+            "3DM 未找到指定资源 ID；不会回退到其他文件".into(),
+        ));
+    }
+    if candidates.len() == 1 && identities.len() == 1 {
+        Ok(candidates.pop())
+    } else {
+        Ok(None)
+    }
 }
 
 impl Provider {
@@ -228,45 +274,13 @@ impl Provider {
             }
             Some(rows) => array(rows)?,
         };
-        if rows.len() > 1024 {
-            return Err(invalid());
-        }
-        let mut ids = BTreeSet::new();
-        let mut candidates = Vec::new();
-        let mut identities = BTreeSet::new();
-        for row in rows {
-            let file = id(&row["id"])?;
-            if id(&row["mods_id"])? != project || !ids.insert(file) {
-                return Err(invalid());
-            }
-            let latest = match row.get("mods_resource_latest_version") {
-                None | Some(Value::Null) => false,
-                Some(v) => v.as_bool().ok_or_else(invalid)?,
-            };
-            if resource.map_or(latest, |selected| selected == file) {
-                identities.insert((
-                    text(row, "mods_resource_name", 512)?,
-                    text(row, "mods_resource_version", 128)?,
-                ));
-                let url = text(row, "mods_resource_url", 8192)?;
-                if let Some(url) = direct_url(&url) {
-                    candidates.push((row, file, url));
-                }
-            }
-        }
-        if resource.is_some_and(|selected| !ids.contains(&selected)) {
-            return Err(AppError::NotFound(
-                "3DM 未找到指定资源 ID；不会回退到其他文件".into(),
-            ));
-        }
-        if candidates.len() != 1 || identities.len() != 1 {
+        let Some((row, file, url)) = select_resource(rows, project, resource)? else {
             return Ok(self.unresolved(
                 SourceState::ManualDownload,
                 "没有唯一可核验的直链资源，可能是网盘或多个可选文件；请在原始页面选择",
                 home,
             ));
-        }
-        let (row, file, url) = candidates.pop().unwrap();
+        };
         let filename = text(row, "mods_resource_name", 180)?;
         crate::download::safe_filename(&filename).map_err(|_| invalid())?;
         self.resolved(ResolvedMod {

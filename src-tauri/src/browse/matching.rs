@@ -66,7 +66,7 @@ impl GameScope {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GameOption {
     pub(super) id: String,
-    name: String,
+    pub(super) name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -91,6 +91,10 @@ fn normalized_name(value: &str) -> String {
         .to_lowercase()
 }
 
+pub(super) fn same_title(left: &str, right: &str) -> bool {
+    normalized_name(left) == normalized_name(right)
+}
+
 fn normalized_slug(value: &str) -> String {
     value
         .split(['-', '_', ' '])
@@ -98,6 +102,97 @@ fn normalized_slug(value: &str) -> String {
         .collect::<Vec<_>>()
         .join("-")
         .to_ascii_lowercase()
+}
+
+const LEGACY_LABELS: [&str; 4] = ["传承版", "傳承版", "传统版", "傳統版"];
+const ENHANCED_LABELS: [&str; 4] = ["增强版", "增強版", "加强版", "加強版"];
+
+/// A discovery term for catalogs that index a base name such as “GTA5”.
+/// Removing the edition is never evidence for auto-selecting the result.
+pub(super) fn base_search_name(name: &str) -> Option<&str> {
+    LEGACY_LABELS
+        .iter()
+        .chain(&ENHANCED_LABELS)
+        .find_map(|label| {
+            let name = name
+                .strip_suffix(label)?
+                .trim_end_matches([' ', '-', '·', ':', '：']);
+            name.chars().any(char::is_alphanumeric).then_some(name)
+        })
+}
+
+// Localized edition names are a common reason to ask the model. Preserve
+// explicit edition evidence even if a guess or a matching slug drops it.
+fn edition_compatible(local: &str, steam: Option<&str>, candidate: &str) -> bool {
+    let local = local.to_lowercase();
+    let steam = steam.unwrap_or_default().to_lowercase();
+    let candidate = candidate.to_lowercase();
+    let mut required = [false; 2];
+    let mut observed = [false; 2];
+    for (index, (word, explicit, localized)) in [
+        (
+            "legacy",
+            ["(legacy)", "- legacy", "legacy edition"],
+            LEGACY_LABELS,
+        ),
+        (
+            "enhanced",
+            ["(enhanced)", "- enhanced", "enhanced edition"],
+            ENHANCED_LABELS,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let translated = |name: &str| localized.iter().any(|label| name.contains(label));
+        let marked = |name: &str| {
+            // A word such as “Legacy” can also be part of the base game's name.
+            // A release suffix after an installment number (e.g. “V Legacy”)
+            // and explicit edition labels provide stronger evidence.
+            let numbered = name
+                .strip_suffix(word)
+                .and_then(|prefix| prefix.strip_suffix(' '))
+                .and_then(|prefix| prefix.split_whitespace().next_back())
+                .is_some_and(|part| {
+                    part.ends_with(|ch: char| ch.is_ascii_digit())
+                        || matches!(
+                            part,
+                            "i" | "ii" | "iii" | "iv" | "v" | "vi" | "vii" | "viii" | "ix" | "x"
+                        )
+                });
+            translated(name) || explicit.iter().any(|label| name.contains(label)) || numbered
+        };
+        required[index] = marked(&local) || marked(&steam);
+        observed[index] = translated(&candidate)
+            || candidate
+                .split(|ch: char| !ch.is_ascii_alphanumeric())
+                .any(|part| part == word);
+    }
+    match required {
+        [false, false] => true,
+        [true, true] => false,
+        _ => required == observed,
+    }
+}
+
+pub(super) fn use_suggestion(
+    game: &GameScope,
+    steam: Option<&str>,
+    options: Vec<GameOption>,
+    index: Option<usize>,
+) -> Match {
+    if let Some(selected) = index.and_then(|i| options.get(i)) {
+        let label = normalized_name(&selected.name);
+        let unique = options
+            .iter()
+            .filter(|other| normalized_name(&other.name) == label)
+            .count()
+            == 1;
+        if unique && edition_compatible(&game.name, steam, &selected.name) {
+            return Match::Exact(selected.id.clone());
+        }
+    }
+    Match::Choices(options)
 }
 
 pub(super) fn decide(
@@ -126,9 +221,10 @@ pub(super) fn decide(
         .iter()
         .filter(|(id, candidate_name)| {
             let candidate_name = normalized_name(candidate_name);
-            candidate_name == name
-                || alias.as_ref() == Some(&candidate_name)
-                || (!slug.is_empty() && normalized_slug(id) == slug)
+            edition_compatible(&game.name, catalog_title, &candidate_name)
+                && (candidate_name == name
+                    || alias.as_ref() == Some(&candidate_name)
+                    || (!slug.is_empty() && normalized_slug(id) == slug))
         })
         .map(|(id, _)| id)
         .take(2)

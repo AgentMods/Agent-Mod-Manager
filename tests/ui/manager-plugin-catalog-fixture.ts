@@ -16,12 +16,13 @@ type Options = { separateGames?: boolean; installed?: boolean; directory?: "empt
 
 export async function openCatalogFixture(page: Page, options: Options = {}) {
   await installMockTauri(page, {
-    onboarding: options.onboarding,
+    onboarding: options.onboarding, gameSteamAppId: "413150",
     gameWithoutAdapter: true, withExternalAdapter: options.installed, gameWithoutMods: true,
     failInstalledPluginRemoval: options.removeFailsOnce ? "once" : null,
   });
   await page.route(GAME_COVER_URL, route => route.fulfill({status: 200, contentType: "image/png", body: GAME_COVER_BYTES}));
   await page.goto("/");
+  if (options.onboarding) await page.getByRole("button", {name: "开始设置", exact: true}).click();
   const fixtureAdapter = {...adapter};
   if (options.missingCover) delete fixtureAdapter.coverUrl;
   const fixtureAdapterText = JSON.stringify(fixtureAdapter, null, 2) + "\n";
@@ -46,7 +47,6 @@ export async function openCatalogFixture(page: Page, options: Options = {}) {
         host.__AMM_TEST__.calls.push({command, args});
         return args.releaseId === release.releaseId ? display : null;
       }
-      if (command === "list_games") return (await original(command, args)).map((game: object) => ({...game, steamAppId: "413150"}));
       if (["list_manager_plugin_games", "preview_manager_plugin", "install_manager_plugin"].includes(command)) {
         host.__AMM_TEST__.calls.push({command, args});
         if (command === "list_manager_plugin_games") {

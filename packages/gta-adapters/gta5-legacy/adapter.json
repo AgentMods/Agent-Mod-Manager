@@ -1,9 +1,10 @@
 {
   "schemaVersion": 1,
   "slug": "gta5-legacy",
-  "name": "GTA V Legacy 单机适配包",
-  "gameName": "Grand Theft Auto V",
-  "version": "1.0.0",
+  "name": "GTA5 传承版 单机适配包",
+  "gameName": "GTA5传承版",
+  "version": "1.1.0",
+  "coverUrl": "https://cdn.cloudflare.steamstatic.com/steam/apps/271590/header.jpg",
   "platforms": [
     "windows"
   ],
@@ -25,11 +26,7 @@
       "transport": "stdio",
       "command": "uvx",
       "args": [
-        "--offline",
-        "--no-index",
-        "--from",
-        "./tools/gta-rpf-mcp/dist/gta_rpf_mcp-1.0.0-py3-none-any.whl",
-        "gta-rpf-mcp"
+        "gta-rpf-mcp@latest"
       ]
     }
   ],
@@ -215,7 +212,7 @@
   ],
   "sources": [
     {
-      "title": "Steam · Grand Theft Auto V",
+      "title": "Steam · Grand Theft Auto V Legacy（271590）",
       "url": "https://store.steampowered.com/app/271590/",
       "checkedAt": "2026-11-25"
     },

@@ -253,6 +253,7 @@ test("cancelled tool approval keeps its own status in conversation history", asy
 test("approval can retry an IPC failure and waits for the definitive tool outcome", async ({page}) => {
   await installMockTauri(page, {holdAgentTurn: true});
   await page.goto("/");
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await page.getByRole("textbox", {name: "告诉 Agent 你想做什么"}).fill("下载模组");
   await page.getByRole("button", {name: "发送消息", exact: true}).click();
   await expect(page.getByRole("button", {name: "停止生成", exact: true})).toBeVisible();
@@ -670,7 +671,7 @@ test("all views fit both themes without viewport overflow", async ({page}, info)
   page.on("pageerror", (error) => errors.push(error.message));
   await page.goto("/");
   await page.getByRole("button", {name: "游戏库", exact: true}).click();
-  const views = ["Agent", "游戏库", "插件中心", "回收站", "历史对话", "设置"];
+  const views = ["首页", "Agent", "游戏库", "插件中心", "回收站", "历史对话", "设置"];
   await expect(page.getByRole("button", {name: "Mod 发现", exact: true})).toHaveCount(0);
   for (const theme of ["light", "dark"]) {
     const current = await page.locator("html").getAttribute("data-theme");

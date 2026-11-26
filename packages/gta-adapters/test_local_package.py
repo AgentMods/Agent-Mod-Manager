@@ -2,10 +2,9 @@
 import json
 import tempfile
 import unittest
-import zipfile
 from pathlib import Path
 
-from local_package import BASE, FILES, GAMES, WHEEL, digest, local_reference, render, source, verify
+from local_package import BASE, FILES, GAMES, source, verify
 
 
 class Packages(unittest.TestCase):
@@ -13,22 +12,13 @@ class Packages(unittest.TestCase):
         temp = tempfile.TemporaryDirectory(); self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
 
-    def wheel(self, version='1.0.0', depends=''):
-        path = self.root / WHEEL
-        path.parent.mkdir(parents=True, exist_ok=True)
-        metadata = 'gta_rpf_mcp-1.0.0.dist-info/'
-        with zipfile.ZipFile(path, 'w') as z:
-            z.writestr(metadata + 'METADATA', f'Metadata-Version: 2.1\nName: gta-rpf-mcp\nVersion: {version}\n{depends}')
-            z.writestr(metadata + 'entry_points.txt', '[console_scripts]\ngta-rpf-mcp = gta_rpf_mcp.server:main\n')
-            z.writestr('gta_rpf_mcp/server.py', b'# never executed\n')
-        return path
-
     def test_different_required_file_not_a_shared_launcher(self):
+        markers = {slug: json.loads(source(slug)['adapter.json'])['markers'][0]['path'] for slug in GAMES}
         for slug, (app, exe) in GAMES.items():
             directory = self.root / app; directory.mkdir()
             (directory / 'PlayGTAV.exe').touch()
             def matches():
-                return {s for s in GAMES if (directory / source(s)[0]['markers'][0]['path']).is_file()}
+                return {name for name, marker in markers.items() if (directory / marker).is_file()}
             self.assertEqual(matches(), set())
             (directory / exe).mkdir(); self.assertFalse(matches()); (directory / exe).rmdir()
             (directory / exe).touch(); self.assertEqual(matches(), {slug})
@@ -36,7 +26,9 @@ class Packages(unittest.TestCase):
     def test_staged_only_service_and_root_contract(self):
         runtime_ids = set()
         for slug in GAMES:
-            doc, markdown = source(slug)
+            files = source(slug)
+            doc = json.loads(files['adapter.json'])
+            markdown = files['SKILL.md']
             runtime_ids.add(f"plugin_{slug}_{doc['mcpServers'][0]['id']}")
             roots = {r['id']: r['relativePath'] for r in doc['installRoots']}
             for mod in doc['modTypes']:
@@ -45,29 +37,91 @@ class Packages(unittest.TestCase):
             self.assertEqual({p.name for p in (BASE/slug).iterdir()},set(FILES))
         self.assertEqual(runtime_ids, {'plugin_gta5-legacy_rpf','plugin_gta5-enhanced_rpf'})
 
-    def test_no_wheel_no_network_fallback(self):
-        with self.assertRaises(FileNotFoundError): render('gta5-legacy', self.root)
-
-    def test_pin_and_readback_are_byte_exact(self):
-        wheel = self.wheel(); expected = digest(wheel.read_bytes())
-        declarations = []
+    def test_skill_uses_the_returned_namespaced_job_tool(self):
         for slug in GAMES:
-            files, sha = render(slug, self.root)
-            self.assertEqual(expected, sha)
-            mcp = json.loads(files['adapter.json'])['mcpServers'][0]; declarations.append(mcp['args'])
-            self.assertEqual(mcp['args'], ['--offline', '--no-index', '--from', f'gta-rpf-mcp @ {wheel.as_uri()}#sha256={expected}', 'gta-rpf-mcp'])
-            folder = self.root / 'plugins' / 'games' / slug; folder.mkdir(parents=True)
-            for name, content in files.items(): (folder/name).write_bytes(content)
-            verify(slug, self.root, files)
-            (folder/'SKILL.md').write_bytes(files['SKILL.md']+b'\n')
-            with self.assertRaisesRegex(ValueError, 'installed bytes differ'): verify(slug, self.root, files)
-        self.assertEqual(*declarations)
+            with self.subTest(slug=slug):
+                markdown = source(slug)['SKILL.md'].decode('utf-8')
+                for name in (
+                    'mcpTool', 'gta_rpf_inspect_dlc', 'gta_rpf_register_dlc',
+                    'gta_rpf_replace_gameconfig', 'gta_rpf_prepare',
+                    'gta_rpf_list_entries', 'gta_rpf_read_entry',
+                    'gta_rpf_write_entry', 'gta_rpf_add_entry',
+                    'gta_rpf_delete_entry', 'gta_rpf_create_archive',
+                ):
+                    self.assertIn(f'`{name}`', markdown)
+                self.assertIn('prepare_gta_rpf_archive_job', markdown)
+                self.assertIn('mods/update/update.rpf/common/data/dlclist.xml', markdown)
+                self.assertIn('`gta_rpf_describe_job({jobId})`', markdown)
+                for name in ('gta_rpf_build_vehicle_pack', 'gta_rpf_build_ped_pack'):
+                    self.assertEqual(f'`{name}`' in markdown, slug == 'gta5-legacy')
 
-    def test_reject_mislabeled_or_dependency_bearing_wheel(self):
-        for version, dep in [('1.0.1',''), ('1.0.0','Requires-Dist: unexpected\n')]:
-            with self.subTest(version=version,dep=dep):
-                self.wheel(version,dep)
-                with self.assertRaisesRegex(ValueError, 'wrong wheel identity'): local_reference(self.root)
+    def test_latest_declaration_and_readback_are_byte_exact(self):
+        for slug in GAMES:
+            with self.subTest(slug=slug):
+                files = source(slug)
+                adapter = json.loads(files['adapter.json'])
+                self.assertEqual(adapter['version'], '1.1.0')
+                mcp = adapter['mcpServers'][0]
+                self.assertEqual(mcp['transport'], 'stdio')
+                self.assertEqual(mcp['command'], 'uvx')
+                self.assertEqual(mcp['args'], ['gta-rpf-mcp@latest'])
+                folder = self.root / 'plugins' / 'games' / slug
+                folder.mkdir(parents=True)
+                for name, content in files.items():
+                    self.assertEqual(content, (BASE / slug / name).read_bytes())
+                    (folder / name).write_bytes(content)
+                verify(slug, self.root, files)
+                for name, content in files.items():
+                    (folder / name).write_bytes(content.replace(b'\n', b'\r\n'))
+                    with self.assertRaisesRegex(ValueError, f'{slug}/{name}: installed bytes differ'):
+                        verify(slug, self.root, files)
+                    (folder / name).write_bytes(content)
+
+    def test_reject_crlf_source_files(self):
+        slug = 'gta5-legacy'
+        files = source(slug)
+        folder = self.root / slug
+        folder.mkdir()
+        for name, content in files.items():
+            (folder / name).write_bytes(content)
+        for name, content in files.items():
+            with self.subTest(name=name):
+                path = folder / name
+                path.write_bytes(content.replace(b'\n', b'\r\n'))
+                with self.assertRaisesRegex(ValueError, f'{slug}/{name}: expected LF line endings'):
+                    source(slug, self.root)
+                path.write_bytes(content)
+
+    def test_reject_non_utf8_manifest(self):
+        slug = 'gta5-legacy'
+        files = source(slug)
+        folder = self.root / slug
+        folder.mkdir()
+        (folder / 'SKILL.md').write_bytes(files['SKILL.md'])
+        (folder / 'adapter.json').write_text(files['adapter.json'].decode('utf-8'), encoding='utf-16')
+        with self.assertRaises(UnicodeDecodeError):
+            source(slug, self.root)
+
+    def test_reject_old_adapter_version_and_altered_mcp_args(self):
+        slug = 'gta5-legacy'
+        files = source(slug)
+        folder = self.root / slug
+        folder.mkdir()
+        (folder / 'SKILL.md').write_bytes(files['SKILL.md'])
+        adapter = json.loads(files['adapter.json'])
+        adapter['version'] = '1.0.2'
+        manifest = folder / 'adapter.json'
+        manifest.write_text(json.dumps(adapter), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, 'wrong package identity'):
+            source(slug, self.root)
+
+        adapter['version'] = '1.1.0'
+        for args in (['gta-rpf-mcp'], ['gta-rpf-mcp@1.0.0'], ['--from', './local.whl', 'gta-rpf-mcp']):
+            with self.subTest(args=args):
+                adapter['mcpServers'][0]['args'] = args
+                manifest.write_text(json.dumps(adapter), encoding='utf-8')
+                with self.assertRaisesRegex(ValueError, 'unexpected MCP declaration'):
+                    source(slug, self.root)
 
 
 if __name__ == '__main__': unittest.main()

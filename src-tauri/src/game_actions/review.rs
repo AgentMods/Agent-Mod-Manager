@@ -224,6 +224,8 @@ pub(super) fn commit_removal(
     crate::history::remove_game_from_workspaces(&tx, id)?;
     tx.execute("DELETE FROM games WHERE id=?1", [id])?;
     tx.commit()?;
+    drop(conn);
+    engine.notify_plugin_mcp_changed();
     Ok(())
 }
 

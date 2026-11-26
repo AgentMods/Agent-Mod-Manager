@@ -1066,12 +1066,29 @@ fn hash_file(
 pub fn list_for_game(db: &Db, game_id: &str) -> AppResult<Vec<LibraryEntry>> {
     let conn = db.conn();
     let game = games::get_game_from(&conn, game_id)?;
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {COLUMNS} FROM mod_library_entries WHERE state='ready' AND NOT EXISTS (SELECT 1 FROM removed_mod_items h WHERE h.game_id=?1 AND h.kind='archive' AND h.item_id=mod_library_entries.id) \
-         AND (game_id=?1 OR (game_id IS NULL AND game_name_key=?2)) ORDER BY created_at DESC,id"
-    ))?;
+    let query = game_archives_query(COLUMNS, false);
+    let mut stmt = conn.prepare(&format!("{query} ORDER BY created_at DESC,id"))?;
     let rows = stmt.query_map(params![game_id, game_key(&game.name)], read_entry)?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+pub(crate) fn game_archives_query(columns: &str, include_pending_restores: bool) -> String {
+    // Read-only summaries project the membership changes that list_installs reconciles.
+    let pending_restores = if include_pending_restores {
+        let state = crate::install::effective_install_state();
+        format!(
+            "AND NOT {}",
+            crate::mod_management::restorable_archive_owner(&state)
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "SELECT {columns} FROM mod_library_entries WHERE state='ready'
+         AND (game_id=?1 OR (game_id IS NULL AND game_name_key=?2))
+         AND NOT EXISTS (SELECT 1 FROM removed_mod_items archive WHERE archive.game_id=?1
+             AND archive.kind='archive' AND archive.item_id=mod_library_entries.id {pending_restores})"
+    )
 }
 
 fn require_scope(

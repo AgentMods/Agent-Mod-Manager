@@ -33,7 +33,7 @@ test("损坏的侧边栏记录被忽略", async ({page}) => {
 test("侧栏赞助链接通过系统浏览器打开赞助页", async ({page}) => {
   await installMockTauri(page);
   await page.goto("/");
-  const sponsor = page.getByRole("link", {name: "赞助"});
+  const sponsor = rail(page).getByRole("link", {name: "赞助", exact: true});
   await expect(sponsor).toHaveAttribute("href", "https://sponsor.aoe.top/");
   await expect(sponsor).toHaveText("");
   const theme = page.getByRole("button", {name: /切换(亮|暗)色主题/});

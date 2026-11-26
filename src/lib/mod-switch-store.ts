@@ -1,3 +1,4 @@
+import { dashboardStatsKey } from "./dashboard-stats";
 import { tr } from "@/lib/i18n";
 import { isCancelledError, type QueryClient } from "@tanstack/react-query";
 import { create } from "zustand";
@@ -422,7 +423,7 @@ export function syncModSwitches(client: QueryClient, notify: (message: string) =
                 throw error;
             });
             if (disposed) return;
-            for (const key of [["game", gameId], ["mod-library", gameId], ["mod-tags", gameId], ["games"], ["trash"]]) {
+            for (const key of [dashboardStatsKey, ["game", gameId], ["mod-library", gameId], ["mod-tags", gameId], ["games"], ["trash"]]) {
                 void client.invalidateQueries({ queryKey: key });
             }
             completeReadback(gameId, entries, { rows });

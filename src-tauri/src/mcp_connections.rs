@@ -4,11 +4,12 @@ use crate::{
     agent::tools::ToolRegistry,
     error::{AppError, AppResult},
     mcp::{
-        browse::BrowseReader, ConnectionConsent, McpClient, McpRuntime, McpServers, ServerConfig,
+        bridge::McpToolDetails, browse::BrowseReader, ConnectionConsent, McpClient, McpRuntime,
+        McpServers, ServerConfig,
     },
     settings::Settings,
 };
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, MutexGuard},
@@ -39,7 +40,7 @@ enum Slot {
     },
     Running {
         client: Box<McpClient>,
-        names: Vec<String>,
+        info: ConnectionInfo,
         browse: Option<Box<BrowseReader>>,
     },
 }
@@ -54,8 +55,8 @@ impl Slot {
     fn revoke(self, registry: &ToolRegistry) -> Option<Box<McpClient>> {
         match self {
             Self::Starting { cancel, .. } => cancel.cancel(),
-            Self::Running { client, names, .. } => {
-                registry.unregister(&names);
+            Self::Running { client, info, .. } => {
+                registry.unregister(&info.tools);
                 client.disconnect();
                 return Some(client);
             }
@@ -77,11 +78,22 @@ impl Start<'_> {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionInfo {
     pub server_id: String,
+    /// Names in the Agent registry, in discovery order.
     pub tools: Vec<String>,
+    /// Validated MCP names and redacted descriptions, aligned with `tools` by index.
+    #[serde(serialize_with = "serialize_tool_details")]
+    pub tool_details: Arc<[Arc<McpToolDetails>]>,
+}
+
+fn serialize_tool_details<S: Serializer>(
+    details: &[Arc<McpToolDetails>],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(details.iter().map(Arc::as_ref))
 }
 impl McpConnections {
     pub fn with_runtime(runtime: McpRuntime) -> Self {
@@ -98,13 +110,10 @@ impl McpConnections {
 
     pub async fn list(&self) -> Vec<ConnectionInfo> {
         self.lock_slots()
-            .iter()
-            .filter_map(|(server, slot)| match slot {
+            .values()
+            .filter_map(|slot| match slot {
                 Slot::Starting { .. } => None,
-                Slot::Running { names, .. } => Some(ConnectionInfo {
-                    server_id: server.clone(),
-                    tools: names.clone(),
-                }),
+                Slot::Running { info, .. } => Some(info.clone()),
             })
             .collect()
     }
@@ -151,6 +160,79 @@ impl McpConnections {
         )
         .await
         .map(|(info, _)| info)
+    }
+
+    /// Install the listener before startup restore so that game changes committed during
+    /// slow handshakes also take effect. The callback runs under the file write lock.
+    pub(crate) fn watch_game_tools(
+        &self,
+        engine: &crate::transaction::FileEngine,
+        registry: &ToolRegistry,
+        progress: impl Fn() + Send + Sync + 'static,
+    ) -> AppResult<tokio::sync::mpsc::UnboundedReceiver<ServerConfig>> {
+        let _files = crate::transaction::write_lock();
+        let servers = McpServers::new(engine.db.clone());
+        let snapshot = |servers: &McpServers| -> AppResult<BTreeMap<String, ServerConfig>> {
+            servers.sync_game_tools()?;
+            Ok(servers
+                .game_tool_requests()?
+                .into_iter()
+                .map(|config| (config.id.clone(), config))
+                .collect())
+        };
+        // Existing requests are handled by the regular desktop startup restore.
+        let previous = Mutex::new(snapshot(&servers)?);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let connections = self.clone();
+        let registry = registry.clone();
+        engine.set_plugin_mcp_change_handler(move || {
+            let next = snapshot(&servers);
+            connections.invalidate_plugins(&registry, &servers);
+            match next {
+                Ok(next) => {
+                    let mut previous = previous.lock().unwrap_or_else(|err| err.into_inner());
+                    for (id, config) in &next {
+                        if !previous
+                            .get(id)
+                            .is_some_and(|old| config.same_connection_config(old))
+                        {
+                            let _ = sender.send(config.clone());
+                        }
+                    }
+                    *previous = next;
+                }
+                Err(error) => tracing::warn!(%error, "could not synchronize game MCP services"),
+            }
+            progress();
+        });
+        Ok(receiver)
+    }
+
+    pub(crate) async fn restore_game_tools(
+        &self,
+        receiver: tokio::sync::mpsc::UnboundedReceiver<ServerConfig>,
+        settings: &Settings,
+        registry: &ToolRegistry,
+        progress: impl Fn(),
+    ) {
+        use futures_util::{stream, StreamExt};
+        let progress = &progress;
+        stream::unfold(receiver, |mut rx| async move {
+            rx.recv().await.map(|config| (config, rx))
+        })
+        .for_each_concurrent(4, |config| async move {
+            let id = config.id.clone();
+            if !self.lock_slots().contains_key(&id) {
+                if let Err(error) = self
+                    .start(settings.clone(), registry, config, Start::Remembered)
+                    .await
+                {
+                    tracing::warn!(server_id = id, %error, "could not start game MCP service");
+                }
+            }
+            progress();
+        })
+        .await;
     }
 
     pub(crate) async fn restore_requested(
@@ -357,15 +439,9 @@ impl McpConnections {
         slot: Option<&Slot>,
         expected: &ServerConfig,
     ) -> AppResult<(ConnectionInfo, McpClient)> {
-        if let Some(Slot::Running { client, names, .. }) = slot {
+        if let Some(Slot::Running { client, info, .. }) = slot {
             if client.server_config().same_connection_config(expected) {
-                return Ok((
-                    ConnectionInfo {
-                        server_id: expected.id.clone(),
-                        tools: names.clone(),
-                    },
-                    client.as_ref().clone(),
-                ));
+                return Ok((info.clone(), client.as_ref().clone()));
             }
         }
         Err(AppError::Conflict(
@@ -403,8 +479,20 @@ impl McpConnections {
                 }
             };
             let browse = BrowseReader::from_discovery(&client, &catalog).map(Box::new);
-            let tools = client.agent_tools_from_catalog(catalog);
-            Ok((client, tools, browse))
+            let mut names = Vec::new();
+            let mut details = Vec::new();
+            let mut tools = Vec::new();
+            for tool in client.agent_tools_from_catalog(catalog) {
+                names.push(tool.name);
+                details.push(tool.details);
+                tools.push(tool.agent);
+            }
+            let info = ConnectionInfo {
+                server_id: expected.id.clone(),
+                tools: names,
+                tool_details: details.into(),
+            };
+            Ok((client, info, tools, browse))
         }
         .await;
         let mut client_to_close = None;
@@ -421,12 +509,11 @@ impl McpConnections {
                 {
                     slots.remove(&expected.id);
                 }
-                client_to_close = prepared.ok().map(|(client, _, _)| client);
+                client_to_close = prepared.ok().map(|(client, ..)| client);
                 return Err(AppError::Cancelled);
             }
             slots.remove(&expected.id);
-            let (client, tools, browse) = prepared?;
-            let names: Vec<_> = tools.iter().map(|t| t.definition().name).collect();
+            let (client, info, tools, browse) = prepared?;
             let result = (|| {
                 client.ensure_current()?;
                 if start.requires_saved_consent() {
@@ -435,7 +522,7 @@ impl McpConnections {
                 registry.register_batch(tools)?;
                 if matches!(start, Start::Confirmed(_)) {
                     if let Err(err) = servers.remember_start(&expected) {
-                        registry.unregister(&names);
+                        registry.unregister(&info.tools);
                         return Err(err);
                     }
                 }
@@ -445,15 +532,11 @@ impl McpConnections {
                 client_to_close = Some(client);
                 return Err(err);
             }
-            let info = ConnectionInfo {
-                server_id: expected.id.clone(),
-                tools: names.clone(),
-            };
             slots.insert(
                 expected.id,
                 Slot::Running {
                     client: Box::new(client.clone()),
-                    names,
+                    info: info.clone(),
                     browse,
                 },
             );
@@ -465,22 +548,14 @@ impl McpConnections {
         finished
     }
 
-    /// Revoke stale slots for this plugin after a committed change. Other plugins,
-    /// manual services, and matching launch configurations/consents are untouched.
-    pub(crate) fn invalidate_plugin(
-        &self,
-        registry: &ToolRegistry,
-        servers: &McpServers,
-        slug: &str,
-    ) {
+    /// Revoke plugin slots whose owner, binding or launch authorization changed.
+    pub(crate) fn invalidate_plugins(&self, registry: &ToolRegistry, servers: &McpServers) {
         let mut slots = self.lock_slots();
         let stale: Vec<_> = slots
             .iter()
             .filter_map(|(id, slot)| {
                 let expected = slot.config();
-                if expected.plugin_slug.as_deref() != Some(slug) {
-                    return None;
-                }
+                expected.plugin_slug.as_ref()?;
                 let requires_saved_consent = match slot {
                     Slot::Starting {
                         requires_saved_consent,

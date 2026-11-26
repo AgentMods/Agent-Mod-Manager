@@ -1,43 +1,184 @@
 # Agent Mod Manager implementation status
 
-Updated: 2026-11-25. The desktop release target is `1.0.3`. See the
+Updated: 2026-11-26. The desktop release target is `1.0.3`. See the
 [Chinese release notes](releases/1.0.3.md) for user-facing features and
 installation limitations. This page records implementation and verification
 evidence; it does not establish that the release workflow or CI has passed.
 The broader project scope remains active.
 
-**Mod Browse (2026-11-25).** The desktop sidebar opens a responsive cover-card
-catalog for registered games. With the user's consent, it reads connected stock
-MCP catalogs, groups results across selected games, and searches the original
-and translated terms. The configured model localizes public metadata and
-classifies results. The page preserves the original author and title, opens
-verified project pages in the system browser, and supports installation review
-and task recovery in place. See the [desktop command contract](browse-ipc.md).
+**Home dashboard (2026-11-26).** Every launch opens Home. The primary action
+opens first-run setup, resumes setup after a migration, or opens the game
+library. Registered games have direct links to their detail pages. The local
+SQLite summary counts managed games, installed Mods and all visible Mod rows
+across the game libraries. The sponsor panel reads up to six distinct public
+display names from the sponsorship site and opens the site in the system browser.
+The production frontend build and 102 Home, sidebar, onboarding and plugin catalog
+UI checks passed across the three configured viewports.
 
-The production frontend build and 33 mocked-IPC Browse tests passed across
-1280, 1440 and 390 px viewports. They cover both themes, cover geometry,
-keyboard project opening, filtered pagination and installation approvals.
-The full Rust library suite passed with six test threads (1,239 passed, 16
-ignored). Stock provider and installation contracts were exercised offline.
+**Mod Browse (2026-11-26).** The desktop sidebar opens a responsive cover-card
+catalog for registered games. On first entry it automatically creates a
+read-only grant for every available connected source and loads the feed for the
+selected games. If no source is available, the page directs users to Settings
+and offers to reload sources. A source-loading error offers Retry. The
+right-hand Choose sources dropdown holds a multi-select draft. Apply starts a
+search within the new scope. If a selected source is no longer available, the
+page keeps the current search scope and results while the user revises the
+selection or retries. Cancel or closing the dropdown discards the draft. The
+left-hand filter selects All sources or one source within the applied scope
+for the current results. The source-selection update passed the frontend build
+and the Browse Playwright suite across three viewports (60 passed, three
+viewport-specific skips).
+
+Browse groups results across selected games and searches original and translated
+terms. The configured model localizes public metadata and classifies results.
+The page preserves the original author and title and opens verified project
+pages in the system browser. Clicking Install on a card starts the Agent task
+for its single matched game. For multiple matches, selecting the target game
+starts the task in the background. The card button shows Installing while the task
+is starting or running, then Installed when the native receipt is verified. Each
+game has its own status in the target selector. Users can open Install tasks to follow progress
+or answer a question. Card installs inherit the saved permission mode. Full Trust
+runs downloads and installation without tool confirmations. Agent chat can continue
+or retry the same installation using the registered game and source project from
+the task record, even after restarting the app. The task status follows the latest
+turn and verifies the native installation receipt. A Nexus download made by an
+earlier turn can be filed using its stored tool receipt. The filename, size and
+SHA-256 must match the local archive. Regression coverage includes resuming from
+a legacy download receipt and committing an installation in a temporary game
+directory. See the [desktop command contract](browse-ipc.md).
+
+Each Browse install turn builds its system prompt and tool list from the saved
+card target. The model uses `match_mod_install` to read the target game's adapter
+rules and archive contents. The tool schemas omit game and project fields that
+the manager supplies. A call to an undeclared tool returns the list of available
+tools so the Agent can continue. Calls for a different project or archive still
+fail the native scope check. The same tool list is used for model requests,
+context compression and dispatch on initial, continued and retried turns.
+A regression test forces compaction on a retry with no IDs in the user text and
+checks the next model request. The Rust library suite passed (1,300 passed, 18
+ignored), along with 33 Browse install and chat-card UI tests across three
+viewports, the frontend build, rustfmt and Clippy.
+
+Agent chat displays the opening Browse install request as a card with the target
+game, source and project ID. Its disclosure lists the exact native identifiers.
+The frontend recognizes current and earlier saved prompt formats and keeps the original message
+available for copying and editing.
+
+3DM card installs bind the stock `get-mod-detail` request's numeric `id` to the
+selected project. Scoped native catalog calls map `glossmod_3dm` to `3dm` and
+verify the same project and provider game. Both paths select the sole official
+direct file when the latest entries share a filename and version. Regression
+coverage follows a text-only MCP detail response with a matching mirror through
+to the scoped `download_mod` approval preview.
+
+Browse classifies each fetched mod into one of twelve primary types, including
+tools, fixes, interface, vehicles, characters and performance. Each page has a
+separate Agent classification pass before localization. The card and filter
+use the same type, and a cached classification survives UI language changes.
+Public source categories, tags, titles and summaries supply an immediate local
+classification while the Agent is working or when the model is unavailable.
+A desktop IPC regression with a local model fixture checks classification,
+reopening results from cache and preserving the type when translation returns
+no text. Browse-related Rust checks passed (75 passed, two live checks skipped).
+The frontend build and 45 Browse Playwright checks passed across three viewport
+sizes, with three viewport-specific skips. The classification change passed the full Rust library suite
+(1,284 passed, 18 ignored), rustfmt and Clippy.
+
+Browse caches successful MCP directory and Mod pages in memory for five minutes
+per authorization. Returning to Browse within five minutes restores the search,
+filters and page with fresh item handles. IPC tests exercise repeated searches
+and renewed authorization. UI coverage includes returning to the second page
+and opening a cached result.
+
+Game matching now uses the library name and verified Steam title across all
+seven stock sources. When direct lookup fails, the configured model suggests
+localized names and abbreviations, then compares actual MCP candidates.
+It can use an edition-neutral term for discovery. Explicit Legacy and Enhanced
+registrations keep an unqualified or conflicting result for manual selection.
+Related sources share one alias request per game in a search. Successful model
+responses can be reused for the same names and candidate snapshot. Manually
+added Steam installations are verified by App ID and registered directory. The
+stock 3DM connection supports guest access and custom credential references.
+Both search and pagination use settings from the desktop Agent runtime.
+
+The Agent matching regression exercises desktop authorization, game lookup and
+project cards through Tauri IPC, using a local model fixture and a GameBanana
+stdio fixture. Separate live MCP queries for `GTA5` on 3DM returned the
+explicit Enhanced entry (475) and a series entry (261). Mod客栈 returned
+`GTA5` (8) for `GTA5`, with no edition label on that entry. Both catalogs
+returned no rows for the exact library names `GTA5增强版` and `GTA5传承版`.
+Tests cover manual selection for an unqualified entry, reuse of an earlier
+user selection and rejection of crossed Legacy/Enhanced suggestions.
+
+The live desktop IPC checks for `影之刃零` passed on Nexus and 3DM with an
+empty credential store. Nexus matched `Phantom Blade Zero` to `phantombladezero`,
+returned two distinct 24-project pages and found 20 projects for `Parry`.
+3DM returned two 24-project pages and three results for `服装`. The production
+frontend build and 33 Browse-related Playwright checks passed (three
+viewport-specific skips). The full Rust library run passed with six threads
+(1,272 passed, 18 ignored by default, including the two live Browse checks run
+separately). Rust formatting and Clippy across all targets passed.
 
 **Grand Theft Auto V external adapters (2026-11-25).** Separate Windows packages for
-Legacy (271590 / `GTA5.exe`) and Enhanced (3240220 / `GTA5_Enhanced.exe`) live in
-[`packages/gta-adapters`](../packages/gta-adapters/README.md). Their manual mappings
+Legacy (271590 / `GTA5.exe`) and Enhanced (3240220 / `GTA5_Enhanced.exe`) are version
+`1.1.0` in [`packages/gta-adapters`](../packages/gta-adapters/README.md). Their manual mappings
 cover story-mode Script Hook V, ASI and scripts. RPF candidates use a separate native
 job, not archive-as-directory mappings. Mixed payloads need selection, OIV installers
-are not run, and Enhanced RPF is explicitly unavailable. Neither package is bundled,
-auto-bound, or a source of implicit stdio launch consent.
+are not run. Enhanced supports gameconfig and complete DLC packs. Neither package is bundled
+or auto-bound. A package-owned MCP becomes eligible for automatic enablement and
+connection only when its package is enabled and validated and at least one registered
+game is bound to it. First use requests configuration-specific authorization for
+unrecognized stdio, configured credentials, local HTTP, or any network endpoint
+other than the exact AMM public URLs `https://www.glossmod.com/api/v1/mcp` and
+`https://mod.3dmgame.com/mcp`; those are exempt only without credential references
+or a credential URL.
+The credential-free Windows GTA `rpf` declarations (`uvx gta-rpf-mcp@latest`) are
+the stdio exception. Manual Stop takes precedence over
+automatic reconnection; removing the last bound game revokes adapter-owned startup
+intent. Manual connection permission remains separate from adapter auto-start
+permission. On Windows, the desktop restored both registered GTA editions on startup.
+Settings reported two running tools for each after MCP initialization and discovery.
+A local HTTP fixture covers registration, shared bindings, removal and manual Stop.
+The previous 1.0.0 server returned `missing_tool` without the 205014 ZIP.
 
-The optional [RPF MCP](../tools/gta-rpf-mcp/README.md) uses a local, version-pinned
-wheel. The separate prerequisite is the unmodified 3DM project 205014 / resource
-356110 (1.4.0) ZIP; pinning the observed digest is not a publisher signature. It
-only edits disposable Legacy copies. AMM verifies outputs, uses existing file plan
-approval/recovery, and records contributions for gameconfig, DLC, vehicles and peds.
-Uninstall rebuilds affected shared archives from the baseline and surviving
-contributions; external drift or stale jobs stop the transaction. Tests include
-disposable RPF files with the real 3DM release and native synthetic journal fixtures.
-This does not verify a particular retail build or in-game behavior. No game files
-or official tool binaries are distributed by these packages.
+The optional RPF MCP uses `uvx gta-rpf-mcp@latest` to resolve the newest available
+release at startup. For the two exact recognized Windows declarations, AMM
+overrides its general uvx mirror with official PyPI (`https://pypi.org/simple`),
+because the Tsinghua mirror does not yet carry this package. AMM passes the same
+`LOCALAPPDATA` to the MCP child; both use
+`%LOCALAPPDATA%\\GlossMod\\AMM\\gta-rpf-jobs`. Package information is on
+[PyPI](https://pypi.org/project/gta-rpf-mcp/).
+Package contract tests cover both MCP declarations, draft bytes and readback.
+
+The 1.3.0 RPF service exposes 15 MCP tools, including separate add, read, replace and delete operations for files inside nested RPF7 archives. The desktop Agent can request a standalone snapshot of a named archive from the selected game with `prepare_gta_rpf_archive_job`. It receives an archive reference and optional payload references for the MCP, with no installation receipt. On Windows both retail `update/update.rpf` snapshots returned `common/data/dlclist.xml` as UTF-8 (101 Legacy and 103 Enhanced DLC entries). Staged edits inside the nested `chinesesimp.rpf` reopened correctly after add, replace and delete in both editions.
+
+The published [1.2.0 RPF service](https://pypi.org/project/gta-rpf-mcp/1.2.0/) advertises 13 tools. Four operate on individual
+archives (list entries, read an entry, write an existing binary entry, create
+an archive). Six expose specific AMM job operations. Job discovery returns input
+references for these tools. Status and the original preparation entry point remain
+available. A bound client's native job response selects the discovered operation
+in its own adapter namespace, with a fallback for older services. Both adapters
+use the same catalog. Edition checks apply to the job manifest. On Windows `uvx gta-rpf-mcp@latest` fetched 1.2.0 from PyPI. The
+stdio tools read 96 entries from the Legacy reference DLC and 92 from Enhanced,
+then replaced and independently reopened gameconfig on copies of both retail
+update archives. The game directories were read-only during these checks.
+
+GitHub Release [v1.1.0](https://github.com/GlossMod/gta-rpf-mcp/releases/tag/v1.1.0)
+passed both Windows build jobs and published to PyPI. The `gta-rpf-mcp` 1.1.0
+Python wheel contains the RPF7 reader/writer, format tables
+and GMM template. Legacy supports gameconfig, existing DLC, loose vehicles, Peds
+and Menyoo. Enhanced supports `inspectDlc`, gameconfig and DLC registration. The
+native job and MCP reject Enhanced loose resources and Menyoo. AMM still verifies
+outputs and uses its normal approval, contribution tracking and rollback.
+
+On Windows, the Python stdio server modified disposable copies of both retail
+NG-encrypted `update.rpf` files (2,014,193,664 and 3,122,239,488 input bytes)
+and copies of each edition's `mp2023_01_g9ec/dlc.rpf`. The original 205014
+C# reader independently reopened the finished archives. Its byte digests matched
+Python for `common/data/gameconfig.xml`, `common/data/dlclist.xml` and `setup2.xml`
+in both editions. A separate Legacy job rebuilt a nested GMM DLC from the retail
+`jester2` vehicle and `u_m_y_smugmech_01` Ped and read back all six contributed
+assets byte-for-byte. In-game loading and Enhanced loose model templates remain unverified.
 
 **Desktop game launch methods (2026-11-25).** The arrow beside **Launch game**
 lists available Steam, direct and modded launch methods without changing the
@@ -725,7 +866,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
 - First-run onboarding has five steps. Users select a data directory, configure
   the AI model service, enable MCP tools, scan for games and review their setup
   before entering the library. The storage step shares the Settings directory
-  picker and migration confirmation. After a migration restart, the guide opens
+  picker and migration confirmation. After a migration restart, Continue setup on Home opens the guide
   at model configuration when the active root has changed, or returns to the
   storage step to show a migration error. Model setup, tool activation and game
   scanning can be deferred. Clicking “添加” on a scan result adds that game directly.
@@ -737,10 +878,10 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   `get_bootstrap_state` reports `onboardingCompleted`, `isFirstRun` (not
   completed and no registered games) and `resumeOnboarding`. The first
   registration inside automatic onboarding records a private in-progress marker
-  through `start_onboarding`, so quitting mid-way resumes the guide; existing
+  through `start_onboarding`, so Home can offer to continue the guide; existing
   users with registered games are not interrupted. Finishing or "退出引导"
   calls `set_onboarding_completed(true)`. The desktop WebView smoke script
-  dismisses the guide before its library workflow. Existing pages keep their
+  verifies Home before its library workflow. Existing pages keep their
   `src/components/ui.tsx` imports; Button, IconButton, Badge and ErrorState now
   render through the shadcn/ui components while `Modal` stays a native dialog.
 - Onboarding and AI settings share an editable model table with provider import,
@@ -938,7 +1079,7 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   Bing search uses a fresh browser session and keeps raw pages out of that cache.
 - Agent Chat supports conversational Mod search and downloads. The desktop Browse
   page also searches connected Mod catalogs and opens installation tasks in place.
-  Its [IPC contract](browse-ipc.md) describes source consent, pagination and task recovery.
+  Its [IPC contract](browse-ipc.md) describes read-only grants, pagination and task recovery.
 - Modrinth releases can be browsed by game version and loader via the read-only
   desktop IPC, Agent and local MCP version list. Resolve the exact ID with the
   same filters before downloading. Thunderstore direct dependency declarations are now also
@@ -1101,7 +1242,9 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   Schema v9 moves the stock 3DM stdio preset to `https://mod.3dmgame.com/mcp`
   and expires its old launch consent while retaining the credential reference. Desktop bundles carry Node.js/npm/npx and uv/uvx. A confirmed
   bare launcher uses the packaged runtime with a child-only npm or PyPI mirror
-  (npmmirror or Tsinghua). When uvx needs to download CPython, it uses the
+  (npmmirror or Tsinghua), except that the exact recognized Windows GTA RPF
+  launcher uses official PyPI and passes AMM's `LOCALAPPDATA` to share its job
+  workspace. When uvx needs to download CPython, it uses the
   npmmirror `python-build-standalone` archive via `UV_PYTHON_INSTALL_MIRROR`.
   Explicit executable paths retain their own configuration. A Windows x64 cold-start
   check using bundled uvx 0.13.9 and empty caches downloaded CPython 3.15.2,
@@ -1133,9 +1276,17 @@ Windows and Linux smoke scripts use the new identity for future package runs.
 - Game adapters can declare optional stdio and Streamable HTTP services in
   `adapter.json` under `mcpServers`. The plugin detail and draft validation show
   the declared services. The MCP settings list identifies their owner and handles
-  credentials and explicit startup. Deployment and rollback synchronize the
-  service definitions with the verified package inside the registry transaction.
-  Disabling the owner or replacing a launch configuration revokes launch consent.
+  credentials, manual connections and first-use adapter authorization. An
+  enabled, validated package bound to a registered game can auto-start its
+  services only under the exact credential-free Windows GTA declarations or
+  the two fixed public HTTPS URLs `https://www.glossmod.com/api/v1/mcp` and
+  `https://mod.3dmgame.com/mcp`, without credential references or a credential
+  URL. Other first-use stdio, credential-bearing, local HTTP or network endpoint
+  configurations require one-time consent tied to the exact configuration.
+  Deployment and rollback synchronize service definitions with the verified
+  package inside the registry transaction. Disabling the owner or changing its
+  configuration invalidates adapter startup authorization; manual connection
+  permission remains separate.
   See [the package example](../README.md#mcp-services-in-game-plugins).
 - The 3DM public HTTP endpoint accepts anonymous tool discovery and takes the raw API key in `Authorization` for authenticated requests. The desktop client selects that format by endpoint, including for saved and custom connections. HTTP 401 and 403 startup errors identify the credential or permission problem without exposing response bodies. The opt-in native smoke registered 16 tools on 2026-11-21.
 - External MCP connections show an optional single-line description beside the
@@ -1143,6 +1294,11 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   include Chinese descriptions, custom connections can be edited in Settings,
   and adapters can supply a `description` per service in `mcpServers`.
   Settings and onboarding show bundled website logos for the seven built-in Mod sources.
+  Selecting a running connection's tool count opens a searchable list of its
+  registered tools, with full MCP names and provider descriptions from discovery.
+  The same list is available for the running local server in Settings.
+  Mocked-IPC tests cover per-connection lists, filtering, keyboard focus, empty
+  results and the local server across 390, 1280 and 1440 px viewports.
   The per-service credentials dialog handles Bearer and stdio environment secrets.
   Each password field shows whether a nonblank value is saved locally, or whether
   its status could not be read. The desktop status command returns booleans for
@@ -1155,14 +1311,20 @@ Windows and Linux smoke scripts use the new identity for future package runs.
   启动中, 运行中 (tool count) or 启动失败 with the reason, and has one start/stop
   button. Clicking Start launches the selected external service directly and saves `enabled`.
   The desktop has no fixed limit on the number of connected MCP servers.
-  On desktop launch, previously started connections restore in the background.
-  Only a successful manual handshake and tool registration save consent to that
-  exact configuration selected with Start.
-  Merely enabled or legacy configurations have no consent. Stopping, changing
-  connection parameters or removing the service
-  revokes it. A transient restore failure permits retry on the next launch or
-  cancellation from Settings even when disconnected. The local server remembers
-  its opt-in separately and recreates its loopback endpoint and token.
+  On desktop launch, manually authorized connections and eligible adapter-owned
+  services restore in the background. Only a successful manual handshake and
+  tool registration save the independent manual startup receipt for the exact
+  configuration selected with Start. The adapter policy separately auto-starts
+  only the exact credential-free Windows GTA declarations or the two fixed
+  public HTTPS URLs above; other first-use adapter configurations require
+  one-time exact-configuration consent. Merely enabled or legacy configurations
+  have no manual receipt. Manual Stop suppresses adapter auto-reconnection;
+  changing connection parameters or removing the service invalidates its
+  applicable startup decision. Removing the last game binding revokes only
+  adapter-owned startup intent, not a separate manual grant. A transient restore
+  failure permits retry on the next launch or cancellation from Settings even
+  when disconnected. The local server remembers its opt-in separately and
+  recreates its loopback endpoint and token.
   Playwright covers both transports, masked inputs, keyboard dismissal and
   start/stop/failure states at 390, 1280, and 1440 px.
 - An optional desktop-owned MCP server binds numeric loopback on a random port,

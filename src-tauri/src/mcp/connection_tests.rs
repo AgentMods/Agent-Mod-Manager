@@ -9,8 +9,8 @@ fn wire_plugin_revocation(
     servers: &McpServers,
 ) {
     let (connections, registry, servers) = (connections.clone(), registry.clone(), servers.clone());
-    engine.set_plugin_mcp_change_handler(move |slug| {
-        connections.invalidate_plugin(&registry, &servers, slug);
+    engine.set_plugin_mcp_change_handler(move || {
+        connections.invalidate_plugins(&registry, &servers);
     });
 }
 
@@ -286,7 +286,7 @@ async fn plugin_runtime_revokes_only_stale_connections() {
             "first",
             &[upgrade, stable_edited.clone()]
         ));
-        context.engine.clone().notify_plugin_mcp_changed("first");
+        context.engine.clone().notify_plugin_mcp_changed();
     }
     let connected: Vec<_> = connections
         .list()
@@ -321,7 +321,7 @@ async fn plugin_runtime_revokes_only_stale_connections() {
     {
         let _files = crate::transaction::write_lock();
         sync_test_plugin(&servers, "first", &[changed.clone(), stable]);
-        context.engine.notify_plugin_mcp_changed("first");
+        context.engine.notify_plugin_mcp_changed();
     }
     let mut expected = changed;
     expected.enabled = true;
@@ -366,7 +366,7 @@ async fn plugin_runtime_cancels_handshake_without_registering_or_remembering() {
     {
         let _files = crate::transaction::write_lock();
         sync_test_plugin(&servers, "starting", std::slice::from_ref(&config));
-        context.engine.notify_plugin_mcp_changed("starting");
+        context.engine.notify_plugin_mcp_changed();
     }
     assert!(connections.list().await.is_empty());
     assert!(registry.definitions().is_empty());
@@ -446,7 +446,7 @@ io.on('line', (line) => {
         let revoke = || {
             let _files = crate::transaction::write_lock();
             sync_test_plugin(&servers, "stdio-owner", &[]);
-            context.engine.notify_plugin_mcp_changed("stdio-owner");
+            context.engine.notify_plugin_mcp_changed();
         };
         tokio::time::timeout(Duration::from_secs(8), async {
             let mut child_socket = if mode == "hang" {
@@ -475,6 +475,103 @@ io.on('line', (line) => {
         assert!(registry.definitions().is_empty());
         assert!(servers.startup_requests().unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn connection_tool_details_preserve_catalog_order_and_redaction() {
+    use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
+
+    const FIRST: &str = "lookup_mod_projects_with_compatibility";
+    const SECOND: &str = "lookup_mod_files_with_dependencies";
+    const SECRET: &str = "private-connection-details-test-token";
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new().route(
+        "/mcp",
+        post({
+            let requests = requests.clone();
+            move |body: String| async move {
+                let request: Value = serde_json::from_str(&body).unwrap();
+                if request.get("id").is_none() {
+                    return StatusCode::ACCEPTED.into_response();
+                }
+                let method = request["method"].as_str().unwrap();
+                let cursor = request["params"]["cursor"].as_str();
+                requests
+                    .lock()
+                    .unwrap()
+                    .push((method.to_owned(), cursor.map(str::to_owned)));
+                let result = match (method, cursor) {
+                    ("initialize", None) => json!({
+                        "protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fixture", "version": "1"}
+                    }),
+                    ("tools/list", None) => json!({
+                        "tools": [{"name": FIRST, "description": format!("Search with {SECRET}"),
+                            "inputSchema": {"type": "object"}}],
+                        "nextCursor": "next"
+                    }),
+                    ("tools/list", Some("next")) => json!({
+                        "tools": [{"name": SECOND, "inputSchema": {"type": "object"}}]
+                    }),
+                    _ => return StatusCode::BAD_REQUEST.into_response(),
+                };
+                (
+                    [("content-type", "application/json")],
+                    json!({"jsonrpc": "2.0", "id": request["id"], "result": result}).to_string(),
+                )
+                    .into_response()
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let (_dir, servers, settings, _) = fixture();
+    let connections = McpConnections::default();
+    let registry = ToolRegistry::default();
+    let mut config = ServerConfig::http("display_details", "Fixture", &url);
+    config.enabled = true;
+    config.bearer_secret_ref = Some("mcp.fixture.tool_details".into());
+    servers
+        .write_secret(&settings, "mcp.fixture.tool_details", SECRET)
+        .unwrap();
+    servers.create(&config).unwrap();
+
+    let connected = connections
+        .connect(settings, &registry, config, false)
+        .await
+        .unwrap();
+    let names = [FIRST, SECOND].map(|name| client::namespaced_tool_name("display_details", name));
+    for name in &names {
+        assert!(registry.get(name).is_ok());
+    }
+    let expected = json!({
+        "serverId": "display_details", "tools": names,
+        "toolDetails": [{"name": FIRST, "description": "Search with [REDACTED]"},
+                        {"name": SECOND, "description": ""}]
+    });
+    assert_eq!(serde_json::to_value(connected).unwrap(), expected);
+    for _ in 0..2 {
+        assert_eq!(
+            serde_json::to_value(connections.list().await).unwrap(),
+            json!([expected])
+        );
+    }
+    assert_eq!(
+        *requests.lock().unwrap(),
+        [
+            ("initialize".to_owned(), None),
+            ("tools/list".to_owned(), None),
+            ("tools/list".to_owned(), Some("next".to_owned())),
+        ]
+    );
+    connections
+        .disconnect(&registry, &servers, "display_details")
+        .await
+        .unwrap();
+    assert!(connections.list().await.is_empty());
+    assert!(registry.definitions().is_empty());
+    server.abort();
 }
 
 #[tokio::test]
@@ -612,4 +709,85 @@ fn stock_source_download_dirs_use_each_active_storage_root_without_touching_user
             }
         }
     }
+}
+#[tokio::test]
+async fn game_bound_mcp_connects_and_revokes_after_the_last_library_binding() {
+    let (temp, servers, settings, context) = fixture();
+    let engine = &context.engine;
+    crate::plugins::test_fixtures::install(&servers.db, &engine.paths).unwrap();
+    let (url, stop, _) = mock_http("echo").await;
+    let _stop = stop.drop_guard();
+    let mut config = plugin_server("fallout4", "test");
+    config.url = Some(url);
+    sync_test_plugin(&servers, "fallout4", std::slice::from_ref(&config));
+    let connections = McpConnections::default();
+    let registry = ToolRegistry::default();
+    let mut queue = connections
+        .watch_game_tools(engine, &registry, || {})
+        .unwrap();
+    let register = |name| {
+        let root = temp.path().join(name);
+        std::fs::create_dir_all(root.join("Data")).unwrap();
+        std::fs::write(root.join("Fallout4.exe"), b"test").unwrap();
+        std::fs::write(root.join("Data/Fallout4.esm"), b"test").unwrap();
+        crate::game_actions::register_local_from_desktop(engine, &root, Some("fallout4"), false)
+            .unwrap()
+    };
+    let first = register("first");
+    assert_eq!(servers.pending_game_tools().unwrap(), [config.clone()]);
+    assert!(queue.try_recv().is_err());
+    {
+        let _guard = crate::transaction::write_lock();
+        servers.set_game_tool_consent(&config, true).unwrap();
+        engine.notify_plugin_mcp_changed();
+    }
+    let second = register("second");
+    assert_eq!(
+        queue.len(),
+        1,
+        "matching multiple games schedules one handshake"
+    );
+    let progress = Arc::new(tokio::sync::Notify::new());
+    let worker = {
+        let (connections, registry, settings, progress) = (
+            connections.clone(),
+            registry.clone(),
+            settings.clone(),
+            progress.clone(),
+        );
+        tokio::spawn(async move {
+            connections
+                .restore_game_tools(queue, &settings, &registry, || progress.notify_one())
+                .await;
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(10), progress.notified())
+        .await
+        .unwrap();
+    let connected = connections.list().await;
+    assert_eq!(connected.len(), 1);
+    assert_eq!(connected[0].server_id, config.id);
+    let tool = &connected[0].tools[0];
+    assert!(registry.get(tool).is_ok());
+    crate::game_actions::remove_game_adapter(engine, &first.id).unwrap();
+    assert!(registry.get(tool).is_ok());
+    crate::game_actions::remove_game(engine, &second.id).unwrap();
+    assert!(registry.get(tool).is_err());
+    assert!(connections.list().await.is_empty());
+    register("first");
+    tokio::time::timeout(Duration::from_secs(10), progress.notified())
+        .await
+        .unwrap();
+    assert!(registry.get(tool).is_ok());
+    connections
+        .disconnect(&registry, &servers, &config.id)
+        .await
+        .unwrap();
+    register("third");
+    connections
+        .restore_requested(&settings, &registry, || {})
+        .await;
+    assert!(registry.get(tool).is_err());
+    assert!(servers.startup_requests().unwrap().is_empty());
+    worker.abort();
 }

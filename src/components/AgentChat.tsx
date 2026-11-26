@@ -47,6 +47,7 @@ import {
 import { cn } from "@/lib/utils";
 import { tr, useLocale } from "@/lib/i18n";
 import { ModRequestCard } from "./ModRequestCard";
+import { parseBrowseInstallRequest, type BrowseInstallRequest } from "@/lib/browse-install-request";
 import { parseModRequest, type ModRequest } from "@/lib/mod-request";
 import { AgentConfirmation } from "./AgentConfirmation";
 import { AgentWorkspaceDialog } from "./AgentWorkspaceDialog";
@@ -178,13 +179,15 @@ export function AgentChat() {
   }, [stream.length]);
 
   const modRequests = useMemo(() => {
-    const requests = new Map<string, ModRequest>();
-    for (const message of detail.data?.messages ?? []) {
-      const request = parseModRequest(message);
+    const requests = new Map<string, ModRequest | BrowseInstallRequest>();
+    const history = detail.data?.messages ?? [];
+    const opening = detail.data?.conversation.category === "install" ? history.find(message => message.role === "user") : undefined;
+    for (const message of history) {
+      const request = parseModRequest(message) ?? (message === opening ? parseBrowseInstallRequest(message) : null);
       if (request) requests.set(message.id, request);
     }
     return requests;
-  }, [detail.data?.messages]);
+  }, [detail.data?.messages, detail.data?.conversation.category]);
 
   const { messages, visibleIds, errors, unlinkedErrors, streamingReplyId } = useMemo(() => {
     const all = (detail.data?.messages || []).map((message) => ({ ...message }));

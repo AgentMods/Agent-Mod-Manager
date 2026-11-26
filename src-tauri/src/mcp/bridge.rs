@@ -6,13 +6,28 @@ use crate::{
     },
     error::{AppError, AppResult},
 };
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 pub struct McpAgentTool {
     client: McpClient,
-    tool: McpTool,
+    name: String,
+    details: Arc<McpToolDetails>,
+    input_schema: Value,
+}
+
+#[derive(Serialize)]
+pub struct McpToolDetails {
+    name: String,
+    description: String,
+}
+
+pub(crate) struct BridgedTool {
+    pub name: String,
+    pub details: Arc<McpToolDetails>,
+    pub agent: Arc<dyn AgentTool>,
 }
 
 impl McpClient {
@@ -22,37 +37,59 @@ impl McpClient {
         &self,
         cancel: &CancellationToken,
     ) -> AppResult<Vec<Arc<dyn AgentTool>>> {
-        self.list_tools(cancel)
-            .await
-            .map(|tools| self.agent_tools_from_catalog(tools))
+        let catalog = self.list_tools(cancel).await?;
+        Ok(self
+            .agent_tools_from_catalog(catalog)
+            .map(|tool| tool.agent)
+            .collect())
     }
 
-    pub(crate) fn agent_tools_from_catalog(&self, tools: Vec<McpTool>) -> Vec<Arc<dyn AgentTool>> {
+    pub(crate) fn agent_tools_from_catalog(
+        &self,
+        tools: Vec<McpTool>,
+    ) -> impl Iterator<Item = BridgedTool> + '_ {
+        let is_glossmod = self.server_config().is_glossmod_endpoint();
         tools
             .into_iter()
             // The built-in publication workflow binds consent to an exact package and target.
-            .filter(|tool| {
-                !(self.server_config().is_glossmod_endpoint()
+            .filter(move |tool| {
+                !(is_glossmod
                     && matches!(
                         tool.remote_name.as_str(),
                         "publish_manager_plugin" | "publish_manager_plugin_release"
                     ))
             })
-            .map(|tool| {
-                if self.server_config().is_glossmod_endpoint()
-                    && tool.remote_name == super::glossmod_download::TOOL
-                {
-                    return Arc::new(super::glossmod_download::GlossModDownload::new(
-                        self.clone(),
-                        tool.name,
-                    )) as Arc<dyn AgentTool>;
+            .map(move |tool| {
+                let McpTool {
+                    name,
+                    remote_name,
+                    description,
+                    input_schema,
+                } = tool;
+                let details = Arc::new(McpToolDetails {
+                    name: remote_name,
+                    description,
+                });
+                let agent: Arc<dyn AgentTool> =
+                    if is_glossmod && details.name == super::glossmod_download::TOOL {
+                        Arc::new(super::glossmod_download::GlossModDownload::new(
+                            self.clone(),
+                            name.clone(),
+                        ))
+                    } else {
+                        Arc::new(McpAgentTool {
+                            client: self.clone(),
+                            name: name.clone(),
+                            details: details.clone(),
+                            input_schema,
+                        })
+                    };
+                BridgedTool {
+                    name,
+                    details,
+                    agent,
                 }
-                Arc::new(McpAgentTool {
-                    client: self.clone(),
-                    tool,
-                }) as Arc<dyn AgentTool>
             })
-            .collect()
     }
 
     pub async fn register_tools(
@@ -60,8 +97,11 @@ impl McpClient {
         registry: &ToolRegistry,
         cancel: &CancellationToken,
     ) -> AppResult<Vec<String>> {
-        let tools = self.agent_tools(cancel).await?;
-        let names = tools.iter().map(|tool| tool.definition().name).collect();
+        let catalog = self.list_tools(cancel).await?;
+        let (names, tools) = self
+            .agent_tools_from_catalog(catalog)
+            .map(|tool| (tool.name, tool.agent))
+            .unzip();
         if cancel.is_cancelled() {
             return Err(AppError::Cancelled);
         }
@@ -75,21 +115,21 @@ impl McpClient {
 impl AgentTool for McpAgentTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: self.tool.name.clone(),
+            name: self.name.clone(),
             description: format!(
                 "[External untrusted MCP: {}] {} — {}",
                 self.client.server_id(),
-                self.tool.remote_name,
-                self.tool.description
+                self.details.name,
+                self.details.description
             ),
-            parameters: self.tool.input_schema.clone(),
+            parameters: self.input_schema.clone(),
             effect: Effect::ExternalWrite,
         }
     }
 
     fn host_tool_kind(&self) -> Option<&'static str> {
         (self.client.server_config().is_glossmod_endpoint()
-            && self.tool.remote_name == "list_work_files")
+            && self.details.name == "list_work_files")
             .then_some("glossmod_work_files")
     }
 
@@ -98,7 +138,7 @@ impl AgentTool for McpAgentTool {
         // permission or an additional way to call the tool.
         (self.client.server_config().is_stock_browse_source()
             && self.client.ensure_browse_current().is_ok())
-        .then(|| (self.client.server_id(), self.tool.remote_name.as_str()))
+        .then(|| (self.client.server_id(), self.details.name.as_str()))
     }
 
     async fn prepare(&self, context: &ToolContext, args: &Value) -> AppResult<PreparedTool> {
@@ -112,7 +152,7 @@ impl AgentTool for McpAgentTool {
         server.description = None;
         Ok(PreparedTool {
             preview: json!({
-                "server": server, "tool": self.tool.remote_name, "arguments":args,
+                "server": server, "tool": self.details.name, "arguments":args,
                 "trust":"untrusted_external", "localFileWhitelistEnforced":false,
                 "warning":"External MCP may change remote state. Stdio runs with OS user privileges and can bypass local file guards. No remote annotation is trusted."
             }),
@@ -131,14 +171,14 @@ impl AgentTool for McpAgentTool {
         if prepared.effect != Effect::ExternalWrite
             || prepared.plan.is_some()
             || prepared.preview["arguments"] != args
-            || prepared.preview["tool"] != self.tool.remote_name
+            || prepared.preview["tool"] != self.details.name
         {
             return Err(AppError::Denied(
                 "MCP execution does not match its external approval preview".into(),
             ));
         }
         self.client
-            .call_agent_tool(&self.tool.remote_name, args, &context.cancel)
+            .call_agent_tool(&self.details.name, args, &context.cancel)
             .await
     }
 }

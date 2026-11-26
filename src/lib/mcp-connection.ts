@@ -1,3 +1,4 @@
+import type { QueryClient } from "@tanstack/react-query";
 import { api } from "./api";
 
 export interface McpConfig {
@@ -14,6 +15,12 @@ export interface McpConfig {
   enabled: boolean;
   builtin: boolean;
   plugin_slug?: string | null;
+}
+
+export async function refreshMcpQueries(client: QueryClient) {
+  // Invalidation alone can reuse a first fetch started before the native change.
+  await client.cancelQueries({ queryKey: ["mcp"] });
+  await client.invalidateQueries({ queryKey: ["mcp"] });
 }
 
 /** Called only by an explicit Start action, which authorizes the selected config. */

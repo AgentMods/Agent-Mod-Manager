@@ -9,7 +9,6 @@ export type BrowseSource = {
   status: "available" | "notConnected" | "permissionDenied" | "unsupported";
 };
 export type BrowseGrant = { authorizationId: string; sources: BrowseSource[] };
-export type BrowseType = "visual" | "localization" | "gameplay" | "audio" | "framework" | "other" | "unknown";
 export interface BrowseItem {
   id: string;
   sourceId: string;
@@ -18,7 +17,7 @@ export interface BrowseItem {
   originalTitle: string;
   author: string | null;
   summary: string | null;
-  typeKey: BrowseType;
+  typeKey: string;
   tags: { key: string; label: string }[];
   coverUrl: string | null;
   canOpenProject: boolean;
@@ -38,15 +37,25 @@ interface BrowsePageData {
   hasNext: boolean;
   isEnriching: boolean;
 }
-export const browseTypes = (): Record<BrowseType, string> => ({
+export const browseTypes = () => ({
   visual: tr("视觉增强"),
   localization: tr("本地化"),
   gameplay: tr("玩法"),
   audio: tr("音频"),
   framework: tr("框架"),
+  tools: tr("工具与修改器"),
+  fixes: tr("修复与兼容"),
+  interface: tr("界面"),
+  vehicles: tr("载具"),
+  characters: tr("角色与外观"),
+  performance: tr("性能优化"),
   other: tr("其他"),
-  unknown: tr("未分类"),
 });
+type BrowseTypes = ReturnType<typeof browseTypes>;
+
+export function resolveBrowseType(typeKey: string, types: BrowseTypes): keyof BrowseTypes {
+  return Object.hasOwn(types, typeKey) ? (typeKey as keyof BrowseTypes) : "other";
+}
 export const sourceStatus = (status: BrowseSource["status"]) =>
   ({
     available: tr("已连接"),

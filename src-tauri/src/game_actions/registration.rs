@@ -37,6 +37,10 @@ pub(crate) fn apply_registration(
     require_same(&current, approved)?;
     let game = games::apply_new_registration(&tx, &game)?;
     tx.commit()?;
+    drop(conn);
+    if game.adapter_slug.is_some() {
+        engine.notify_plugin_mcp_changed();
+    }
     Ok(game)
 }
 
@@ -50,11 +54,14 @@ pub(crate) fn register_local_from_desktop(
 ) -> AppResult<Game> {
     let _guard = transaction::write_lock();
     let root = desktop_registration_root(engine, directory)?;
-    if from_discovery {
-        games::register_discovered_game(&engine.db, &root, adapter_slug)
+    let game = if from_discovery {
+        games::register_discovered_game(&engine.db, &root, adapter_slug)?
     } else {
-        games::register_game(&engine.db, &root, adapter_slug)
-    }
+        games::register_game(&engine.db, &root, adapter_slug)?
+    };
+    // A refresh may also remove the previously selected adapter.
+    engine.notify_plugin_mcp_changed();
+    Ok(game)
 }
 
 fn review_registration(

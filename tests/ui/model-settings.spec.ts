@@ -152,6 +152,7 @@ test("设置中的空行和重复 ID 可行内修正，删除最后一行后可�
 test("首次引导需要一个有效模型才能保存并继续", async ({page}) => {
   await installMockTauri(page, {onboarding: true});
   await page.goto("/");
+  await page.getByRole("button", {name: "开始设置", exact: true}).click();
   await page.getByRole("button", {name: "下一步", exact: true}).click();
   await expect(page.getByRole("heading", {name: "配置 AI 模型服务", exact: true})).toBeVisible();
   const save = page.getByRole("button", {name: "保存并继续", exact: true});

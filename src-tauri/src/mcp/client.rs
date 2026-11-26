@@ -450,6 +450,14 @@ impl McpClient {
                         command.env(key, value);
                     }
                 }
+                if config.is_gta_rpf_launcher() {
+                    // This adapter is published on PyPI; mirrors may lag or omit it.
+                    command.env("UV_DEFAULT_INDEX", "https://pypi.org/simple");
+                    // The native installer and the server resolve the same fixed staging root.
+                    if let Some(local) = dirs::data_local_dir().filter(|dir| dir.is_absolute()) {
+                        command.env("LOCALAPPDATA", local);
+                    }
+                }
                 configure_source_download_dir(&mut command, &config, &servers.db)?;
                 for (env, key) in &config.env_secret_refs {
                     let Some(value) = stdio_secret(settings, &config, env, key)? else {

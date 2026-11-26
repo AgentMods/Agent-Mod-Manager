@@ -22,6 +22,14 @@ pub(super) fn permits(source: &str, tool: &str) -> bool {
     }
 }
 
+pub(super) fn download_tool(source: &str) -> Option<&'static str> {
+    if source == "thunderstore" {
+        Some("download_version")
+    } else {
+        permits(source, "download_file").then_some("download_file")
+    }
+}
+
 pub(super) fn downloading(tool: &str) -> bool {
     matches!(tool, "download_file" | "download_version")
 }
@@ -34,6 +42,14 @@ pub(super) fn number(value: &str) -> AppResult<u64> {
         .ok_or_else(boundary)
 }
 
+fn valid_version(version: &str) -> bool {
+    version.len() <= 64
+        && version.split('.').count() == 3
+        && version
+            .split('.')
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
 pub(super) fn arguments(key: &WorkKey, remote: &str, args: &mut Value) -> AppResult<()> {
     let mut allowed = vec![];
     let download = downloading(remote);
@@ -44,18 +60,16 @@ pub(super) fn arguments(key: &WorkKey, remote: &str, args: &mut Value) -> AppRes
         allowed.extend(["namespace", "name"]);
         if download {
             let version = args["version"].as_str().ok_or_else(boundary)?;
-            if version.len() > 64
-                || !version
-                    .split('.')
-                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-                || version.split('.').count() != 3
-            {
+            if !valid_version(version) {
                 return Err(boundary());
             }
             allowed.push("version");
         } else {
             allowed.extend(["offset", "limit"]);
         }
+    } else if key.source_id == "glossmod_3dm" && remote == "get-mod-detail" {
+        bind(args, "id", json!(number(&key.project_id)?))?;
+        allowed.push("id");
     } else {
         let project = key.project_id.rsplit('/').next().ok_or_else(boundary)?;
         bind(args, "mod_id", json!(number(project)?))?;
@@ -163,7 +177,7 @@ pub(super) fn list_result(value: &Value) -> AppResult<Value> {
 #[derive(Clone)]
 pub(super) struct StockReceipt {
     pub filename: String,
-    path: PathBuf,
+    path: Option<PathBuf>,
     pub size: u64,
     pub sha256: String,
     pub file_id: String,
@@ -174,6 +188,36 @@ impl StockReceipt {
         json!({"filename": self.filename, "gameId":key.game_id})
     }
 
+    pub(super) fn saved(&self, key: &WorkKey) -> Value {
+        json!({"status":"saved", "filename":self.filename, "sha256":self.sha256,
+            "size":self.size, "fileId":self.file_id, "gameId":key.game_id})
+    }
+
+    /// Read only the normalized receipt emitted by InstallScope after the
+    /// native transfer receipt has verified the provider response and file.
+    pub(super) fn from_saved(key: &WorkKey, args: &Value, value: &Value) -> Option<Self> {
+        let remote = download_tool(&key.source_id)?;
+        let mut bound = args.clone();
+        arguments(key, remote, &mut bound).ok()?;
+        let file_id = download_file_id(key, &bound)?;
+        if value["status"] != "saved"
+            || value["gameId"] != key.game_id
+            || value["fileId"] != file_id
+        {
+            return None;
+        }
+        let filename = value["filename"].as_str()?;
+        crate::download::safe_filename(filename).ok()?;
+        let receipt = Self {
+            filename: filename.into(),
+            path: None,
+            size: receipt_size(&value["size"])?,
+            sha256: hash(&value["sha256"], 64)?,
+            file_id,
+        };
+        (receipt.saved(key) == *value).then_some(receipt)
+    }
+
     pub(super) fn matches_preview(&self, game: &str, value: &Value) -> bool {
         value["receiptFolder"] == "incoming"
             && value["gameId"] == game
@@ -182,10 +226,25 @@ impl StockReceipt {
             && value["sourceFingerprint"]["sha256"]
                 .as_str()
                 .is_some_and(|v| v == self.sha256)
-            && value["sourcePath"]
-                .as_str()
-                .is_some_and(|source| same_path(&self.path, Path::new(source)))
+            && self.path.as_ref().is_none_or(|path| {
+                value["sourcePath"]
+                    .as_str()
+                    .is_some_and(|source| same_path(path, Path::new(source)))
+            })
     }
+}
+
+fn download_file_id(key: &WorkKey, args: &Value) -> Option<String> {
+    if key.source_id == "thunderstore" {
+        return args["version"]
+            .as_str()
+            .filter(|version| valid_version(version))
+            .map(str::to_owned);
+    }
+    args["file_id"]
+        .as_u64()
+        .and_then(|id| number(&id.to_string()).ok())
+        .map(|id| id.to_string())
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -202,6 +261,12 @@ fn hash(raw: &Value, size: usize) -> Option<String> {
     raw.as_str()
         .filter(|s| s.len() == size && s.bytes().all(|b| b.is_ascii_hexdigit()))
         .map(str::to_ascii_lowercase)
+}
+
+fn receipt_size(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .filter(|n| (1..=4 * 1024 * 1024 * 1024).contains(n))
 }
 
 fn check_id(value: &Value, expected: &Value) -> AppResult<()> {
@@ -291,13 +356,10 @@ pub(super) async fn transfer_receipt(
         .ok_or_else(unavailable)?
         .to_owned();
     crate::download::safe_filename(&filename)?;
-    let size = data[size_key]
-        .as_u64()
-        .filter(|n| (1..=4 * 1024 * 1024 * 1024).contains(n))
-        .ok_or_else(unavailable)?;
+    let size = receipt_size(&data[size_key]).ok_or_else(unavailable)?;
     let mut receipt = StockReceipt {
         filename,
-        path,
+        path: Some(path.clone()),
         size,
         sha256: String::new(),
         file_id,
@@ -312,11 +374,14 @@ pub(super) async fn transfer_receipt(
         return Err(unavailable());
     }
     receipt.sha256 = captured_sha;
-    if !receipt.matches_preview(&key.game_id, &prepared.preview) {
+    if !receipt.matches_preview(&key.game_id, &prepared.preview)
+        || !prepared.preview["sourcePath"]
+            .as_str()
+            .is_some_and(|source| same_path(&path, Path::new(source)))
+    {
         return Err(unavailable());
     }
     if sha1.is_some() || md5.is_some() {
-        let path = receipt.path.clone();
         let digest = receipt.sha256.clone();
         let cancel = context.cancel.clone();
         tokio::task::spawn_blocking(move || check_legacy(&path, size, &digest, sha1, md5, &cancel))

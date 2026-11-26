@@ -4,13 +4,16 @@ use crate::{
     settings::Settings,
     util::now,
 };
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
+use rusqlite::{params, Connection, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
+
+#[path = "game_tools.rs"]
+mod game_tools;
 
 // Historical Playwright launchers used the platform-specific npx shim.
 const LEGACY_PLAYWRIGHT_COMMAND: &str = if cfg!(windows) { "npx.cmd" } else { "npx" };
@@ -677,6 +680,24 @@ impl ServerConfig {
         }
     }
 
+    /// Only the two shipped Windows declarations use the dedicated PyPI launcher environment.
+    pub(crate) fn is_gta_rpf_launcher(&self) -> bool {
+        cfg!(windows)
+            && !self.builtin
+            && self.transport == McpTransport::Stdio
+            && matches!(
+                (self.plugin_slug.as_deref(), self.id.as_str()),
+                (Some("gta5-legacy"), "plugin_gta5-legacy_rpf")
+                    | (Some("gta5-enhanced"), "plugin_gta5-enhanced_rpf")
+            )
+            && self.command.as_deref() == Some("uvx")
+            && self.args == ["gta-rpf-mcp@latest"]
+            && self.url.is_none()
+            && self.env_secret_refs.is_empty()
+            && self.bearer_secret_ref.is_none()
+            && self.credential_url.is_none()
+    }
+
     /// Keep the pre-description exact match for live connections and pending consent.
     /// Unlike the persisted digest, this also checks the credential page, as before.
     pub(crate) fn same_connection_config(&self, other: &Self) -> bool {
@@ -843,14 +864,14 @@ impl McpServers {
     }
 
     pub fn list(&self) -> AppResult<Vec<ServerConfig>> {
-        let conn = self.db.conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {SERVER_COLUMNS} FROM mcp_servers WHERE {OWNER_ACTIVE} ORDER BY builtin DESC,name,id"
-        ))?;
-        let result = stmt
-            .query_map([], from_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(result)
+        game_tools::states(
+            &self.db.conn(),
+            &format!("WHERE {OWNER_ACTIVE} ORDER BY builtin DESC,name,id"),
+            [],
+        )?
+        .into_iter()
+        .map(game_tools::ServerState::effective_config)
+        .collect()
     }
 
     pub fn get(&self, id: &str) -> AppResult<ServerConfig> {
@@ -860,66 +881,72 @@ impl McpServers {
     // Read the config and its effective availability from the same SQLite snapshot.
     // Keep an inactive owned config readable, but never present it as enabled to callers.
     fn get_from(conn: &Connection, id: &str) -> AppResult<ServerConfig> {
-        conn.query_row(
-            &format!("SELECT {SERVER_COLUMNS}, {OWNER_ACTIVE} FROM mcp_servers WHERE id=?1"),
-            [id],
-            |row| {
-                let mut config = from_row(row)?;
-                config.enabled &= row.get::<_, bool>(13)?;
-                Ok(config)
-            },
-        )
-        .optional()?
-        .ok_or_else(|| AppError::NotFound("MCP server".into()))
+        game_tools::find(conn, id)?.effective_config()
     }
 
     pub(crate) fn startup_requests(&self) -> AppResult<Vec<String>> {
         let conn = self.db.conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id FROM mcp_servers WHERE startup_digest IS NOT NULL AND enabled=1 AND id<>?1
-             AND {OWNER_ACTIVE} ORDER BY id"
-        ))?;
-        let ids = stmt
-            .query_map([crate::mcp_connections::LOCAL_SERVER_ID], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut ids = Vec::new();
+        for state in game_tools::states(
+            &conn,
+            &format!(
+                "WHERE id<>?1 AND {OWNER_ACTIVE} AND (
+                    (enabled=1 AND startup_digest IS NOT NULL) OR game_tool_state.decision IS NOT NULL
+                ) ORDER BY id"
+            ),
+            [crate::mcp_connections::LOCAL_SERVER_ID],
+        )? {
+            if state.has_manual_start()? || state.has_game_start()? {
+                ids.push(state.config.id);
+            }
+        }
         Ok(ids)
     }
 
     pub(super) fn startup_digest(&self, id: &str) -> AppResult<Option<Vec<u8>>> {
-        Ok(self.db.conn().query_row(
-            &format!("SELECT CASE WHEN {OWNER_ACTIVE} THEN startup_digest END FROM mcp_servers WHERE id=?1"),
-            [id],
-            |r| r.get(0),
-        )?)
+        let state = game_tools::find(&self.db.conn(), id)?;
+        if state.has_manual_start()? {
+            return Ok(state.manual_digest);
+        }
+        if state.has_game_start()? {
+            return Ok(Some(
+                state.effective_config()?.confirmation_digest()?.to_vec(),
+            ));
+        }
+        Ok(None)
     }
 
     pub(crate) fn remember_start(&self, confirmed: &ServerConfig) -> AppResult<()> {
         let digest = confirmed.confirmation_digest()?;
-        let conn = self.db.conn();
-        let current = Self::get_from(&conn, &confirmed.id)?;
+        let mut conn = self.db.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = Self::get_from(&tx, &confirmed.id)?;
         if !current.same_connection_config(confirmed) {
             return Err(AppError::Conflict(
                 "配置已变化，请重新确认完整连接配置".into(),
             ));
         }
-        let changed = conn.execute(
-            &format!(
-                "UPDATE mcp_servers SET startup_digest=?2 WHERE id=?1
-                      AND (plugin_slug IS NULL OR (enabled=1 AND {OWNER_ACTIVE}))"
-            ),
-            params![confirmed.id, digest],
-        )?;
-        if changed == 0 {
+        if current.plugin_slug.is_some() && !current.enabled {
             return Err(inactive_plugin_error());
         }
+        tx.execute(
+            "UPDATE mcp_servers SET startup_digest=?2,
+                    enabled=CASE WHEN plugin_slug IS NULL THEN enabled ELSE 1 END WHERE id=?1",
+            params![confirmed.id, digest],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
     pub(crate) fn forget_start(&self, id: &str) -> AppResult<()> {
-        self.db.conn().execute(
+        let mut conn = self.db.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        game_tools::record_stop(&tx, id)?;
+        tx.execute(
             "UPDATE mcp_servers SET startup_digest=NULL WHERE id=?1",
             [id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -971,10 +998,11 @@ impl McpServers {
     }
 
     pub fn set_enabled(&self, id: &str, enabled: bool) -> AppResult<()> {
-        let conn = self.db.conn();
+        let mut conn = self.db.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // The condition is part of the write, so a concurrent plugin disable cannot
         // slip in between checking ownership and enabling the service.
-        let changed = conn.execute(
+        let changed = tx.execute(
             &format!(
                 "UPDATE mcp_servers SET enabled=?2,startup_digest=NULL WHERE id=?1
                       AND (?2=0 OR {OWNER_ACTIVE})"
@@ -982,8 +1010,12 @@ impl McpServers {
             params![id, enabled],
         )?;
         if changed != 0 {
+            if !enabled {
+                game_tools::record_stop(&tx, id)?;
+            }
+            tx.commit()?;
             Ok(())
-        } else if has_server(&conn, id)? {
+        } else if has_server(&tx, id)? {
             Err(inactive_plugin_error())
         } else {
             Err(AppError::NotFound("MCP server".into()))
@@ -1146,6 +1178,7 @@ pub(crate) fn sync_plugin_servers(
     for (id, config) in &desired {
         if let Some(current) = existing.get(id) {
             if !config.same_connection_config(current) {
+                tx.execute("DELETE FROM game_tool_state WHERE server_id=?1", [id])?;
                 changed |= tx.execute(
                     "UPDATE mcp_servers SET name=?2,transport=?3,command=?4,args_json=?5,url=?6,env_json=?7,secret_ref=?8,credential_url=?9,description=?10,enabled=0,startup_digest=NULL WHERE id=?1 AND plugin_slug=?11",
                     params![config.id,config.name,config.transport.as_str(),config.command,serde_json::to_string(&config.args)?,config.url,
@@ -1170,9 +1203,12 @@ pub(crate) fn sync_plugin_servers(
     Ok(changed)
 }
 
-/// Revoke locally granted enablement and remembered launch without unregistering.
-/// Returns whether any MCP rows changed in this transaction.
+/// Preserve manual grants for game-managed packages while the owner is disabled.
+/// The disabled owner prevents all of its connections from starting.
 pub(crate) fn revoke_plugin_servers(tx: &Transaction<'_>, slug: &str) -> AppResult<bool> {
+    if game_tools::revoke_bound_plugin(tx, slug)? {
+        return Ok(true);
+    }
     Ok(tx.execute(
         "UPDATE mcp_servers SET enabled=0,startup_digest=NULL WHERE plugin_slug=?1
          AND (enabled<>0 OR startup_digest IS NOT NULL)",

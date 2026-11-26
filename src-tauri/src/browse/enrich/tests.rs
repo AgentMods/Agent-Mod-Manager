@@ -23,7 +23,6 @@ fn reply(index: usize, title: &str, label: &str) -> Value {
         "index":index,
         "title":title,
         "summary":"Localized summary.",
-        "typeKey":"visual",
         "tags":[{"key":"textures","label":label}]
     })
 }
@@ -50,11 +49,16 @@ fn stable_taxonomy_converges_on_known_tags_without_losing_provider_labels() {
     }
     let tags = ["Co-op".to_owned(), "联机".to_owned(), "CO OP".to_owned()];
     assert_eq!(fallback_item(test_item(&tags)).tags.len(), 1);
-    assert_eq!(fallback_item(test_item(&[])).type_key.as_str(), "unknown");
+    let plain = EnrichmentInput {
+        title: "Quiet Example",
+        summary: None,
+        ..test_item(&[])
+    };
+    assert_eq!(fallback_item(plain).type_key, ModType::Other);
     assert_eq!(
         fallback_item(EnrichmentInput {
             kind: Some("Miscellaneous"),
-            ..test_item(&[])
+            ..plain
         })
         .type_key,
         ModType::Other
@@ -68,8 +72,12 @@ fn stable_taxonomy_converges_on_known_tags_without_losing_provider_labels() {
     }
     let conflicting = ["Models".to_owned(), "Music".to_owned()];
     assert_eq!(
-        fallback_item(test_item(&conflicting)).type_key,
-        ModType::Unknown
+        fallback_item(EnrichmentInput {
+            tags: &conflicting,
+            ..plain
+        })
+        .type_key,
+        ModType::Other
     );
 }
 
@@ -147,9 +155,9 @@ async fn malformed_or_unavailable_enrichment_never_poison_cache_or_replace_origi
         Some("{broken}".into()),
         Some(json!({"items":[row.clone(), row.clone()]}).to_string()),
         Some(json!({"items":[reply(7, "Unknown item", "Textures")]}).to_string()),
-        Some(json!({"items":[{"index":0,"title":"Wrong","typeKey":"visual","tags":[]}]}).to_string()),
-        Some(json!({"items":[{"index":0,"title":"Wrong","summary":null,"typeKey":"visual","tags":[]}]}).to_string()),
-        Some(json!({"items":[{"index":0,"title":"Wrong","summary":"Wrong","typeKey":"visual","tags":[{"key":"invented-key","label":"Fake"}]}]}).to_string()),
+        Some(json!({"items":[{"index":0,"title":"Wrong","tags":[]}]}).to_string()),
+        Some(json!({"items":[{"index":0,"title":"Wrong","summary":null,"tags":[]}]}).to_string()),
+        Some(json!({"items":[{"index":0,"title":"Wrong","summary":"Wrong","tags":[{"key":"invented-key","label":"Fake"}]}]}).to_string()),
     ] {
         assert_eq!(
             enrich_with(&db, &[input], "zh-CN", &cancel, |_| async { invalid }).await[0],

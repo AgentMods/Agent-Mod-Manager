@@ -339,7 +339,7 @@ struct ApplyEvidence {
 
 #[cfg(test)]
 type RenameHook = Box<dyn Fn(&JournalRename) + Send + Sync>;
-type PluginMcpChangeHandler = Box<dyn Fn(&str) + Send + Sync>;
+type PluginMcpChangeHandler = Box<dyn Fn() + Send + Sync>;
 
 #[derive(Clone)]
 pub struct FileEngine {
@@ -373,10 +373,7 @@ impl FileEngine {
         }
     }
 
-    pub(crate) fn set_plugin_mcp_change_handler(
-        &self,
-        handler: impl Fn(&str) + Send + Sync + 'static,
-    ) {
+    pub(crate) fn set_plugin_mcp_change_handler(&self, handler: impl Fn() + Send + Sync + 'static) {
         assert!(self
             .plugin_mcp_change_handler
             .set(Box::new(handler))
@@ -385,9 +382,9 @@ impl FileEngine {
 
     /// Notify the desktop runtime after committing and dropping the DB guard,
     /// before releasing the file write lock that serializes plugin mutations.
-    pub(crate) fn notify_plugin_mcp_changed(&self, slug: &str) {
+    pub(crate) fn notify_plugin_mcp_changed(&self) {
         if let Some(handler) = self.plugin_mcp_change_handler.get() {
-            handler(slug);
+            handler();
         }
     }
 
@@ -1412,8 +1409,8 @@ impl FileEngine {
             crate::analytics::track("mod_installed");
             self.organization_wake.notify_one();
         }
-        if let Some(slug) = plugin_changed {
-            self.notify_plugin_mcp_changed(&slug);
+        if plugin_changed.is_some() {
+            self.notify_plugin_mcp_changed();
         }
         Ok(())
     }

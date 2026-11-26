@@ -1,8 +1,11 @@
-//! Native authority for the GTA V (Legacy) RPF job protocol. Nothing returned
+//! Native authority for the GTA V RPF job protocol. Nothing returned
 //! by an MCP chooses a destination. Only this module constructs deployment ops.
-use super::{InstallInspection, InstallPreview, InstalledMod};
+use super::{
+    gta_layout::{enhanced_rpf_unsupported, Edition},
+    InstallInspection, InstallPreview, InstalledMod,
+};
 use crate::{
-    error::{AppError, AppResult},
+    error::{AppError, AppResult, NativeMessage},
     games, mod_library,
     mod_organization::OrganizationSuggestion,
     safe_fs,
@@ -20,12 +23,15 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+#[path = "gta_rpf/archive.rs"]
+mod archive;
 #[path = "gta_rpf/files.rs"]
 mod files;
 #[path = "gta_rpf/journal.rs"]
 mod journal;
 #[path = "gta_rpf/model.rs"]
 mod model;
+pub(crate) use archive::{prepare_archive_job, MAX_ARCHIVE_PAYLOADS};
 use files::*;
 pub(crate) use journal::{
     active_files, guard_foreign_plan, inspect, plan_install, plan_uninstall, validate_apply,
@@ -56,22 +62,40 @@ pub(crate) struct PreparedJob {
     pub action: &'static str,
 }
 
+fn check_edition_job(edition: Edition, kind: &str, menyoo: bool) -> AppResult<()> {
+    if edition == Edition::Enhanced && (!edition.supports_rpf_kind(kind) || menyoo) {
+        return Err(AppError::Presented(enhanced_rpf_unsupported()));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_job_options(
+    slug: &str,
+    kind: Option<&str>,
+    options: Option<&Value>,
+) -> AppResult<()> {
+    if let (Some(edition), Some(kind)) = (Edition::from_slug(slug), kind) {
+        let menyoo = options.and_then(|o| o["menyoo"].as_bool()).unwrap_or(false);
+        check_edition_job(edition, kind, menyoo)?;
+    }
+    Ok(())
+}
+
 fn binding(e: &FileEngine, game: &str, c: &CancellationToken) -> AppResult<Binding> {
-    let g = games::get_game(&e.db, game)?;
+    binding_for_game(e, &games::get_game(&e.db, game)?, c)
+}
+
+fn checked_game_root(
+    e: &FileEngine,
+    g: &games::Game,
+) -> AppResult<(Edition, PathBuf, crate::plugins::GameAdapter)> {
     let slug = g
         .adapter_slug
         .as_deref()
         .ok_or_else(|| invalid("请先绑定 GTA 适配包"))?;
-    if slug == "gta5-enhanced" {
-        return Err(AppError::Unsupported(
-            "GTA V Enhanced 尚无已验证的 RPF 读写能力".into(),
-        ));
-    }
-    if slug != "gta5-legacy" {
-        return Err(invalid("游戏或 Steam 版本不是 GTA V Legacy"));
-    }
-    super::gta_layout::check_edition(&g, slug)?;
-    let adapter = crate::game_roots::adapter(&e.db, &g)?;
+    let edition = Edition::from_slug(slug).ok_or_else(|| invalid("请先绑定 GTA 适配包"))?;
+    super::gta_layout::check_edition(g, slug)?;
+    let adapter = crate::game_roots::adapter(&e.db, g)?;
     if adapter.slug != slug
         || g.adapter_version
             .as_deref()
@@ -84,18 +108,28 @@ fn binding(e: &FileEngine, game: &str, c: &CancellationToken) -> AppResult<Bindi
     if e.paths.overlaps_storage(&root) || crate::paths::overlaps(&root, &jobs(e)?) {
         return Err(invalid("游戏与 RPF 存储根重叠"));
     }
-    let marker = root.join("GTA5.exe");
+    Ok((edition, root, adapter))
+}
+
+fn binding_for_game(e: &FileEngine, g: &games::Game, c: &CancellationToken) -> AppResult<Binding> {
+    let (edition, root, adapter) = checked_game_root(e, g)?;
+    let marker = root.join(edition.marker());
     let original = root.join("update/update.rpf");
     e.stable_path(&marker, false)?;
     e.stable_path(&original, false)?;
-    let exe = file_fp(&marker, c)?.ok_or_else(|| invalid("未找到 Legacy 游戏标记 GTA5.exe"))?;
+    let exe = file_fp(&marker, c)?.ok_or_else(|| {
+        AppError::Presented(NativeMessage::new(
+            "gta.rpf.marker_missing",
+            [("marker", edition.marker().into())],
+        ))
+    })?;
     let original_fp =
         file_fp(&original, c)?.ok_or_else(|| invalid("缺少原版 update/update.rpf"))?;
     check_shape(&original, "update")?;
     Ok(Binding {
-        game: g.id,
+        game: g.id.clone(),
         root,
-        slug: slug.into(),
+        slug: adapter.slug,
         version: adapter.version,
         exe,
         original: original_fp,
@@ -120,9 +154,10 @@ fn frozen(e: &FileEngine, id: &str) -> AppResult<Frozen> {
             .optional()?
             .ok_or_else(|| invalid("未知本机 RPF 任务"))?;
     let j: Frozen = serde_json::from_str(&raw)?;
-    if j.input.job_id != id {
+    if j.input.job_id != id || j.input.kind != j.binding.edition()? {
         return Err(conflict("RPF 任务账本不一致"));
     }
+    check_edition_job(j.input.kind, j.item.contribution.kind(), j.item.menyoo)?;
     Ok(j)
 }
 fn pending(e: &FileEngine) -> AppResult<()> {
@@ -177,13 +212,18 @@ pub(crate) fn prepare_job(
 ) -> AppResult<PreparedJob> {
     let _guard = transaction::write_lock_cancellable(c)?;
     pending(e)?;
-    let b = binding(e, game_id, c)?;
+    let game = games::get_game(&e.db, game_id)?;
+    if let Some(slug) = &game.adapter_slug {
+        validate_job_options(slug, kind, options)?;
+    }
+    let b = binding_for_game(e, &game, c)?;
+    let edition = b.edition()?;
     let (parent, state) = head(e, game_id)?;
     check_active(e, &b, &state, c)?;
     let mut consumed_probe = None;
     let (install, item) = match (artifact_id, install_id, kind) {
         (Some(a), None, Some(k)) => {
-            let adapter = crate::game_roots::adapter(&e.db, &games::get_game(&e.db, game_id)?)?;
+            let adapter = crate::game_roots::adapter(&e.db, &game)?;
             if !adapter.mod_types.iter().any(|t| t.id == format!("rpf-{k}")) {
                 return Err(invalid("适配包未声明该 RPF Mod 类型"));
             }
@@ -283,11 +323,12 @@ pub(crate) fn prepare_job(
             ))
         }
     };
+    check_edition_job(edition, item.contribution.kind(), item.menyoo)?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     let mut input = Input {
         schema_version: 1,
         job_id: id.clone(),
-        kind: "legacy".into(),
+        kind: edition,
         targets: vec![],
         inspect_dlc: None,
     };

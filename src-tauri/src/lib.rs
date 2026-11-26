@@ -9,6 +9,9 @@ pub mod archive;
 pub mod artifacts;
 pub(crate) mod browse;
 pub mod commands;
+mod dashboard;
+#[cfg(not(test))]
+mod dashboard_sponsors;
 pub mod db;
 pub mod diagnostics;
 pub mod download;
@@ -154,6 +157,8 @@ pub fn run() {
             commands::list_snapshots,
             commands::restore_snapshot,
             commands::list_games,
+            commands::get_dashboard_stats,
+            dashboard_sponsors::list_dashboard_sponsors,
             commands::get_game,
             commands::update_game,
             commands::set_game_adapter,
@@ -222,6 +227,9 @@ pub fn run() {
             commands::mcp_create,
             commands::mcp_update,
             commands::mcp_remove,
+            commands::mcp_pending_game_tools,
+            commands::mcp_approve_game_tool,
+            commands::mcp_decline_game_tool,
             commands::mcp_connect,
             commands::mcp_disconnect,
             commands::mcp_connections,
@@ -264,14 +272,22 @@ pub fn run() {
             let connections = services.mcp_connections.clone();
             {
                 use tauri::Emitter;
-                let connections = connections.clone();
-                let registry = agent.registry.clone();
-                let servers = mcp::McpServers::new(services.engine.db.clone());
                 let handle = app.handle().clone();
-                services.engine.set_plugin_mcp_change_handler(move |slug| {
-                    connections.invalidate_plugin(&registry, &servers, slug);
-                    // Settings uses the same refetch path for restoration and revocation.
+                let progress = move || {
                     let _ = handle.emit("mcp://restore-progress", ());
+                };
+                let queue = connections.watch_game_tools(
+                    &services.engine,
+                    &agent.registry,
+                    progress.clone(),
+                )?;
+                let connections = connections.clone();
+                let settings = agent.settings.clone();
+                let registry = agent.registry.clone();
+                tauri::async_runtime::spawn(async move {
+                    connections
+                        .restore_game_tools(queue, &settings, &registry, progress)
+                        .await;
                 });
             }
             app.manage(local.clone());

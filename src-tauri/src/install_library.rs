@@ -551,21 +551,23 @@ pub fn match_library_install_cancellable(
     }
     let mut candidates = Vec::new();
     if let Some(adapter) = &adapter {
-        let gta = super::gta_layout::is_gta(&adapter.slug).then(|| {
+        let edition = super::gta_layout::Edition::from_slug(&adapter.slug);
+        let gta = edition.map(|_| {
             let names = scan
                 .as_ref()
                 .map(|s| s.names.keys().map(String::as_str).collect())
                 .unwrap_or_else(|| vec![entry.filename.as_str()]);
             super::gta_layout::classify(names)
         });
+        let unsupported_rpf = |mod_type: &str| {
+            mod_type
+                .strip_prefix("rpf-")
+                .is_some_and(|kind| edition.is_some_and(|e| !e.supports_rpf_kind(kind)))
+        };
         if let Some(hints) = &gta {
             warnings.extend(hints.warnings.iter().map(|s| (*s).to_string()));
-            if adapter.slug == "gta5-enhanced"
-                && hints.types.iter().any(|ty| ty.starts_with("rpf-"))
-            {
-                warnings.push(
-                    "增强版 RPF 尚无独立兼容性验证；不要启动或借用 Legacy 工具处理。".to_owned(),
-                );
+            if hints.types.iter().any(|ty| unsupported_rpf(ty)) {
+                warnings.push(super::gta_layout::enhanced_rpf_unsupported().message);
             }
         }
         for ty in &adapter.mod_types {
@@ -580,7 +582,7 @@ pub fn match_library_install_cancellable(
                         layout: ArchiveLayout::Manual,
                         status: if super::gta_layout::check_edition(&game, &adapter.slug).is_err() {
                             "rootUnavailable"
-                        } else if adapter.slug == "gta5-enhanced" && ty.id.starts_with("rpf-") {
+                        } else if unsupported_rpf(&ty.id) {
                             "unsupportedEdition"
                         } else if hints.review {
                             "requiresUser"

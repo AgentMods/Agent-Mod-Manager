@@ -45,7 +45,7 @@ pub(crate) struct ProviderItem {
     pub tags: Vec<String>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProviderPage {
     pub items: Vec<ProviderItem>,
     pub next: Option<String>,
@@ -57,7 +57,7 @@ pub(crate) struct ProviderGame {
     pub name: String,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProviderGamePage {
     pub games: Vec<ProviderGame>,
     pub next: Option<String>,

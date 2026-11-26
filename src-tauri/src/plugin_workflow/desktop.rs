@@ -65,6 +65,8 @@ pub(crate) fn register_catalog_game(
         let tx = conn.transaction()?;
         let game = registration.register(&tx, &engine.paths, slug)?;
         tx.commit()?;
+        drop(conn);
+        engine.notify_plugin_mcp_changed();
         return Ok(game);
     }
     // The newly created registration is read back under the same write lock.

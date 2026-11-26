@@ -1091,3 +1091,452 @@ fn three_legacy_owners_with_identical_payloads_only_rollback_from_the_top() {
         assert_eq!(std::fs::read(&path).unwrap(), expected);
     }
 }
+
+#[cfg(windows)]
+fn bind_gta_rpf_adapter(engine: &crate::transaction::FileEngine, manifest: &str) -> String {
+    let adapter: crate::plugins::GameAdapter = serde_json::from_str(manifest).unwrap();
+    let [config]: [_; 1] = adapter.mcp_configs().unwrap().try_into().unwrap();
+    assert!(config.is_gta_rpf_launcher());
+    let mut conn = engine.db.conn();
+    let tx = conn.transaction().unwrap();
+    tx.execute(
+        "INSERT INTO plugins(slug,name,game_name,version,source,install_path,adapter_json,created_at,updated_at)
+         VALUES (?1,?2,'GTA V',?3,'local','test',?4,'now','now')",
+        rusqlite::params![adapter.slug, adapter.name, adapter.version, manifest],
+    )
+    .unwrap();
+    tx.execute(
+        "UPDATE games SET adapter_slug=?1 WHERE id='g'",
+        [&adapter.slug],
+    )
+    .unwrap();
+    let server_id = config.id.clone();
+    crate::mcp::config::sync_plugin_servers(&tx, &adapter.slug, &[config]).unwrap();
+    tx.commit().unwrap();
+    drop(conn);
+
+    let servers = crate::mcp::McpServers::new(engine.db.clone());
+    servers.sync_game_tools().unwrap();
+    assert!(servers.get(&server_id).unwrap().enabled);
+    server_id
+}
+
+#[cfg(windows)]
+#[test]
+fn gta_rpf_agent_prefers_the_bound_adapters_specialized_tools_and_falls_back() {
+    for manifest in [
+        include_str!("../../../packages/gta-adapters/gta5-legacy/adapter.json"),
+        include_str!("../../../packages/gta-adapters/gta5-enhanced/adapter.json"),
+    ] {
+        let (_dir, engine, _) = setup();
+        let server_id = bind_gta_rpf_adapter(&engine, manifest);
+        let fallback = crate::mcp::client::namespaced_tool_name(&server_id, "gta_rpf_prepare");
+        let mut jobs = vec![
+            (
+                json!({"game_id":"g","artifact_id":"artifact","kind":"gameconfig"}),
+                "gta_rpf_replace_gameconfig",
+            ),
+            (
+                json!({"game_id":"g","artifact_id":"artifact","kind":"dlc"}),
+                "gta_rpf_inspect_dlc",
+            ),
+            (
+                json!({"game_id":"g","artifact_id":"artifact","kind":"dlc","options":{"packName":null,"sourceDir":"payload"}}),
+                "gta_rpf_inspect_dlc",
+            ),
+            (
+                json!({"game_id":"g","artifact_id":"artifact","kind":"dlc","options":{"packName":"example"}}),
+                "gta_rpf_register_dlc",
+            ),
+            (
+                json!({"game_id":"g","artifact_id":"artifact","kind":"dlc","options":{"inspectJobId":"0123456789abcdef0123456789abcdef"}}),
+                "gta_rpf_register_dlc",
+            ),
+            (
+                json!({"game_id":"g","install_id":"install"}),
+                "gta_rpf_prepare",
+            ),
+        ];
+        if server_id == "plugin_gta5-legacy_rpf" {
+            jobs.extend([
+                (
+                    json!({"game_id":"g","artifact_id":"artifact","kind":"vehicle","options":{"menyoo":true}}),
+                    "gta_rpf_build_vehicle_pack",
+                ),
+                (
+                    json!({"game_id":"g","artifact_id":"artifact","kind":"ped","options":{"modelName":"example","sex":"Female","streamed":false}}),
+                    "gta_rpf_build_ped_pack",
+                ),
+                (
+                    json!({"game_id":"g","artifact_id":"artifact","kind":"dlc","options":{"packName":"example","menyoo":true}}),
+                    "gta_rpf_register_dlc",
+                ),
+            ]);
+        }
+        for (args, preferred) in jobs {
+            let spec: GtaJobArgs = serde_json::from_value(args).unwrap();
+            spec.validate().unwrap();
+            let expected = crate::mcp::client::namespaced_tool_name(&server_id, preferred);
+            assert_eq!(gta_mcp_tool(&engine, &spec, &|_| true).unwrap(), expected);
+            assert_eq!(
+                gta_mcp_tool(&engine, &spec, &|tool| tool == expected).unwrap(),
+                expected
+            );
+            assert_eq!(
+                gta_mcp_tool(&engine, &spec, &|tool| tool == fallback).unwrap(),
+                fallback
+            );
+            let custom = crate::mcp::client::namespaced_tool_name("custom_rpf", preferred);
+            assert!(gta_mcp_tool(&engine, &spec, &|tool| tool == custom).is_err());
+        }
+        let uninstall =
+            serde_json::from_value(json!({"game_id":"g","install_id":"install"})).unwrap();
+        let dedicated =
+            crate::mcp::client::namespaced_tool_name(&server_id, "gta_rpf_register_dlc");
+        assert!(gta_mcp_tool(&engine, &uninstall, &|tool| tool == dedicated).is_err());
+    }
+}
+
+#[tokio::test]
+async fn gta_rpf_archive_tools_are_discoverable_in_a_selected_game_agent_turn() {
+    use crate::{
+        agent::{
+            mod_library_flow_tests::{
+                connect_mock_mcp, final_reply, next_event, scripted_agent, turn_request,
+                LoopbackMcpFixture,
+            },
+            policy::PermissionMode,
+        },
+        history::History,
+        mcp::client::namespaced_tool_name,
+    };
+
+    let (_dir, engine, _) = setup();
+    let (agent, conversation, mut events, model) =
+        scripted_agent(engine, None, 1, |_, _| final_reply()).await;
+    History::new(agent.engine.db.clone())
+        .set_conversation_workspace(&conversation, Some(&["g".into()]))
+        .unwrap();
+    let job_id = json!({"type": "string", "description": "Job ID returned by AMM preparation."});
+    let job_schema = json!({
+        "type": "object",
+        "properties": {"jobId": job_id},
+        "required": ["jobId"],
+        "additionalProperties": false,
+    });
+    let archive = json!({
+        "type": "object",
+        "description": "Archive reference returned by job discovery or a staged write.",
+        "properties": {
+            "path": {"type": "string", "description": "Job-relative archive path."},
+            "name": {"type": "string", "description": "Original RPF basename."},
+        },
+        "required": ["path", "name"],
+    });
+    let entry = json!({"type": "string", "description": "Entry path inside the RPF archive."});
+    let source_path =
+        json!({"type": "string", "description": "Job input path for replacement bytes."});
+    let catalog: [_; 15] = [
+        (
+            "gta_rpf_prepare",
+            "Stage the full job, including uninstall rebuilds.",
+            job_schema.clone(),
+        ),
+        (
+            "gta_rpf_inspect_dlc",
+            "Read the staged DLC pack name from setup2.xml.",
+            job_schema.clone(),
+        ),
+        (
+            "gta_rpf_register_dlc",
+            "Register the staged DLC in dlclist.xml.",
+            job_schema.clone(),
+        ),
+        (
+            "gta_rpf_replace_gameconfig",
+            "Replace gameconfig.xml in the staged update archive.",
+            job_schema.clone(),
+        ),
+        (
+            "gta_rpf_build_vehicle_pack",
+            "Build a staged DLC from Legacy vehicle models.",
+            job_schema.clone(),
+        ),
+        (
+            "gta_rpf_build_ped_pack",
+            "Build a staged DLC from Legacy Ped models and metadata.",
+            job_schema.clone(),
+        ),
+        (
+            "gta_rpf_update_menyoo",
+            "Rebuild the staged Legacy Menyoo vehicle list.",
+            job_schema,
+        ),
+        (
+            "gta_rpf_status",
+            "Report the RPF backend and supported operations by edition.",
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        ),
+        (
+            "gta_rpf_describe_job",
+            "Discover manifest input references for a staged job.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "jobId": job_id,
+                    "offset": {"type": "integer", "minimum": 0, "description": "First input to return."},
+                },
+                "required": ["jobId"],
+            }),
+        ),
+        (
+            "gta_rpf_list_entries",
+            "List file paths and nested archives in a staged RPF.",
+            json!({
+                "type": "object",
+                "properties": {"jobId": job_id, "archive": archive},
+                "required": ["jobId", "archive"],
+            }),
+        ),
+        (
+            "gta_rpf_read_entry",
+            "Read one archive entry as Base64 or UTF-8.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "jobId": job_id, "archive": archive, "entry": entry,
+                    "encoding": {"enum": ["base64", "utf8"], "description": "Encoding of returned entry data."},
+                },
+                "required": ["jobId", "archive", "entry"],
+            }),
+        ),
+        (
+            "gta_rpf_write_entry",
+            "Replace an entry with job input bytes and return a staged archive copy.",
+            json!({
+                "type": "object",
+                "properties": {"jobId": job_id, "archive": archive, "entry": entry, "sourcePath": source_path},
+                "required": ["jobId", "archive", "entry", "sourcePath"],
+            }),
+        ),
+        (
+            "gta_rpf_add_entry",
+            "Add a new file to the root or a nested archive and return a staged archive copy.",
+            json!({
+                "type": "object",
+                "properties": {"jobId": job_id, "archive": archive, "entry": entry, "sourcePath": source_path},
+                "required": ["jobId", "archive", "entry", "sourcePath"],
+            }),
+        ),
+        (
+            "gta_rpf_delete_entry",
+            "Delete an existing file in the root or a nested archive and return a staged archive copy.",
+            json!({
+                "type": "object",
+                "properties": {"jobId": job_id, "archive": archive, "entry": entry},
+                "required": ["jobId", "archive", "entry"],
+            }),
+        ),
+        (
+            "gta_rpf_create_archive",
+            "Create a staged RPF archive from job inputs.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "jobId": job_id,
+                    "archiveName": {"type": "string", "description": "Basename of the new RPF archive."},
+                    "entries": {
+                        "type": "array",
+                        "description": "Files to add to the new RPF archive.",
+                        "items": {
+                            "type": "object",
+                            "properties": {"entry": entry, "sourcePath": source_path},
+                            "required": ["entry", "sourcePath"],
+                        },
+                    },
+                },
+                "required": ["jobId", "archiveName", "entries"],
+            }),
+        ),
+    ];
+    let remote_catalog = catalog
+        .iter()
+        .map(|(name, description, schema)| {
+            json!({"name": name, "description": description, "inputSchema": schema})
+        })
+        .collect();
+    let fixture = LoopbackMcpFixture::start(remote_catalog, |name, _| {
+        panic!("tool discovery unexpectedly called {name}")
+    })
+    .await;
+    let server_id = "gta_rpf_archive_fixture";
+    let (_client, _) = connect_mock_mcp(&agent, &fixture, server_id, "GTA RPF fixture").await;
+    agent
+        .start_turn(turn_request(
+            &conversation,
+            "Which tools can inspect, modify, or prepare staged RPF archives for this game?",
+            PermissionMode::RequestApproval,
+        ))
+        .unwrap();
+    assert_eq!(
+        next_event(&mut events, "done").await.payload["status"],
+        "done"
+    );
+    let requests = model.await.unwrap();
+    let tools = requests[0]["tools"].as_array().unwrap();
+    let native = tools
+        .iter()
+        .find(|tool| tool["function"]["name"] == "prepare_gta_rpf_archive_job")
+        .expect("standalone archive preparation must be available to the Agent");
+    assert_eq!(
+        native["function"]["parameters"]["required"],
+        json!(["game_id", "archive_path"])
+    );
+    assert_eq!(
+        native["function"]["parameters"]["additionalProperties"],
+        false
+    );
+    for (remote_name, remote_description, schema) in catalog {
+        let expected = namespaced_tool_name(server_id, remote_name);
+        let function = tools
+            .iter()
+            .map(|tool| &tool["function"])
+            .find(|function| function["name"] == expected)
+            .unwrap_or_else(|| panic!("selected-game turn is missing {remote_name}"));
+        let description = function["description"].as_str().unwrap();
+        assert!(
+            description.contains(remote_name),
+            "missing raw name {remote_name}"
+        );
+        assert!(
+            description.contains(remote_description),
+            "missing operation description for {remote_name}: {description}"
+        );
+        assert_eq!(function["parameters"], schema, "schema for {remote_name}");
+    }
+    fixture.finish().await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn gta_rpf_archive_tool_requires_the_selected_game_and_bound_mcp() {
+    use crate::{
+        history::History, mcp::client::namespaced_tool_name, sources::resolutions::ResolutionScope,
+    };
+
+    let (_dir, engine, game_root) = setup();
+    let server_id = bind_gta_rpf_adapter(
+        &engine,
+        include_str!("../../../packages/gta-adapters/gta5-enhanced/adapter.json"),
+    );
+    engine
+        .db
+        .conn()
+        .execute("UPDATE games SET platform='windows' WHERE id='g'", [])
+        .unwrap();
+    std::fs::write(game_root.join("GTA5_Enhanced.exe"), b"edition").unwrap();
+    let archive_name = "dlc.rpf";
+    let mut contents = b"7FPR".to_vec();
+    contents.extend(1u32.to_le_bytes());
+    contents.extend(1u32.to_le_bytes());
+    contents.extend(b"OPEN");
+    contents.extend([0; 17]);
+    std::fs::write(game_root.join(archive_name), &contents).unwrap();
+    let history = History::new(engine.db.clone());
+    let conversation = history.create_conversation("RPF", None).unwrap();
+    history
+        .set_conversation_workspace(&conversation.id, Some(&["g".into()]))
+        .unwrap();
+    let mut context = ToolContext {
+        engine,
+        cancel: CancellationToken::new(),
+        progress: None,
+        resolution_scope: ResolutionScope::Agent(conversation.id),
+    };
+    let args = json!({"game_id":"g", "archive_path":archive_name});
+    let describe = namespaced_tool_name(&server_id, "gta_rpf_describe_job");
+    let older_describe = describe.clone();
+    let old_tool = GtaArchiveJobTool {
+        tool_available: Arc::new(move |tool| tool == older_describe),
+    };
+    assert!(matches!(
+        old_tool.prepare(&context, &args).await,
+        Err(AppError::Denied(_))
+    ));
+    let supported = [
+        "gta_rpf_describe_job",
+        "gta_rpf_add_entry",
+        "gta_rpf_delete_entry",
+    ]
+    .map(|name| namespaced_tool_name(&server_id, name));
+    let tool = GtaArchiveJobTool {
+        tool_available: Arc::new(move |tool| supported.iter().any(|name| name == tool)),
+    };
+    assert!(tool
+        .prepare(
+            &context,
+            &json!({"game_id":"outside", "archive_path":archive_name})
+        )
+        .await
+        .is_err());
+    let prepared = tool.prepare(&context, &args).await.unwrap();
+    assert_eq!(prepared.effect, Effect::ManagerWrite);
+    assert!(prepared.plan.is_none());
+    assert!(matches!(
+        tool.execute(
+            &context,
+            json!({"game_id":"g", "archive_path":"other.rpf"}),
+            prepared
+        )
+        .await,
+        Err(AppError::Denied(_))
+    ));
+    let prepared = tool.prepare(&context, &args).await.unwrap();
+    let result = tool
+        .execute(&context, args.clone(), prepared)
+        .await
+        .unwrap();
+    assert_eq!(result["mcpTool"], describe);
+    assert_eq!(result["edition"], "enhanced");
+    assert_eq!(
+        result["archive"],
+        json!({"path":"inputs/archive", "name":archive_name})
+    );
+    let prepared = tool.prepare(&context, &args).await.unwrap();
+    context.resolution_scope = ResolutionScope::Mcp("external".into());
+    assert!(matches!(
+        tool.prepare(&context, &args).await,
+        Err(AppError::Denied(_))
+    ));
+    assert!(matches!(
+        tool.execute(&context, args, prepared).await,
+        Err(AppError::Denied(_))
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn gta_rpf_agent_rejects_unsupported_enhanced_jobs_before_tool_selection() {
+    let (_dir, engine, _) = setup();
+    bind_gta_rpf_adapter(
+        &engine,
+        include_str!("../../../packages/gta-adapters/gta5-enhanced/adapter.json"),
+    );
+    for args in [
+        json!({"game_id":"g","artifact_id":"artifact","kind":"vehicle"}),
+        json!({"game_id":"g","artifact_id":"artifact","kind":"ped"}),
+        json!({"game_id":"g","artifact_id":"artifact","kind":"dlc","options":{"menyoo":true}}),
+    ] {
+        let spec: GtaJobArgs = serde_json::from_value(args).unwrap();
+        spec.validate().unwrap();
+        assert_eq!(
+            gta_mcp_tool(&engine, &spec, &|_| panic!(
+                "unsupported job reached MCP lookup"
+            ))
+            .unwrap_err()
+            .presentation()
+            .key,
+            "gta.rpf.enhanced_unsupported"
+        );
+    }
+}

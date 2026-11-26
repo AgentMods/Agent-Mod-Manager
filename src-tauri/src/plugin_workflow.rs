@@ -1106,7 +1106,7 @@ fn register(
     tx.commit()?;
     drop(conn);
     if mcp_changed {
-        engine.notify_plugin_mcp_changed(slug);
+        engine.notify_plugin_mcp_changed();
     }
     Ok(())
 }
@@ -1147,7 +1147,7 @@ fn disable(engine: &FileEngine, slug: &str, target: &Path) -> AppResult<bool> {
     tx.commit()?;
     drop(conn);
     if mcp_changed {
-        engine.notify_plugin_mcp_changed(slug);
+        engine.notify_plugin_mcp_changed();
     }
     Ok(count != 0)
 }
@@ -1177,7 +1177,7 @@ fn reconcile_locked(engine: &FileEngine) -> AppResult<ReconcileReport> {
                     .conn()
                     .execute("DELETE FROM mcp_servers WHERE plugin_slug=?1", [&slug])?;
                 if removed != 0 {
-                    engine.notify_plugin_mcp_changed(&slug);
+                    engine.notify_plugin_mcp_changed();
                 }
                 report.issues.push(WorkflowIssue {
                     code: "ownership".into(),
@@ -1405,8 +1405,8 @@ pub fn set_enabled(
     let mcp_revoked = !enabled && revoke_plugin_servers(&tx, slug)?;
     tx.commit()?;
     drop(conn);
-    if mcp_revoked {
-        engine.notify_plugin_mcp_changed(slug);
+    if info.enabled != enabled || mcp_revoked {
+        engine.notify_plugin_mcp_changed();
     }
     Ok(plugins::PluginInfo { enabled, ..info })
 }

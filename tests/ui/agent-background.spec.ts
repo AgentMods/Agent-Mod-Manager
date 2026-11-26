@@ -6,6 +6,7 @@ test("replays a completed turn while Agent is in the background", async ({page})
 
   await installMockTauri(page, {holdAgentTurn: true});
   await page.goto("/");
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await page.getByRole("button", {name: "检查 Minecraft 模组", exact: true}).click();
 
   await page.getByRole("textbox", {name: "告诉 Agent 你想做什么"}).fill("检查 Minecraft 模组");
@@ -94,6 +95,7 @@ test("returning to a running turn shows its backend permission instead of the Fu
     };
   });
   await page.goto("/");
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await page.getByRole("button", {name: "检查 Minecraft 模组", exact: true}).click();
   const permission = page.getByRole("button", {name: "本轮权限策略", exact: true});
   await expect(permission).toContainText("完全信任");
@@ -126,6 +128,7 @@ test(`running legacy or external turn with ${recorded} permission does not inher
       ? {model: null, reasoning_effort: null, permission_mode: "full_trust"} : invoke(command, args);
   });
   await page.goto("/");
+  await page.getByRole("button", {name: /^Agent( 对话)?$/}).click();
   await page.getByRole("button", {name: "检查 Minecraft 模组", exact: true}).click();
   const permission = page.getByRole("button", {name: "本轮权限策略", exact: true});
   await expect(permission).toContainText("完全信任");

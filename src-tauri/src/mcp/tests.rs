@@ -2782,9 +2782,7 @@ async fn live_3dm_public_http_initializes_and_registers_tools() {
     let (_dir, servers, settings, _) = fixture();
     servers.seed_presets().unwrap();
     servers.set_enabled("glossmod_3dm", true).unwrap();
-    let mut config = servers.get("glossmod_3dm").unwrap();
-    config.bearer_secret_ref = Some("mcp.personal.3dm_key".into());
-    servers.update(&config).unwrap();
+    let config = servers.get("glossmod_3dm").unwrap();
 
     let registry = ToolRegistry::default();
     let connections = McpConnections::default();
@@ -2797,9 +2795,6 @@ async fn live_3dm_public_http_initializes_and_registers_tools() {
     for name in &info.tools {
         assert!(registry.get(name).is_ok(), "tool not registered: {name}");
     }
-    connections
-        .browse_reader(&servers, &info.server_id)
-        .expect("the connected stock 3DM catalogue must be available to desktop Browse");
     connections
         .disconnect(&registry, &servers, &info.server_id)
         .await

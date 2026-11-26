@@ -1,4 +1,5 @@
 import type { QueryClient } from "@tanstack/react-query";
+import { dashboardStatsKey } from "./dashboard-stats";
 import type { AgentEvent } from "./types";
 
 function record(value: unknown): Record<string, unknown> {
@@ -92,4 +93,5 @@ export function invalidateAgentModQueries(client: QueryClient, events: AgentEven
   }
   if (allLibraryGames) invalidate("mod-library");
   else for (const gameId of libraryGames) invalidate("mod-library", gameId);
+  if (allLibraryGames || libraryGames.size) invalidate(...dashboardStatsKey);
 }

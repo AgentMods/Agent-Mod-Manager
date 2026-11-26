@@ -20,16 +20,28 @@ struct World {
 }
 impl World {
     fn new() -> Self {
+        Self::for_edition(Edition::Legacy)
+    }
+    fn for_edition(edition: Edition) -> Self {
+        let (slug, manifest) = match edition {
+            Edition::Legacy => (
+                "gta5-legacy",
+                include_str!("../../../../packages/gta-adapters/gta5-legacy/adapter.json"),
+            ),
+            Edition::Enhanced => (
+                "gta5-enhanced",
+                include_str!("../../../../packages/gta-adapters/gta5-enhanced/adapter.json"),
+            ),
+        };
         let temp = tempfile::tempdir().unwrap();
         let p = AppPaths::new(temp.path().join("data")).unwrap();
         let e = FileEngine::new(Db::open(&p.db_file()).unwrap(), p);
         let root = temp.path().join("gta");
         fs::create_dir_all(root.join("update")).unwrap();
-        fs::write(root.join("GTA5.exe"), b"legacy marker").unwrap();
+        fs::write(root.join(edition.marker()), edition.marker().as_bytes()).unwrap();
         fs::write(root.join("update/update.rpf"), container("vanilla")).unwrap();
-        let a = include_str!("../../../../packages/gta-adapters/gta5-legacy/adapter.json");
-        e.db.conn().execute("INSERT INTO plugins(slug,name,game_name,version,source,install_path,adapter_json,created_at,updated_at) VALUES('gta5-legacy','test','Grand Theft Auto V','1.0.0','local','test',?1,'now','now')",[a]).unwrap();
-        let g = games::register_game(&e.db, &root, Some("gta5-legacy")).unwrap();
+        e.db.conn().execute("INSERT INTO plugins(slug,name,game_name,version,source,install_path,adapter_json,created_at,updated_at) VALUES(?1,'test','Grand Theft Auto V',json_extract(?2,'$.version'),'local','test',?2,'now','now')",params![slug, manifest]).unwrap();
+        let g = games::register_game(&e.db, &root, Some(slug)).unwrap();
         assert_eq!(g.platform, "windows");
         Self {
             _temp: temp,
@@ -519,4 +531,310 @@ fn gta_rpf_menyoo_restores_bytes_and_vendor_update_invalidates_job() {
     fs::write(original, container("vanilla")).unwrap();
     w.delete(&installed.install_id);
     assert_eq!(fs::read(p).unwrap(), baseline);
+}
+
+#[test]
+fn gta_rpf_enhanced_installs_and_uninstalls_gameconfig_and_inspected_dlc() {
+    let w = World::for_edition(Edition::Enhanced);
+    let root = Path::new(&w.g.root_path);
+    let baseline = root.join("update/update.rpf");
+    let marker = root.join("GTA5_Enhanced.exe");
+    let config = w.import("gameconfig.xml", b"<fwAllConfigs/>");
+    let dlc = w.import("dlc.rpf", &container("enhanced dlc source"));
+
+    for (artifact, mod_type) in [(&config, "rpf-gameconfig"), (&dlc, "rpf-dlc")] {
+        let matched = super::super::match_library_install(
+            &w.e,
+            &super::super::LibraryMatchRequest {
+                game_id: w.g.id.clone(),
+                library_entry_id: artifact.clone(),
+            },
+        )
+        .unwrap();
+        assert!(matched.candidates.iter().any(|candidate| {
+            candidate.mod_type == mod_type && candidate.status == "requiresGtaRpf"
+        }));
+    }
+
+    let config_job = w.prep(&config, "gameconfig", json!({})).unwrap();
+    let job_root = jobs(&w.e).unwrap();
+    let input = |id: &str| -> Value {
+        serde_json::from_slice(&fs::read(job_root.join(id).join("input.json")).unwrap()).unwrap()
+    };
+    assert_eq!(input(&config_job)["kind"], "enhanced");
+    assert_eq!(input(&config_job)["targets"][0]["id"], "update");
+    assert!(!w.p("update").exists());
+    w.publish(&config_job);
+    let preview = super::super::plan_library_install(
+        &w.e,
+        &serde_json::from_value(json!({
+            "gameId":w.g.id, "artifactId":config, "mode":"gtaRpf", "jobId":config_job
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    w.commit(&preview.plan);
+    assert_eq!(fs::read(w.p("update")).unwrap(), container("gameconfig"));
+    assert!(guard_foreign_plan(
+        &w.e,
+        &dummy_plan(FileOp::WriteText {
+            dst: marker.clone(),
+            content: "foreign write".into(),
+        })
+    )
+    .is_err());
+
+    let probe = w.prep(&dlc, "dlc", json!({})).unwrap();
+    assert_eq!(input(&probe)["kind"], "enhanced");
+    assert_eq!(input(&probe)["targets"], json!([]));
+    assert!(input(&probe)["inspectDlc"].is_object());
+    fs::write(
+        job_root.join(&probe).join("result.json"),
+        json!({"schemaVersion":1,"jobId":probe,"status":"inspected","packName":"enh_pack"})
+            .to_string(),
+    )
+    .unwrap();
+    let job = w
+        .prep(&dlc, "dlc", json!({"inspectJobId":probe, "menyoo":false}))
+        .unwrap();
+    assert_eq!(input(&job)["kind"], "enhanced");
+    assert!(input(&job).get("inspectDlc").is_none());
+    assert_eq!(input(&job)["targets"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        input(&job)["targets"][0]["contributions"][1]["packName"],
+        "enh_pack"
+    );
+    w.publish(&job);
+    let dlc_preview = plan_install(&w.e, &w.g.id, &dlc, &job, None, &w.c).unwrap();
+    w.commit(&dlc_preview.plan);
+    assert_eq!(
+        fs::read(w.p("update")).unwrap(),
+        container("gameconfig+enh_pack")
+    );
+    assert_eq!(
+        fs::read(w.p("dlc:enh_pack")).unwrap(),
+        container("enhanced dlc source")
+    );
+
+    let remove = w.remove(&preview.install_id).unwrap();
+    assert_eq!(input(&remove)["kind"], "enhanced");
+    w.publish(&remove);
+    let removal = plan_uninstall(&w.e, &w.g.id, &preview.install_id, &remove, &w.c).unwrap();
+    w.commit(&removal);
+    assert_eq!(fs::read(w.p("update")).unwrap(), container("enh_pack"));
+    w.delete(&dlc_preview.install_id);
+    assert!(!w.p("update").exists());
+    assert!(!w.p("dlc:enh_pack").exists());
+    assert!(!w.p("gmm").exists());
+    assert!(!w.p("menyoo").exists());
+    assert_eq!(fs::read(&baseline).unwrap(), container("vanilla"));
+    assert_eq!(fs::read(&marker).unwrap(), b"GTA5_Enhanced.exe");
+}
+
+#[test]
+fn gta_rpf_enhanced_rejects_unverified_jobs_and_ambiguous_markers() {
+    let w = World::for_edition(Edition::Enhanced);
+    let vehicle = w.import("car.yft", b"vehicle");
+    let matched = super::super::match_library_install(
+        &w.e,
+        &super::super::LibraryMatchRequest {
+            game_id: w.g.id.clone(),
+            library_entry_id: vehicle.clone(),
+        },
+    )
+    .unwrap();
+    assert!(matched.candidates.iter().any(|candidate| {
+        candidate.mod_type == "rpf-vehicle" && candidate.status == "unsupportedEdition"
+    }));
+    let ped = w.import("ped.ydd", b"ped");
+    let dlc = w.import("dlc.rpf", &container("unverified Menyoo contribution"));
+    for (artifact, kind, options) in [
+        (&vehicle, "vehicle", json!({})),
+        (&ped, "ped", json!({"modelName":"ped","sex":"Male"})),
+        (&dlc, "dlc", json!({"menyoo":true})),
+    ] {
+        assert_eq!(
+            w.prep(artifact, kind, options)
+                .unwrap_err()
+                .presentation()
+                .key,
+            "gta.rpf.enhanced_unsupported"
+        );
+    }
+    assert!(!jobs(&w.e).unwrap().exists());
+
+    let legacy_marker = Path::new(&w.g.root_path).join("GTA5.exe");
+    fs::write(&legacy_marker, b"another edition").unwrap();
+    assert!(matches!(
+        w.prep(&dlc, "dlc", json!({})),
+        Err(AppError::Conflict(_))
+    ));
+    fs::remove_file(legacy_marker).unwrap();
+    w.e.db
+        .conn()
+        .execute(
+            "UPDATE games SET steam_app_id='271590' WHERE id=?1",
+            [&w.g.id],
+        )
+        .unwrap();
+    assert!(matches!(
+        w.prep(&dlc, "dlc", json!({})),
+        Err(AppError::Conflict(_))
+    ));
+    assert!(!jobs(&w.e).unwrap().exists());
+}
+
+#[test]
+fn gta_rpf_enhanced_rejects_oversize_receipts_and_marker_drift_after_plan() {
+    let w = World::for_edition(Edition::Enhanced);
+    let config = w.import("gameconfig.xml", b"<fwAllConfigs/>");
+    let id = w.prep(&config, "gameconfig", json!({})).unwrap();
+    w.publish(&id);
+    let result_path = jobs(&w.e).unwrap().join(&id).join("result.json");
+    let valid_result = fs::read(&result_path).unwrap();
+    let mut result: Value = serde_json::from_slice(&valid_result).unwrap();
+    result["outputs"][0]["size"] = json!(4_u64 * 1024_u64.pow(3) + 1);
+    fs::write(&result_path, result.to_string()).unwrap();
+    assert!(matches!(
+        plan_install(&w.e, &w.g.id, &config, &id, None, &w.c),
+        Err(AppError::Invalid(reason)) if reason.contains("尺寸")
+    ));
+    assert!(!w.p("update").exists());
+
+    fs::write(&result_path, valid_result).unwrap();
+    let preview = plan_install(&w.e, &w.g.id, &config, &id, None, &w.c).unwrap();
+    w.e.approve_plan(&preview.plan.id).unwrap();
+    fs::write(
+        Path::new(&w.g.root_path).join("GTA5_Enhanced.exe"),
+        b"changed marker",
+    )
+    .unwrap();
+    assert!(matches!(
+        w.e.apply_file_ops(&preview.plan.id),
+        Err(AppError::Conflict(_))
+    ));
+    assert!(!w.p("update").exists());
+}
+
+#[test]
+fn gta_rpf_archive_job_snapshots_the_requested_path_for_both_editions() {
+    for (edition, wire_edition) in [(Edition::Legacy, "legacy"), (Edition::Enhanced, "enhanced")] {
+        let w = World::for_edition(edition);
+        let root = Path::new(&w.g.root_path);
+        let path = "mods/update/update.rpf";
+        let Err(AppError::NotFound(reason)) = prepare_archive_job(&w.e, &w.g.id, path, &[], &w.c)
+        else {
+            panic!("missing mods copy must be reported even when the original exists");
+        };
+        assert!(reason.contains(path));
+        let modified = container("existing mods copy");
+        fs::create_dir_all(root.join("mods/update")).unwrap();
+        fs::write(root.join(path), &modified).unwrap();
+        fs::write(root.join("mods/replacement.xml"), b"replacement").unwrap();
+        fs::write(root.join("mods/empty.txt"), b"").unwrap();
+        let result = serde_json::to_value(
+            prepare_archive_job(
+                &w.e,
+                &w.g.id,
+                r"mods\update\update.rpf",
+                &[r"mods\replacement.xml".into(), "mods/empty.txt".into()],
+                &w.c,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let job_id = result["jobId"].as_str().unwrap();
+        assert!(digest_ok(job_id, 32));
+        assert_eq!(result["gameId"], w.g.id);
+        assert_eq!(result["edition"], wire_edition);
+        assert_eq!(result["archivePath"], path);
+        assert_eq!(
+            result["archive"],
+            json!({"path":"inputs/archive", "name":"update.rpf"})
+        );
+        assert_eq!(
+            result["payloads"],
+            json!([
+                {"gamePath":"mods/replacement.xml", "sourcePath":"inputs/payload-0"},
+                {"gamePath":"mods/empty.txt", "sourcePath":"inputs/payload-1"}
+            ])
+        );
+        let job_dir = jobs(&w.e).unwrap().join(job_id);
+        let wire: Value =
+            serde_json::from_slice(&fs::read(job_dir.join("input.json")).unwrap()).unwrap();
+        let file_ref = |path: &str, data: &[u8]| {
+            assert_eq!(fs::read(job_dir.join(path)).unwrap(), data);
+            json!({"path":path,"sha256":hex::encode(Sha256::digest(data)),"size":data.len()})
+        };
+        assert_eq!(
+            wire,
+            json!({
+                "schemaVersion":1,"jobId":job_id,"kind":wire_edition,
+                "archiveInputs":[{"name":"update.rpf","source":file_ref("inputs/archive", &modified)}],
+                "payloadInputs":[file_ref("inputs/payload-0", b"replacement"),file_ref("inputs/payload-1", b"")]
+            })
+        );
+        assert_eq!(fs::read(root.join(path)).unwrap(), modified);
+        assert_eq!(
+            fs::read(root.join("update/update.rpf")).unwrap(),
+            container("vanilla")
+        );
+        assert!(
+            matches!(frozen(&w.e, job_id), Err(AppError::Invalid(reason)) if reason == "未知本机 RPF 任务")
+        );
+        assert!(matches!(
+            plan_install(&w.e, &w.g.id, "artifact", job_id, None, &w.c),
+            Err(AppError::Invalid(reason)) if reason == "未知本机 RPF 任务"
+        ));
+        assert!(matches!(
+            plan_uninstall(&w.e, &w.g.id, "install", job_id, &w.c),
+            Err(AppError::Invalid(reason)) if reason == "未知本机 RPF 任务"
+        ));
+    }
+}
+
+#[test]
+fn gta_rpf_archive_job_rejects_unsafe_paths_and_payload_sources() {
+    let w = World::new();
+    let root = Path::new(&w.g.root_path);
+    let path = "update/update.rpf";
+    fs::write(root.join(".env"), b"private").unwrap();
+    fs::hard_link(root.join(path), root.join("alias.rpf")).unwrap();
+    assert!(prepare_archive_job(&w.e, &w.g.id, path, &[], &w.c).is_err());
+    fs::remove_file(root.join("alias.rpf")).unwrap();
+    for candidate in [
+        "../update/update.rpf",
+        r"C:\game\update.rpf",
+        "update/update.rpf/common/data/dlclist.xml",
+        "update.rpf:stream",
+    ] {
+        assert!(
+            prepare_archive_job(&w.e, &w.g.id, candidate, &[], &w.c).is_err(),
+            "{candidate}"
+        );
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.join("update"), root.join("linked")).unwrap();
+    #[cfg(unix)]
+    assert!(prepare_archive_job(&w.e, &w.g.id, "linked/update.rpf", &[], &w.c).is_err());
+    fs::write(root.join("bad.rpf"), [0; 64]).unwrap();
+    assert!(prepare_archive_job(&w.e, &w.g.id, "bad.rpf", &[], &w.c).is_err());
+    for payload in [
+        ".env",
+        "../outside.xml",
+        r"C:\game\payload.xml",
+        "update",
+        "missing.xml",
+    ] {
+        assert!(
+            prepare_archive_job(&w.e, &w.g.id, path, &[payload.into()], &w.c).is_err(),
+            "{payload}"
+        );
+    }
+    w.c.cancel();
+    assert!(matches!(
+        prepare_archive_job(&w.e, &w.g.id, path, &[], &w.c),
+        Err(AppError::Cancelled)
+    ));
+    assert!(!jobs(&w.e).unwrap().exists());
 }

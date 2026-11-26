@@ -32,6 +32,9 @@ pub fn register(registry: &ToolRegistry) -> AppResult<()> {
             tool_available: Arc::new(registry.tool_available()),
         }))?;
     }
+    registry.register(Arc::new(GtaArchiveJobTool {
+        tool_available: Arc::new(registry.tool_available()),
+    }))?;
     registry.register(Arc::new(CheckModrinthDependencies))?;
     registry.register(Arc::new(VerifyInstallFiles))
 }
@@ -220,23 +223,17 @@ impl GtaJobArgs {
     }
 }
 
-// Use the manager's complete package-scoped identity, never a similarly named custom service.
-fn gta_mcp_tool(
-    engine: &crate::transaction::FileEngine,
-    game: &str,
-    available: &dyn Fn(&str) -> bool,
-) -> AppResult<String> {
-    let game = crate::games::get_game(&engine.db, game)?;
-    let slug = game
-        .adapter_slug
+fn gta_adapter_slug(game: &crate::games::Game) -> AppResult<&str> {
+    game.adapter_slug
         .as_deref()
-        .filter(|s| matches!(*s, "gta5-legacy" | "gta5-enhanced"))
-        .ok_or_else(|| AppError::Denied("游戏尚未绑定 GTA V 适配包".into()))?;
-    if slug == "gta5-enhanced" {
-        return Err(AppError::Unsupported(
-            "增强版 RPF 尚未独立验证，无需为此启动工具。".into(),
-        ));
-    }
+        .filter(|slug| matches!(*slug, "gta5-legacy" | "gta5-enhanced"))
+        .ok_or_else(|| AppError::Denied("游戏尚未绑定 GTA V 适配包".into()))
+}
+
+fn gta_mcp_config(
+    engine: &crate::transaction::FileEngine,
+    slug: &str,
+) -> AppResult<crate::mcp::ServerConfig> {
     let id = format!("plugin_{slug}_rpf");
     let config = crate::mcp::McpServers::new(engine.db.clone()).get(&id)?;
     if config.plugin_slug.as_deref() != Some(slug) || !config.enabled {
@@ -244,13 +241,146 @@ fn gta_mcp_tool(
             "请先从本游戏适配包的工具设置启用 RPF MCP".into(),
         ));
     }
-    let tool = crate::mcp::client::namespaced_tool_name(&id, "gta_rpf_prepare");
-    if !available(&tool) {
-        return Err(AppError::Denied(
-            "RPF MCP 尚未连接或未提供 gta_rpf_prepare；请在本适配包的工具设置中启动并确认。".into(),
-        ));
+    Ok(config)
+}
+
+// Use the manager's complete package-scoped identity, never a similarly named custom service.
+fn gta_mcp_tool(
+    engine: &crate::transaction::FileEngine,
+    spec: &GtaJobArgs,
+    available: &dyn Fn(&str) -> bool,
+) -> AppResult<String> {
+    let game = crate::games::get_game(&engine.db, &spec.game_id)?;
+    let slug = gta_adapter_slug(&game)?;
+    install::gta_rpf::validate_job_options(slug, spec.kind.as_deref(), spec.options.as_ref())?;
+    let id = gta_mcp_config(engine, slug)?.id;
+    let preferred = match spec.kind.as_deref() {
+        Some("dlc")
+            if spec.options.as_ref().is_some_and(|options| {
+                options["packName"].is_string() || options["inspectJobId"].is_string()
+            }) =>
+        {
+            Some("gta_rpf_register_dlc")
+        }
+        Some("dlc") => Some("gta_rpf_inspect_dlc"),
+        Some("gameconfig") => Some("gta_rpf_replace_gameconfig"),
+        Some("vehicle") => Some("gta_rpf_build_vehicle_pack"),
+        Some("ped") => Some("gta_rpf_build_ped_pack"),
+        _ => None,
+    };
+    preferred
+        .into_iter()
+        .chain(["gta_rpf_prepare"])
+        .map(|name| crate::mcp::client::namespaced_tool_name(&id, name))
+        .find(|tool| available(tool))
+        .ok_or_else(|| {
+            AppError::Denied(
+                "RPF MCP 尚未连接或缺少此任务所需工具，请在本适配包的工具设置中确认。".into(),
+            )
+        })
+}
+
+struct GtaArchiveJobTool {
+    tool_available: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GtaArchiveJobArgs {
+    game_id: String,
+    archive_path: String,
+    #[serde(default)]
+    source_paths: Vec<String>,
+}
+
+impl GtaArchiveJobTool {
+    fn describe_tool(&self, context: &ToolContext, game_id: &str) -> AppResult<String> {
+        use crate::sources::resolutions::ResolutionScope;
+        if context.cancel.is_cancelled() {
+            return Err(AppError::Cancelled);
+        }
+        if !matches!(&context.resolution_scope, ResolutionScope::Agent(_)) {
+            return Err(AppError::Denied("GTA RPF 任务仅面向本地桌面 Agent".into()));
+        }
+        super::workspace::tool_target(context, Some(game_id))?;
+        let game = crate::games::get_game(&context.engine.db, game_id)?;
+        let config = gta_mcp_config(&context.engine, gta_adapter_slug(&game)?)?;
+        let tool = |name| crate::mcp::client::namespaced_tool_name(&config.id, name);
+        // The add/delete release also introduced the standalone manifest.
+        if !config.is_gta_rpf_launcher()
+            || [
+                "gta_rpf_describe_job",
+                "gta_rpf_add_entry",
+                "gta_rpf_delete_entry",
+            ]
+            .into_iter()
+            .any(|name| !(self.tool_available)(&tool(name)))
+        {
+            return Err(AppError::Denied(
+                "请连接支持独立归档任务的本游戏适配包 RPF MCP".into(),
+            ));
+        }
+        Ok(tool("gta_rpf_describe_job"))
     }
-    Ok(tool)
+}
+
+#[async_trait::async_trait]
+impl AgentTool for GtaArchiveJobTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "prepare_gta_rpf_archive_job".into(),
+            description: "将已绑定 GTA 游戏的指定现有 RPF 和可选载荷复制到私有任务目录。支持直接读取、列出、添加、替换和删除归档条目。archive_path 是游戏目录内的相对 .rpf 文件路径，例如 mods/update/update.rpf；common/data/dlclist.xml 或 x64/example.rpf/file.xml 在 MCP 的 entry 参数中另传。只使用指定路径，缺失时返回错误。仅在用户指定或授权同一游戏目录下的载荷文件时传 source_paths。返回 jobId、archive、各载荷的 sourcePath 和用于查询任务的完整 mcpTool。独立任务只生成暂存副本，不能用于正式安装或卸载。".into(),
+            parameters: json!({"type":"object","properties":{
+                "game_id":{"type":"string","minLength":1},
+                "archive_path":{"type":"string","minLength":1,"maxLength":512,"description":"游戏相对 .rpf 文件路径，保留实际名称。"},
+                "source_paths":{"type":"array","maxItems":install::gta_rpf::MAX_ARCHIVE_PAYLOADS,
+                    "items":{"type":"string","minLength":1,"maxLength":512},"description":"用户授权的同一游戏目录相对载荷文件，用于添加或替换条目。"}
+            },"required":["game_id","archive_path"],"additionalProperties":false}),
+            effect: Effect::ManagerWrite,
+        }
+    }
+
+    async fn prepare(&self, context: &ToolContext, args: &Value) -> AppResult<PreparedTool> {
+        let spec: GtaArchiveJobArgs = serde_json::from_value(args.clone())?;
+        self.describe_tool(context, &spec.game_id)?;
+        Ok(PreparedTool {
+            preview: args.clone(),
+            effect: Effect::ManagerWrite,
+            plan: None,
+        })
+    }
+
+    async fn execute(
+        &self,
+        context: &ToolContext,
+        args: Value,
+        prepared: PreparedTool,
+    ) -> AppResult<Value> {
+        if prepared.effect != Effect::ManagerWrite
+            || prepared.plan.is_some()
+            || prepared.preview != args
+        {
+            return Err(AppError::Denied("GTA 暂存任务与批准的选项不一致".into()));
+        }
+        let spec: GtaArchiveJobArgs = serde_json::from_value(args)?;
+        let tool = self.describe_tool(context, &spec.game_id)?;
+        let engine = context.engine.clone();
+        let cancel = context.cancel.clone();
+        tokio::task::spawn_blocking(move || {
+            let job = install::gta_rpf::prepare_archive_job(
+                &engine,
+                &spec.game_id,
+                &spec.archive_path,
+                &spec.source_paths,
+                &cancel,
+            )?;
+            let mut result = json!(job);
+            result["mcpTool"] = json!(tool);
+            Ok(result)
+        })
+        .await
+        .map_err(|error| AppError::Other(error.to_string()))?
+    }
 }
 
 struct InstallTool {
@@ -266,7 +396,7 @@ fn text<'a>(args: &'a Value, key: &str) -> AppResult<&'a str> {
 fn library_install_commit_error(error: AppError) -> AppError {
     match error {
         AppError::Conflict(reason) => AppError::Conflict(format!(
-            "{reason}\n涉及已安装文件时，先用 list_installs 和 inspect_install 核对归属与建议操作。预览过期时，重新匹配并提交新安装计划。保留冲突文件，勿用 plan_file_ops 或 trash_paths 绕过。"
+            "{reason}\n请保留冲突文件。用 match_mod_install 重新检查原包，若有 activeInstallId，用 inspect_install 核对现有安装。预览过期时，重新匹配并提交新安装计划。"
         )),
         error => error,
     }
@@ -318,7 +448,7 @@ impl AgentTool for InstallTool {
             "list_mod_library" => ("列出当前已登记游戏可用的 Mods 原包、artifactId、来源和作者项目页。game_id 是本机登记 ID。gameId 为空的条目下载时按游戏名分类。", json!({"game_id":{"type":"string"}}),vec!["game_id"],Effect::Read),
             "match_mod_install" => ("只读核对目标游戏的本地适配规则、已校验原包、README、归档清单及 FOMOD。若 activeInstallId 非空，先用当前 game_id 和该安装 ID 调用 inspect_install，按报告核对已有部署。根据候选状态选择安装方法，需要用户选择时询问具体选项。手工映射时从 archiveEntries 取实际文件的完整成员路径（含包内目录）。archiveEntriesTruncated 为 true 时先补查所需成员，勿猜文件名或用外层 ZIP 文件名代替。", json!({"game_id":{"type":"string"},"artifact_id":{"type":"string"}}),vec!["game_id","artifact_id"],Effect::Read),
             "prepare_gta_rpf_job" => (
-                "仅供已绑定 GTA 适配包的本地游戏。先核对玩家已启动该包的 RPF MCP；按批准的选项，把校验过的输入复制到独立任务目录，不修改游戏、不启动 MCP。安装提供 artifact_id 和 kind；卸载仅提供 install_id。将返回的 jobId 交给返回的 mcpTool，再用 install_library_mod 的 gtaRpf 模式或 uninstall_mod 的 rpf_job_id 提交。",
+                "仅供已绑定 GTA 适配包的本地游戏。先确认该包的 RPF MCP 已连接；按批准的选项，把校验过的输入复制到独立任务目录，不修改游戏、不启动 MCP。安装提供 artifact_id 和 kind；卸载仅提供 install_id。Enhanced 仅支持 gameconfig 和独立 DLC，menyoo 保持关闭。使用返回的完整 mcpTool 名称调用该工具，只传入 {jobId}。DLC 探测成功后，用 options.inspectJobId 准备正式任务。正式安装或卸载任务成功后，再用 install_library_mod 的 gtaRpf 模式或 uninstall_mod 的 rpf_job_id 提交。",
                 json!({"game_id":{"type":"string"},"artifact_id":{"type":"string"},"install_id":{"type":"string"},
                     "kind":{"type":"string","enum":["dlc","gameconfig","vehicle","ped"]}, "options":{"type":"object","additionalProperties":false,
                     "properties":{"inspectJobId":{"type":"string","pattern":"^[a-f0-9]{32}$","description":"DLC 暂存探测任务返回的 jobId；与 packName 互斥。"},"sourceDir":{"type":"string"},"packName":{"type":"string"},"modelName":{"type":"string"},
@@ -418,7 +548,7 @@ impl AgentTool for InstallTool {
                 "prepare_gta_rpf_job" => {
                     let spec: GtaJobArgs = serde_json::from_value(args.clone())?;
                     spec.validate()?;
-                    gta_mcp_tool(&engine, &spec.game_id, &*available)?;
+                    gta_mcp_tool(&engine, &spec, &*available)?;
                     (args.clone(), None)
                 }
                 "forget_uninstalled_mod" => {
@@ -543,7 +673,7 @@ impl AgentTool for InstallTool {
                     }
                     let spec: GtaJobArgs = serde_json::from_value(args)?;
                     spec.validate()?;
-                    let tool = gta_mcp_tool(&engine, &spec.game_id, &*available)?;
+                    let tool = gta_mcp_tool(&engine, &spec, &*available)?;
                     let job = install::gta_rpf::prepare_job(&engine, &spec.game_id, spec.artifact_id.as_deref(), spec.install_id.as_deref(), spec.kind.as_deref(), spec.options.as_ref(), &cancel)?;
                     let mut receipt = json!(job);
                     receipt["mcpTool"] = json!(tool);

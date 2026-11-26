@@ -39,8 +39,10 @@ fn protected(e: &FileEngine, except: Option<&str>) -> AppResult<Protection> {
                     .files
                     .insert(super::super::path_key(&destination(root, key)?));
             }
-            for p in ["GTA5.exe", "update/update.rpf"] {
-                claims.files.insert(super::super::path_key(&root.join(p)));
+            for path in [binding.edition()?.marker(), "update/update.rpf"] {
+                claims
+                    .files
+                    .insert(super::super::path_key(&root.join(path)));
             }
         }
     }

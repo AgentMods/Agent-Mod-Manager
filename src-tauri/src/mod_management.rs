@@ -31,13 +31,27 @@ fn inactive(status: &str) -> bool {
     )
 }
 
+pub(crate) fn install_is_visible(status: &str, removed: bool) -> bool {
+    !removed || !(inactive(status) || status == "planned")
+}
+
 // After a journal restore, the active install and its original archive belong
 // in management again, even after a later ordinary uninstall.
+pub(crate) fn restorable_archive_owner(state: &str) -> String {
+    format!("EXISTS (
+        SELECT 1 FROM removed_mod_items record JOIN installs ON installs.id=record.item_id AND installs.game_id=record.game_id
+        WHERE record.kind='install' AND record.game_id=archive.game_id AND ({state}) IN ('enabled','installed','partially_restored')
+        AND ({ARTIFACT_ID})=archive.item_id)")
+}
+
 pub(crate) fn restore_membership(conn: &Connection) -> AppResult<()> {
-    conn.execute(&format!("DELETE FROM removed_mod_items AS archive WHERE archive.kind='archive' AND EXISTS (
-        SELECT 1 FROM removed_mod_items record JOIN installs i ON i.id=record.item_id AND i.game_id=record.game_id
-        WHERE record.kind='install' AND record.game_id=archive.game_id AND i.status IN ('enabled','installed','partially_restored')
-        AND ({ARTIFACT_ID})=archive.item_id)"), [])?;
+    conn.execute(
+        &format!(
+            "DELETE FROM removed_mod_items AS archive WHERE archive.kind='archive' AND {}",
+            restorable_archive_owner("installs.status")
+        ),
+        [],
+    )?;
     conn.execute("DELETE FROM removed_mod_items AS record WHERE kind='install' AND EXISTS (
         SELECT 1 FROM installs i WHERE i.id=record.item_id AND i.game_id=record.game_id AND i.status IN ('enabled','installed','partially_restored'))", [])?;
     Ok(())
@@ -57,7 +71,7 @@ pub(crate) fn visible_installs(
     // Restoring an uninstall can make a formerly removed record own game files again.
     Ok(records
         .into_iter()
-        .filter(|r| !removed.contains(&r.id) || !(inactive(&r.status) || r.status == "planned"))
+        .filter(|r| install_is_visible(&r.status, removed.contains(&r.id)))
         .collect())
 }
 

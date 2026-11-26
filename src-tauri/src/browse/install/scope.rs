@@ -1,3 +1,5 @@
+mod tool_definitions;
+
 use super::{stock, three_dm, verified_install, GameScope, WorkKey};
 use crate::{
     agent::{
@@ -35,23 +37,26 @@ impl InstallScope {
         }
     }
 
-    pub(crate) fn instruction(&self) -> String {
-        let identity = json!({
+    pub(crate) fn identity(&self) -> Value {
+        json!({
             "gameId": self.key.game_id,
             "providerGameId": self.key.provider_game_id,
             "sourceId": self.key.source_id,
+            "catalogSourceId": self.key.catalog_id(),
             "projectId": self.key.origin_project(),
-        });
+        })
+    }
+
+    pub(crate) fn instruction(&self) -> String {
+        let identity = self.identity();
         let workflow = if self.key.source_id == "glossmod_http" {
             "用官方 Mod 客栈 list_work_files 查询此 work_id，核对附件、版本与 entitlement；只使用官方 get_work_file_download 下载本作品的附件。"
         } else if self.key.source_id == "glossmod_3dm" {
-            "优先用原厂 3DM MCP get-mod-detail 核对作品资源；只使用返回的会话 resolution_id 调用 download_mod，不传 URL。若不能验证官方直链，提示用户在原作品页选择文件并手动导入。"
-        } else if stock::permits(&self.key.source_id, "download_file")
-            || self.key.source_id == "thunderstore"
-        {
-            "用原厂来源的附件或版本列表确认版本，对同一作品调用 download_file 或 download_version。只收到可信下载回执后，用 file_received_mod 归档模型收到的精确文件名；若无法验证、账号拒绝或只能从网站手动下载，明确停止并提示用户到原作品页选择并手动导入。"
+            "用原厂 3DM MCP get-mod-detail 查询作品，id 取 projectId 的整数值。用返回的 download.resolution_id 调用 download_mod。若不能验证官方直链，提示用户在原作品页选择文件并手动导入。"
+        } else if stock::download_tool(&self.key.source_id).is_some() {
+            "已有可信下载回执时，用 file_received_mod 归档回执中的精确文件名；省略 gameName、modName 和 projectPage。否则用原厂附件或版本列表确认版本，对同一作品调用 download_file 或 download_version。若无法验证、账号拒绝或只能从网站手动下载，明确停止并提示用户到原作品页选择并手动导入。下载工具直接返回 artifactId 时，使用该已归档原包。"
         } else {
-            "用 resolve_mod 解析这个原生来源和作品；需要时用 list_mod_versions 或 ask_user 确认版本。用 download_mod 消费该会话签发的 resolution_id。"
+            "用 resolve_mod 解析这个作品，source_id 取 catalogSourceId；需要时用 list_mod_versions 或 ask_user 确认版本。用 download_mod 消费该会话签发的 resolution_id。"
         };
         format!("用户从浏览卡片发起了本机安装。下列 JSON 由原生浏览结果生成，不来自翻译、作品文案或模型推断：{identity}\n只处理这一个来源作品和登记游戏，不要搜索替代品、打开任意 URL 或安装其他依赖。{workflow}\n可先用 list_mod_library 检查已有的本作品归档。用 match_mod_install 检查已归档原包，再用 install_library_mod 审批原生安装计划。兼容性、版本、映射或用户意图不明确时用 ask_user；如果无法完成就停下说明，不根据下载成功或模型文本宣称已安装。明确停止于一个经验证的安装事务。")
     }
@@ -77,9 +82,7 @@ impl InstallScope {
             | "install_library_mod"
             | "inspect_install" => kind.is_none(),
             "file_received_mod" => {
-                kind.is_none()
-                    && (stock::permits(&self.key.source_id, "download_file")
-                        || self.key.source_id == "thunderstore")
+                kind.is_none() && stock::download_tool(&self.key.source_id).is_some()
             }
             "list_mod_versions" | "resolve_mod" | "download_mod" | "retry_mod_library_download" => {
                 self.key.catalog_id().is_some() && kind.is_none()
@@ -103,7 +106,15 @@ impl InstallScope {
         let native = crate::artifacts::for_id(db, id)?
             .and_then(|record| record.origin())
             .is_some_and(|origin| self.matches_origin(&origin));
-        Ok(native || self.stock_matches(db, id, None)?)
+        if native || self.stock_matches(db, id, None)? {
+            return Ok(true);
+        }
+        // A previous attempt may have committed its local archive before the
+        // dispatcher could link it to the work. Recover only exact receipt bytes.
+        if let Some(receipt) = self.stock_receipt(db)? {
+            return self.record_stock_archive(db, id, &receipt);
+        }
+        Ok(false)
     }
 
     fn stock_matches(&self, db: &Db, id: &str, hash: Option<&str>) -> AppResult<bool> {
@@ -116,12 +127,97 @@ impl InstallScope {
         )?)
     }
 
-    fn pending_receipt(&self) -> AppResult<stock::StockReceipt> {
-        self.receipt
+    fn stock_receipt(&self, db: &Db) -> AppResult<Option<stock::StockReceipt>> {
+        let Some(remote) = stock::download_tool(&self.key.source_id) else {
+            return Ok(None);
+        };
+        if let Some(receipt) = self
+            .receipt
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
-            .ok_or_else(boundary)
+        {
+            return Ok(Some(receipt));
+        }
+        // Only the exact stock tool identity can establish a persisted receipt.
+        // Read the latest attempt once, so a failed later download cannot fall
+        // back to an earlier file or version.
+        let namespaced = crate::mcp::client::namespaced_tool_name(&self.key.source_id, remote);
+        let connection = db.conn();
+        let mut stmt = connection.prepare(
+            "SELECT t.arguments_json, t.result_json, t.status
+             FROM browse_install_tasks b JOIN tool_calls t ON t.conversation_id=b.conversation_id
+             WHERE b.game_id=?1 AND b.source_id=?2 AND b.provider_game_id=?3
+               AND CASE WHEN b.source_id='nexusmods' AND instr(b.project_id,'/')=0
+                        THEN b.provider_game_id || '/' || b.project_id ELSE b.project_id END=?4
+               AND t.name=?5
+             ORDER BY t.rowid DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![
+            self.key.game_id,
+            self.key.source_id,
+            self.key.provider_game_id,
+            self.key.origin_project().as_ref(),
+            namespaced,
+        ])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        if row.get::<_, String>(2)? != "done" {
+            return Ok(None);
+        }
+        let raw_args = row.get::<_, String>(0)?;
+        let Some(raw_result) = row.get::<_, Option<String>>(1)? else {
+            return Ok(None);
+        };
+        let Ok(args) = serde_json::from_str::<Value>(&raw_args) else {
+            return Ok(None);
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&raw_result) else {
+            return Ok(None);
+        };
+        Ok(stock::StockReceipt::from_saved(&self.key, &args, &value))
+    }
+
+    fn pending_receipt(&self, db: &Db) -> AppResult<stock::StockReceipt> {
+        self.stock_receipt(db)?.ok_or_else(boundary)
+    }
+
+    fn record_stock_archive(
+        &self,
+        db: &Db,
+        id: &str,
+        receipt: &stock::StockReceipt,
+    ) -> AppResult<bool> {
+        if !id.strip_prefix("received-").is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }) {
+            return Ok(false);
+        }
+        let changed = db.conn().execute(
+            "INSERT INTO browse_install_downloads(task_id,artifact_id,file_id,sha256)
+             SELECT b.id,l.id,?3,l.sha256 FROM mod_library_entries l
+             JOIN browse_install_tasks b ON b.id=?1 AND b.game_id=l.game_id
+             WHERE l.id=?2 AND l.sha256=?4 AND l.filename=?5 AND l.size=?6
+               AND l.state='ready' AND l.source_id='local'
+               AND b.game_id=?7 AND b.source_id=?8 AND b.project_id=?9 AND b.provider_game_id=?10
+             ON CONFLICT(task_id,artifact_id) DO UPDATE SET file_id=excluded.file_id
+               WHERE browse_install_downloads.sha256=excluded.sha256
+                 AND browse_install_downloads.file_id=excluded.file_id",
+            params![
+                self.id,
+                id,
+                receipt.file_id,
+                receipt.sha256,
+                receipt.filename,
+                receipt.size,
+                self.key.game_id,
+                self.key.source_id,
+                self.key.project_id,
+                self.key.provider_game_id
+            ],
+        )?;
+        Ok(changed == 1)
     }
 
     pub(crate) fn arguments(
@@ -145,7 +241,12 @@ impl InstallScope {
         let game = json!(self.key.game_id);
         match name {
             "resolve_mod" | "list_mod_versions" => {
-                bind(&mut args, "source_id", json!(self.key.catalog_id()))?;
+                let catalog = json!(self.key.catalog_id());
+                if args["source_id"] == self.key.source_id {
+                    args["source_id"] = catalog;
+                } else {
+                    bind(&mut args, "source_id", catalog)?;
+                }
                 bind(&mut args, "project_id", json!(self.key.origin_project()))?;
                 bind(&mut args, "game_id", json!(self.key.provider_game_id))?;
             }
@@ -180,12 +281,26 @@ impl InstallScope {
                 }
             }
             "file_received_mod" => {
-                let receipt = self.pending_receipt()?;
-                bind(&mut args, "filename", json!(receipt.filename))?;
-                bind(&mut args, "gameId", game)?;
-                if args.as_object().is_none_or(|obj| obj.len() != 2) {
+                let receipt = self.pending_receipt(db)?;
+                let fields = args.as_object().ok_or_else(boundary)?;
+                if fields.keys().any(|field| {
+                    !matches!(
+                        field.as_str(),
+                        "filename" | "gameId" | "gameName" | "modName" | "projectPage"
+                    )
+                }) || fields.get("gameName").is_some_and(|name| {
+                    !name.is_null()
+                        && !name.as_str().is_some_and(|name| {
+                            crate::mod_library::game_key(name)
+                                == crate::mod_library::game_key(&self.game.name)
+                        })
+                }) {
                     return Err(boundary());
                 }
+                bind(&mut args, "filename", json!(receipt.filename))?;
+                bind(&mut args, "gameId", game)?;
+                // Keep native classification and a stable receipt identity across retries.
+                args = receipt.import_args(&self.key);
             }
             "ask_user" => {}
             _ => {
@@ -268,7 +383,7 @@ impl InstallScope {
                 if prepared.effect != Effect::UncatalogedDownload
                     || prepared.plan.is_some()
                     || !self
-                        .pending_receipt()?
+                        .pending_receipt(db)?
                         .matches_preview(&self.key.game_id, view) =>
             {
                 return Err(boundary());
@@ -338,8 +453,7 @@ impl InstallScope {
                 if stock::downloading(remote) {
                     let receipt =
                         stock::transfer_receipt(&self.key, args, &value, context, registry).await?;
-                    let payload = json!({"status":"saved", "filename": receipt.filename, "sha256":receipt.sha256,"size":receipt.size,
-                        "fileId":receipt.file_id,"gameId":self.key.game_id});
+                    let payload = receipt.saved(&self.key);
                     *self.receipt.lock().unwrap_or_else(|e| e.into_inner()) = Some(receipt);
                     return Ok(payload);
                 }
@@ -356,7 +470,8 @@ impl InstallScope {
             }
         }
         if name == "file_received_mod" {
-            let receipt = self.pending_receipt()?;
+            self.check_game(db)?;
+            let receipt = self.pending_receipt(db)?;
             let id = value["artifactId"].as_str().ok_or_else(boundary)?;
             if value["gameId"] != self.key.game_id
                 || value["filename"] != receipt.filename
@@ -365,24 +480,22 @@ impl InstallScope {
             {
                 return Err(boundary());
             }
-            let conn = db.conn();
-            let changed = conn.execute(
-                "INSERT INTO browse_install_downloads(task_id,artifact_id,file_id,sha256)
-                  SELECT ?1,id,?3,sha256 FROM mod_library_entries
-                  WHERE id=?2 AND game_id=?4 AND sha256=?5 AND state='ready'
-                    ON CONFLICT(task_id,artifact_id) DO NOTHING",
-                params![
-                    self.id,
-                    id,
-                    receipt.file_id,
-                    self.key.game_id,
-                    receipt.sha256
-                ],
-            )?;
-            if changed != 1 {
+            if !self.record_stock_archive(db, id, &receipt)? {
                 return Err(boundary());
             }
             *self.receipt.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        if name == "list_mod_library" {
+            let entries = value.as_array().ok_or_else(boundary)?;
+            let mut matching = Vec::new();
+            for entry in entries {
+                if let Some(id) = entry["artifactId"].as_str() {
+                    if self.artifact_matches(db, id)? {
+                        matching.push(entry.clone());
+                    }
+                }
+            }
+            return Ok(Value::Array(matching));
         }
         Ok(value)
     }

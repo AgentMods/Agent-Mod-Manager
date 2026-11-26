@@ -17,6 +17,9 @@ type McpFixture = {
   plugin_slug?: string;
 };
 
+type McpToolDetailFixture = {name: string; description: string};
+type McpConnectionFixture = {tools: string[]; toolDetails?: McpToolDetailFixture[]};
+
 const httpConfig: McpFixture = {
   id: "fixture-http",
   name: "Remote HTTP",
@@ -249,18 +252,19 @@ test("credential status read failures are shown in the credentials dialog", asyn
 });
 
 // Stateful stand-in for the MCP lifecycle commands. Every call is recorded for exact assertions.
-async function openLifecycle(page: Page, configs: McpFixture[], {failConnect, failConnectId, holdConnect = false, remembered = [], localRequested = false, localRunning = false, active = []}: {
+async function openLifecycle(page: Page, configs: McpFixture[], {failConnect, failConnectId, holdConnect = false, remembered = [], localRequested = false, localRunning = false, active = [], connectionFixtures = {}}: {
   failConnect?: string; failConnectId?: string; holdConnect?: boolean; remembered?: string[]; localRequested?: boolean; localRunning?: boolean; active?: string[];
+  connectionFixtures?: Record<string, McpConnectionFixture>;
 } = {}) {
   await installMockTauri(page);
   await page.goto("/");
-  await page.evaluate(({configs, failConnect, failConnectId, holdConnect, remembered, localRequested, localRunning, active}) => {
+  await page.evaluate(({configs, failConnect, failConnectId, holdConnect, remembered, localRequested, localRunning, active, connectionFixtures}) => {
     const internals = (window as any).__TAURI_INTERNALS__;
     const invoke = internals.invoke.bind(internals);
     const state = {
       configs: structuredClone(configs), remembered, localRequested, localRunning, failConnect, failConnectId,
       finishConnect: undefined as (() => void) | undefined,
-      active: [...active] as string[], calls: [] as Array<{command: string; args: any}>,
+      active: [...active] as string[], connectionFixtures, calls: [] as Array<{command: string; args: any}>,
     };
     (window as any).__MCP__ = state;
     internals.invoke = async (command: string, args: any, ...rest: unknown[]) => {
@@ -271,7 +275,10 @@ async function openLifecycle(page: Page, configs: McpFixture[], {failConnect, fa
       if (command === "mcp_server_stop") { state.localRequested = false; state.localRunning = false; return; }
       if (command === "mcp_list") return structuredClone(state.configs);
       if (command === "mcp_startup_requests") return [...state.remembered];
-      if (command === "mcp_connections") return state.active.map((serverId) => ({serverId, tools: ["fixture_search", "fixture_read"]}));
+      if (command === "mcp_connections") return state.active.map((serverId) => ({
+        serverId,
+        ...structuredClone(state.connectionFixtures[serverId] ?? {tools: ["fixture_search", "fixture_read"]}),
+      }));
       if (command === "mcp_update") { state.configs = state.configs.map((item) => item.id === args.config.id ? args.config : item); return null; }
       if (command === "mcp_create") { state.configs.push(args.config); return null; }
       if (command === "mcp_remove") { state.configs = state.configs.filter((item) => item.id !== args.id); return null; }
@@ -284,7 +291,7 @@ async function openLifecycle(page: Page, configs: McpFixture[], {failConnect, fa
       if (command === "mcp_disconnect") { state.remembered = state.remembered.filter((id) => id !== args.id); state.active = state.active.filter((id) => id !== args.id); return null; }
       return invoke(command, args, ...rest);
     };
-  }, {configs, failConnect, failConnectId, holdConnect, remembered, localRequested, localRunning, active});
+  }, {configs, failConnect, failConnectId, holdConnect, remembered, localRequested, localRunning, active, connectionFixtures});
   await page.getByRole("button", {name: "设置", exact: true}).click();
   await page.getByRole("tab", {name: "工具", exact: true}).click();
 }
@@ -298,6 +305,106 @@ const lifecycleCalls = (page: Page) => page.evaluate(() => (window as any).__MCP
 
 const mcpWriteCalls = (page: Page) => page.evaluate(() => (window as any).__MCP__.calls
   .filter((call: any) => ["mcp_create", "mcp_update"].includes(call.command)));
+
+test("running MCP tool details are searchable, scoped to their connection, and keyboard accessible", async ({page}) => {
+  const catalog = {...httpConfig, id: "fixture-catalog", name: "Catalog MCP"};
+  const inventory = {...stdioConfig, id: "fixture-inventory", name: "Inventory MCP"};
+  const catalogTools: McpToolDetailFixture[] = [
+    {name: "vendor.catalog.search_entries", description: "Search catalog records by their complete name."},
+    {name: "vendor.catalog.read_entry", description: "Read one catalog record and its metadata."},
+  ];
+  const inventoryTools: McpToolDetailFixture[] = [
+    {name: "vendor.inventory.lookup_mods", description: "Find installed mods in the inventory."},
+  ];
+  await openLifecycle(page, [catalog, inventory], {
+    active: [catalog.id, inventory.id],
+    connectionFixtures: {
+      [catalog.id]: {
+        tools: ["catalog_7a91__search_f4e2", "catalog_7a91__read_8c3d"],
+        toolDetails: catalogTools,
+      },
+      [inventory.id]: {
+        tools: ["inventory_1d6b__lookup_a905"],
+        toolDetails: inventoryTools,
+      },
+    },
+  });
+
+  const catalogTrigger = page.getByRole("button", {name: "查看 Catalog MCP 的工具", exact: true});
+  await catalogTrigger.focus();
+  await page.keyboard.press("Enter");
+  const catalogDialog = page.getByRole("dialog", {name: "Catalog MCP 的工具", exact: true});
+  await expect(catalogDialog).toBeVisible();
+  for (const tool of catalogTools) {
+    await expect(catalogDialog.getByText(tool.name, {exact: true})).toBeVisible();
+    await expect(catalogDialog.getByText(tool.description, {exact: true})).toBeVisible();
+  }
+  await expect(catalogDialog.getByText("catalog_7a91__search_f4e2", {exact: true})).toHaveCount(0);
+  await expect(catalogDialog.getByText("catalog_7a91__read_8c3d", {exact: true})).toHaveCount(0);
+  const search = catalogDialog.getByRole("searchbox", {name: "搜索工具名称", exact: true});
+  await search.fill("search_entries");
+  await expect(catalogDialog.getByText(catalogTools[0].name, {exact: true})).toBeVisible();
+  await expect(catalogDialog.getByText(catalogTools[1].name, {exact: true})).toHaveCount(0);
+  await search.fill("no_matching_tool");
+  await expect(catalogDialog.getByRole("status")).toHaveText("没有匹配结果");
+
+  await page.keyboard.press("Escape");
+  await expect(catalogDialog).toBeHidden();
+  await expect(catalogTrigger).toBeFocused();
+
+  const inventoryTrigger = page.getByRole("button", {name: "查看 Inventory MCP 的工具", exact: true});
+  await inventoryTrigger.click();
+  const inventoryDialog = page.getByRole("dialog", {name: "Inventory MCP 的工具", exact: true});
+  await expect(inventoryDialog).toBeVisible();
+  await expect(inventoryDialog.getByRole("searchbox", {name: "搜索工具名称", exact: true})).toHaveValue("");
+  await expect(inventoryDialog.getByText(inventoryTools[0].name, {exact: true})).toBeVisible();
+  await expect(inventoryDialog.getByText(inventoryTools[0].description, {exact: true})).toBeVisible();
+  await expect(inventoryDialog.getByText(catalogTools[0].name, {exact: true})).toHaveCount(0);
+});
+
+test("tool dialogs fall back to legacy names and show an empty state for empty connections", async ({page}) => {
+  const legacy = {...httpConfig, id: "fixture-legacy-tools", name: "Legacy MCP"};
+  const empty = {...stdioConfig, id: "fixture-empty-tools", name: "Empty MCP"};
+  const legacyTool = "legacy_51be__find_mods_88da";
+  await openLifecycle(page, [legacy, empty], {
+    active: [legacy.id, empty.id],
+    connectionFixtures: {
+      [legacy.id]: {tools: [legacyTool]},
+      [empty.id]: {tools: [], toolDetails: []},
+    },
+  });
+
+  await page.getByRole("button", {name: "查看 Legacy MCP 的工具", exact: true}).click();
+  const legacyDialog = page.getByRole("dialog", {name: "Legacy MCP 的工具", exact: true});
+  await expect(legacyDialog.getByText(legacyTool, {exact: true})).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(legacyDialog).toBeHidden();
+
+  await page.getByRole("button", {name: "查看 Empty MCP 的工具", exact: true}).click();
+  const emptyDialog = page.getByRole("dialog", {name: "Empty MCP 的工具", exact: true});
+  await expect(emptyDialog).toBeVisible();
+  await expect(emptyDialog.getByRole("status")).toHaveText("此连接没有提供工具。");
+  await expect(emptyDialog.getByText(legacyTool, {exact: true})).toHaveCount(0);
+});
+
+test("the running local MCP connection exposes its own tool details", async ({page}) => {
+  await openLifecycle(page, [], {
+    active: ["amm_local"],
+    localRequested: true,
+    localRunning: true,
+    connectionFixtures: {
+      amm_local: {
+        tools: ["amm_local_19ac__list_games_0c21"],
+        toolDetails: [{name: "agent_mod_manager.list_games", description: "List registered games."}],
+      },
+    },
+  });
+
+  await page.getByRole("button", {name: "查看 Agent Mod Manager 的工具", exact: true}).click();
+  const dialog = page.getByRole("dialog", {name: "Agent Mod Manager 的工具", exact: true});
+  await expect(dialog.getByText("agent_mod_manager.list_games", {exact: true})).toBeVisible();
+  await expect(dialog.getByText("List registered games.", {exact: true})).toBeVisible();
+});
 
 test("plugin details and draft validation list declared MCP services", async ({ page }) => {
   await installMockTauri(page);

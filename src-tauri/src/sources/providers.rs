@@ -9,7 +9,7 @@ pub(super) mod dependency_graph;
 #[path = "nexus_search.rs"]
 mod nexus_search;
 #[path = "three_dm.rs"]
-mod three_dm;
+pub(super) mod three_dm;
 
 // Primary references (read-only operations only):
 // https://docs.modrinth.com/api/operations/searchprojects/

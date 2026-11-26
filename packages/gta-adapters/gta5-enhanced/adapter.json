@@ -1,9 +1,10 @@
 {
   "schemaVersion": 1,
   "slug": "gta5-enhanced",
-  "name": "GTA V Enhanced 单机适配包",
-  "gameName": "Grand Theft Auto V Enhanced",
-  "version": "1.0.0",
+  "name": "GTA5 增强版 单机适配包",
+  "gameName": "GTA5增强版",
+  "version": "1.1.0",
+  "coverUrl": "https://cdn.cloudflare.steamstatic.com/steam/apps/3240220/header.jpg",
   "platforms": [
     "windows"
   ],
@@ -25,11 +26,7 @@
       "transport": "stdio",
       "command": "uvx",
       "args": [
-        "--offline",
-        "--no-index",
-        "--from",
-        "./tools/gta-rpf-mcp/dist/gta_rpf_mcp-1.0.0-py3-none-any.whl",
-        "gta-rpf-mcp"
+        "gta-rpf-mcp@latest"
       ]
     }
   ],
@@ -178,28 +175,28 @@
       "layout": "manual",
       "sourcePrefix": null,
       "requiredFiles": [],
-      "notes": "当前版本无 Enhanced RPF 写入验证，停止。只允许经过验证的版本专属 RPF 暂存任务；不可生成直接文件映射。"
+      "notes": "通过本版 RPF 任务替换暂存 update.rpf 中的 gameconfig.xml，完成后重新打开核对。"
     },
     {
       "modType": "rpf-dlc",
       "layout": "manual",
       "sourcePrefix": null,
       "requiredFiles": [],
-      "notes": "当前版本无 Enhanced RPF 写入验证，停止。只允许经过验证的版本专属 RPF 暂存任务；不可生成直接文件映射。"
+      "notes": "读取 setup2.xml/nameHash，再在暂存 update.rpf 登记该 DLC。Enhanced 不生成 Menyoo 列表。"
     },
     {
       "modType": "rpf-vehicle",
       "layout": "manual",
       "sourcePrefix": null,
       "requiredFiles": [],
-      "notes": "当前版本无 Enhanced RPF 写入验证，停止。只允许经过验证的版本专属 RPF 暂存任务；不可生成直接文件映射。"
+      "notes": "Enhanced 的散装车辆模板尚未验证，停止此项操作。"
     },
     {
       "modType": "rpf-ped",
       "layout": "manual",
       "sourcePrefix": null,
       "requiredFiles": [],
-      "notes": "当前版本无 Enhanced RPF 写入验证，停止。只允许经过验证的版本专属 RPF 暂存任务；不可生成直接文件映射。"
+      "notes": "Enhanced 的行人模板尚未验证，停止此项操作。"
     }
   ],
   "loadOrder": {
@@ -215,7 +212,7 @@
   ],
   "sources": [
     {
-      "title": "Steam · Grand Theft Auto V Enhanced",
+      "title": "Steam · Grand Theft Auto V Enhanced（3240220）",
       "url": "https://store.steampowered.com/app/3240220/",
       "checkedAt": "2026-11-25"
     },

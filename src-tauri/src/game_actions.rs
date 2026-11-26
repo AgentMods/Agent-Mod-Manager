@@ -229,6 +229,8 @@ fn commit_game_adapter_binding(
     // have been checked against the approval. No binding input is taken from args.
     let updated = games::rebind_game(&tx, game, &selected, current.requested_name())?;
     tx.commit()?;
+    drop(conn);
+    engine.notify_plugin_mcp_changed();
     Ok(updated)
 }
 
@@ -338,6 +340,10 @@ pub(crate) fn remove_game_adapter(engine: &FileEngine, id: &str) -> AppResult<Ga
         games::get_game_from(&tx, id)?
     };
     tx.commit()?;
+    drop(conn);
+    if changed != 0 {
+        engine.notify_plugin_mcp_changed();
+    }
     Ok(updated)
 }
 

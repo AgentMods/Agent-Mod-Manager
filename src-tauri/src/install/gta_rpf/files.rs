@@ -41,17 +41,22 @@ pub(super) fn blob_path(e: &FileEngine, b: &Blob) -> AppResult<PathBuf> {
 }
 /// No path-based copy of files controlled by the service: hold the source
 /// handle, reject links/hardlinks, bound length and hash the bytes being copied.
-fn consume(
+fn consume(path: &Path, c: &CancellationToken, writer: impl Write, cap: u64) -> AppResult<Blob> {
+    consume_bounded(path, c, writer, 1..=cap)
+}
+
+pub(super) fn consume_bounded(
     path: &Path,
     c: &CancellationToken,
     mut writer: impl Write,
-    cap: u64,
+    sizes: std::ops::RangeInclusive<u64>,
 ) -> AppResult<Blob> {
     let mut r = safe_fs::open_regular(path)?;
     safe_fs::verify_regular_at(&r, path)?;
-    let n = r.metadata()?.len();
-    if n == 0 || n > cap {
-        return Err(invalid("RPF 文件为空或超过大小限制"));
+    let before = r.metadata()?;
+    let n = before.len();
+    if !sizes.contains(&n) {
+        return Err(invalid("RPF 文件大小超出允许范围"));
     }
     let mut hash = Sha256::new();
     let mut left = n;
@@ -64,7 +69,9 @@ fn consume(
         hash.update(&block[..chunk]);
         left -= chunk as u64;
     }
-    if r.read(&mut block[..1])? != 0 || r.metadata()?.len() != n {
+    let grew = r.read(&mut block[..1])? != 0;
+    let after = r.metadata()?;
+    if grew || after.len() != n || before.modified()? != after.modified()? {
         return Err(conflict("RPF 文件复制期间发生变化"));
     }
     safe_fs::verify_regular_at(&r, path)?;
@@ -146,7 +153,10 @@ pub(super) fn check_shape(path: &Path, id: &str) -> AppResult<()> {
         let count = u32::from_le_bytes(h[4..8].try_into().unwrap()) as u64;
         let names = u32::from_le_bytes(h[8..12].try_into().unwrap()) as u64;
         if h[..4] != *b"7FPR" || count == 0 || 16 + count * 16 + names > size {
-            return Err(invalid("文件不是具有完整目录表的 Legacy RPF7"));
+            return Err(AppError::Presented(NativeMessage::new(
+                "gta.rpf.invalid_rpf7",
+                [],
+            )));
         }
     }
     Ok(())

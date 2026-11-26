@@ -126,6 +126,7 @@ test.describe("游戏卡片操作", () => {
     // The onboarding fixture registers "Fixture Game" with zero installed Mods.
     await installMockTauri(page, {onboarding: true, withExternalAdapter: true});
     await page.goto("/");
+    await page.getByRole("button", {name: "开始设置", exact: true}).click();
     await page.getByRole("button", {name: "下一步", exact: true}).click();
     await expect(page.getByRole("heading", {name: "配置 AI 模型服务", exact: true})).toBeVisible();
     await page.getByRole("button", {name: "跳过配置", exact: true}).click();

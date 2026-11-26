@@ -1,8 +1,10 @@
 //! Desktop-only discovery through explicitly authorized, current stock MCP connections.
 mod aggregation;
+mod catalog_cache;
 pub(crate) mod enrich;
 pub(crate) mod install;
 mod links;
+mod lookup;
 mod matching;
 mod providers;
 
@@ -14,6 +16,7 @@ use crate::mcp::McpServers;
 use crate::mcp_connections::McpConnections;
 use crate::settings::Settings;
 use aggregation::{Candidate, Fetch, Issue, IssueCode, MatchedPair, MixedPage, Mixer, Pair};
+use catalog_cache::{CatalogCache, PageKey};
 use enrich::{BrowseTag, EnrichedItem, EnrichmentInput, ModType};
 use futures_util::{stream, StreamExt};
 use matching::{GameChoice, GameScope, Match};
@@ -25,7 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tauri::{Runtime, State, WebviewWindow};
 use tauri_plugin_opener::OpenerExt;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{watch, OnceCell, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 const MAX_WINDOWS: usize = 8;
@@ -34,8 +37,6 @@ const MAX_SOURCES: usize = 7;
 const MAX_QUERY: usize = 240;
 const PAGE_SIZE: usize = 24;
 const MAX_PAGES: usize = 12;
-const MAX_GAME_PAGES: usize = 3;
-const MAX_GAME_OPTIONS: usize = 36;
 const AUTH_TTL: Duration = Duration::from_secs(30 * 60);
 const SEARCH_TTL: Duration = Duration::from_secs(12 * 60);
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(8);
@@ -93,6 +94,7 @@ fn source_status(availability: ProviderAvailability) -> SourceStatus {
 }
 
 struct Grant {
+    catalogs: Arc<CatalogCache>,
     id: String,
     db: Db,
     expires: Instant,
@@ -179,134 +181,43 @@ impl Context {
         McpServers::new(self.db().clone())
     }
 
-    async fn lookup(&self, pair: Pair, cancel: &CancellationToken) -> (Pair, Lookup) {
-        let request = cancel.child_token();
-        let _cancel_on_drop = request.clone().drop_guard();
-        let result =
-            tokio::time::timeout(Duration::from_secs(16), self.lookup_inner(&pair, &request))
-                .await
-                .unwrap_or(Lookup::Failed(IssueCode::QueryFailed));
-        (pair, result)
-    }
-
-    async fn lookup_inner(&self, pair: &Pair, cancel: &CancellationToken) -> Lookup {
-        let servers = self.servers();
-        let db = self.db();
-        let Some(registered) = pair.game.current_game(db) else {
-            return Lookup::Failed(IssueCode::PermissionDenied);
-        };
-        if !current(&self.connections, &servers, pair.source, &pair.connection) {
-            return Lookup::Failed(IssueCode::PermissionDenied);
-        }
-        let Ok(remembered) = matching::remembered(db, &pair.game, pair.source) else {
-            return Lookup::Failed(IssueCode::QueryFailed);
-        };
-        let Some(local_name) = links::public_text(&pair.game.name, MAX_QUERY) else {
-            return Lookup::Failed(IssueCode::NoGameMatch);
-        };
-        // Nexus find_games accepts display names. Its returned domainName is the
-        // identifier used later by find_mods, including for translated library names.
-        let catalog_title = (pair.source == "nexusmods")
-            .then(|| registered.steam_catalog_title())
-            .flatten()
-            .filter(|title| !title.contains(['/', '\\']) && title.len() <= MAX_QUERY)
-            .and_then(|title| links::public_text(&title, MAX_QUERY))
-            .filter(|title| !title.eq_ignore_ascii_case(&local_name));
-        let mut query = catalog_title.as_deref().unwrap_or(&local_name);
-        let mut fallback = catalog_title.as_ref().map(|_| local_name.as_str());
-        let mut options = Vec::new();
-        let mut next: Option<String> = None;
-        let mut visited = BTreeSet::new();
-        let mut complete = false;
-        for _ in 0..MAX_GAME_PAGES {
-            let call = cancel.child_token();
-            let _cancel_on_drop = call.clone().drop_guard();
-            let listed = tokio::time::timeout(
-                PROVIDER_TIMEOUT,
-                providers::list_games(
-                    &self.connections,
-                    &servers,
-                    pair.source,
-                    &pair.connection,
-                    query,
-                    next.as_deref(),
-                    &call,
-                ),
-            )
-            .await;
-            let page = match listed {
-                Ok(Ok(page)) => page,
-                Ok(Err(error)) => return Lookup::Failed(classify(&error)),
-                Err(_) => return Lookup::Failed(IssueCode::QueryFailed),
-            };
-            let remaining = MAX_GAME_OPTIONS - options.len();
-            let overflow = page.games.len() > remaining;
-            options.extend(page.games.into_iter().take(remaining));
-            next = page.next;
-            if overflow {
-                break;
-            }
-            if let Some(cursor) = &next {
-                if !aggregation::valid_cursor(cursor) || !visited.insert(cursor.clone()) {
-                    break;
-                }
-            } else if let Some(local_query) = fallback.take().filter(|_| options.is_empty()) {
-                query = local_query;
-                visited.clear();
-            } else {
-                complete = true;
-                break;
-            }
-            if options.len() == MAX_GAME_OPTIONS {
-                break;
-            }
-        }
-        if !current(&self.connections, &servers, pair.source, &pair.connection) {
-            return Lookup::Failed(IssueCode::PermissionDenied);
-        }
-        let decision = matching::decide(
-            &pair.game,
-            catalog_title.as_deref(),
-            options,
-            remembered.as_deref(),
-            complete,
-        );
-        if !complete && matches!(decision, Match::Missing) {
-            Lookup::Failed(IssueCode::LimitReached)
-        } else {
-            Lookup::Resolved(decision)
-        }
-    }
-
-    async fn fetch(
-        &self,
-        request: Fetch,
-        cancel: &CancellationToken,
-    ) -> Result<ProviderPage, IssueCode> {
+    async fn fetch(&self, request: Fetch, search: &Search) -> Result<ProviderPage, IssueCode> {
         let servers = self.servers();
         let pair = &request.matched.pair;
-        if !pair.game.current(self.db())
+        if search.cancel.is_cancelled()
+            || !pair.game.current(self.db())
             || !current(&self.connections, &servers, pair.source, &pair.connection)
         {
             return Err(IssueCode::PermissionDenied);
         }
-        let call = cancel.child_token();
+        let call = search.cancel.child_token();
         let _cancel_on_drop = call.clone().drop_guard();
+        let key = PageKey::new(
+            pair.source,
+            Some(&request.matched.provider_game_id),
+            &request.query,
+            request.cursor.as_deref(),
+        );
         let data = tokio::time::timeout(
             PROVIDER_TIMEOUT,
-            providers::search(
-                &self.connections,
-                &servers,
-                pair.source,
-                &pair.connection,
-                Some(&request.matched.provider_game_id),
-                &request.query,
-                request.cursor.as_deref(),
-                &call,
+            search.catalogs.mods.read(
+                key,
+                providers::search(
+                    &self.connections,
+                    &servers,
+                    pair.source,
+                    &pair.connection,
+                    Some(&request.matched.provider_game_id),
+                    &request.query,
+                    request.cursor.as_deref(),
+                    &call,
+                ),
             ),
         )
         .await;
-        if !current(&self.connections, &servers, pair.source, &pair.connection) {
+        if search.cancel.is_cancelled()
+            || !current(&self.connections, &servers, pair.source, &pair.connection)
+        {
             return Err(IssueCode::PermissionDenied);
         }
         match data {
@@ -338,6 +249,7 @@ fn current(
 }
 
 struct Search {
+    catalogs: Arc<CatalogCache>,
     id: String,
     db: Db,
     expires: Instant,
@@ -366,7 +278,10 @@ struct Progress {
     translations_added: bool,
 }
 
+type PageCategories = OnceCell<Vec<Option<ModType>>>;
+
 struct Frame {
+    categories: Arc<PageCategories>,
     ids: Vec<String>,
     has_next: bool,
     translated: Option<(String, Vec<EnrichedItem>)>,
@@ -375,16 +290,20 @@ struct Frame {
 
 impl Progress {
     async fn initialize(ctx: &Context, search: &Search) -> (Self, Vec<GameChoice>) {
-        let mut results = stream::iter(
-            search
-                .pairs
-                .iter()
-                .cloned()
-                .map(|pair| ctx.lookup(pair, &search.cancel)),
-        )
-        .buffer_unordered(8)
-        .collect::<Vec<_>>()
-        .await;
+        let hints: BTreeMap<_, lookup::GameHints> = search
+            .pairs
+            .iter()
+            .map(|pair| (pair.game.id.as_str(), lookup::GameHints::default()))
+            .collect();
+        let lookups: Vec<_> = search
+            .pairs
+            .iter()
+            .map(|pair| lookup::lookup(ctx, pair, &hints[pair.game.id.as_str()], search))
+            .collect();
+        let mut results = stream::iter(lookups)
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
         // Network completion order must not affect which feed gets the first slot.
         results.sort_by(|a, b| (&a.0.game.id, a.0.source).cmp(&(&b.0.game.id, b.0.source)));
         let mut progress = Self::default();
@@ -577,7 +496,7 @@ fn start_page(ctx: Context, search: Arc<Search>, page: usize, progress: Option<P
                 .retain(|matched| available.contains(matched.pair.source));
             let mixed = progress
                 .mix_page(page, search.translations.clone(), |request| {
-                    ctx.fetch(request, &search.cancel)
+                    ctx.fetch(request, &search)
                 })
                 .await;
             let pending = !progress.translations_added && !progress.matched.is_empty();
@@ -607,6 +526,7 @@ fn start_page(ctx: Context, search: Arc<Search>, page: usize, progress: Option<P
             }
             inner.issues.clone_from(&progress.mixer.issues);
             inner.pages.push(Frame {
+                categories: Arc::default(),
                 ids: mixed.ids,
                 has_next,
                 translated: None,
@@ -640,36 +560,53 @@ fn start_enrichment(
     search: Arc<Search>,
     page: usize,
     original: Vec<(Candidate, bool)>,
+    categories: Arc<PageCategories>,
     locale: String,
 ) {
     tauri::async_runtime::spawn(async move {
         let work = async {
             let _permit = search.enrichment_slots.acquire().await.ok()?;
-            let current_sources = available_sources(&ctx.connections, &ctx.servers(), &search);
-            let mut presentation = original
-                .iter()
-                .map(|(row, _)| enrich::fallback_item(entry(row)))
-                .collect::<Vec<_>>();
-            let visible = original
-                .iter()
-                .enumerate()
-                .filter(|(_, (row, visible))| *visible && current_sources.contains(row.source))
-                .map(|(index, (row, _))| (index, entry(row)))
-                .collect::<Vec<_>>();
-            let input = visible.iter().map(|(_, input)| *input).collect::<Vec<_>>();
+            let visible_items = || {
+                let sources = available_sources(&ctx.connections, &ctx.servers(), &search);
+                original
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (row, visible))| *visible && sources.contains(row.source))
+                    .map(|(index, (row, _))| (index, entry(row)))
+                    .collect::<Vec<_>>()
+            };
+            // Publish types before translating. The same search page keeps its
+            // classifications when the display language changes.
+            categories
+                .get_or_init(|| async {
+                    let visible = visible_items();
+                    let inputs: Vec<_> = visible.iter().map(|(_, input)| *input).collect();
+                    let classified =
+                        enrich::classify_items(&ctx.settings, &inputs, &search.cancel).await;
+                    let mut types = vec![None; original.len()];
+                    for ((index, _), category) in visible.into_iter().zip(classified) {
+                        types[index] = category;
+                    }
+                    types
+                })
+                .await;
+            let visible = visible_items();
+            let input: Vec<_> = visible.iter().map(|(_, input)| *input).collect();
             let enriched =
                 enrich::enrich_items(&ctx.settings, &input, &locale, &search.cancel).await;
-            if enriched.len() == visible.len() {
-                for ((index, _), text) in visible.into_iter().zip(enriched) {
-                    presentation[index] = text;
-                }
+            let mut presentation: Vec<_> = original
+                .iter()
+                .map(|(row, _)| enrich::fallback_item(entry(row)))
+                .collect();
+            for ((index, _), text) in visible.into_iter().zip(enriched) {
+                presentation[index] = text;
             }
             Some(presentation)
         };
         let output = tokio::select! {
             _ = search.cancel.cancelled() => return,
             _ = tokio::time::sleep_until(search.expires.into()) => return,
-            result = tokio::time::timeout(MODEL_TIMEOUT, work) => result.ok().flatten(),
+            result = work => result,
         };
         let effective = crate::app_locale::effective(ctx.db());
         let mut inner = lock(&search.inner);
@@ -954,6 +891,7 @@ pub(crate) fn browse_authorize<R: Runtime>(
         search.cancel.cancel();
     }
     slot.grant = Some(Grant {
+        catalogs: Arc::default(),
         id: authorization_id.clone(),
         db: db.clone(),
         expires: Instant::now() + AUTH_TTL,
@@ -1033,6 +971,7 @@ pub(crate) fn browse_start_search<R: Runtime>(
         }
     }
     let search = Arc::new(Search {
+        catalogs: grant.catalogs.clone(),
         id: search_id.clone(),
         db: ctx.db().clone(),
         expires: grant.expires.min(Instant::now() + SEARCH_TTL),
@@ -1109,10 +1048,13 @@ pub(crate) fn browse_get_page<R: Runtime>(
             let original = &inner.items[id];
             let visible = available.contains(original.source);
             if visible {
-                let text = localized
+                let mut text = localized
                     .and_then(|(_, text)| text.get(index))
                     .cloned()
                     .unwrap_or_else(|| enrich::fallback_item(entry(original)));
+                if let Some(category) = frame.categories.get().and_then(|types| types[index]) {
+                    text.type_key = category;
+                }
                 result
                     .items
                     .push(BrowseItem::display(id.clone(), original, text));
@@ -1125,9 +1067,10 @@ pub(crate) fn browse_get_page<R: Runtime>(
         result.has_next = frame.has_next;
         result.is_enriching = localized.is_none() && !result.items.is_empty();
         if result.is_enriching && frame.enriching.as_deref() != Some(&locale) {
+            let categories = frame.categories.clone();
             inner.pages[page].enriching = Some(locale.clone());
             drop(inner);
-            start_enrichment(ctx, search, page, originals, locale);
+            start_enrichment(ctx, search, page, originals, categories, locale);
         }
         return Ok(result);
     }

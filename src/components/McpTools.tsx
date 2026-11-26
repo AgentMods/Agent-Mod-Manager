@@ -2,12 +2,12 @@ import { tr } from "@/lib/i18n";
 import { mcpSiteLogo } from "@/assets/mcp-sites";
 import { startMcpConnection, type McpConfig } from "@/lib/mcp-connection";
 import { Fragment, useEffect, useId, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { useMutation, useMutationState, useQuery, useQueryClient } from "@tanstack/react-query";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ChevronDownIcon, CircleCheckIcon, CircleHelpIcon, CircleIcon, ExternalLinkIcon, KeyRoundIcon, PencilIcon, PlayIcon, PlusIcon, SaveIcon, ServerIcon, SquareIcon, Trash2Icon } from "lucide-react";
 import { api, backendAvailable, errorText, useBackendQuery } from "@/lib/api";
 import { useUI } from "@/lib/store";
+import { McpToolListButton, type McpConnection } from "@/components/McpToolList";
 import { Badge, EmptyState, ErrorState, IconButton, Modal, PathText } from "@/components/ui";
 import { Button } from "@/components/ui/button";
 import { Card, CardAction, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -22,7 +22,6 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/lib/utils";
 
 type LocalStatus = { startupRequested: boolean; running: boolean; stopping: boolean; endpoint: string | null; tokenRef: string; activeCalls: number };
-type Connection = { serverId: string; tools: string[] };
 
 type ConnectionAction = "enable" | "disable";
 type ConnectionChange = { action: ConnectionAction; targets: McpConfig[]; singleSuccessMessage?: string };
@@ -162,7 +161,7 @@ export function McpTools({ onboarding = false, onBusyChange }: { onboarding?: bo
   const configs = useBackendQuery<McpConfig[]>(["mcp", "configs"], "mcp_list");
   const externalConfigs = configs.data?.filter((config) => config.id !== "amm_local") ?? [];
   const startup = useBackendQuery<string[]>(["mcp", "startup"], "mcp_startup_requests");
-  const connections = useBackendQuery<Connection[]>(["mcp", "connections"], "mcp_connections");
+  const connections = useBackendQuery<McpConnection[]>(["mcp", "connections"], "mcp_connections");
   const local = useBackendQuery<LocalStatus>(["mcp", "local"], "mcp_server_status", undefined, !onboarding);
   const [edit, setEdit] = useState<McpConfig | null>(null);
   const [fresh, setFresh] = useState(false);
@@ -176,23 +175,6 @@ export function McpTools({ onboarding = false, onBusyChange }: { onboarding?: bo
   const [error, setError] = useState<unknown>(null);
   const notify = useUI((s) => s.notify);
   const client = useQueryClient();
-  useEffect(() => {
-    if (!backendAvailable) return;
-    let mounted = true;
-    let unlisten: (() => void) | undefined;
-    const sync = async () => {
-      if (!mounted) return;
-      // A first fetch may still reflect pre-restore state when an event arrives.
-      await client.cancelQueries({ queryKey: ["mcp"] });
-      if (mounted) await client.invalidateQueries({ queryKey: ["mcp"] });
-    };
-    void listen("mcp://restore-progress", () => { void sync(); }).then((stop) => {
-      if (!mounted) { stop(); return; }
-      unlisten = stop;
-      void sync(); // Catch restores that finished before subscription.
-    }).catch((cause) => { if (mounted) setError(cause); });
-    return () => { mounted = false; unlisten?.(); };
-  }, [client]);
   const forget = (id: string) => setFailures(({ [id]: _removed, ...rest }) => rest);
   const refresh = () => client.invalidateQueries({ queryKey: ["mcp"] });
   const change = useMutation({
@@ -241,6 +223,7 @@ export function McpTools({ onboarding = false, onBusyChange }: { onboarding?: bo
     catch (failure) { setError(failure); } finally { setLocalBusy(false); }
   }
 
+  const localConnection = connections.data?.find(({ serverId }) => serverId === "amm_local");
   const runningIds = new Set(connections.data?.map(({ serverId }) => serverId));
   const toEnable = externalConfigs.filter(({ id }) => !runningIds.has(id));
   const toDisable = externalConfigs.filter(({ id }) => runningIds.has(id) || startup.data?.includes(id));
@@ -302,12 +285,13 @@ export function McpTools({ onboarding = false, onBusyChange }: { onboarding?: bo
               {!active && startup.data?.includes(config.id) && <Button variant="link" size="sm" className="h-auto self-start p-0 text-xs" disabled={busy} aria-label={tr("取消 {name} 自动启动", { name: config.name })} onClick={() => { changeConnections("disable", [config], tr("已取消自动启动")); }}>{tr("取消自动启动")}</Button>}
               {failure && (!active || failure.action === "disable") && <p className="truncate text-xs text-destructive" title={failure.message}>{failure.action === "disable" && tr("禁用失败：")}{failure.message}</p>}
             </ItemContent>
-            <ItemActions className={cn("grid shrink-0 gap-0.5 [&_button]:size-7 sm:[&_button]:size-8", onboarding
+            <ItemActions className={cn("grid shrink-0 gap-0.5 [&_[data-size=icon-sm]]:size-7 sm:[&_[data-size=icon-sm]]:size-8", onboarding
                 ? "grid-cols-[auto_repeat(2,1.75rem)] sm:grid-cols-[auto_repeat(2,2rem)]"
                 : "grid-cols-[auto_repeat(3,1.75rem)] sm:grid-cols-[auto_repeat(3,2rem)]")}>
-              <Badge className="mr-1 whitespace-nowrap" tone={active ? "success" : failure ? "danger" : "neutral"}>
-                {stopping ? tr("停止中") : active ? <>{tr("运行中")}<span className="hidden sm:inline"> {tr("· {length} 个工具", { length: active.tools.length })}</span></> : starting ? tr("启动中") : failure?.action === "enable" ? tr("启动失败") : tr("未启动")}
-              </Badge>
+              {active && !stopping ? <McpToolListButton name={config.name} connection={active} /> :
+                <Badge className="mr-1 whitespace-nowrap" tone={stopping ? "success" : failure ? "danger" : "neutral"}>
+                  {stopping ? tr("停止中") : starting ? tr("启动中") : failure?.action === "enable" ? tr("启动失败") : tr("未启动")}
+                </Badge>}
               {hasCredentials && <IconButton className="col-start-2" title={tr("配置 {name} 凭据", { name: config.name })} aria-haspopup="dialog" disabled={busy} onClick={(event) => setCredentials({ config, trigger: event.currentTarget })}><KeyRoundIcon /></IconButton>}
               {!onboarding && !config.plugin_slug && <IconButton className="col-start-3" title={tr("编辑 {name}", { name: config.name })} disabled={busy} onClick={() => { setFresh(false); setEdit(config); }}><PencilIcon /></IconButton>}
               {active
@@ -334,7 +318,10 @@ export function McpTools({ onboarding = false, onBusyChange }: { onboarding?: bo
       <CardHeader>
         <CardTitle>{tr("本地工具")}</CardTitle>
         <CardDescription>{tr("让外部 Agent 通过受控工具使用本机的 Agent Mod Manager。开启后会随应用启动，手动停止即可取消。")}</CardDescription>
-        <CardAction><Badge tone={local.data?.running ? "success" : "neutral"}>{local.data?.stopping ? tr("正在等待事务完成") : local.data?.running ? tr("运行中") : tr("未开启")}</Badge></CardAction>
+        <CardAction>
+          {local.data?.running && !local.data.stopping && localConnection ? <McpToolListButton name="Agent Mod Manager" connection={localConnection} /> :
+            <Badge tone={local.data?.running ? "success" : "neutral"}>{local.data?.stopping ? tr("正在等待事务完成") : local.data?.running ? tr("运行中") : tr("未开启")}</Badge>}
+        </CardAction>
       </CardHeader>
       <CardContent className="flex flex-col items-start gap-3">
         {local.data?.startupRequested && !local.data.running && <Button variant="link" size="sm" disabled={busy} onClick={() => { void runLocal(() => api("mcp_server_stop"), tr("已取消本地工具自动启动")); }}>{tr("取消本地工具自动启动")}</Button>}

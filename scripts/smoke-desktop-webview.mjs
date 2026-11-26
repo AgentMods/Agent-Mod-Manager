@@ -285,10 +285,7 @@ async function installExternalMinecraftAdapter(ui) {
 
 async function registerAndOpen(ui, root) {
   const packagedUrl = windows ? /^https?:\/\/tauri\.localhost(?:[/?#]|$)/ : /^tauri:\/\/localhost(?:[/?#]|$)/;
-  // A fresh profile starts with first-run onboarding before the normal shell is shown.
-  await ui.visible(`${main}//h2`);
-  assert.equal(await ui.count('//nav[@aria-label="主导航"]'), 0, 'Onboarding must replace the normal navigation');
-  await ui.click('//footer//button');
+  await ui.visible(`${main}//*[@data-testid='home-page']//h1`);
   // Package smoke always starts from a disposable app profile. Pin its persisted UI and
   // future Mod-organization language before using the existing Simplified Chinese flow.
   await ui.click(iconButton('settings'));

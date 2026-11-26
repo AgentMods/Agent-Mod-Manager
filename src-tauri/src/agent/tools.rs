@@ -159,25 +159,20 @@ impl ToolRegistry {
             .ok_or_else(|| AppError::NotFound(format!("工具未注册: {name}")))
     }
     pub fn definitions(&self) -> Vec<Value> {
-        self.definitions_for(false, |_| true)
+        self.select_definitions(|_, tool| Some(tool.definition()))
     }
     pub(crate) fn inbound_definitions(&self, exported: impl Fn(&str) -> bool) -> Vec<Value> {
-        self.definitions_for(true, exported)
+        self.select_definitions(|name, tool| exported(name).then(|| tool.inbound_definition()))
     }
-    fn definitions_for(&self, inbound: bool, include: impl Fn(&str) -> bool) -> Vec<Value> {
-        self.tools
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|(name, _)| include(name))
-            .map(|(_, t)| {
-                if inbound {
-                    t.inbound_definition()
-                } else {
-                    t.definition()
-                }
-                .as_json()
-            })
+    pub(crate) fn select_definitions(
+        &self,
+        select: impl Fn(&str, &dyn AgentTool) -> Option<ToolDefinition>,
+    ) -> Vec<Value> {
+        // A scope may consult live provider state. Release the registry lock first.
+        let tools = self.tools.read().unwrap_or_else(|e| e.into_inner()).clone();
+        tools
+            .into_iter()
+            .filter_map(|(name, tool)| select(&name, tool.as_ref()).map(|def| def.as_json()))
             .collect()
     }
     pub fn builtin() -> AppResult<Self> {

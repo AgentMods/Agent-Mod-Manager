@@ -1,24 +1,61 @@
 //! GTA's loaders share extensions. Report independent payloads instead of picking
 //! the first DLL, and never treat an archive edit as a loose-file installation.
 use crate::error::{AppError, AppResult, NativeMessage};
+use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::Path};
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum Edition {
+    Legacy,
+    Enhanced,
+}
+
+impl Edition {
+    pub(super) fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            "gta5-legacy" => Some(Self::Legacy),
+            "gta5-enhanced" => Some(Self::Enhanced),
+            _ => None,
+        }
+    }
+
+    pub(super) fn marker(self) -> &'static str {
+        match self {
+            Self::Legacy => "GTA5.exe",
+            Self::Enhanced => "GTA5_Enhanced.exe",
+        }
+    }
+
+    pub(super) fn supports_rpf_kind(self, kind: &str) -> bool {
+        matches!(kind, "dlc" | "gameconfig")
+            || self == Self::Legacy && matches!(kind, "vehicle" | "ped")
+    }
+}
+
+pub(super) fn enhanced_rpf_unsupported() -> NativeMessage {
+    NativeMessage::new("gta.rpf.enhanced_unsupported", [])
+}
+
 pub(super) fn is_gta(slug: &str) -> bool {
-    matches!(slug, "gta5-legacy" | "gta5-enhanced")
+    Edition::from_slug(slug).is_some()
 }
 
 /// A saved binding remains in the library even if Steam has since removed or replaced the game.
 pub(super) fn check_edition(game: &crate::games::Game, slug: &str) -> AppResult<()> {
-    let (expected, other, app) = match slug {
-        "gta5-legacy" => ("GTA5.exe", "GTA5_Enhanced.exe", "271590"),
-        "gta5-enhanced" => ("GTA5_Enhanced.exe", "GTA5.exe", "3240220"),
-        _ => return Ok(()),
+    let Some(edition) = Edition::from_slug(slug) else {
+        return Ok(());
     };
+    let (other, app) = match edition {
+        Edition::Legacy => (Edition::Enhanced, "271590"),
+        Edition::Enhanced => (Edition::Legacy, "3240220"),
+    };
+    let expected = edition.marker();
     let root = Path::new(&game.root_path);
     let marker = root.join(expected);
     if game.platform != "windows"
         || game.steam_app_id.as_deref().is_some_and(|id| id != app)
-        || root.join(other).try_exists()?
+        || root.join(other.marker()).try_exists()?
         || crate::safe_fs::open_regular(&marker)
             .and_then(|file| crate::safe_fs::verify_regular_at(&file, &marker))
             .is_err()
@@ -117,7 +154,7 @@ pub(super) fn classify<'a>(names: impl IntoIterator<Item = &'a str>) -> Hints {
     let mut warnings = Vec::new();
     if tool || oiv {
         warnings.push(if tool {
-            "rpf.dll 是外部工具前置，不作为游戏 Mod 安装；只接受经过核验的 205014 发行包。"
+            "rpf.dll 不作为游戏 Mod 安装。GTA 归档请使用适配包的 RPF MCP。"
         } else {
             "OIV 包需用 OpenIV 人工审核和安装，AMM 不执行包内安装器。"
         });

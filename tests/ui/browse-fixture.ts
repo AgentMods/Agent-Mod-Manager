@@ -15,7 +15,7 @@ export type BrowseItemFixture = {
   originalTitle: string;
   author: string | null;
   summary: string | null;
-  typeKey: "visual" | "localization" | "gameplay" | "audio" | "framework" | "other" | "unknown";
+  typeKey: string;
   tags: { key: string; label: string }[];
   coverUrl: string | null;
   canOpenProject: boolean;
@@ -29,6 +29,14 @@ export type BrowsePageFixture = {
   isEnriching?: boolean;
   loadingPolls?: number;
   enrichedItems?: BrowseItemFixture[];
+};
+
+export type BrowseFixtureOptions = {
+  sources?: BrowseSourceFixture[];
+  pages?: BrowsePageFixture[];
+  workspaceGames?: { id: string; name: string }[];
+  authorizationFailures?: number;
+  searchFailures?: number;
 };
 
 export const BROWSE_SOURCES: BrowseSourceFixture[] = [
@@ -106,16 +114,10 @@ export const BROWSE_PAGES: BrowsePageFixture[] = [
   { items: [BROWSE_ITEMS[2]], hasNext: false, isEnriching: false },
 ];
 
-type BrowseFixtureOptions = {
-  sources?: BrowseSourceFixture[];
-  pages?: BrowsePageFixture[];
-  workspaceGames?: { id: string; name: string }[];
-};
-
 /** Installs deterministic browse IPC responses over the shared Tauri test transport. */
 export async function installBrowseFixture(page: Page, options: BrowseFixtureOptions = {}) {
   await installMockTauri(page, { workspaceGames: options.workspaceGames ?? BROWSE_GAMES });
-  await page.addInitScript(({ sources, pages }) => {
+  await page.addInitScript(({ sources, pages, authorizationFailures, searchFailures }) => {
     const target = window as any;
     const state = {
       calls: [] as { command: string; args: Record<string, unknown> }[],
@@ -124,10 +126,14 @@ export async function installBrowseFixture(page: Page, options: BrowseFixtureOpt
       pageReads: new Map<string, number>(),
       nextSearch: 0,
       activeSearchId: "" as string,
+      cancelledSearchIds: [] as string[],
       activeGameIds: [] as string[],
       activeSourceIds: null as string[] | null,
       authorizedSourceIds: [] as string[],
-      authorizationId: "browse-authorization-fixture",
+      authorizationId: "" as string,
+      authorizationCount: 0,
+      remainingAuthorizationFailures: authorizationFailures,
+      remainingSearchFailures: searchFailures,
       sourceListReadAt: 0,
     };
 
@@ -150,6 +156,16 @@ export async function installBrowseFixture(page: Page, options: BrowseFixtureOpt
             if (sourceIds.some((id: string) => !state.sources.some((source: BrowseSourceFixture) => source.id === id && source.status === "available"))) {
               throw new Error("browse authorization contains an unavailable source");
             }
+            if (state.remainingAuthorizationFailures > 0) {
+              state.remainingAuthorizationFailures--;
+              throw new Error("fixture browse authorization failed");
+            }
+            state.authorizationCount++;
+            state.authorizationId = state.authorizationCount === 1
+              ? "browse-authorization-fixture"
+              : `browse-authorization-fixture-${state.authorizationCount}`;
+            if (state.activeSearchId) state.cancelledSearchIds.push(state.activeSearchId);
+            state.activeSearchId = "";
             state.authorizedSourceIds = [...sourceIds];
             return {
               authorizationId: state.authorizationId,
@@ -161,6 +177,10 @@ export async function installBrowseFixture(page: Page, options: BrowseFixtureOpt
             if (!Array.isArray(args.gameIds) || args.gameIds.length === 0) throw new Error("browse search requires at least one selected game");
             if (Array.isArray(args.sourceIds) && args.sourceIds.some((id: string) => !state.authorizedSourceIds.includes(id))) {
               throw new Error("browse search requested a source outside the authorization");
+            }
+            if (state.remainingSearchFailures > 0) {
+              state.remainingSearchFailures--;
+              throw new Error("fixture browse search failed");
             }
             state.nextSearch += 1;
             state.activeSearchId = "browse-search-" + state.nextSearch;
@@ -190,7 +210,12 @@ export async function installBrowseFixture(page: Page, options: BrowseFixtureOpt
           }
           case "browse_select_game_match":
           case "browse_open_project":
+            return null;
           case "browse_cancel_search":
+            if (args.searchId === state.activeSearchId) state.activeSearchId = "";
+            if (typeof args.searchId === "string" && !state.cancelledSearchIds.includes(args.searchId)) {
+              state.cancelledSearchIds.push(args.searchId);
+            }
             return null;
           case "browse_install_task":
             return null;
@@ -213,7 +238,12 @@ export async function installBrowseFixture(page: Page, options: BrowseFixtureOpt
     });
     wrap(internals);
     target.__BROWSE_TEST__ = state;
-  }, { sources: options.sources ?? BROWSE_SOURCES, pages: options.pages ?? BROWSE_PAGES });
+  }, {
+    sources: options.sources ?? BROWSE_SOURCES,
+    pages: options.pages ?? BROWSE_PAGES,
+    authorizationFailures: options.authorizationFailures ?? 0,
+    searchFailures: options.searchFailures ?? 0,
+  });
 }
 
 export async function browseCalls(page: Page, command?: string) {

@@ -41,6 +41,9 @@ mod live_modrinth;
 #[path = "web_download_flow_tests.rs"]
 mod web_download_flow;
 
+#[path = "browse_install_runtime_tests.rs"]
+mod browse_install_runtime;
+
 struct NoSecrets;
 impl SecretStore for NoSecrets {
     fn read(&self, _: &str) -> AppResult<Option<String>> {

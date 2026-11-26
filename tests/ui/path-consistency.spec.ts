@@ -128,6 +128,7 @@ test("扫描候选合并旧路径别名，UNC 与 Unix 大小写不合并，发�
 test("新手引导合并别名并保持原始注册路径", async ({ page }) => {
   await installMockTauri(page, { onboarding: true, onboardingStarted: true, gameRootPath: verbatimUnc });
   await page.goto("/");
+  await page.getByRole("button", { name: "继续设置", exact: true }).click();
   await installDiscoveryResponses(page);
   await page.getByRole("button", { name: "下一步", exact: true }).click();
   await expect(page.getByRole("heading", { name: "配置 AI 模型服务", exact: true })).toBeVisible();

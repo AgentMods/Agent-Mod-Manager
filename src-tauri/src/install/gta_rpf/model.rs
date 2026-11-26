@@ -103,6 +103,11 @@ pub(super) struct Binding {
     pub exe: Fingerprint,
     pub original: Fingerprint,
 }
+impl Binding {
+    pub fn edition(&self) -> AppResult<Edition> {
+        Edition::from_slug(&self.slug).ok_or_else(|| conflict("RPF 任务账本不一致"))
+    }
+}
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub(super) struct State {
     pub binding: Option<Binding>,
@@ -121,7 +126,7 @@ pub(super) struct WireTarget {
 pub(super) struct Input {
     pub schema_version: u8,
     pub job_id: String,
-    pub kind: String,
+    pub kind: Edition,
     pub targets: Vec<WireTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inspect_dlc: Option<Blob>,

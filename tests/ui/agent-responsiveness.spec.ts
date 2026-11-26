@@ -8,6 +8,7 @@ const draft = '[data-message-id="assistant-fixture"]';
 
 async function openConversation(page: Page) {
   await page.goto("/");
+  await page.getByRole("button", { name: /^Agent( 对话)?$/ }).click();
   await page.getByRole("button", { name: "检查 Minecraft 模组", exact: true }).click();
   await page.waitForFunction((id) => (window as any).__AMM_TEST__.calls.some((call: any) =>
     call.command === "replay_agent_events" && call.args.conversationId === id), conversationId);

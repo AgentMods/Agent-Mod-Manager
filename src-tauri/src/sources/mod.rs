@@ -6,6 +6,7 @@ pub mod resolutions;
 pub(crate) mod web_download;
 pub mod web_search;
 pub use providers::dependency_graph::{DependencyGraph, DependencyGraphRequest};
+pub(crate) use providers::three_dm::select_resource as select_three_dm_resource;
 
 #[cfg(test)]
 mod live_provider_tests;

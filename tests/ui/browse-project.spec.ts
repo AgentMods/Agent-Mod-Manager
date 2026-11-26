@@ -5,7 +5,8 @@ async function openFeed(page: Page, pages: BrowsePageFixture[]) {
   await installBrowseFixture(page, { workspaceGames: [], pages });
   await page.goto("/");
   await page.getByRole("button", { name: "游览", exact: true }).click();
-  await page.getByRole("button", { name: "允许本次游览", exact: true }).click();
+  await expect.poll(async () => (await browseCalls(page, "browse_authorize")).length).toBe(1);
+  await expect.poll(async () => (await browseCalls(page, "browse_start_search")).length).toBe(1);
 }
 
 test("作品封面和可聚焦标题打开同一作品，缺少网页的卡片仍可独立安装", async ({ page }) => {
@@ -39,6 +40,8 @@ test("多游戏选择遵守每次八项的限制，清空后再次进入仍保�
   for (const game of games.slice(0, 8)) await checkbox(game.name).check();
   await expect(checkbox(games[8].name)).toBeDisabled();
   await dialog.getByRole("button", { name: "确定", exact: true }).click();
+  await expect.poll(async () => (await browseCalls(page, "browse_authorize")).length).toBe(1);
+  await expect.poll(async () => (await browseCalls(page, "browse_start_search")).length).toBe(1);
   await page.getByRole("button", { name: "游戏库", exact: true }).click();
   await browse.click();
   await picker.click();
@@ -48,5 +51,6 @@ test("多游戏选择遵守每次八项的限制，清空后再次进入仍保�
   await page.getByRole("button", { name: "游戏库", exact: true }).click();
   await browse.click();
   await expect(page.getByText("先选游戏，再开始游览", { exact: true })).toBeVisible();
-  expect(await browseCalls(page, "browse_start_search")).toHaveLength(0);
+  expect(await browseCalls(page, "browse_authorize")).toHaveLength(1);
+  expect(await browseCalls(page, "browse_start_search")).toHaveLength(2);
 });

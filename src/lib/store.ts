@@ -59,7 +59,7 @@ function initialTheme(): "light" | "dark" {
 const adapterResearchPrompt = () => tr("请先使用已有的 Mod 平台 MCP，查找并获取该游戏不同安装类型的代表性 Mod。结合发布页的安装说明、依赖声明和压缩包目录结构，分析并核实各类型的安装规则。请自行核实游戏识别标记，只在信息无法核实或需要我决定偏好时向我提问。");
 
 export const useUI = create<UIState>((set) => ({
-  view: pendingOnboardingMigration() ? "onboarding" : "agent", gameId: null, conversationId: null, adapterChat: null, theme: initialTheme(), planReview: null,
+  view: "home", gameId: null, conversationId: null, adapterChat: null, theme: initialTheme(), planReview: null,
   composer: emptyDraft(), editDraft: null,
   setComposer: (update) => set(state => ({composer: typeof update === "function" ? update(state.composer) : update})),
   setEditDraft: (update) => set(state => ({editDraft: typeof update === "function" ? update(state.editDraft) : update})),

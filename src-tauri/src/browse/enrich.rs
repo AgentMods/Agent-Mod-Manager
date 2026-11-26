@@ -14,8 +14,12 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use tokio_util::sync::CancellationToken;
 
 mod cache;
+mod classification;
+mod game_match;
 mod taxonomy;
 
+pub(super) use classification::classify_items;
+pub(crate) use game_match::{game_aliases, suggest_game};
 pub(crate) use taxonomy::ModType;
 
 const ITEM_RULES: &str = include_str!("enrich/items.txt");
@@ -72,7 +76,7 @@ pub(crate) fn fallback_item(input: EnrichmentInput<'_>) -> EnrichedItem {
     EnrichedItem {
         title: input.title.to_owned(),
         summary: input.summary.map(str::to_owned),
-        type_key: taxonomy::fallback_type(input.kind, &tags),
+        type_key: taxonomy::fallback_type(input.kind, &tags, input.title, input.summary),
         tags,
     }
 }
@@ -250,7 +254,6 @@ struct ModelItem {
     // missing field is a model protocol failure, not an absent original summary.
     #[serde(deserialize_with = "Option::deserialize")]
     summary: Option<String>,
-    type_key: ModType,
     tags: Vec<BrowseTag>,
 }
 
@@ -286,11 +289,7 @@ impl ModelItem {
         Some(EnrichedItem {
             title,
             summary,
-            type_key: if original.type_key == ModType::Unknown {
-                self.type_key
-            } else {
-                original.type_key
-            },
+            type_key: original.type_key,
             tags,
         })
     }

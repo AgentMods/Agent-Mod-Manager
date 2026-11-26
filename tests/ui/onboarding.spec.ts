@@ -29,7 +29,7 @@ const onboardingStdioConfig = {
 
 async function openOnboardingWithMcp(page: Page, {active = []}: {active?: string[]} = {}) {
   await installMockTauri(page, {onboarding: true});
-  await page.goto("/");
+  await enterInitialSetup(page);
   await page.evaluate(({configs, active}) => {
     const internals = (window as any).__TAURI_INTERNALS__;
     const invoke = internals.invoke.bind(internals);
@@ -74,6 +74,19 @@ const onboardingSteps = [
 
 async function expectOnboardingStep(page: Page, index: number) {
   await expect(page.getByRole("heading", {name: onboardingSteps[index], exact: true})).toBeVisible();
+}
+
+async function enterInitialSetup(page: Page) {
+  await page.goto("/");
+  await page.getByRole("button", {name: /^(开始设置|继续设置)$/}).click();
+  await expectOnboardingStep(page, 0);
+}
+
+async function continueSetupAfterReturn(page: Page, step: number) {
+  await expect(page.getByRole("button", {name: "继续设置", exact: true})).toBeVisible();
+  await expect(page.getByRole("heading", {name: onboardingSteps[step], exact: true})).toHaveCount(0);
+  await page.getByRole("button", {name: "继续设置", exact: true}).click();
+  await expectOnboardingStep(page, step);
 }
 
 async function continueToModelSetup(page: Page) {
@@ -128,7 +141,7 @@ async function chooseAndConfirmStorageMigration(page: Page) {
 test.describe("首次启动引导", () => {
   test("五步标题、桌面标签和前后往返一致", async ({page}, info) => {
     await installMockTauri(page, {onboarding: true});
-    await page.goto("/");
+    await enterInitialSetup(page);
 
     const expectCurrent = async (index: number) => {
       await expectOnboardingStep(page, index);
@@ -166,7 +179,7 @@ test.describe("首次启动引导", () => {
 
   test("保留当前存储目录后可跳过扫描并完成引导", async ({page}) => {
     await installMockTauri(page, {onboarding: true});
-    await page.goto("/");
+    await enterInitialSetup(page);
     await expectOnboardingStep(page, 0);
     await expect(page.getByText("/sandbox/data", {exact: true})).toBeVisible();
 
@@ -203,7 +216,7 @@ test.describe("首次启动引导", () => {
 
     await page.evaluate(() => (window as any).__AMM_TEST__.finishStorageMigration());
     await page.reload();
-    await expectOnboardingStep(page, 1);
+    await continueSetupAfterReturn(page, 1);
     await expect(page.getByText(/迁移失败/)).toHaveCount(0);
     await page.getByRole("button", {name: "上一步", exact: true}).click();
     await expectOnboardingStep(page, 0);
@@ -212,12 +225,11 @@ test.describe("首次启动引导", () => {
 
   test("迁移后目录未变时刷新仍回到第 1 步", async ({page}) => {
     await installOnboardingMigrationMock(page, {nextDataRoot: migrationCurrentRoot, onboarding: true});
-    await page.goto("/");
-    await expectOnboardingStep(page, 0);
+    await enterInitialSetup(page);
     await chooseAndConfirmStorageMigration(page);
     await expect(page.getByRole("button", {name: "正在重启…", exact: true})).toBeDisabled();
     await page.reload();
-    await expectOnboardingStep(page, 0);
+    await continueSetupAfterReturn(page, 0);
     await expect(page.getByText(migrationCurrentRoot, {exact: true})).toBeVisible();
   });
 
@@ -227,8 +239,7 @@ test.describe("首次启动引导", () => {
       rejectMigration: true,
       onboarding: true,
     });
-    await page.goto("/");
-    await expectOnboardingStep(page, 0);
+    await enterInitialSetup(page);
     const dialog = await chooseAndConfirmStorageMigration(page);
     await expect(dialog.getByText(migrationFailureMessage, {exact: true})).toBeVisible();
     await expect(dialog.getByRole("button", {name: "迁移并重启", exact: true})).toBeEnabled();
@@ -247,7 +258,7 @@ test.describe("首次启动引导", () => {
     ]);
 
     await page.reload();
-    await expectOnboardingStep(page, 1);
+    await continueSetupAfterReturn(page, 1);
   });
 
   test("重启后 bootstrap 报告存储迁移失败时回到第 1 步", async ({page}) => {
@@ -256,8 +267,7 @@ test.describe("首次启动引导", () => {
       nextMigrationError: migrationFailureMessage,
       onboarding: true,
     });
-    await page.goto("/");
-    await expectOnboardingStep(page, 0);
+    await enterInitialSetup(page);
     const dialog = await chooseAndConfirmStorageMigration(page);
     await expect(dialog.getByRole("button", {name: "正在重启…", exact: true})).toBeDisabled();
     await expect.poll(() => page.evaluate(() => (window as any).__AMM_TEST__.calls.filter(
@@ -265,13 +275,13 @@ test.describe("首次启动引导", () => {
     ))).toEqual([{command: "migrate_storage", args: {parent: migrationParent}}]);
 
     await page.reload();
-    await expectOnboardingStep(page, 0);
+    await continueSetupAfterReturn(page, 0);
     await expect(page.getByText(/迁移失败，仍在使用原目录/)).toBeVisible();
   });
 
   test("扫描候选不会自动添加，失败候选不影响其他候选", async ({page}) => {
     await installMockTauri(page, {onboarding: true, failRegistration: true, withExternalAdapter: true});
-    await page.goto("/");
+    await enterInitialSetup(page);
     await continueToGameScan(page);
     await expect(page.getByRole("navigation", {name: "主导航"})).toHaveCount(0);
 
@@ -309,7 +319,7 @@ test.describe("首次启动引导", () => {
 
   test("引导页添加无建议的扫描候选时不绑定适配包", async ({page}) => {
     await installMockTauri(page, {onboarding: true});
-    await page.goto("/");
+    await enterInitialSetup(page);
     await continueToGameScan(page);
     await page.getByRole("button", {name: "扫描已安装游戏"}).click();
     const directory = "/sandbox/steam/Broken";
@@ -601,7 +611,7 @@ test.describe("首次启动引导", () => {
 
   test("BaseLLM 不可用时仍可手动添加模型并保存", async ({page}) => {
     await installMockTauri(page, {onboarding: true});
-    await page.goto("/");
+    await enterInitialSetup(page);
     await continueToModelSetup(page);
     await page.getByLabel("API 地址", {exact: true}).fill("https://offline.example/v1");
     await page.getByRole("button", {name: "手动添加", exact: true}).click();
@@ -620,7 +630,7 @@ test.describe("首次启动引导", () => {
 
   test("在模型步骤退出失败时显示错误并允许重试", async ({page}) => {
     await installMockTauri(page, {onboarding: true});
-    await page.goto("/");
+    await enterInitialSetup(page);
     await continueToModelSetup(page);
     await page.evaluate(() => {
       const transport = (window as any).__TAURI_INTERNALS__;
@@ -643,16 +653,19 @@ test.describe("首次启动引导", () => {
 
   test("退出引导会持久化完成状态并解除阻断", async ({page}) => {
     await installMockTauri(page, {onboarding: true});
-    await page.goto("/");
+    await enterInitialSetup(page);
     await page.getByRole("button", {name: "退出引导", exact: true}).click();
     await expect(page.getByTestId("library-page")).toBeVisible();
     const completed = await page.evaluate(() => (window as any).__AMM_TEST__.calls.filter((call: any) => call.command === "set_onboarding_completed"));
     expect(completed.at(-1)?.args.completed).toBe(true);
   });
 
-  test("添加后中途退出会恢复引导，已有游戏的旧用户不会被阻断", async ({page}) => {
+  test("未完成引导返回首页后可继续设置", async ({page}) => {
     await installMockTauri(page, {onboarding: true, onboardingStarted: true});
     await page.goto("/");
+    await expect(page.getByRole("button", {name: "继续设置", exact: true})).toBeVisible();
+    await expect(page.getByRole("heading", {name: onboardingSteps[0], exact: true})).toHaveCount(0);
+    await page.getByRole("button", {name: "继续设置", exact: true}).click();
     await expectOnboardingStep(page, 0);
     await expect(page.getByRole("navigation", {name: "主导航"})).toHaveCount(0);
   });

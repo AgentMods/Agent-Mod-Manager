@@ -2,10 +2,7 @@
 //! install arguments or URLs; a browse result capability is resolved natively.
 use super::{matching::GameScope, resolve_work, BrowseState, TrustedWork};
 use crate::{
-    agent::{
-        policy::PermissionMode,
-        runtime::{AgentRuntime, TurnRequest},
-    },
+    agent::runtime::{AgentRuntime, TurnRequest},
     app::AppServices,
     db::Db,
     error::{AppError, AppResult},
@@ -67,10 +64,44 @@ pub(crate) fn init(db: &Db) -> AppResult<()> {
     Ok(())
 }
 
-pub(crate) fn is_task_conversation(conn: &Connection, id: &str) -> AppResult<bool> {
+/// Recover the binding created from the original native catalog result for a chat follow-up.
+pub(crate) fn conversation_scope(
+    conn: &Connection,
+    conversation: &str,
+) -> AppResult<Option<InstallScope>> {
+    let task = conn
+        .query_row(
+            "SELECT id,game_id,source_id,project_id,provider_game_id
+             FROM browse_install_tasks WHERE conversation_id=?1",
+            [conversation],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    WorkKey {
+                        game_id: row.get(1)?,
+                        source_id: row.get(2)?,
+                        project_id: row.get(3)?,
+                        provider_game_id: row.get(4)?,
+                    },
+                ))
+            },
+        )
+        .optional()?;
+    task.map(|(id, key)| {
+        let game = crate::games::get_game_from(conn, &key.game_id)?;
+        Ok(InstallScope::new(id, key, GameScope::new(game)))
+    })
+    .transpose()
+}
+
+/// A card retry and a chat follow-up can refer to different conversations for the same work.
+pub(crate) fn sibling_install_running(conn: &Connection, conversation: &str) -> AppResult<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM browse_install_tasks WHERE conversation_id=?1)",
-        [id],
+        "SELECT EXISTS (SELECT 1 FROM browse_install_tasks b
+           JOIN browse_install_tasks other USING (game_id,source_id,project_id,provider_game_id)
+           JOIN agent_turns t ON t.conversation_id=other.conversation_id AND t.status='running'
+           WHERE b.conversation_id=?1 AND other.id<>b.id)",
+        [conversation],
         |row| row.get(0),
     )?)
 }
@@ -179,12 +210,13 @@ fn task_for(conn: &Connection, key: &WorkKey) -> AppResult<Option<BrowseInstallT
     let row = conn
         .query_row(
             "SELECT b.id,b.conversation_id,t.id,t.status,
-           EXISTS (SELECT 1 FROM approvals a WHERE a.conversation_id=b.conversation_id
-             AND a.status='rejected' AND a.title<>'ask_user')
+           EXISTS (SELECT 1 FROM agent_events e JOIN approvals a ON a.id=json_extract(e.payload_json,'$.approvalId')
+             WHERE e.conversation_id=b.conversation_id AND e.turn_id=t.id AND e.kind='approval-request'
+               AND a.status='rejected' AND a.title<>'ask_user')
          FROM browse_install_tasks b
          LEFT JOIN agent_turns t ON t.conversation_id=b.conversation_id
          WHERE b.game_id=?1 AND b.source_id=?2 AND b.project_id=?3 AND b.provider_game_id=?4
-         ORDER BY b.rowid DESC LIMIT 1",
+         ORDER BY (t.status='running') DESC, t.rowid DESC, b.rowid DESC LIMIT 1",
             params![
                 key.game_id,
                 key.source_id,
@@ -412,7 +444,7 @@ fn start(
         content: scope.instruction(),
         attachments: None,
         model: None,
-        permission_mode: Some(PermissionMode::RequestApproval),
+        permission_mode: None,
         reasoning_effort: None,
     };
     if let Err(error) = agent.start_browse_turn(request, scope) {
