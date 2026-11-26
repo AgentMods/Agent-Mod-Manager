@@ -6,12 +6,12 @@ installation limitations. This page records implementation and verification
 evidence; it does not establish that the release workflow or CI has passed.
 The broader project scope remains active.
 
-**Home dashboard (2026-11-26).** Every launch opens Home. The primary action
-opens first-run setup, resumes setup after a migration, or opens the game
-library. Registered games have direct links to their detail pages. The local
+**Home dashboard (2026-11-26).** Every launch opens Home. The welcome panel shows library counts above
+four shortcuts: Get started (Agent), Library, Browse and Settings. First-run and
+migration setup remain available separately. Registered games have direct links to their detail pages. The local
 SQLite summary counts managed games, installed Mods and all visible Mod rows
 across the game libraries. The sponsor panel reads up to six distinct public
-display names from the sponsorship site and opens the site in the system browser.
+display names, followed by one Sponsor link that opens the site in the system browser.
 The production frontend build and 102 Home, sidebar, onboarding and plugin catalog
 UI checks passed across the three configured viewports.
 
