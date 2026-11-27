@@ -7,7 +7,6 @@ use super::{
 use crate::{
     error::{AppError, AppResult, NativeMessage},
     games::{self, Game},
-    paths,
     storage::AppPaths,
     transaction::{self, FileEngine},
     util,
@@ -267,6 +266,7 @@ fn mod_preset(paths: &AppPaths, game: &Game, root: &Path, method: Method) -> Opt
 mod windows_presets {
     use super::super::guarded_launch_path;
     use super::*;
+    use crate::paths;
 
     const STARDEW_STEAM_ID: &str = "413150";
     const ELDEN_RING_STEAM_ID: &str = "1245620";

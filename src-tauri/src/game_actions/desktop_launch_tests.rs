@@ -1,5 +1,8 @@
 use super::*;
-use crate::game_actions::{self, tests::Fixture};
+use crate::{
+    game_actions::{self, tests::Fixture},
+    paths,
+};
 use serde_json::json;
 use std::fs;
 

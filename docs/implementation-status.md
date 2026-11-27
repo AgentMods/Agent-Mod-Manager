@@ -1,7 +1,7 @@
 # Agent Mod Manager implementation status
 
-Updated: 2026-11-27. The desktop release target is `1.0.3`. See the
-[Chinese release notes](releases/1.0.3.md) for user-facing features and
+Updated: 2026-11-27. The desktop release target is `1.1.0`. See the
+[Chinese release notes](releases/1.1.0.md) for user-facing features and
 installation limitations. This page records implementation and verification
 evidence; it does not establish that the release workflow or CI has passed.
 The broader project scope remains active.

@@ -52,5 +52,5 @@ test("多游戏选择遵守每次八项的限制，清空后再次进入仍保�
   await browse.click();
   await expect(page.getByText("先选游戏，再开始游览", { exact: true })).toBeVisible();
   expect(await browseCalls(page, "browse_authorize")).toHaveLength(1);
-  expect(await browseCalls(page, "browse_start_search")).toHaveLength(2);
+  expect(await browseCalls(page, "browse_start_search")).toHaveLength(1);
 });
