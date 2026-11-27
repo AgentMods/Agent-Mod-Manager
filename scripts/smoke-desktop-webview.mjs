@@ -306,7 +306,8 @@ async function registerAndOpen(ui, root) {
   await ui.visible(`${scanDialog}//*[@role="status"]//p[starts-with(normalize-space(.), '已检查 ')]`);
   await ui.fill(`${scanDialog}//input[@aria-label="游戏目录"]`, root);
   await ui.click(button('检查单个游戏', scanDialog));
-  const candidate = `${scanDialog}//*[@data-slot="item" and .//*[@data-slot="item-title" and ${exact(game)}] and .//*[@data-slot="item-description"]//*[${pathIs(root)}]]`;
+  // ScanGameCard uses an h3 and renders the path directly in PathText, not ItemTitle/ItemDescription.
+  const candidate = `${scanDialog}//*[@data-slot="item" and .//h3[${exact(game)}] and .//span[${pathIs(root)}]]`;
   await ui.click(button('添加', candidate));
 
   // Registration updates the same result in place. Open details from the library card after closing the dialog.
