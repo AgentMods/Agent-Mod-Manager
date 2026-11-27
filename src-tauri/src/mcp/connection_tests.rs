@@ -478,7 +478,7 @@ io.on('line', (line) => {
 }
 
 #[tokio::test]
-async fn connection_tool_details_preserve_catalog_order_and_redaction() {
+async fn connection_tool_details_keep_order_and_redaction_without_disclosing_local_roots() {
     use axum::{http::StatusCode, response::IntoResponse, routing::post, Router};
 
     const FIRST: &str = "lookup_mod_projects_with_compatibility";
@@ -491,15 +491,12 @@ async fn connection_tool_details_preserve_catalog_order_and_redaction() {
             let requests = requests.clone();
             move |body: String| async move {
                 let request: Value = serde_json::from_str(&body).unwrap();
+                requests.lock().unwrap().push(request.clone());
                 if request.get("id").is_none() {
                     return StatusCode::ACCEPTED.into_response();
                 }
                 let method = request["method"].as_str().unwrap();
                 let cursor = request["params"]["cursor"].as_str();
-                requests
-                    .lock()
-                    .unwrap()
-                    .push((method.to_owned(), cursor.map(str::to_owned)));
                 let result = match (method, cursor) {
                     ("initialize", None) => json!({
                         "protocolVersion": "2025-03-26", "capabilities": {"tools": {}},
@@ -526,7 +523,10 @@ async fn connection_tool_details_preserve_catalog_order_and_redaction() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/mcp", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let (_dir, servers, settings, _) = fixture();
+    let (dir, servers, settings, context) = fixture();
+    let game = dir.path().join("registered-local-game-not-for-mcp");
+    std::fs::create_dir(&game).unwrap();
+    crate::games::register_game(&context.engine.db, &game, None).unwrap();
     let connections = McpConnections::default();
     let registry = ToolRegistry::default();
     let mut config = ServerConfig::http("display_details", "Fixture", &url);
@@ -557,14 +557,37 @@ async fn connection_tool_details_preserve_catalog_order_and_redaction() {
             json!([expected])
         );
     }
-    assert_eq!(
-        *requests.lock().unwrap(),
-        [
-            ("initialize".to_owned(), None),
-            ("tools/list".to_owned(), None),
-            ("tools/list".to_owned(), Some("next".to_owned())),
-        ]
-    );
+    {
+        let requests = requests.lock().unwrap();
+        let methods: Vec<_> = requests
+            .iter()
+            .filter(|request| request.get("id").is_some())
+            .map(|request| {
+                (
+                    request["method"].as_str().unwrap(),
+                    request["params"]["cursor"].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                ("initialize", None),
+                ("tools/list", None),
+                ("tools/list", Some("next"))
+            ]
+        );
+        let initialize = requests
+            .iter()
+            .find(|request| request["method"] == "initialize")
+            .unwrap();
+        assert!(initialize["params"]["capabilities"].get("roots").is_none());
+        for request in requests.iter() {
+            let body = request.to_string();
+            assert!(!body.contains(dir.path().file_name().unwrap().to_str().unwrap()));
+            assert!(!body.contains("registered-local-game-not-for-mcp"));
+        }
+    }
     connections
         .disconnect(&registry, &servers, "display_details")
         .await

@@ -457,7 +457,11 @@ async fn storage_directory_discovery_and_file_ops_use_current_engine_and_desktop
     let client = connect(&server, &fixture.runtime).await;
 
     let listed = client.peer().list_tools(None).await.unwrap();
-    let storage = listed.tools.iter().find(|t| t.name == STORAGE_TOOL).unwrap();
+    let storage = listed
+        .tools
+        .iter()
+        .find(|t| t.name == STORAGE_TOOL)
+        .unwrap();
     assert_eq!(storage.input_schema["additionalProperties"], false);
     assert_eq!(storage.input_schema["properties"], json!({}));
     let response = call(&client, STORAGE_TOOL, json!({})).await;
@@ -467,48 +471,82 @@ async fn storage_directory_discovery_and_file_ops_use_current_engine_and_desktop
     assert_eq!(*result, json!({"path":crate::paths::display_path(&root)}));
     let reported = std::path::PathBuf::from(result["path"].as_str().unwrap());
     assert_eq!(reported.canonicalize().unwrap(), root);
+    let rejected = call(&client, STORAGE_TOOL, json!({"path":old_root})).await;
+    assert_eq!(rejected.is_error, Some(true));
     assert_eq!(
-        call(&client, STORAGE_TOOL, json!({"path":old_root}))
+        rejected.structured_content.unwrap()["result"]["error"],
+        "工具 get_storage_directory 不接受参数。"
+    );
+    let response = call(
+        &client,
+        "read_file",
+        json!({"path":reported.join("notes.txt")}),
+    )
+    .await;
+    assert_eq!(response.is_error, Some(false), "{response:?}");
+    assert!(response.structured_content.unwrap()["result"]
+        .to_string()
+        .contains("ordinary work file"));
+    assert_eq!(
+        call(&client, "read_file", json!({"path":old_file}))
             .await
             .is_error,
         Some(true)
     );
-    let response = call(&client, "read_file", json!({"path":reported.join("notes.txt")})).await;
-    assert_eq!(response.is_error, Some(false), "{response:?}");
-    assert!(response.structured_content.unwrap()["result"].to_string().contains("ordinary work file"));
-    assert_eq!(
-        call(&client, "read_file", json!({"path":old_file})).await.is_error,
-        Some(true)
-    );
 
     let destination = reported.join("notes copy.txt");
-    let response = call(&client, "plan_file_ops", json!({
-        "summary":"Copy a work file in active storage",
-        "operations":[{"op":"copy","src":reported.join("notes.txt"),"dst":destination}]
-    })).await;
+    let response = call(
+        &client,
+        "plan_file_ops",
+        json!({
+            "summary":"Copy a work file in active storage",
+            "operations":[{"op":"copy","src":reported.join("notes.txt"),"dst":destination}]
+        }),
+    )
+    .await;
     assert_eq!(response.is_error, Some(false), "{response:?}");
     let plan_id = response.structured_content.unwrap()["result"]["id"]
-        .as_str().unwrap().to_owned();
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert!(!destination.exists());
     let peer = client.peer().clone();
     let apply = tokio::spawn(async move {
-        peer.call_tool(CallToolRequestParams::new("apply_file_ops").with_arguments(
-            json!({"plan_id":plan_id,"approved":true}).as_object().unwrap().clone(),
-        )).await.unwrap()
+        peer.call_tool(
+            CallToolRequestParams::new("apply_file_ops").with_arguments(
+                json!({"plan_id":plan_id,"approved":true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap()
     });
     let approval = next_event(&mut fixture.events, "approval-request").await;
     assert_eq!(approval.payload["title"], "apply_file_ops");
     assert!(!apply.is_finished());
     assert!(!destination.exists());
-    fixture.runtime.respond_approval(
-        &approval.conversation_id,
-        approval.payload["approvalId"].as_str().unwrap(),
-        ApprovalResponse { approved: true, answer: Value::Null },
-    ).unwrap();
+    fixture
+        .runtime
+        .respond_approval(
+            &approval.conversation_id,
+            approval.payload["approvalId"].as_str().unwrap(),
+            ApprovalResponse {
+                approved: true,
+                answer: Value::Null,
+            },
+        )
+        .unwrap();
     let response = tokio::time::timeout(Duration::from_secs(5), apply)
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(response.is_error, Some(false), "{response:?}");
-    assert_eq!(std::fs::read_to_string(&destination).unwrap(), "ordinary work file");
+    assert_eq!(
+        std::fs::read_to_string(&destination).unwrap(),
+        "ordinary work file"
+    );
 
     set_mode(&fixture.runtime, "full_trust");
     for operation in [
@@ -517,9 +555,14 @@ async fn storage_directory_discovery_and_file_ops_use_current_engine_and_desktop
         json!({"op":"copy","src":source,"dst":root.join("manager.db")}),
         json!({"op":"copy","src":source,"dst":old_root.join("probe.txt")}),
     ] {
-        let response = call(&client, "plan_file_ops", json!({
-            "summary":"Out of file scope", "operations":[operation]
-        })).await;
+        let response = call(
+            &client,
+            "plan_file_ops",
+            json!({
+                "summary":"Out of file scope", "operations":[operation]
+            }),
+        )
+        .await;
         assert_eq!(response.is_error, Some(true), "{operation}: {response:?}");
     }
     client.cancel().await.unwrap();

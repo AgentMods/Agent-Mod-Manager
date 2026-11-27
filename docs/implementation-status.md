@@ -6,6 +6,21 @@ installation limitations. This page records implementation and verification
 evidence; it does not establish that the release workflow or CI has passed.
 The broader project scope remains active.
 
+**Managed directory access (2026-11-27).** Desktop file operations, the local
+Agent, and authenticated inbound MCP use the live game registrations and the
+active Settings storage directory. Generic plans can now create and update
+ordinary files directly under storage or in user-created subdirectories, not
+just under staging, downloads, plugins and skills. The same approval,
+rollback, credential and reserved-state protections apply. Mod library files,
+backups and trash still use their dedicated operations. The Agent and inbound
+MCP can discover the active path on demand with `get_storage_directory`;
+`list_games` supplies registered game paths. No host ACL is changed and no
+local paths are automatically advertised to third-party MCP servers.
+`extract_preview` directs callers to `read_dir` if given a directory instead
+of an archive, after validating the caller's access to the path. On Windows,
+57 focused Rust tests passed across file transactions, filesystem reads, local
+Agent tools, storage migration, inbound MCP and outbound path non-disclosure.
+
 **Agent sidebar reminders (2026-11-27).** The Agent navigation item counts conversations with pending questions, approvals or new background replies. The expanded rail displays a badge and the collapsed rail displays a dot. Selecting the item opens a conversation, prioritizing pending actions. Viewing a reply clears its unread indicator. Questions and approvals stay visible until resolved. Active conversation checkpoints restore outstanding actions when the WebView reloads.
 
 **Mod source metadata (2026-11-27).** Source downloads retain the selected file's display version separately from its resource ID and store a public work page in the library and install record when available. This covers native providers and Browse/MCP downloads, not just 3DM. The archive list and installation planner can recover missing fields offline from an exact download receipt. Public project routes can also be reconstructed for 3DM, Mod Inn, Modrinth, Nexus (game domain and project ID), CurseForge and GameBanana. Community/slug-dependent pages use recorded source metadata; ambiguous IDs, generic local imports and file IDs alone are not enough to identify the work or invent its version.

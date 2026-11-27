@@ -251,6 +251,18 @@
     "ru": "Недопустимый ввод: {detail}",
     "it": "Input non valido: {detail}"
   },
+  "tool.no_arguments": {
+    "zh-CN": "工具 {tool} 不接受参数。",
+    "en": "The {tool} tool does not accept arguments.",
+    "ja": "ツール {tool} は引数を受け取りません。",
+    "ko": "{tool} 도구는 인수를 받지 않습니다.",
+    "de": "Das Werkzeug {tool} akzeptiert keine Argumente.",
+    "fr": "L’outil {tool} n’accepte aucun argument.",
+    "es": "La herramienta {tool} no acepta argumentos.",
+    "pt-BR": "A ferramenta {tool} não aceita argumentos.",
+    "ru": "Инструмент {tool} не принимает аргументы.",
+    "it": "Lo strumento {tool} non accetta argomenti."
+  },
   "error.denied": {
     "zh-CN": "权限被拒绝: {detail}",
     "en": "Permission denied: {detail}",

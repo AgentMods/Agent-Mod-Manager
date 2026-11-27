@@ -495,7 +495,10 @@ impl AgentTool for Builtin {
                 )?)),
                 "get_storage_directory" => {
                     if !args.as_object().is_some_and(|args| args.is_empty()) {
-                        return Err(AppError::Invalid("存储目录查询不接受参数".into()));
+                        return Err(AppError::Presented(crate::error::NativeMessage::new(
+                            "tool.no_arguments",
+                            [("tool", name.clone())],
+                        )));
                     }
                     // Use the live engine, not a pending location that needs a restart.
                     let paths = &engine.paths;

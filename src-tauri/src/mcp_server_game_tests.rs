@@ -470,6 +470,9 @@ async fn discovery_and_rejected_registration_never_grant_file_scope() {
             .is_error,
         Some(false)
     );
+    let plan = call(&client, "plan_file_ops", plan_args).await;
+    assert_eq!(plan.is_error, Some(false), "{plan:?}");
+    assert!(!root.join("mods").exists(), "planning must not write");
     let repeated = call(&client, "register_game", json!({"directory":root})).await;
     assert_eq!(repeated.is_error, Some(true));
     let games = games::list_games(&engine.db).unwrap();

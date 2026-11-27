@@ -666,6 +666,28 @@ async fn write_text_is_desktop_agent_only_even_in_game_and_accepts_more_than_one
 }
 
 #[tokio::test]
+async fn agent_can_write_and_read_a_custom_storage_folder_with_manager_approval() {
+    let f = Fixture::new();
+    let agent = f.agent();
+    let storage = f
+        .call(&agent, "get_storage_directory", json!({}))
+        .await
+        .unwrap();
+    let dst = Path::new(storage["path"].as_str().unwrap()).join("custom/config.ini");
+    let id = f
+        .plan(&agent, json!([write(&dst, "enabled=true")]))
+        .await
+        .unwrap();
+    assert!(!dst.exists());
+    f.apply_after_review(&id, Effect::ManagerWrite).await;
+    let read = f
+        .call(&agent, "read_file", json!({"path":dst}))
+        .await
+        .unwrap();
+    assert_eq!(read["lines"][0]["text"], "enabled=true");
+}
+
+#[tokio::test]
 async fn local_file_access_still_protects_env_and_manager_credentials() {
     let f = Fixture::new();
     let private = f.engine.paths.root.join("private");
